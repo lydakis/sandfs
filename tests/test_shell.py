@@ -149,6 +149,19 @@ def test_host_rm_syncs_back():
     assert not shell.vfs.exists("/workspace/app.py")
 
 
+def test_host_rm_removes_missing_subtree():
+    shell = setup_shell()
+    shell.exec("mkdir /workspace/tmp")
+    shell.exec("mkdir /workspace/tmp/sub")
+    shell.exec("write /workspace/tmp/sub/nested.txt hi")
+
+    result = shell.exec("host -p /workspace rm -rf tmp")
+
+    assert result.exit_code == 0
+    assert shell.vfs.exists("/workspace/tmp") is False
+    assert shell.vfs.exists("/workspace/tmp/sub/nested.txt") is False
+
+
 def test_host_sync_skips_read_only_files():
     shell = setup_shell()
     node = shell.vfs._resolve_node("/workspace/app.py")
