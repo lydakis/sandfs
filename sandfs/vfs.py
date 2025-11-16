@@ -311,7 +311,7 @@ class VirtualFileSystem:
         self._ensure_write_allowed(node, append=append)
         self._check_version(node, expected_version)
         previous_version = node.version
-        previous_content = node.read(self)
+        previous_content = getattr(node, "_content", "")
         previous_provider = getattr(node, "_provider", None)
         node.write(data, append=append)
         node.version += 1
@@ -319,7 +319,7 @@ class VirtualFileSystem:
             self._persist_storage(node, previous_version)
         except InvalidOperation:
             node.version = previous_version
-            node.write(previous_content)
+            node._content = previous_content
             node._provider = previous_provider
             raise
         event_type = "create" if previous_version == 0 else "update"
