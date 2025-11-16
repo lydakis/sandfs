@@ -55,6 +55,20 @@ def test_host_command_requires_subcommand():
     assert "expects a command" in res.stderr.lower()
 
 
+def test_host_dashdash_sets_cwd_and_preserves_args():
+    shell = setup_shell()
+    sentinel_name = ".cwd-sentinel"
+    shell.vfs.write_file(f"/workspace/{sentinel_name}", "marker")
+
+    res = shell.exec("host -C /workspace -- ls -a")
+    assert res.exit_code == 0
+    assert sentinel_name in res.stdout
+
+    dash_res = shell.exec("host -C /workspace -- --version")
+    assert dash_res.exit_code == 127
+    assert "'--version'" in dash_res.stderr
+
+
 def test_agent_mode_blocks_commands():
     vfs = VirtualFileSystem()
     vfs.write_file("/workspace/allowed.txt", "ok")
