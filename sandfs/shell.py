@@ -160,6 +160,8 @@ class SandboxShell:
         self.register_command("rg", self._cmd_rg)
         self.register_command("python", self._cmd_python)
         self.register_command("host", self._cmd_host)
+        self.register_command("help", self._cmd_help)
+        self.register_command("append", self._cmd_append)
 
     def _cmd_pwd(self, _: List[str]) -> CommandResult:
         return CommandResult(stdout=self.vfs.pwd())
@@ -177,6 +179,9 @@ class SandboxShell:
         for arg in args:
             if arg in ("-l", "--long"):
                 long = True
+            elif arg.startswith("-"):
+                # fallback for other flags via host
+                return self._run_host_process(["ls", *args], None)
             else:
                 targets.append(arg)
         if not targets:
@@ -213,6 +218,15 @@ class SandboxShell:
             self._ensure_visible_path(path)
             blobs.append(self.vfs.read_file(path))
         return CommandResult(stdout="".join(blobs))
+
+    def _cmd_append(self, args: List[str]) -> CommandResult:
+        if len(args) < 2:
+            return CommandResult(stderr="append expects a path and text", exit_code=2)
+        path = args[0]
+        self._ensure_visible_path(path)
+        text = " ".join(args[1:])
+        self.vfs.append_file(path, text)
+        return CommandResult()
 
     def _cmd_touch(self, args: List[str]) -> CommandResult:
         if not args:
@@ -399,6 +413,16 @@ class SandboxShell:
         if not command_tokens:
             return CommandResult(stderr="host expects a command to run", exit_code=2)
         return self._run_host_process(command_tokens, path)
+
+    def _cmd_help(self, _: List[str]) -> CommandResult:
+        commands = ", ".join(self.available_commands())
+        return CommandResult(
+            stdout=(
+                "Available commands: "
+                + commands
+                + "\nUse host <cmd> (or run unknown commands directly) to access full GNU tools."
+            )
+        )
 
 
 __all__ = ["SandboxShell", "CommandResult"]

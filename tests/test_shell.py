@@ -77,3 +77,22 @@ def test_bash_is_routed_through_host():
     shell = setup_shell()
     res = shell.exec("bash -lc 'printf test'")
     assert res.stdout.strip() == "test"
+
+
+def test_help_lists_commands():
+    shell = setup_shell()
+    res = shell.exec("help")
+    assert "Available commands" in res.stdout
+
+
+def test_append_command():
+    shell = setup_shell()
+    shell.exec("append /workspace/README.md appended text")
+    out = shell.exec("cat /workspace/README.md").stdout
+    assert "appended text" in out
+
+
+def test_ls_accepts_flags():
+    shell = setup_shell()
+    res = shell.exec("ls -la")
+    assert "workspace" in res.stdout
