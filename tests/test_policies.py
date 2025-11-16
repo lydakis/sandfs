@@ -28,7 +28,7 @@ def test_visibility_view_hides_nodes_from_shell():
     vfs.write_file("/blue/public.txt", "public")
     vfs.write_file("/blue/private.txt", "secret")
     vfs.set_policy("/blue/private.txt", NodePolicy(visibility="private"))
-    shell = SandboxShell(vfs, view=VisibilityView(allowed={"public"}))
+    shell = SandboxShell(vfs, view=VisibilityView(labels={"public"}))
     listing = shell.exec("ls /blue").stdout
     assert "public.txt" in listing
     assert "private.txt" not in listing

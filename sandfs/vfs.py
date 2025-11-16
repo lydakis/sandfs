@@ -174,6 +174,7 @@ class VirtualFileSystem:
             writable=policy.writable,
             append_only=policy.append_only,
             visibility=policy.visibility,
+            contacts=set(policy.contacts),
         )
 
     def _find_storage_mount(
