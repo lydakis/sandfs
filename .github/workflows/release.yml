@@ -8,6 +8,9 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,8 +22,6 @@ jobs:
         run: |
           uv build
       - name: Publish to PyPI
-        env:
-          UV_PYPI_USERNAME: __token__
-          UV_PYPI_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          uv publish dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
