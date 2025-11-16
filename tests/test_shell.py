@@ -60,7 +60,7 @@ def test_grep_case_insensitive():
 
 def test_grep_recursive_regex():
     shell = setup_shell()
-    res = shell.exec("grep -e 'regex[0-9]+' -r /workspace/docs")
+    res = shell.exec("grep -E -e 'regex[0-9]+' -r /workspace/docs")
     assert "/workspace/docs/guide.txt:regex123" in res.stdout
     assert "/workspace/docs/reference/spec.txt:prefix regex999 suffix" in res.stdout
 
