@@ -74,6 +74,18 @@ shell = SandboxShell(vfs, view=VisibilityView({"public"}))
 print(shell.exec("ls /blue").stdout)  # persona.md hidden
 ```
 
+### Agent shell mode
+
+```python
+shell = SandboxShell(
+    vfs,
+    allowed_commands={"ls", "cat", "rg"},
+    max_output_bytes=8_192,
+)
+```
+
+Commands outside `allowed_commands` now return an error immediately, and outputs larger than `max_output_bytes` are rejected so partner-facing agents cannot dump oversized payloads.
+
 ## Repository layout
 
 ```
@@ -92,9 +104,6 @@ uv pip install -e .[dev]
 uv run pytest
 ```
 
-## License
-
-MIT
 ### Persistence hooks
 
 Register a write hook to flush files into your own store and use optimistic versions to avoid clobbering concurrent updates:
@@ -112,3 +121,7 @@ vfs.register_write_hook("/blue/work", flush)
 vfs.write_file("/blue/work/note.md", "draft")
 vfs.write_file("/blue/work/note.md", "final", expected_version=1)
 ```
+
+## License
+
+MIT

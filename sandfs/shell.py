@@ -6,7 +6,7 @@ import re
 import shlex
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from .exceptions import InvalidOperation, SandboxError, NodeNotFound
 from .policies import VisibilityView
@@ -34,12 +34,16 @@ class SandboxShell:
         python_executor: Optional[PythonExecutor] = None,
         env: Optional[Dict[str, str]] = None,
         view: Optional[VisibilityView] = None,
+        allowed_commands: Optional[Iterable[str]] = None,
+        max_output_bytes: Optional[int] = None,
     ) -> None:
         self.vfs = vfs
         self.env: Dict[str, str] = dict(env or {})
         self.commands: Dict[str, CommandHandler] = {}
         self.py_exec = python_executor or PythonExecutor(vfs)
         self.view = view or VisibilityView()
+        self.allowed_commands: Optional[Set[str]] = set(allowed_commands) if allowed_commands else None
+        self.max_output_bytes = max_output_bytes
         self._register_builtin_commands()
 
     # ------------------------------------------------------------------
@@ -60,6 +64,18 @@ class SandboxShell:
             return
         if not self.view.allows(policy):
             raise InvalidOperation(f"Path {path} is hidden for this view")
+
+    def _enforce_output_limit(self, result: CommandResult) -> CommandResult:
+        if self.max_output_bytes is None:
+            return result
+        total = len(result.stdout) + len(result.stderr)
+        if total <= self.max_output_bytes:
+            return result
+        return CommandResult(
+            stdout="",
+            stderr=f"Output limit ({self.max_output_bytes} bytes) exceeded",
+            exit_code=1,
+        )
 
     # ------------------------------------------------------------------
     # Dispatcher
@@ -85,6 +101,8 @@ class SandboxShell:
         handler = self.commands.get(name)
         if handler is None:
             return CommandResult(stderr=f"Unknown command: {name}", exit_code=127)
+        if self.allowed_commands is not None and name not in self.allowed_commands:
+            return CommandResult(stderr=f"Command '{name}' is disabled in this shell", exit_code=1)
         try:
             result = handler(args)
         except SandboxError as exc:
@@ -92,10 +110,10 @@ class SandboxShell:
         except Exception as exc:  # pragma: no cover - unexpected failure path
             return CommandResult(stderr=f"{name} failed: {exc}", exit_code=1)
         if isinstance(result, CommandResult):
-            return result
+            return self._enforce_output_limit(result)
         if result is None:
-            return CommandResult()
-        return CommandResult(stdout=str(result))
+            return self._enforce_output_limit(CommandResult())
+        return self._enforce_output_limit(CommandResult(stdout=str(result)))
 
     # ------------------------------------------------------------------
     # Builtin commands

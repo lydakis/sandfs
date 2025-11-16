@@ -47,3 +47,21 @@ def test_host_command_requires_subcommand():
     res = shell.exec("host -p /workspace")
     assert res.exit_code != 0
     assert "expects a command" in res.stderr.lower()
+
+
+def test_agent_mode_blocks_commands():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/workspace/allowed.txt", "ok")
+    shell = SandboxShell(vfs, allowed_commands={"ls", "cat"})
+    res = shell.exec("host -p /workspace ls")
+    assert res.exit_code == 1
+    assert "disabled" in res.stderr.lower()
+
+
+def test_agent_mode_output_limit():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/workspace/big.txt", "0123456789")
+    shell = SandboxShell(vfs, max_output_bytes=5)
+    res = shell.exec("cat /workspace/big.txt")
+    assert res.exit_code == 1
+    assert "output limit" in res.stderr.lower()
