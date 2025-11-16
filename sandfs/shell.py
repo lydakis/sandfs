@@ -170,7 +170,17 @@ class SandboxShell:
             except UnicodeDecodeError:
                 text = path.read_bytes().decode(errors="ignore")
             self.vfs.mkdir(sandbox_path.parent, parents=True, exist_ok=True)
-            self.vfs.write_file(sandbox_path, text)
+            should_write = True
+            if self.vfs.is_file(sandbox_path):
+                try:
+                    existing = self.vfs.read_file(sandbox_path)
+                except InvalidOperation:
+                    existing = None
+                else:
+                    if existing == text:
+                        should_write = False
+            if should_write:
+                self.vfs.write_file(sandbox_path, text)
         self._remove_missing(host_dirs, host_files)
 
     def _remove_missing(self, host_dirs: Set[PurePosixPath], host_files: Set[PurePosixPath]) -> None:

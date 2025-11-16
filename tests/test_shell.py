@@ -149,6 +149,26 @@ def test_host_rm_syncs_back():
     assert not shell.vfs.exists("/workspace/app.py")
 
 
+def test_host_sync_skips_read_only_files():
+    shell = setup_shell()
+    node = shell.vfs._resolve_node("/workspace/app.py")
+    node.policy.writable = False
+
+    result = shell.exec("host -p /workspace ls")
+
+    assert result.exit_code == 0
+
+
+def test_host_sync_does_not_rewrite_unchanged_files():
+    shell = setup_shell()
+    original_version = shell.vfs.get_version("/workspace/app.py")
+
+    result = shell.exec("host -p /workspace ls")
+
+    assert result.exit_code == 0
+    assert shell.vfs.get_version("/workspace/app.py") == original_version
+
+
 def test_urls_not_rewritten():
     shell = setup_shell()
     res = shell.exec("bash -lc 'printf https://example.com'")
