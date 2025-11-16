@@ -5,6 +5,24 @@ from sandfs.adapters import MemoryStorageAdapter
 from sandfs.exceptions import InvalidOperation
 
 
+def test_storage_adapter_delete_propagates_and_emits_event():
+    adapter = MemoryStorageAdapter()
+    vfs = VirtualFileSystem()
+    events = []
+    vfs.register_path_hook("/records", events.append)
+
+    vfs.mount_storage("/records", adapter, policy=NodePolicy(writable=True))
+    vfs.write_file("/records/report.txt", "contents")
+
+    entries = adapter.list()
+    assert set(entries.keys()) == {"report.txt"}
+
+    vfs.remove("/records/report.txt")
+
+    assert adapter.list() == {}
+    assert any(event.event == "delete" and event.path == "/records/report.txt" for event in events)
+
+
 def test_storage_adapter_mount_and_persist():
     adapter = MemoryStorageAdapter(
         initial={
