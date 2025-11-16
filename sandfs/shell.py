@@ -41,6 +41,7 @@ class SandboxShell:
         self.vfs = vfs
         self.env: Dict[str, str] = dict(env or {})
         self.commands: Dict[str, CommandHandler] = {}
+        self.command_docs: Dict[str, str] = {}
         self.py_exec = python_executor or PythonExecutor(vfs)
         self.view = view or VisibilityView()
         self.allowed_commands: Optional[Set[str]] = set(allowed_commands) if allowed_commands else None
@@ -51,8 +52,10 @@ class SandboxShell:
     # ------------------------------------------------------------------
     # Command registration
     # ------------------------------------------------------------------
-    def register_command(self, name: str, handler: CommandHandler) -> None:
+    def register_command(self, name: str, handler: CommandHandler, *, description: str = "") -> None:
         self.commands[name] = handler
+        if description:
+            self.command_docs[name] = description
 
     def available_commands(self) -> List[str]:
         return sorted(self.commands)
@@ -147,21 +150,21 @@ class SandboxShell:
     # Builtin commands
     # ------------------------------------------------------------------
     def _register_builtin_commands(self) -> None:
-        self.register_command("pwd", self._cmd_pwd)
-        self.register_command("cd", self._cmd_cd)
-        self.register_command("ls", self._cmd_ls)
-        self.register_command("cat", self._cmd_cat)
-        self.register_command("touch", self._cmd_touch)
-        self.register_command("mkdir", self._cmd_mkdir)
-        self.register_command("rm", self._cmd_rm)
-        self.register_command("tree", self._cmd_tree)
-        self.register_command("write", self._cmd_write)
-        self.register_command("grep", self._cmd_grep)
-        self.register_command("rg", self._cmd_rg)
-        self.register_command("python", self._cmd_python)
-        self.register_command("host", self._cmd_host)
-        self.register_command("help", self._cmd_help)
-        self.register_command("append", self._cmd_append)
+        self.register_command("pwd", self._cmd_pwd, description="Print working directory")
+        self.register_command("cd", self._cmd_cd, description="Change directory")
+        self.register_command("ls", self._cmd_ls, description="List directory contents")
+        self.register_command("cat", self._cmd_cat, description="Print file contents")
+        self.register_command("touch", self._cmd_touch, description="Create empty file")
+        self.register_command("mkdir", self._cmd_mkdir, description="Create directories")
+        self.register_command("rm", self._cmd_rm, description="Remove files or directories")
+        self.register_command("tree", self._cmd_tree, description="Render tree view")
+        self.register_command("write", self._cmd_write, description="Write text to file")
+        self.register_command("append", self._cmd_append, description="Append text to file")
+        self.register_command("grep", self._cmd_grep, description="Search files (non-recursive)")
+        self.register_command("rg", self._cmd_rg, description="Search files recursively")
+        self.register_command("python", self._cmd_python, description="Execute Python snippet")
+        self.register_command("host", self._cmd_host, description="Run host command in materialized tree")
+        self.register_command("help", self._cmd_help, description="Show available commands")
 
     def _cmd_pwd(self, _: List[str]) -> CommandResult:
         return CommandResult(stdout=self.vfs.pwd())
@@ -415,14 +418,15 @@ class SandboxShell:
         return self._run_host_process(command_tokens, path)
 
     def _cmd_help(self, _: List[str]) -> CommandResult:
-        commands = ", ".join(self.available_commands())
-        return CommandResult(
-            stdout=(
-                "Available commands: "
-                + commands
-                + "\nUse host <cmd> (or run unknown commands directly) to access full GNU tools."
-            )
-        )
+        lines = ["Available commands:"]
+        for name in self.available_commands():
+            desc = self.command_docs.get(name, "")
+            if desc:
+                lines.append(f"  {name} - {desc}")
+            else:
+                lines.append(f"  {name}")
+        lines.append("Use host <cmd> (or run unknown commands directly) for full GNU tools.")
+        return CommandResult(stdout="\n".join(lines))
 
 
 __all__ = ["SandboxShell", "CommandResult"]

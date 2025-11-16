@@ -82,7 +82,7 @@ def test_bash_is_routed_through_host():
 def test_help_lists_commands():
     shell = setup_shell()
     res = shell.exec("help")
-    assert "Available commands" in res.stdout
+    assert "ls - List directory contents" in res.stdout
 
 
 def test_append_command():
