@@ -466,11 +466,13 @@ class VirtualFileSystem:
             clone = VirtualFile(name=node.name, metadata=dict(node.metadata))
             clone.policy = self._clone_policy(node.policy)
             clone.write(node.read(self))
+            clone.version = node.version
             return clone
         if isinstance(node, VirtualDirectory):
             node.ensure_loaded(self)
             clone = VirtualDirectory(name=node.name, metadata=dict(node.metadata))
             clone.policy = self._clone_policy(node.policy)
+            clone.version = node.version
             for child in node.iter_children(self):
                 child_clone = self._clone_node(child, recursive=recursive)
                 clone.add_child(child_clone)
