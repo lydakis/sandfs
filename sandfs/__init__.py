@@ -6,6 +6,7 @@ from .pyexec import PythonExecutor, PythonExecutionResult
 from .providers import ContentProvider, DirectoryProvider, NodeContext, ProvidedNode
 from .policies import NodePolicy, VisibilityView
 from .hooks import WriteEvent, WriteHook
+from .adapters import MemoryStorageAdapter, StorageAdapter
 
 __all__ = [
     "VirtualFileSystem",
@@ -21,4 +22,6 @@ __all__ = [
     "VisibilityView",
     "WriteEvent",
     "WriteHook",
+    "StorageAdapter",
+    "MemoryStorageAdapter",
 ]

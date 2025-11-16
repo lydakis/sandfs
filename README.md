@@ -86,6 +86,22 @@ shell = SandboxShell(
 
 Commands outside `allowed_commands` now return an error immediately, and outputs larger than `max_output_bytes` are rejected so partner-facing agents cannot dump oversized payloads.
 
+### Storage adapters
+
+```python
+from sandfs import MemoryStorageAdapter, VirtualFileSystem
+
+adapter = MemoryStorageAdapter(initial={"a.txt": "seed"})
+vfs = VirtualFileSystem()
+vfs.mount_storage("/data", adapter)
+
+print(vfs.read_file("/data/a.txt"))
+vfs.write_file("/data/a.txt", "update")
+vfs.sync_storage("/data")  # refresh from adapter if it changed externally
+```
+
+`mount_storage` keeps the virtual tree synchronized with the adapter, while `sync_storage` refreshes the VFS from the latest adapter contents.
+
 ## Repository layout
 
 ```
