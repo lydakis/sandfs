@@ -149,17 +149,13 @@ vfs.write_file("/blue/work/note.md", "final", expected_version=1)
 ### Integration hooks
 
 ```python
-from sandfs.integrations import PathEvent
+from sandfs.integrations import InboxRecorder
 
-events: list[PathEvent] = []
-
-def inbox_handler(event: PathEvent) -> None:
-    events.append(event)
-
-vfs.register_path_hook("/blue/inbox", inbox_handler)
+recorder = InboxRecorder()
+recorder.attach(vfs, "/blue/inbox")
 ```
 
-`PathEvent` carries the path, event type (`create`, `update`, `delete`), and the latest content so you can fan writes into staging queues.
+`PathEvent` (used under the hood) carries the path, event type (`create`, `update`, `delete`), and latest content so you can fan writes into staging queues or audit logs.
 
 ## License
 
