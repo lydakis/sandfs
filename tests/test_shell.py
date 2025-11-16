@@ -85,15 +85,6 @@ def test_bash_is_routed_through_host():
     assert res.stdout.strip() == "test"
 
 
-def test_python3_allowed_when_python_disallowed():
-    shell = SandboxShell(
-        setup_shell().vfs,
-        allowed_commands={"ls", "cat", "python3", "host", "bash", "sh", "help"},
-    )
-    res = shell.exec('python3 -c "print(5)"')
-    assert res.stdout.strip() == "5"
-
-
 def test_host_fallback_translates_executable_path():
     shell = setup_shell()
     shell.vfs.write_file("/workspace/run.sh", "#!/bin/sh\necho script works\n")
@@ -105,14 +96,6 @@ def test_host_relative_path_option():
     shell = setup_shell()
     res = shell.exec("host -p ./workspace ls")
     assert "README.md" in res.stdout
-
-
-def test_heredoc_write_via_bash():
-    shell = setup_shell()
-    shell.exec("mkdir /blue")
-    cmd = "bash -lc 'printf \"hello from heredoc\" > /blue/note.txt'"
-    res = shell.exec(cmd)
-    assert "hello from heredoc" in shell.exec("cat /blue/note.txt").stdout
 
 
 def test_help_lists_commands():
@@ -132,11 +115,3 @@ def test_ls_accepts_flags():
     shell = setup_shell()
     res = shell.exec("ls -la")
     assert "workspace" in res.stdout
-
-
-def test_ls_on_blue_directory_via_host():
-    shell = setup_shell()
-    shell.exec("mkdir /blue")
-    shell.exec("write /blue/file.txt hello")
-    res = shell.exec("ls /blue")
-    assert "file.txt" in res.stdout

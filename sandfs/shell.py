@@ -102,7 +102,6 @@ class SandboxShell:
                     text=True,
                     check=False,
                 )
-                self._update_from_host(fs_root)
         except SandboxError as exc:
             return CommandResult(stderr=str(exc), exit_code=1)
         except FileNotFoundError as exc:
@@ -127,38 +126,11 @@ class SandboxShell:
         return [self._translate_token(token, fs_root) for token in tokens]
 
     def _translate_token(self, token: str, fs_root: Path) -> str:
-        replaced = token
-        matches = sorted(
-            {m.group(0) for m in re.finditer(r"/[A-Za-z0-9._/\-]+", token)},
-            key=len,
-            reverse=True,
-        )
-        for path_str in matches:
-            normalized = PurePosixPath(self.vfs._normalize(path_str))
-            host_path = self._sandbox_to_host_path(fs_root, normalized)
-            replaced = replaced.replace(path_str, str(host_path))
-        if replaced != token:
-            return replaced
         if token.startswith("/") and self.vfs.exists(token):
             normalized = PurePosixPath(self.vfs._normalize(token))
             host_path = self._sandbox_to_host_path(fs_root, normalized)
             return str(host_path)
         return token
-
-    def _update_from_host(self, fs_root: Path) -> None:
-        for host_path in sorted(fs_root.rglob("*")):
-            if host_path.is_dir():
-                sandbox_path = PurePosixPath("/").joinpath(*host_path.relative_to(fs_root).parts)
-                if str(sandbox_path) != "/":
-                    self.vfs.mkdir(sandbox_path, parents=True, exist_ok=True)
-                continue
-            sandbox_path = PurePosixPath("/").joinpath(*host_path.relative_to(fs_root).parts)
-            try:
-                text = host_path.read_text()
-            except UnicodeDecodeError:
-                text = host_path.read_bytes().decode(errors="ignore")
-            self.vfs.mkdir(sandbox_path.parent, parents=True, exist_ok=True)
-            self.vfs.write_file(sandbox_path, text)
 
     # ------------------------------------------------------------------
     # Dispatcher
