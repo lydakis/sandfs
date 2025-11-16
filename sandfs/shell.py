@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from .exceptions import InvalidOperation, SandboxError, NodeNotFound
@@ -89,11 +90,14 @@ class SandboxShell:
             return CommandResult(stderr="Missing host command", exit_code=2)
         target = path or self.vfs.pwd()
         self._ensure_visible_path(target)
+        sandbox_cwd = PurePosixPath(target)
         try:
-            with self.vfs.materialize(target) as fs_root:
+            with self.vfs.materialize("/") as fs_root:
+                host_cwd = self._sandbox_to_host_path(fs_root, sandbox_cwd)
+                mapped = self._map_command_tokens(command_tokens, fs_root)
                 completed = subprocess.run(
-                    command_tokens,
-                    cwd=str(fs_root),
+                    mapped,
+                    cwd=str(host_cwd),
                     capture_output=True,
                     text=True,
                     check=False,
@@ -107,6 +111,28 @@ class SandboxShell:
             stderr=completed.stderr,
             exit_code=completed.returncode,
         )
+
+    def _sandbox_to_host_path(self, fs_root: Path, sandbox_path: PurePosixPath) -> Path:
+        if sandbox_path == PurePosixPath("/"):
+            return fs_root
+        rel = sandbox_path.relative_to("/")
+        return fs_root.joinpath(*rel.parts)
+
+    def _map_command_tokens(self, tokens: List[str], fs_root: Path) -> List[str]:
+        mapped: List[str] = []
+        for idx, token in enumerate(tokens):
+            if idx == 0:
+                mapped.append(token)
+                continue
+            mapped.append(self._translate_token(token, fs_root))
+        return mapped
+
+    def _translate_token(self, token: str, fs_root: Path) -> str:
+        if token.startswith("/") and self.vfs.exists(token):
+            sandbox_path = PurePosixPath(token)
+            host_path = self._sandbox_to_host_path(fs_root, sandbox_path)
+            return str(host_path)
+        return token
 
     # ------------------------------------------------------------------
     # Dispatcher
