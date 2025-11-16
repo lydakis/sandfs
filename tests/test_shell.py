@@ -186,3 +186,39 @@ def test_host_command_preserves_trailing_slash_paths():
     assert not shell.vfs.exists("/blue/inboxnote.txt")
     assert shell.vfs.exists("/blue/inbox/note.txt")
     assert shell.vfs.read_file("/blue/inbox/note.txt") == "hi"
+
+
+def test_mv_moves_file_into_directory():
+    shell = setup_shell()
+    shell.exec("mkdir /blue")
+    shell.exec("mkdir /blue/inbox")
+    shell.exec("write /workspace/note.txt hi")
+
+    result = shell.exec("mv /workspace/note.txt /blue/inbox/")
+
+    assert result.exit_code == 0
+    assert not shell.vfs.exists("/workspace/note.txt")
+    assert shell.vfs.read_file("/blue/inbox/note.txt") == "hi"
+
+
+def test_mv_renames_file():
+    shell = setup_shell()
+
+    result = shell.exec("mv /workspace/app.py /workspace/renamed.py")
+
+    assert result.exit_code == 0
+    assert not shell.vfs.exists("/workspace/app.py")
+    assert shell.vfs.read_file("/workspace/renamed.py") == "print('hi')\n"
+
+
+def test_mv_moves_directories():
+    shell = setup_shell()
+    shell.exec("mkdir /blue")
+    shell.exec("mkdir /blue/inbox")
+    shell.exec("write /blue/inbox/note.txt hi")
+
+    result = shell.exec("mv /blue/inbox /workspace/messages")
+
+    assert result.exit_code == 0
+    assert not shell.vfs.exists("/blue/inbox")
+    assert shell.vfs.read_file("/workspace/messages/note.txt") == "hi"

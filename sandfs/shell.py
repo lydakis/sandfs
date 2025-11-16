@@ -256,6 +256,7 @@ class SandboxShell:
         self.register_command("touch", self._cmd_touch, description="Create empty file")
         self.register_command("mkdir", self._cmd_mkdir, description="Create directories")
         self.register_command("rm", self._cmd_rm, description="Remove files or directories")
+        self.register_command("mv", self._cmd_mv, description="Move or rename files and directories")
         self.register_command("tree", self._cmd_tree, description="Render tree view")
         self.register_command("write", self._cmd_write, description="Write text to file")
         self.register_command("append", self._cmd_append, description="Append text to file")
@@ -369,6 +370,18 @@ class SandboxShell:
         for target in targets:
             self._ensure_visible_path(target)
             self.vfs.remove(target, recursive=recursive)
+        return CommandResult()
+
+    def _cmd_mv(self, args: List[str]) -> CommandResult:
+        if len(args) != 2:
+            return CommandResult(stderr="mv expects a source and destination", exit_code=2)
+        source, dest = args
+        self._ensure_visible_path(source)
+        self._ensure_visible_path(dest)
+        try:
+            self.vfs.move(source, dest)
+        except (InvalidOperation, NodeNotFound) as exc:
+            return CommandResult(stderr=str(exc), exit_code=1)
         return CommandResult()
 
     def _cmd_tree(self, args: List[str]) -> CommandResult:

@@ -363,6 +363,58 @@ class VirtualFileSystem:
             self._delete_storage_entry(node)
             self._emit_path_event(node.path(), "delete", None)
 
+    def move(self, source: str | PurePosixPath, target: str | PurePosixPath) -> None:
+        src_path = self._normalize(source)
+        if src_path == PurePosixPath("/"):
+            raise InvalidOperation("Cannot move root directory")
+        node = self._resolve_node(src_path)
+        parent = node.parent
+        if parent is None:
+            raise InvalidOperation("Cannot move node without parent")
+        self._ensure_write_allowed(node)
+        self._ensure_write_allowed(parent)
+
+        dest_path = self._normalize(target)
+        dest_parent: VirtualDirectory
+        dest_name: str
+
+        try:
+            dest_node = self._resolve_node(dest_path)
+        except (NodeNotFound, InvalidOperation):
+            dest_parent = self._resolve_dir(dest_path.parent or PurePosixPath("/"))
+            self._ensure_write_allowed(dest_parent)
+            dest_name = dest_path.name
+            if not dest_name:
+                raise InvalidOperation("Destination path missing file name")
+        else:
+            if isinstance(dest_node, VirtualDirectory):
+                self._ensure_write_allowed(dest_node)
+                dest_parent = dest_node
+                dest_name = node.name
+            else:
+                raise InvalidOperation(f"Destination {dest_path} already exists")
+
+        dest_parent_path = dest_parent.path()
+        node_path = node.path()
+        if isinstance(node, VirtualDirectory):
+            try:
+                dest_parent_path.relative_to(node_path)
+                raise InvalidOperation("Cannot move a directory inside itself")
+            except ValueError:
+                pass
+            if dest_parent_path == node_path:
+                raise InvalidOperation("Destination directory matches source directory")
+
+        if dest_parent is parent and dest_name == node.name:
+            return
+
+        if dest_parent is node:
+            raise InvalidOperation("Cannot move a node into itself")
+
+        parent.remove_child(node.name)
+        node.name = dest_name
+        dest_parent.add_child(node)
+
     def walk(self, path: str | PurePosixPath | None = None) -> Iterator[Tuple[PurePosixPath, VirtualNode]]:
         start_node = self._resolve_node(path or self.cwd.path())
 
