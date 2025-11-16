@@ -19,3 +19,24 @@ def test_contact_visibility_filters_shell():
     res = shell.exec("cat /blue/alice.txt")
     assert res.exit_code == 1
     assert "hidden" in res.stderr.lower()
+
+
+def test_principal_only_file_hidden_without_principal_view():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/blue/public.txt", "pub")
+    vfs.set_policy(
+        "/blue/public.txt",
+        NodePolicy(classification="public", principals={"alice"}),
+    )
+
+    view = VisibilityView(classifications={"public"})
+    assert view.principals is None
+    assert not view.allows(vfs.get_policy("/blue/public.txt"))
+
+    shell = SandboxShell(vfs, view=view)
+    listing = shell.exec("ls /blue").stdout
+    assert "public.txt" not in listing
+
+    res = shell.exec("cat /blue/public.txt")
+    assert res.exit_code == 1
+    assert "hidden" in res.stderr.lower()
