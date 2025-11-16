@@ -1,0 +1,393 @@
+"""Virtual filesystem implementation."""
+
+from __future__ import annotations
+
+import contextlib
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+
+from .exceptions import InvalidOperation, NodeExists, NodeNotFound
+from .nodes import VirtualDirectory, VirtualFile, VirtualNode
+from .policies import NodePolicy, VisibilityView
+from .providers import ContentProvider, DirectoryProvider
+
+
+@dataclass
+class DirEntry:
+    name: str
+    path: PurePosixPath
+    is_dir: bool
+    metadata: Dict[str, object]
+    policy: NodePolicy
+
+
+class VirtualFileSystem:
+    """In-memory filesystem that supports dynamic nodes."""
+
+    def __init__(self) -> None:
+        self.root = VirtualDirectory(name="")
+        self.cwd = self.root
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+    def _normalize(self, path: str | PurePosixPath | None) -> PurePosixPath:
+        if path is None or str(path) == "":
+            base = self.cwd.path()
+            raw = base
+        else:
+            raw = PurePosixPath(path)
+            if not raw.is_absolute():
+                base = self.cwd.path()
+                raw = base.joinpath(raw)
+        parts: List[str] = []
+        for part in raw.parts:
+            if part in ("", "/", "."):
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        return PurePosixPath("/" + "/".join(parts)) if parts else PurePosixPath("/")
+
+    def _iterate_parts(self, path: PurePosixPath) -> Iterable[str]:
+        for part in path.parts:
+            if part in ("", "/"):
+                continue
+            yield part
+
+    def _resolve_node(self, path: str | PurePosixPath) -> VirtualNode:
+        target = self._normalize(path)
+        current: VirtualNode = self.root
+        if target == PurePosixPath("/"):
+            return self.root
+        for part in self._iterate_parts(target):
+            if not isinstance(current, VirtualDirectory):
+                raise InvalidOperation(f"{current.path()} is not a directory")
+            current = current.get_child(part, self)
+        return current
+
+    def _resolve_dir(self, path: str | PurePosixPath, *, create: bool = False) -> VirtualDirectory:
+        target = self._normalize(path)
+        if target == PurePosixPath("/"):
+            return self.root
+        current = self.root
+        for part in self._iterate_parts(target):
+            if not isinstance(current, VirtualDirectory):
+                raise InvalidOperation(f"{current.path()} is not a directory")
+            try:
+                next_node = current.get_child(part, self)
+            except NodeNotFound:
+                if not create:
+                    raise
+                next_node = VirtualDirectory(name=part, parent=current)
+                current.add_child(next_node)
+            if not isinstance(next_node, VirtualDirectory):
+                raise InvalidOperation(f"{next_node.path()} is not a directory")
+            current = next_node
+        return current
+
+    def _ensure_file(self, path: str | PurePosixPath, *, create: bool = False) -> VirtualFile:
+        target = self._normalize(path)
+        parent_path = target.parent
+        if parent_path == target:
+            raise InvalidOperation("Cannot create file at root path")
+        parent = self._resolve_dir(parent_path or PurePosixPath("/"), create=create)
+        name = target.name
+        if not name:
+            raise InvalidOperation("Missing file name")
+        try:
+            node = parent.get_child(name, self)
+        except NodeNotFound:
+            if not create:
+                raise
+            node = VirtualFile(name=name, parent=parent)
+            parent.add_child(node)
+            return node
+        if not isinstance(node, VirtualFile):
+            raise InvalidOperation(f"{node.path()} is not a file")
+        return node
+
+    def _ensure_read_allowed(self, node: VirtualNode) -> None:
+        if not node.policy.readable:
+            raise InvalidOperation(f"{node.path()} is not readable")
+
+    def _ensure_write_allowed(self, node: VirtualNode, *, append: bool = False) -> None:
+        if not node.policy.writable:
+            raise InvalidOperation(f"{node.path()} is read-only")
+        if node.policy.append_only and not append:
+            raise InvalidOperation(f"{node.path()} is append-only")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def pwd(self) -> str:
+        return str(self.cwd.path())
+
+    def cd(self, path: str | PurePosixPath) -> str:
+        node = self._resolve_node(path)
+        if not isinstance(node, VirtualDirectory):
+            raise InvalidOperation(f"{node.path()} is not a directory")
+        self._ensure_read_allowed(node)
+        self.cwd = node
+        return self.pwd()
+
+    def ls(
+        self,
+        path: str | PurePosixPath | None = None,
+        *,
+        view: Optional[VisibilityView] = None,
+    ) -> List[DirEntry]:
+        directory = self._resolve_dir(path or self.cwd.path())
+        self._ensure_read_allowed(directory)
+        directory.ensure_loaded(self)
+        entries: List[DirEntry] = []
+        for child in directory.iter_children(self):
+            if view and not view.allows(child.policy):
+                continue
+            entries.append(
+                DirEntry(
+                    name=child.name,
+                    path=child.path(),
+                    is_dir=isinstance(child, VirtualDirectory),
+                    metadata=child.metadata,
+                    policy=child.policy,
+                )
+            )
+        entries.sort(key=lambda entry: (not entry.is_dir, entry.name))
+        return entries
+
+    def mkdir(
+        self,
+        path: str | PurePosixPath,
+        *,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> VirtualDirectory:
+        normalized = self._normalize(path)
+        if normalized == PurePosixPath("/"):
+            return self.root
+        parent = self._resolve_dir(normalized.parent or PurePosixPath("/"), create=parents)
+        self._ensure_write_allowed(parent)
+        name = normalized.name
+        if not name:
+            raise InvalidOperation("Directory name missing")
+        try:
+            existing = parent.get_child(name, self)
+        except NodeNotFound:
+            node = VirtualDirectory(name=name, parent=parent)
+            parent.add_child(node)
+            return node
+        if not isinstance(existing, VirtualDirectory):
+            raise InvalidOperation(f"{existing.path()} is not a directory")
+        if not exist_ok:
+            raise NodeExists(f"Directory {existing.path()} already exists")
+        return existing
+
+    def write_file(
+        self,
+        path: str | PurePosixPath,
+        data: str,
+        *,
+        append: bool = False,
+    ) -> VirtualFile:
+        node = self._ensure_file(path, create=True)
+        self._ensure_write_allowed(node, append=append)
+        node.write(data, append=append)
+        return node
+
+    def append_file(self, path: str | PurePosixPath, data: str) -> VirtualFile:
+        return self.write_file(path, data, append=True)
+
+    def read_file(self, path: str | PurePosixPath) -> str:
+        node = self._ensure_file(path, create=False)
+        self._ensure_read_allowed(node)
+        return node.read(self)
+
+    def touch(self, path: str | PurePosixPath) -> VirtualFile:
+        node = self._ensure_file(path, create=True)
+        self._ensure_write_allowed(node, append=True)
+        return node
+
+    def remove(self, path: str | PurePosixPath, *, recursive: bool = False) -> None:
+        target = self._normalize(path)
+        if target == PurePosixPath("/"):
+            raise InvalidOperation("Cannot remove root directory")
+        node = self._resolve_node(target)
+        if isinstance(node, VirtualDirectory):
+            node.ensure_loaded(self)
+        parent = node.parent
+        if parent is None:
+            raise InvalidOperation("Cannot remove node without parent")
+        self._ensure_write_allowed(node)
+        self._ensure_write_allowed(parent)
+        if isinstance(node, VirtualDirectory) and node.children and not recursive:
+            raise InvalidOperation("Directory not empty; pass recursive=True")
+        if isinstance(node, VirtualDirectory) and recursive:
+            names = list(node.children.keys())
+            for child_name in names:
+                child_node = node.children.get(child_name)
+                if child_node is None:
+                    continue
+                self.remove(child_node.path(), recursive=True)
+        parent.remove_child(node.name)
+
+    def walk(self, path: str | PurePosixPath | None = None) -> Iterator[Tuple[PurePosixPath, VirtualNode]]:
+        start_node = self._resolve_node(path or self.cwd.path())
+
+        def _walk(node: VirtualNode) -> Iterator[Tuple[PurePosixPath, VirtualNode]]:
+            yield (node.path(), node)
+            if isinstance(node, VirtualDirectory):
+                node.ensure_loaded(self)
+                for child in node.iter_children(self):
+                    yield from _walk(child)
+
+        return _walk(start_node)
+
+    def iter_files(
+        self,
+        path: str | PurePosixPath | None = None,
+        *,
+        recursive: bool = True,
+    ) -> Iterator[Tuple[PurePosixPath, VirtualFile]]:
+        start_node = self._resolve_node(path or self.cwd.path())
+        self._ensure_read_allowed(start_node)
+        if isinstance(start_node, VirtualFile):
+            yield (start_node.path(), start_node)
+            return
+
+        directory = self._resolve_dir(start_node.path())
+        directory.ensure_loaded(self)
+
+        def _walk_dir(dir_node: VirtualDirectory) -> Iterator[Tuple[PurePosixPath, VirtualFile]]:
+            for child in dir_node.iter_children(self):
+                if isinstance(child, VirtualFile):
+                    yield (child.path(), child)
+                elif isinstance(child, VirtualDirectory) and recursive:
+                    child.ensure_loaded(self)
+                    yield from _walk_dir(child)
+
+        yield from _walk_dir(directory)
+
+    def export_to_path(
+        self,
+        target: Path,
+        *,
+        source: str | PurePosixPath | None = None,
+    ) -> Path:
+        node = self._resolve_dir(source or self.cwd.path())
+        target = Path(target)
+        target.mkdir(parents=True, exist_ok=True)
+        self._export_directory(node, target)
+        return target
+
+    @contextlib.contextmanager
+    def materialize(self, path: str | PurePosixPath | None = None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.export_to_path(root, source=path)
+            yield root
+
+    def _export_directory(self, node: VirtualDirectory, dest: Path) -> None:
+        node.ensure_loaded(self)
+        dest.mkdir(parents=True, exist_ok=True)
+        for child in node.iter_children(self):
+            target = dest / child.name
+            if isinstance(child, VirtualDirectory):
+                self._export_directory(child, target)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(child.read(self))
+
+    def exists(self, path: str | PurePosixPath) -> bool:
+        try:
+            self._resolve_node(path)
+            return True
+        except (NodeNotFound, InvalidOperation):
+            return False
+
+    def is_dir(self, path: str | PurePosixPath) -> bool:
+        try:
+            return isinstance(self._resolve_node(path), VirtualDirectory)
+        except (NodeNotFound, InvalidOperation):
+            return False
+
+    def is_file(self, path: str | PurePosixPath) -> bool:
+        try:
+            return isinstance(self._resolve_node(path), VirtualFile)
+        except (NodeNotFound, InvalidOperation):
+            return False
+
+    def mount_file(
+        self,
+        path: str | PurePosixPath,
+        provider: ContentProvider,
+        *,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> VirtualFile:
+        node = self._ensure_file(path, create=True)
+        node.set_provider(provider)
+        if metadata:
+            node.metadata.update(metadata)
+        return node
+
+    def mount_directory(
+        self,
+        path: str | PurePosixPath,
+        provider: DirectoryProvider,
+        *,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> VirtualDirectory:
+        node = self.mkdir(path, parents=True, exist_ok=True)
+        node.loader = provider
+        node._loaded = False  # allow reload
+        if metadata:
+            node.metadata.update(metadata)
+        return node
+
+    def set_policy(self, path: str | PurePosixPath, policy: NodePolicy) -> None:
+        node = self._resolve_node(path)
+        node.policy = policy
+
+    def get_policy(self, path: str | PurePosixPath) -> NodePolicy:
+        node = self._resolve_node(path)
+        return node.policy
+
+    def get_node(self, path: str | PurePosixPath) -> VirtualNode:
+        return self._resolve_node(path)
+
+    def tree(
+        self,
+        path: str | PurePosixPath | None = None,
+        *,
+        view: Optional[VisibilityView] = None,
+    ) -> str:
+        root_dir = self._resolve_dir(path or self.cwd.path())
+        self._ensure_read_allowed(root_dir)
+        lines: List[str] = []
+
+        def render(directory: VirtualDirectory, prefix: str = "") -> None:
+            entries = sorted(
+                (
+                    child
+                    for child in directory.iter_children(self)
+                    if not view or view.allows(child.policy)
+                ),
+                key=lambda node: (not isinstance(node, VirtualDirectory), node.name),
+            )
+            for idx, node in enumerate(entries):
+                connector = "└──" if idx == len(entries) - 1 else "├──"
+                lines.append(f"{prefix}{connector} {node.name}/" if isinstance(node, VirtualDirectory) else f"{prefix}{connector} {node.name}")
+                if isinstance(node, VirtualDirectory):
+                    extension = "    " if idx == len(entries) - 1 else "│   "
+                    render(node, prefix + extension)
+
+        render(root_dir)
+        header = str(root_dir.path())
+        return "\n".join([header] + lines)
+
+
+__all__ = ["VirtualFileSystem", "DirEntry"]

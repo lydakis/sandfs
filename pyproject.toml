@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.20"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sandfs"
+version = "0.1.0"
+description = "Composable virtual filesystem sandbox with a UNIX-like command surface for agents"
+requires-python = ">=3.10"
+authors = [
+  { name = "sandfs contributors" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+keywords = ["virtual filesystem", "agents", "sandbox", "in-memory"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: System :: Filesystems",
+  "Topic :: Software Development :: Libraries"
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.urls]
+Homepage = "https://example.com/sandfs"
+Repository = "https://example.com/sandfs.git"
+
+[tool.hatch.metadata]
+allow-direct-references = true
