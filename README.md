@@ -20,6 +20,8 @@ Agent builders frequently need a scratch filesystem for planning, iterating on g
 - Storage adapters and snapshots so you can mount external state and roll forward/back within a turn.
 - Serialization helpers to snapshot or hydrate sandboxes (planned).
 
+See [`docs/roadmap.md`](docs/roadmap.md) for the up-to-date view of supported commands and the upcoming backlog.
+
 ## Installation
 
 ```bash
