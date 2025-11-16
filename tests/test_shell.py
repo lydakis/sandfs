@@ -173,3 +173,16 @@ def test_urls_not_rewritten():
     shell = setup_shell()
     res = shell.exec("bash -lc 'printf https://example.com'")
     assert "https://example.com" in res.stdout
+
+
+def test_host_command_preserves_trailing_slash_paths():
+    shell = setup_shell()
+    shell.exec("mkdir /blue")
+
+    cmd = "bash -lc 'fname=/blue/inbox/; mkdir -p \"$fname\"; printf hi > ${fname}note.txt'"
+    res = shell.exec(cmd)
+
+    assert res.exit_code == 0
+    assert not shell.vfs.exists("/blue/inboxnote.txt")
+    assert shell.vfs.exists("/blue/inbox/note.txt")
+    assert shell.vfs.read_file("/blue/inbox/note.txt") == "hi"

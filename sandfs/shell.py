@@ -136,7 +136,10 @@ class SandboxShell:
             if sandbox_path is None:
                 return candidate
             host_path = self._sandbox_to_host_path(fs_root, sandbox_path)
-            return str(host_path)
+            rendered = str(host_path)
+            if candidate.endswith("/") and not rendered.endswith("/"):
+                rendered = f"{rendered}/"
+            return rendered
 
         return re.sub(r"/[A-Za-z0-9._/\-]+", replacer, token)
 
