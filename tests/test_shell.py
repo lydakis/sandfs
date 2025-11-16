@@ -127,6 +127,13 @@ def test_ls_accepts_flags():
     assert "workspace" in res.stdout
 
 
+def test_ls_handles_file_targets():
+    shell = setup_shell()
+    res = shell.exec("ls /workspace/app.py")
+    assert res.exit_code == 0
+    assert "app.py" in res.stdout.split()
+
+
 def test_ls_on_blue_directory_via_host():
     shell = setup_shell()
     shell.exec("mkdir /blue")

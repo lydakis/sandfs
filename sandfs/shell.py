@@ -296,7 +296,21 @@ class SandboxShell:
         blocks: List[str] = []
         for idx, target in enumerate(targets):
             self._ensure_visible_path(target)
-            entries = self.vfs.ls(target, view=self.view)
+            node = self.vfs.get_node(target)
+            if isinstance(node, VirtualDirectory):
+                entries = self.vfs.ls(target, view=self.view)
+            else:
+                if isinstance(node, VirtualFile) and not node.policy.readable:
+                    raise InvalidOperation(f"{node.path()} is not readable")
+                entries = [
+                    DirEntry(
+                        name=node.name or str(node.path()),
+                        path=node.path(),
+                        is_dir=False,
+                        metadata=node.metadata,
+                        policy=node.policy,
+                    )
+                ]
             if len(targets) > 1:
                 blocks.append(f"{target}:")
             blocks.append(self._format_ls(entries, long_format=long))
