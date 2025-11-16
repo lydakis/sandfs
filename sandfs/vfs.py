@@ -415,6 +415,68 @@ class VirtualFileSystem:
         node.name = dest_name
         dest_parent.add_child(node)
 
+    def copy(self, source: str | PurePosixPath, target: str | PurePosixPath, *, recursive: bool = False) -> None:
+        src_path = self._normalize(source)
+        node = self._resolve_node(src_path)
+        if isinstance(node, VirtualDirectory) and not recursive:
+            raise InvalidOperation("Source is a directory; pass recursive=True")
+        self._ensure_read_allowed(node)
+
+        dest_path = self._normalize(target)
+        dest_parent: VirtualDirectory
+        dest_name: str
+
+        try:
+            dest_node = self._resolve_node(dest_path)
+        except (NodeNotFound, InvalidOperation):
+            dest_parent = self._resolve_dir(dest_path.parent or PurePosixPath("/"))
+            self._ensure_write_allowed(dest_parent)
+            dest_name = dest_path.name
+            if not dest_name:
+                raise InvalidOperation("Destination path missing file name")
+        else:
+            if isinstance(dest_node, VirtualDirectory):
+                self._ensure_write_allowed(dest_node)
+                dest_parent = dest_node
+                dest_name = node.name
+            else:
+                dest_parent = dest_node.parent
+                if dest_parent is None:
+                    raise InvalidOperation("Cannot overwrite root directory")
+                self._ensure_write_allowed(dest_parent)
+                self._ensure_write_allowed(dest_node)
+                dest_parent.remove_child(dest_node.name)
+                dest_name = dest_node.name
+
+        if isinstance(node, VirtualDirectory):
+            dest_parent_path = dest_parent.path()
+            target_path = dest_parent_path.joinpath(dest_name)
+            try:
+                target_path.relative_to(node.path())
+                raise InvalidOperation("Cannot copy a directory inside itself")
+            except ValueError:
+                pass
+
+        clone = self._clone_node(node, recursive=recursive)
+        clone.name = dest_name
+        dest_parent.add_child(clone)
+
+    def _clone_node(self, node: VirtualNode, *, recursive: bool) -> VirtualNode:
+        if isinstance(node, VirtualFile):
+            clone = VirtualFile(name=node.name, metadata=dict(node.metadata))
+            clone.policy = self._clone_policy(node.policy)
+            clone.write(node.read(self))
+            return clone
+        if isinstance(node, VirtualDirectory):
+            node.ensure_loaded(self)
+            clone = VirtualDirectory(name=node.name, metadata=dict(node.metadata))
+            clone.policy = self._clone_policy(node.policy)
+            for child in node.iter_children(self):
+                child_clone = self._clone_node(child, recursive=recursive)
+                clone.add_child(child_clone)
+            return clone
+        raise InvalidOperation("Unsupported node type for copy")
+
     def walk(self, path: str | PurePosixPath | None = None) -> Iterator[Tuple[PurePosixPath, VirtualNode]]:
         start_node = self._resolve_node(path or self.cwd.path())
 

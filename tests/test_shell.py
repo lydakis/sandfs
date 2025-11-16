@@ -222,3 +222,40 @@ def test_mv_moves_directories():
     assert result.exit_code == 0
     assert not shell.vfs.exists("/blue/inbox")
     assert shell.vfs.read_file("/workspace/messages/note.txt") == "hi"
+
+
+def test_cp_copies_file_to_new_name():
+    shell = setup_shell()
+    shell.host_fallback = False
+
+    result = shell.exec("cp /workspace/app.py /workspace/app_copy.py")
+
+    assert result.exit_code == 0
+    assert shell.vfs.read_file("/workspace/app.py") == "print('hi')\n"
+    assert shell.vfs.read_file("/workspace/app_copy.py") == "print('hi')\n"
+
+
+def test_cp_copies_file_into_directory():
+    shell = setup_shell()
+    shell.host_fallback = False
+    shell.exec("mkdir /blue")
+    shell.exec("mkdir /blue/inbox")
+
+    result = shell.exec("cp /workspace/README.md /blue/inbox/")
+
+    assert result.exit_code == 0
+    assert shell.vfs.read_file("/blue/inbox/README.md") == "hello world\n"
+
+
+def test_cp_copies_directory_with_recursive_flag():
+    shell = setup_shell()
+    shell.host_fallback = False
+    shell.exec("mkdir /blue")
+    shell.exec("mkdir /blue/inbox")
+    shell.exec("write /blue/inbox/note.txt hi")
+
+    result = shell.exec("cp -r /blue /workspace/archive")
+
+    assert result.exit_code == 0
+    assert shell.vfs.read_file("/workspace/archive/inbox/note.txt") == "hi"
+    assert shell.vfs.exists("/blue/inbox/note.txt")
