@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sandfs"
-version = "0.2.1"
+version = "0.2.2"
 description = "Composable virtual filesystem sandbox with a UNIX-like command surface for agents"
 requires-python = ">=3.10"
 authors = [
