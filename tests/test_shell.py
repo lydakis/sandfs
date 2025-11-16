@@ -65,3 +65,15 @@ def test_agent_mode_output_limit():
     res = shell.exec("cat /workspace/big.txt")
     assert res.exit_code == 1
     assert "output limit" in res.stderr.lower()
+
+
+def test_unknown_command_falls_back_to_host():
+    shell = setup_shell()
+    res = shell.exec("echo hello from host")
+    assert "hello from host" in res.stdout
+
+
+def test_bash_is_routed_through_host():
+    shell = setup_shell()
+    res = shell.exec("bash -lc 'printf test'")
+    assert res.stdout.strip() == "test"

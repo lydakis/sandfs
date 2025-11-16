@@ -36,6 +36,7 @@ class SandboxShell:
         view: Optional[VisibilityView] = None,
         allowed_commands: Optional[Iterable[str]] = None,
         max_output_bytes: Optional[int] = None,
+        host_fallback: bool = True,
     ) -> None:
         self.vfs = vfs
         self.env: Dict[str, str] = dict(env or {})
@@ -44,6 +45,7 @@ class SandboxShell:
         self.view = view or VisibilityView()
         self.allowed_commands: Optional[Set[str]] = set(allowed_commands) if allowed_commands else None
         self.max_output_bytes = max_output_bytes
+        self.host_fallback = host_fallback
         self._register_builtin_commands()
 
     # ------------------------------------------------------------------
@@ -77,6 +79,30 @@ class SandboxShell:
             exit_code=1,
         )
 
+    def _run_host_process(self, command_tokens: List[str], path: Optional[str]) -> CommandResult:
+        if not command_tokens:
+            return CommandResult(stderr="Missing host command", exit_code=2)
+        target = path or self.vfs.pwd()
+        self._ensure_visible_path(target)
+        try:
+            with self.vfs.materialize(target) as fs_root:
+                completed = subprocess.run(
+                    command_tokens,
+                    cwd=str(fs_root),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+        except SandboxError as exc:
+            return CommandResult(stderr=str(exc), exit_code=1)
+        except FileNotFoundError as exc:
+            return CommandResult(stderr=str(exc), exit_code=127)
+        return CommandResult(
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            exit_code=completed.returncode,
+        )
+
     # ------------------------------------------------------------------
     # Dispatcher
     # ------------------------------------------------------------------
@@ -100,6 +126,8 @@ class SandboxShell:
         name, *args = tokens
         handler = self.commands.get(name)
         if handler is None:
+            if self.host_fallback:
+                return self._run_host_process(tokens, None)
             return CommandResult(stderr=f"Unknown command: {name}", exit_code=127)
         if self.allowed_commands is not None and name not in self.allowed_commands:
             return CommandResult(stderr=f"Command '{name}' is disabled in this shell", exit_code=1)
@@ -370,26 +398,7 @@ class SandboxShell:
         command_tokens = args[idx:]
         if not command_tokens:
             return CommandResult(stderr="host expects a command to run", exit_code=2)
-        target = path or self.vfs.pwd()
-        self._ensure_visible_path(target)
-        try:
-            with self.vfs.materialize(target) as fs_root:
-                completed = subprocess.run(
-                    command_tokens,
-                    cwd=str(fs_root),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-        except SandboxError as exc:
-            return CommandResult(stderr=str(exc), exit_code=1)
-        except FileNotFoundError as exc:
-            return CommandResult(stderr=str(exc), exit_code=127)
-        return CommandResult(
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            exit_code=completed.returncode,
-        )
+        return self._run_host_process(command_tokens, path)
 
 
 __all__ = ["SandboxShell", "CommandResult"]

@@ -69,6 +69,8 @@ host -p /workspace grep -n TODO app.py
 
 The example above exports `/workspace` into a temporary directory, runs the system `grep` inside it, then discards the files.
 
+> Tip: unknown commands automatically fall back to the host runner, so `echo`, `python3`, or `bash -lc '…'` work even if they are not native sandfs commands.
+
 ### Policies & views
 
 ```python
