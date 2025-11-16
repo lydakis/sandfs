@@ -44,3 +44,15 @@ def test_tree_representation(tmp_path):
     vfs.write_file("/a/b/c.txt", "data")
     tree = vfs.tree("/a")
     assert "c.txt" in tree
+
+
+def test_copy_overwrites_file_and_advances_version():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/src.txt", "source content")
+    vfs.write_file("/dest.txt", "original dest content")
+
+    vfs.copy("/src.txt", "/dest.txt")
+
+    assert vfs.read_file("/dest.txt") == "source content"
+    assert vfs.read_file("/src.txt") == "source content"
+    assert vfs.get_version("/dest.txt") == 2

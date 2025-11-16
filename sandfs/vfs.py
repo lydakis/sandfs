@@ -6,7 +6,7 @@ import contextlib
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from collections.abc import Iterable, Iterator
 
 from .exceptions import InvalidOperation, NodeExists, NodeNotFound
 from .hooks import WriteEvent, WriteHook
@@ -22,24 +22,24 @@ class DirEntry:
     name: str
     path: PurePosixPath
     is_dir: bool
-    metadata: Dict[str, object]
+    metadata: dict[str, object]
     policy: NodePolicy
 
 
 @dataclass
 class NodeSnapshot:
     is_dir: bool
-    metadata: Dict[str, object]
+    metadata: dict[str, object]
     policy: NodePolicy
     version: int
-    content: Optional[str] = None
+    content: str | None = None
 
 
 @dataclass
 class VFSSnapshot:
-    nodes: Dict[str, NodeSnapshot]
+    nodes: dict[str, NodeSnapshot]
     cwd: PurePosixPath
-    storage_mounts: Dict[str, StorageAdapter]
+    storage_mounts: dict[str, StorageAdapter]
 
 
 class VirtualFileSystem:
@@ -48,9 +48,9 @@ class VirtualFileSystem:
     def __init__(self) -> None:
         self.root = VirtualDirectory(name="")
         self.cwd = self.root
-        self._write_hooks: List[Tuple[PurePosixPath, WriteHook]] = []
-        self._storage_mounts: Dict[PurePosixPath, StorageAdapter] = {}
-        self._path_hooks: List[Tuple[PurePosixPath, PathHook]] = []
+        self._write_hooks: list[tuple[PurePosixPath, WriteHook]] = []
+        self._storage_mounts: dict[PurePosixPath, StorageAdapter] = {}
+        self._path_hooks: list[tuple[PurePosixPath, PathHook]] = []
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -64,7 +64,7 @@ class VirtualFileSystem:
             if not raw.is_absolute():
                 base = self.cwd.path()
                 raw = base.joinpath(raw)
-        parts: List[str] = []
+        parts: list[str] = []
         for part in raw.parts:
             if part in ("", "/", "."):
                 continue
@@ -143,7 +143,7 @@ class VirtualFileSystem:
         if node.policy.append_only and not append:
             raise InvalidOperation(f"{node.path()} is append-only")
 
-    def _check_version(self, node: VirtualNode, expected_version: Optional[int]) -> None:
+    def _check_version(self, node: VirtualNode, expected_version: int | None) -> None:
         if expected_version is None:
             return
         if node.version != expected_version:
@@ -162,7 +162,7 @@ class VirtualFileSystem:
 
         self._emit_path_event(node.path(), event_type, node.read(self))
 
-    def _emit_path_event(self, path: PurePosixPath, event_type: str, content: Optional[str]) -> None:
+    def _emit_path_event(self, path: PurePosixPath, event_type: str, content: str | None) -> None:
         if not self._path_hooks:
             return
         payload = PathEvent(path=str(path), event=event_type, content=content)
@@ -190,8 +190,8 @@ class VirtualFileSystem:
 
     def _find_storage_mount(
         self, path: PurePosixPath
-    ) -> Optional[Tuple[PurePosixPath, StorageAdapter]]:
-        matches: List[Tuple[PurePosixPath, StorageAdapter]] = []
+    ) -> tuple[PurePosixPath, StorageAdapter] | None:
+        matches: list[tuple[PurePosixPath, StorageAdapter]] = []
         for prefix, adapter in self._storage_mounts.items():
             if self._path_matches_prefix(path, prefix):
                 matches.append((prefix, adapter))
@@ -251,12 +251,12 @@ class VirtualFileSystem:
         self,
         path: str | PurePosixPath | None = None,
         *,
-        view: Optional[VisibilityView] = None,
-    ) -> List[DirEntry]:
+        view: VisibilityView | None = None,
+    ) -> list[DirEntry]:
         directory = self._resolve_dir(path or self.cwd.path())
         self._ensure_read_allowed(directory)
         directory.ensure_loaded(self)
-        entries: List[DirEntry] = []
+        entries: list[DirEntry] = []
         for child in directory.iter_children(self):
             if view and not view.allows(child.policy):
                 continue
@@ -305,7 +305,7 @@ class VirtualFileSystem:
         data: str,
         *,
         append: bool = False,
-        expected_version: Optional[int] = None,
+        expected_version: int | None = None,
     ) -> VirtualFile:
         node = self._ensure_file(path, create=True)
         self._ensure_write_allowed(node, append=append)
@@ -323,7 +323,7 @@ class VirtualFileSystem:
         path: str | PurePosixPath,
         data: str,
         *,
-        expected_version: Optional[int] = None,
+        expected_version: int | None = None,
     ) -> VirtualFile:
         return self.write_file(path, data, append=True, expected_version=expected_version)
 
@@ -377,6 +377,7 @@ class VirtualFileSystem:
         dest_path = self._normalize(target)
         dest_parent: VirtualDirectory
         dest_name: str
+        overwrite_version: int | None = None
 
         try:
             dest_node = self._resolve_node(dest_path)
@@ -425,6 +426,7 @@ class VirtualFileSystem:
         dest_path = self._normalize(target)
         dest_parent: VirtualDirectory
         dest_name: str
+        overwrite_version: int | None = None
 
         try:
             dest_node = self._resolve_node(dest_path)
@@ -445,6 +447,7 @@ class VirtualFileSystem:
                     raise InvalidOperation("Cannot overwrite root directory")
                 self._ensure_write_allowed(dest_parent)
                 self._ensure_write_allowed(dest_node)
+                overwrite_version = dest_node.version
                 dest_parent.remove_child(dest_node.name)
                 dest_name = dest_node.name
 
@@ -458,6 +461,8 @@ class VirtualFileSystem:
                 pass
 
         clone = self._clone_node(node, recursive=recursive)
+        if overwrite_version is not None:
+            clone.version = overwrite_version + 1
         clone.name = dest_name
         dest_parent.add_child(clone)
 
@@ -466,21 +471,23 @@ class VirtualFileSystem:
             clone = VirtualFile(name=node.name, metadata=dict(node.metadata))
             clone.policy = self._clone_policy(node.policy)
             clone.write(node.read(self))
+            clone.version = node.version
             return clone
         if isinstance(node, VirtualDirectory):
             node.ensure_loaded(self)
             clone = VirtualDirectory(name=node.name, metadata=dict(node.metadata))
             clone.policy = self._clone_policy(node.policy)
+            clone.version = node.version
             for child in node.iter_children(self):
                 child_clone = self._clone_node(child, recursive=recursive)
                 clone.add_child(child_clone)
             return clone
         raise InvalidOperation("Unsupported node type for copy")
 
-    def walk(self, path: str | PurePosixPath | None = None) -> Iterator[Tuple[PurePosixPath, VirtualNode]]:
+    def walk(self, path: str | PurePosixPath | None = None) -> Iterator[tuple[PurePosixPath, VirtualNode]]:
         start_node = self._resolve_node(path or self.cwd.path())
 
-        def _walk(node: VirtualNode) -> Iterator[Tuple[PurePosixPath, VirtualNode]]:
+        def _walk(node: VirtualNode) -> Iterator[tuple[PurePosixPath, VirtualNode]]:
             yield (node.path(), node)
             if isinstance(node, VirtualDirectory):
                 node.ensure_loaded(self)
@@ -494,7 +501,7 @@ class VirtualFileSystem:
         path: str | PurePosixPath | None = None,
         *,
         recursive: bool = True,
-    ) -> Iterator[Tuple[PurePosixPath, VirtualFile]]:
+    ) -> Iterator[tuple[PurePosixPath, VirtualFile]]:
         start_node = self._resolve_node(path or self.cwd.path())
         self._ensure_read_allowed(start_node)
         if isinstance(start_node, VirtualFile):
@@ -504,7 +511,7 @@ class VirtualFileSystem:
         directory = self._resolve_dir(start_node.path())
         directory.ensure_loaded(self)
 
-        def _walk_dir(dir_node: VirtualDirectory) -> Iterator[Tuple[PurePosixPath, VirtualFile]]:
+        def _walk_dir(dir_node: VirtualDirectory) -> Iterator[tuple[PurePosixPath, VirtualFile]]:
             for child in dir_node.iter_children(self):
                 if isinstance(child, VirtualFile):
                     yield (child.path(), child)
@@ -515,7 +522,7 @@ class VirtualFileSystem:
         yield from _walk_dir(directory)
 
     def snapshot(self) -> VFSSnapshot:
-        nodes: Dict[str, NodeSnapshot] = {}
+        nodes: dict[str, NodeSnapshot] = {}
         for path, node in self.walk("/"):
             if isinstance(node, VirtualFile):
                 content = node.read(self)
@@ -616,7 +623,7 @@ class VirtualFileSystem:
         path: str | PurePosixPath,
         provider: ContentProvider,
         *,
-        metadata: Optional[Dict[str, object]] = None,
+        metadata: dict[str, object] | None = None,
     ) -> VirtualFile:
         node = self._ensure_file(path, create=True)
         node.set_provider(provider)
@@ -629,7 +636,7 @@ class VirtualFileSystem:
         path: str | PurePosixPath,
         provider: DirectoryProvider,
         *,
-        metadata: Optional[Dict[str, object]] = None,
+        metadata: dict[str, object] | None = None,
     ) -> VirtualDirectory:
         node = self.mkdir(path, parents=True, exist_ok=True)
         node.loader = provider
@@ -643,7 +650,7 @@ class VirtualFileSystem:
         path: str | PurePosixPath,
         adapter: StorageAdapter,
         *,
-        policy: Optional[NodePolicy] = None,
+        policy: NodePolicy | None = None,
     ) -> VirtualDirectory:
         normalized = self._normalize(path)
         directory = self.mkdir(normalized, parents=True, exist_ok=True)
@@ -683,11 +690,11 @@ class VirtualFileSystem:
         self,
         path: str | PurePosixPath | None = None,
         *,
-        view: Optional[VisibilityView] = None,
+        view: VisibilityView | None = None,
     ) -> str:
         root_dir = self._resolve_dir(path or self.cwd.path())
         self._ensure_read_allowed(root_dir)
-        lines: List[str] = []
+        lines: list[str] = []
 
         def render(directory: VirtualDirectory, prefix: str = "") -> None:
             entries = sorted(
