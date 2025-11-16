@@ -85,6 +85,16 @@ def test_bash_is_routed_through_host():
     assert res.stdout.strip() == "test"
 
 
+def test_python3_allowed_when_python_disallowed():
+    base_shell = setup_shell()
+    shell = SandboxShell(
+        base_shell.vfs,
+        allowed_commands={"ls", "cat", "python3", "host", "bash", "sh", "help"},
+    )
+    res = shell.exec('python3 -c "print(5)"')
+    assert res.stdout.strip() == "5"
+
+
 def test_host_fallback_translates_executable_path():
     shell = setup_shell()
     shell.vfs.write_file("/workspace/run.sh", "#!/bin/sh\necho script works\n")
@@ -115,3 +125,31 @@ def test_ls_accepts_flags():
     shell = setup_shell()
     res = shell.exec("ls -la")
     assert "workspace" in res.stdout
+
+
+def test_ls_on_blue_directory_via_host():
+    shell = setup_shell()
+    shell.exec("mkdir /blue")
+    shell.exec("write /blue/file.txt hello")
+    res = shell.exec("ls /blue")
+    assert "file.txt" in res.stdout
+
+
+def test_heredoc_write_via_bash():
+    shell = setup_shell()
+    shell.exec("mkdir /blue")
+    cmd = "bash -lc 'printf \"hello from heredoc\" > /blue/note.txt'"
+    shell.exec(cmd)
+    assert "hello from heredoc" in shell.exec("cat /blue/note.txt").stdout
+
+
+def test_host_rm_syncs_back():
+    shell = setup_shell()
+    assert shell.exec("host -p /workspace rm app.py").exit_code == 0
+    assert not shell.vfs.exists("/workspace/app.py")
+
+
+def test_urls_not_rewritten():
+    shell = setup_shell()
+    res = shell.exec("bash -lc 'printf https://example.com'")
+    assert "https://example.com" in res.stdout

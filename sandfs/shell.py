@@ -12,6 +12,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set
 from .exceptions import InvalidOperation, SandboxError, NodeNotFound
 from .policies import VisibilityView
 from .pyexec import PythonExecutor
+from .nodes import VirtualDirectory, VirtualFile
 from .vfs import DirEntry, VirtualFileSystem
 
 
@@ -102,6 +103,7 @@ class SandboxShell:
                     text=True,
                     check=False,
                 )
+                self._sync_from_host(fs_root)
         except SandboxError as exc:
             return CommandResult(stderr=str(exc), exit_code=1)
         except FileNotFoundError as exc:
@@ -126,11 +128,68 @@ class SandboxShell:
         return [self._translate_token(token, fs_root) for token in tokens]
 
     def _translate_token(self, token: str, fs_root: Path) -> str:
-        if token.startswith("/") and self.vfs.exists(token):
-            normalized = PurePosixPath(self.vfs._normalize(token))
-            host_path = self._sandbox_to_host_path(fs_root, normalized)
+        def replacer(match: re.Match[str]) -> str:
+            candidate = match.group(0)
+            if match.start() >= 3 and token[match.start()-3:match.start()] == "://":
+                return candidate
+            sandbox_path = self._eligible_sandbox_path(candidate)
+            if sandbox_path is None:
+                return candidate
+            host_path = self._sandbox_to_host_path(fs_root, sandbox_path)
             return str(host_path)
-        return token
+
+        return re.sub(r"/[A-Za-z0-9._/\-]+", replacer, token)
+
+    def _eligible_sandbox_path(self, path_str: str) -> Optional[PurePosixPath]:
+        try:
+            normalized = PurePosixPath(self.vfs._normalize(path_str))
+        except InvalidOperation:
+            return None
+        if path_str == "/":
+            return normalized
+        if self.vfs.exists(path_str):
+            return normalized
+        parent = normalized.parent if normalized.parent != normalized else None
+        if parent and parent != PurePosixPath("/") and self.vfs.is_dir(str(parent)):
+            return normalized
+        return None
+
+    def _sync_from_host(self, fs_root: Path) -> None:
+        host_dirs: Set[PurePosixPath] = set()
+        host_files: Set[PurePosixPath] = set()
+        for path in sorted(fs_root.rglob("*")):
+            sandbox_path = PurePosixPath("/").joinpath(*path.relative_to(fs_root).parts)
+            if path.is_dir():
+                host_dirs.add(sandbox_path)
+                if sandbox_path != PurePosixPath("/"):
+                    self.vfs.mkdir(sandbox_path, parents=True, exist_ok=True)
+                continue
+            host_files.add(sandbox_path)
+            try:
+                text = path.read_text()
+            except UnicodeDecodeError:
+                text = path.read_bytes().decode(errors="ignore")
+            self.vfs.mkdir(sandbox_path.parent, parents=True, exist_ok=True)
+            self.vfs.write_file(sandbox_path, text)
+        self._remove_missing(host_dirs, host_files)
+
+    def _remove_missing(self, host_dirs: Set[PurePosixPath], host_files: Set[PurePosixPath]) -> None:
+        existing_dirs: List[PurePosixPath] = []
+        existing_files: List[PurePosixPath] = []
+        for path, node in self.vfs.walk("/"):
+            sandbox_path = PurePosixPath(path)
+            if isinstance(node, VirtualDirectory):
+                existing_dirs.append(sandbox_path)
+            elif isinstance(node, VirtualFile):
+                existing_files.append(sandbox_path)
+        for file_path in existing_files:
+            if file_path not in host_files:
+                self.vfs.remove(str(file_path))
+        for dir_path in sorted(existing_dirs, key=lambda p: len(p.parts), reverse=True):
+            if dir_path == PurePosixPath("/"):
+                continue
+            if dir_path not in host_dirs and str(dir_path) != "/":
+                self.vfs.remove(str(dir_path), recursive=True)
 
     # ------------------------------------------------------------------
     # Dispatcher
