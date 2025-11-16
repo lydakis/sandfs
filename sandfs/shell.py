@@ -42,6 +42,8 @@ class SandboxShell:
         self.env: Dict[str, str] = dict(env or {})
         self.commands: Dict[str, CommandHandler] = {}
         self.command_docs: Dict[str, str] = {}
+        self.last_command_name: Optional[str] = None
+        self.command_docs: Dict[str, str] = {}
         self.py_exec = python_executor or PythonExecutor(vfs)
         self.view = view or VisibilityView()
         self.allowed_commands: Optional[Set[str]] = set(allowed_commands) if allowed_commands else None
@@ -127,6 +129,7 @@ class SandboxShell:
         if not tokens:
             return CommandResult()
         name, *args = tokens
+        self.last_command_name = name
         handler = self.commands.get(name)
         if handler is None:
             if self.host_fallback:
@@ -163,7 +166,10 @@ class SandboxShell:
         self.register_command("grep", self._cmd_grep, description="Search files (non-recursive)")
         self.register_command("rg", self._cmd_rg, description="Search files recursively")
         self.register_command("python", self._cmd_python, description="Execute Python snippet")
+        self.register_command("python3", self._cmd_python, description="Execute Python snippet")
         self.register_command("host", self._cmd_host, description="Run host command in materialized tree")
+        self.register_command("bash", self._cmd_shell_host, description="Run bash via host")
+        self.register_command("sh", self._cmd_shell_host, description="Run sh via host")
         self.register_command("help", self._cmd_help, description="Show available commands")
 
     def _cmd_pwd(self, _: List[str]) -> CommandResult:
@@ -395,6 +401,10 @@ class SandboxShell:
             code = " ".join(args)
         result = self.py_exec.run(code)
         return CommandResult(stdout=result.stdout)
+
+    def _cmd_shell_host(self, args: List[str]) -> CommandResult:
+        # First token is bash/sh command itself; delegate to host with same args
+        return self._run_host_process([self.last_command_name] + args, None)
 
     def _cmd_host(self, args: List[str]) -> CommandResult:
         path: Optional[str] = None

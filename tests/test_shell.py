@@ -35,6 +35,12 @@ def test_python_executor():
     assert res.stdout.strip().isdigit()
 
 
+def test_python3_alias():
+    shell = setup_shell()
+    res = shell.exec('python3 -c "print(1+1)"')
+    assert res.stdout.strip() == "2"
+
+
 def test_host_command_grep():
     shell = setup_shell()
     res = shell.exec("host -p /workspace grep hello README.md")
