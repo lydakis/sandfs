@@ -32,10 +32,14 @@ Focus: expand the pure-Python toolchain so normal agent workflows never require 
 - **Editing & diffs**
   - Introduce `cp`, `mv`, `apply_patch`, and `diff` so agents can restructure files safely.
   - Provide `sed`-lite replacements and multi-file write helpers.
+- **File creation ergonomics**
+  - Extend `write`/`append` with heredoc (`<<EOF`) support, timestamp helpers, and batch command execution so agents can create structured notes without `/bin/sh`.
+  - Add native `echo`/`printf` utilities so scripted workflows stay inside the VFS.
 - **Snapshots & history**
   - Surface shell commands for `snapshot`, `restore`, and `diff-snap <id>` (wrapping the existing VFS APIs).
 - **Ergonomics**
   - Structured command responses (rich metadata that the CLI/UI can pretty-print) and better error messaging.
+  - Diagnostics helpers like `status`/`info` to expose visible roots, policies, and current mounts without falling back to host shells.
 
 ## Mid-term explorations
 
