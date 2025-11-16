@@ -13,7 +13,7 @@ from .hooks import WriteEvent, WriteHook
 from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import NodePolicy, VisibilityView
 from .providers import ContentProvider, DirectoryProvider
-from .adapters import StorageAdapter, StorageEntry
+from .adapters import StorageAdapter
 
 
 @dataclass
@@ -23,6 +23,22 @@ class DirEntry:
     is_dir: bool
     metadata: Dict[str, object]
     policy: NodePolicy
+
+
+@dataclass
+class NodeSnapshot:
+    is_dir: bool
+    metadata: Dict[str, object]
+    policy: NodePolicy
+    version: int
+    content: Optional[str] = None
+
+
+@dataclass
+class VFSSnapshot:
+    nodes: Dict[str, NodeSnapshot]
+    cwd: PurePosixPath
+    storage_mounts: Dict[str, StorageAdapter]
 
 
 class VirtualFileSystem:
@@ -151,6 +167,14 @@ class VirtualFileSystem:
             return True
         except ValueError:
             return False
+
+    def _clone_policy(self, policy: NodePolicy) -> NodePolicy:
+        return NodePolicy(
+            readable=policy.readable,
+            writable=policy.writable,
+            append_only=policy.append_only,
+            visibility=policy.visibility,
+        )
 
     def _find_storage_mount(
         self, path: PurePosixPath
@@ -362,6 +386,48 @@ class VirtualFileSystem:
 
         yield from _walk_dir(directory)
 
+    def snapshot(self) -> VFSSnapshot:
+        nodes: Dict[str, NodeSnapshot] = {}
+        for path, node in self.walk("/"):
+            if isinstance(node, VirtualFile):
+                content = node.read(self)
+            else:
+                content = None
+            nodes[str(path)] = NodeSnapshot(
+                is_dir=isinstance(node, VirtualDirectory),
+                metadata=dict(node.metadata),
+                policy=self._clone_policy(node.policy),
+                version=node.version,
+                content=content,
+            )
+        storage_mounts = {str(path): adapter for path, adapter in self._storage_mounts.items()}
+        return VFSSnapshot(nodes=nodes, cwd=self.cwd.path(), storage_mounts=storage_mounts)
+
+    def restore(self, snapshot: VFSSnapshot) -> None:
+        self.root = VirtualDirectory(name="")
+        self.cwd = self.root
+        self._storage_mounts = {PurePosixPath(path): adapter for path, adapter in snapshot.storage_mounts.items()}
+        ordered = sorted(snapshot.nodes.items(), key=lambda item: len(PurePosixPath(item[0]).parts))
+        for path_str, node_state in ordered:
+            path = PurePosixPath(path_str)
+            if path == PurePosixPath("/"):
+                target = self.root
+                target.metadata = dict(node_state.metadata)
+                target.policy = self._clone_policy(node_state.policy)
+                target.version = node_state.version
+                continue
+            if node_state.is_dir:
+                directory = self.mkdir(path, parents=True, exist_ok=True)
+                directory.metadata = dict(node_state.metadata)
+                directory.policy = self._clone_policy(node_state.policy)
+                directory.version = node_state.version
+            else:
+                file_node = self._ensure_file(path, create=True)
+                file_node.metadata = dict(node_state.metadata)
+                file_node.policy = self._clone_policy(node_state.policy)
+                file_node.write(node_state.content or "")
+                file_node.version = node_state.version
+        self.cwd = self._resolve_dir(snapshot.cwd)
     def export_to_path(
         self,
         target: Path,

@@ -17,6 +17,7 @@ Agent builders frequently need a scratch filesystem for planning, iterating on g
 - Bridge to real GNU utilities via `host -p <path> <command>` which materializes the subtree and runs the host binary against it.
 - Node policies (read-only, append-only, visibility labels) plus shell views so different agents see only the nodes they are allowed to.
 - Write hooks and optimistic versions so hosts can flush files to external stores with conflict detection.
+- Storage adapters and snapshots so you can mount external state and roll forward/back within a turn.
 - Serialization helpers to snapshot or hydrate sandboxes (planned).
 
 ## Quickstart
@@ -101,6 +102,16 @@ vfs.sync_storage("/data")  # refresh from adapter if it changed externally
 ```
 
 `mount_storage` keeps the virtual tree synchronized with the adapter, while `sync_storage` refreshes the VFS from the latest adapter contents.
+
+### Snapshots
+
+```python
+snap = vfs.snapshot()
+# run risky operations ...
+vfs.restore(snap)
+```
+
+Snapshots capture the entire tree (including storage-backed nodes) so you can checkpoint before an agent action and roll back on failure.
 
 ## Repository layout
 
