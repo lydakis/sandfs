@@ -378,6 +378,8 @@ class VirtualFileSystem:
         dest_parent: VirtualDirectory
         dest_name: str
 
+        overwrite_version: Optional[int] = None
+
         try:
             dest_node = self._resolve_node(dest_path)
         except (NodeNotFound, InvalidOperation):
@@ -445,6 +447,7 @@ class VirtualFileSystem:
                     raise InvalidOperation("Cannot overwrite root directory")
                 self._ensure_write_allowed(dest_parent)
                 self._ensure_write_allowed(dest_node)
+                overwrite_version = dest_node.version
                 dest_parent.remove_child(dest_node.name)
                 dest_name = dest_node.name
 
@@ -458,6 +461,8 @@ class VirtualFileSystem:
                 pass
 
         clone = self._clone_node(node, recursive=recursive)
+        if overwrite_version is not None:
+            clone.version = overwrite_version + 1
         clone.name = dest_name
         dest_parent.add_child(clone)
 

@@ -55,4 +55,4 @@ def test_copy_overwrites_file_and_advances_version():
 
     assert vfs.read_file("/dest.txt") == "source content"
     assert vfs.read_file("/src.txt") == "source content"
-    assert vfs.get_version("/dest.txt") == 1
+    assert vfs.get_version("/dest.txt") == 2
