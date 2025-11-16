@@ -377,7 +377,6 @@ class VirtualFileSystem:
         dest_path = self._normalize(target)
         dest_parent: VirtualDirectory
         dest_name: str
-
         overwrite_version: int | None = None
 
         try:
@@ -427,6 +426,7 @@ class VirtualFileSystem:
         dest_path = self._normalize(target)
         dest_parent: VirtualDirectory
         dest_name: str
+        overwrite_version: int | None = None
 
         try:
             dest_node = self._resolve_node(dest_path)
