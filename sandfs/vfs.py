@@ -10,6 +10,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .exceptions import InvalidOperation, NodeExists, NodeNotFound
 from .hooks import WriteEvent, WriteHook
+from .integrations import PathEvent, PathHook
 from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import NodePolicy, VisibilityView
 from .providers import ContentProvider, DirectoryProvider
@@ -49,6 +50,7 @@ class VirtualFileSystem:
         self.cwd = self.root
         self._write_hooks: List[Tuple[PurePosixPath, WriteHook]] = []
         self._storage_mounts: Dict[PurePosixPath, StorageAdapter] = {}
+        self._path_hooks: List[Tuple[PurePosixPath, PathHook]] = []
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -149,15 +151,24 @@ class VirtualFileSystem:
                 f"Version mismatch for {node.path()}: expected {expected_version}, current {node.version}"
             )
 
-    def _emit_write_event(self, node: VirtualFile, *, append: bool) -> None:
-        if not self._write_hooks:
+    def _emit_write_event(self, node: VirtualFile, *, append: bool, event_type: str) -> None:
+        if self._write_hooks:
+            path = node.path()
+            content = node.read(self)
+            event = WriteEvent(path=str(path), content=content, version=node.version, append=append)
+            for prefix, hook in self._write_hooks:
+                if self._path_matches_prefix(path, prefix):
+                    hook(event)
+
+        self._emit_path_event(node.path(), event_type, node.read(self))
+
+    def _emit_path_event(self, path: PurePosixPath, event_type: str, content: Optional[str]) -> None:
+        if not self._path_hooks:
             return
-        path = node.path()
-        content = node.read(self)
-        event = WriteEvent(path=str(path), content=content, version=node.version, append=append)
-        for prefix, hook in self._write_hooks:
+        payload = PathEvent(path=str(path), event=event_type, content=content)
+        for prefix, hook in self._path_hooks:
             if self._path_matches_prefix(path, prefix):
-                hook(event)
+                hook(payload)
 
     def _path_matches_prefix(self, path: PurePosixPath, prefix: PurePosixPath) -> bool:
         if prefix == PurePosixPath("/"):
@@ -303,7 +314,8 @@ class VirtualFileSystem:
         node.write(data, append=append)
         node.version += 1
         self._persist_storage(node, previous_version)
-        self._emit_write_event(node, append=append)
+        event_type = "create" if previous_version == 0 else "update"
+        self._emit_write_event(node, append=append, event_type=event_type)
         return node
 
     def append_file(
@@ -349,6 +361,7 @@ class VirtualFileSystem:
         parent.remove_child(node.name)
         if isinstance(node, VirtualFile):
             self._delete_storage_entry(node)
+            self._emit_path_event(node.path(), "delete", None)
 
     def walk(self, path: str | PurePosixPath | None = None) -> Iterator[Tuple[PurePosixPath, VirtualNode]]:
         start_node = self._resolve_node(path or self.cwd.path())
@@ -536,6 +549,10 @@ class VirtualFileSystem:
     def register_write_hook(self, prefix: str | PurePosixPath, hook: WriteHook) -> None:
         normalized = self._normalize(prefix)
         self._write_hooks.append((normalized, hook))
+
+    def register_path_hook(self, prefix: str | PurePosixPath, hook: PathHook) -> None:
+        normalized = self._normalize(prefix)
+        self._path_hooks.append((normalized, hook))
 
     def set_policy(self, path: str | PurePosixPath, policy: NodePolicy) -> None:
         node = self._resolve_node(path)
