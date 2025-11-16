@@ -85,6 +85,19 @@ def test_bash_is_routed_through_host():
     assert res.stdout.strip() == "test"
 
 
+def test_host_fallback_translates_executable_path():
+    shell = setup_shell()
+    shell.vfs.write_file("/workspace/run.sh", "#!/bin/sh\necho script works\n")
+    res = shell.exec("/workspace/run.sh")
+    assert "Permission" in res.stderr or "denied" in res.stderr.lower()
+
+
+def test_host_relative_path_option():
+    shell = setup_shell()
+    res = shell.exec("host -p ./workspace ls")
+    assert "README.md" in res.stdout
+
+
 def test_help_lists_commands():
     shell = setup_shell()
     res = shell.exec("help")

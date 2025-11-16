@@ -88,7 +88,7 @@ class SandboxShell:
     def _run_host_process(self, command_tokens: List[str], path: Optional[str]) -> CommandResult:
         if not command_tokens:
             return CommandResult(stderr="Missing host command", exit_code=2)
-        target = path or self.vfs.pwd()
+        target = str(self.vfs._normalize(path or self.vfs.pwd()))
         self._ensure_visible_path(target)
         sandbox_cwd = PurePosixPath(target)
         try:
@@ -106,6 +106,8 @@ class SandboxShell:
             return CommandResult(stderr=str(exc), exit_code=1)
         except FileNotFoundError as exc:
             return CommandResult(stderr=str(exc), exit_code=127)
+        except OSError as exc:
+            return CommandResult(stderr=str(exc), exit_code=getattr(exc, "errno", 1))
         return CommandResult(
             stdout=completed.stdout,
             stderr=completed.stderr,
@@ -113,24 +115,20 @@ class SandboxShell:
         )
 
     def _sandbox_to_host_path(self, fs_root: Path, sandbox_path: PurePosixPath) -> Path:
+        if not sandbox_path.is_absolute():
+            sandbox_path = PurePosixPath(self.vfs._normalize(sandbox_path))
         if sandbox_path == PurePosixPath("/"):
             return fs_root
         rel = sandbox_path.relative_to("/")
         return fs_root.joinpath(*rel.parts)
 
     def _map_command_tokens(self, tokens: List[str], fs_root: Path) -> List[str]:
-        mapped: List[str] = []
-        for idx, token in enumerate(tokens):
-            if idx == 0:
-                mapped.append(token)
-                continue
-            mapped.append(self._translate_token(token, fs_root))
-        return mapped
+        return [self._translate_token(token, fs_root) for token in tokens]
 
     def _translate_token(self, token: str, fs_root: Path) -> str:
         if token.startswith("/") and self.vfs.exists(token):
-            sandbox_path = PurePosixPath(token)
-            host_path = self._sandbox_to_host_path(fs_root, sandbox_path)
+            normalized = PurePosixPath(self.vfs._normalize(token))
+            host_path = self._sandbox_to_host_path(fs_root, normalized)
             return str(host_path)
         return token
 
