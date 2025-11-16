@@ -20,6 +20,13 @@ Agent builders frequently need a scratch filesystem for planning, iterating on g
 - Storage adapters and snapshots so you can mount external state and roll forward/back within a turn.
 - Serialization helpers to snapshot or hydrate sandboxes (planned).
 
+## Installation
+
+```bash
+pip install git+https://github.com/lydakis/sandfs.git
+# Once a PyPI release is available: pip install sandfs
+```
+
 ## Quickstart
 
 ```python
@@ -160,3 +167,8 @@ recorder.attach(vfs, "/blue/inbox")
 ## License
 
 MIT
+
+## Further reading
+
+- [Using sandfs with Blue](docs/blue.md)
+- [Publishing sandfs](docs/publishing.md)
