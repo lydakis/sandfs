@@ -13,35 +13,43 @@ class NodePolicy:
     readable: bool = True
     writable: bool = True
     append_only: bool = False
-    visibility: str = "public"
-    contacts: Set[str] = field(default_factory=set)
+    classification: str = "public"
+    principals: Set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
 class VisibilityView:
-    """Filters nodes by visibility labels."""
+    """Filters nodes by classification labels and principals."""
 
-    labels: Optional[FrozenSet[str]] = None
-    contacts: Optional[FrozenSet[str]] = None
+    classifications: Optional[FrozenSet[str]] = None
+    principals: Optional[FrozenSet[str]] = None
 
     def __init__(
         self,
-        labels: Optional[Iterable[str]] = None,
-        contacts: Optional[Iterable[str]] = None,
+        classifications: Optional[Iterable[str]] = None,
+        principals: Optional[Iterable[str]] = None,
     ) -> None:
-        object.__setattr__(self, "labels", frozenset(labels) if labels is not None else None)
-        object.__setattr__(self, "contacts", frozenset(contacts) if contacts is not None else None)
+        object.__setattr__(
+            self,
+            "classifications",
+            frozenset(classifications) if classifications is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "principals",
+            frozenset(principals) if principals is not None else None,
+        )
 
     def allows(self, policy: NodePolicy) -> bool:
-        if policy.contacts:
-            if self.contacts is None:
+        if policy.principals:
+            if self.principals is None:
                 return False
-            if not (policy.contacts & self.contacts):
+            if not (policy.principals & self.principals):
                 return False
             return True
-        if self.labels is None:
+        if self.classifications is None:
             return True
-        return policy.visibility in self.labels
+        return policy.classification in self.classifications
 
 
 __all__ = ["NodePolicy", "VisibilityView"]

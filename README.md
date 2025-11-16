@@ -67,9 +67,9 @@ The example above exports `/workspace` into a temporary directory, runs the syst
 ```python
 vfs.set_policy(
     "/blue/identity/persona.md",
-    NodePolicy(writable=False, visibility="private", contacts={"alice", "bob"}),
+    NodePolicy(writable=False, classification="private", principals={"alice", "bob"}),
 )
-shell = SandboxShell(vfs, view=VisibilityView(labels={"public"}, contacts={"alice"}))
+shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}, principals={"alice"}))
 ```
 
 ### Agent shell mode

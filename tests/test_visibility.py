@@ -7,10 +7,10 @@ def test_contact_visibility_filters_shell():
     vfs.write_file("/blue/bob.txt", "bob")
     vfs.write_file("/blue/alice.txt", "alice")
 
-    vfs.set_policy("/blue/bob.txt", NodePolicy(visibility="private", contacts={"bob"}))
-    vfs.set_policy("/blue/alice.txt", NodePolicy(visibility="private", contacts={"alice"}))
+    vfs.set_policy("/blue/bob.txt", NodePolicy(classification="private", principals={"bob"}))
+    vfs.set_policy("/blue/alice.txt", NodePolicy(classification="private", principals={"alice"}))
 
-    shell = SandboxShell(vfs, view=VisibilityView(labels={"public"}, contacts={"bob"}))
+    shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}, principals={"bob"}))
     listing = shell.exec("ls /blue").stdout
     assert "public.txt" in listing
     assert "bob.txt" in listing
