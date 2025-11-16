@@ -16,6 +16,7 @@ Agent builders frequently need a scratch filesystem for planning, iterating on g
 - Optional Python execution helper that evaluates snippets against the sandbox state only.
 - Bridge to real GNU utilities via `host -p <path> <command>` which materializes the subtree and runs the host binary against it.
 - Node policies (read-only, append-only, visibility labels) plus shell views so different agents see only the nodes they are allowed to.
+- Write hooks and optimistic versions so hosts can flush files to external stores with conflict detection.
 - Serialization helpers to snapshot or hydrate sandboxes (planned).
 
 ## Quickstart
@@ -94,3 +95,20 @@ uv run pytest
 ## License
 
 MIT
+### Persistence hooks
+
+Register a write hook to flush files into your own store and use optimistic versions to avoid clobbering concurrent updates:
+
+```python
+from sandfs import VirtualFileSystem
+from sandfs.hooks import WriteEvent
+
+vfs = VirtualFileSystem()
+
+def flush(event: WriteEvent) -> None:
+    save_to_db(event.path, event.content, event.version)
+
+vfs.register_write_hook("/blue/work", flush)
+vfs.write_file("/blue/work/note.md", "draft")
+vfs.write_file("/blue/work/note.md", "final", expected_version=1)
+```

@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .exceptions import InvalidOperation, NodeExists, NodeNotFound
+from .hooks import WriteEvent, WriteHook
 from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import NodePolicy, VisibilityView
 from .providers import ContentProvider, DirectoryProvider
@@ -29,6 +30,7 @@ class VirtualFileSystem:
     def __init__(self) -> None:
         self.root = VirtualDirectory(name="")
         self.cwd = self.root
+        self._write_hooks: List[Tuple[PurePosixPath, WriteHook]] = []
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -121,6 +123,33 @@ class VirtualFileSystem:
         if node.policy.append_only and not append:
             raise InvalidOperation(f"{node.path()} is append-only")
 
+    def _check_version(self, node: VirtualNode, expected_version: Optional[int]) -> None:
+        if expected_version is None:
+            return
+        if node.version != expected_version:
+            raise InvalidOperation(
+                f"Version mismatch for {node.path()}: expected {expected_version}, current {node.version}"
+            )
+
+    def _emit_write_event(self, node: VirtualFile, *, append: bool) -> None:
+        if not self._write_hooks:
+            return
+        path = node.path()
+        content = node.read(self)
+        event = WriteEvent(path=str(path), content=content, version=node.version, append=append)
+        for prefix, hook in self._write_hooks:
+            if self._path_matches_prefix(path, prefix):
+                hook(event)
+
+    def _path_matches_prefix(self, path: PurePosixPath, prefix: PurePosixPath) -> bool:
+        if prefix == PurePosixPath("/"):
+            return True
+        try:
+            path.relative_to(prefix)
+            return True
+        except ValueError:
+            return False
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -193,14 +222,24 @@ class VirtualFileSystem:
         data: str,
         *,
         append: bool = False,
+        expected_version: Optional[int] = None,
     ) -> VirtualFile:
         node = self._ensure_file(path, create=True)
         self._ensure_write_allowed(node, append=append)
+        self._check_version(node, expected_version)
         node.write(data, append=append)
+        node.version += 1
+        self._emit_write_event(node, append=append)
         return node
 
-    def append_file(self, path: str | PurePosixPath, data: str) -> VirtualFile:
-        return self.write_file(path, data, append=True)
+    def append_file(
+        self,
+        path: str | PurePosixPath,
+        data: str,
+        *,
+        expected_version: Optional[int] = None,
+    ) -> VirtualFile:
+        return self.write_file(path, data, append=True, expected_version=expected_version)
 
     def read_file(self, path: str | PurePosixPath) -> str:
         node = self._ensure_file(path, create=False)
@@ -309,6 +348,12 @@ class VirtualFileSystem:
         except (NodeNotFound, InvalidOperation):
             return False
 
+    def get_version(self, path: str | PurePosixPath) -> int:
+        node = self._resolve_node(path)
+        if not isinstance(node, VirtualFile):
+            raise InvalidOperation(f"{node.path()} is not a file")
+        return node.version
+
     def is_dir(self, path: str | PurePosixPath) -> bool:
         try:
             return isinstance(self._resolve_node(path), VirtualDirectory)
@@ -347,6 +392,10 @@ class VirtualFileSystem:
         if metadata:
             node.metadata.update(metadata)
         return node
+
+    def register_write_hook(self, prefix: str | PurePosixPath, hook: WriteHook) -> None:
+        normalized = self._normalize(prefix)
+        self._write_hooks.append((normalized, hook))
 
     def set_policy(self, path: str | PurePosixPath, policy: NodePolicy) -> None:
         node = self._resolve_node(path)

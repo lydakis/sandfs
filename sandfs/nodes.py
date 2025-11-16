@@ -22,6 +22,7 @@ class VirtualNode:
     parent: Optional["VirtualDirectory"] = None
     metadata: Dict[str, object] = field(default_factory=dict)
     policy: NodePolicy = field(default_factory=NodePolicy)
+    version: int = 0
 
     def path(self) -> PurePosixPath:
         if self.parent is None:
