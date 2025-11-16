@@ -36,6 +36,29 @@ def test_storage_adapter_conflict_detection():
         vfs.write_file("/logs/a.txt", "two", expected_version=1)
 
 
+def test_storage_adapter_conflict_preserves_cached_state():
+    adapter = MemoryStorageAdapter(initial={"conflict.txt": "initial"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/data", adapter)
+
+    vfs.write_file("/data/conflict.txt", "local-one")
+    original_content = vfs.read_file("/data/conflict.txt")
+    original_version = vfs.get_version("/data/conflict.txt")
+
+    current = adapter.read("conflict.txt")
+    adapter.write("conflict.txt", "external", version=current.version)
+
+    with pytest.raises(InvalidOperation):
+        vfs.write_file(
+            "/data/conflict.txt",
+            "local-two",
+            expected_version=original_version,
+        )
+
+    assert vfs.read_file("/data/conflict.txt") == original_content
+    assert vfs.get_version("/data/conflict.txt") == original_version
+
+
 def test_storage_adapter_sync_refreshes_vfs():
     adapter = MemoryStorageAdapter(initial={"a.txt": "hello"})
     vfs = VirtualFileSystem()
