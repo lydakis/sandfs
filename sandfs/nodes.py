@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Dict, Iterable, Iterator, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from .exceptions import InvalidOperation, NodeExists, NodeNotFound, ProviderError
 from .policies import NodePolicy
@@ -19,8 +20,8 @@ class VirtualNode:
     """Base node stored inside the sandbox."""
 
     name: str
-    parent: Optional["VirtualDirectory"] = None
-    metadata: Dict[str, object] = field(default_factory=dict)
+    parent: "VirtualDirectory" | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
     policy: NodePolicy = field(default_factory=NodePolicy)
     version: int = 0
 
@@ -28,13 +29,13 @@ class VirtualNode:
         if self.parent is None:
             return PurePosixPath("/")
         segments = []
-        node: Optional[VirtualNode] = self
+        node: VirtualNode | None = self
         while node and node.parent is not None:
             segments.append(node.name)
             node = node.parent
         return PurePosixPath("/" + "/".join(reversed(segments))) if segments else PurePosixPath("/")
 
-    def build_context(self, vfs: Optional["VirtualFileSystem"] = None) -> NodeContext:
+    def build_context(self, vfs: "VirtualFileSystem" | None = None) -> NodeContext:
         return NodeContext(path=self.path(), metadata=self.metadata, vfs=vfs)
 
 
@@ -45,16 +46,16 @@ class VirtualFile(VirtualNode):
         self,
         name: str,
         *,
-        parent: Optional["VirtualDirectory"] = None,
+        parent: "VirtualDirectory" | None = None,
         content: str | None = None,
-        provider: Optional[ContentProvider] = None,
-        metadata: Optional[Dict[str, object]] = None,
+        provider: ContentProvider | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> None:
         super().__init__(name=name, parent=parent, metadata=dict(metadata or {}))
         self._content = content or ""
         self._provider = provider
 
-    def read(self, vfs: Optional["VirtualFileSystem"] = None) -> str:
+    def read(self, vfs: "VirtualFileSystem" | None = None) -> str:
         if self._provider is None:
             return self._content
         ctx = self.build_context(vfs)
@@ -81,16 +82,16 @@ class VirtualDirectory(VirtualNode):
         self,
         name: str,
         *,
-        parent: Optional["VirtualDirectory"] = None,
-        loader: Optional[DirectoryProvider] = None,
-        metadata: Optional[Dict[str, object]] = None,
+        parent: "VirtualDirectory" | None = None,
+        loader: DirectoryProvider | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> None:
         super().__init__(name=name, parent=parent, metadata=dict(metadata or {}))
         self.loader = loader
         self._loaded = loader is None
-        self.children: Dict[str, VirtualNode] = {}
+        self.children: dict[str, VirtualNode] = {}
 
-    def ensure_loaded(self, vfs: Optional["VirtualFileSystem"] = None) -> None:
+    def ensure_loaded(self, vfs: "VirtualFileSystem" | None = None) -> None:
         if self._loaded:
             return
         if self.loader is None:
@@ -115,14 +116,14 @@ class VirtualDirectory(VirtualNode):
             raise NodeNotFound(f"Child {name} not found in {self.path()}")
         del self.children[name]
 
-    def get_child(self, name: str, vfs: Optional["VirtualFileSystem"] = None) -> VirtualNode:
+    def get_child(self, name: str, vfs: "VirtualFileSystem" | None = None) -> VirtualNode:
         self.ensure_loaded(vfs)
         try:
             return self.children[name]
         except KeyError as exc:
             raise NodeNotFound(f"Child {name} not found in {self.path()}") from exc
 
-    def iter_children(self, vfs: Optional["VirtualFileSystem"] = None) -> Iterator[VirtualNode]:
+    def iter_children(self, vfs: "VirtualFileSystem" | None = None) -> Iterator[VirtualNode]:
         self.ensure_loaded(vfs)
         return iter(self.children.values())
 
@@ -131,7 +132,7 @@ def instantiate_provided_node(
     name: str,
     provided: ProvidedNode,
     *,
-    parent: Optional[VirtualDirectory],
+    parent: VirtualDirectory | None,
 ) -> VirtualNode:
     if provided.kind == "file":
         node = VirtualFile(name=name, parent=parent, metadata=provided.metadata)

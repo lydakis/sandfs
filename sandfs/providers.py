@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Callable, Dict, Iterable, Literal, Mapping, MutableMapping, Optional
+from typing import Any, Literal
 
 if False:  # pragma: no cover - for type checkers only
     from .vfs import VirtualFileSystem
@@ -17,7 +18,7 @@ class NodeContext:
 
     path: PurePosixPath
     metadata: Mapping[str, Any]
-    vfs: Optional["VirtualFileSystem"] = None
+    vfs: "VirtualFileSystem" | None = None
 
 
 ContentProvider = Callable[[NodeContext], str]
@@ -30,20 +31,20 @@ class ProvidedNode:
     """Represents a node returned by a directory provider."""
 
     kind: Literal["file", "dir"]
-    content: Optional[str] = None
-    content_provider: Optional[ContentProvider] = None
-    directory_provider: Optional[DirectoryProvider] = None
-    children: Optional[MutableMapping[str, "ProvidedNode"]] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    policy: Optional[NodePolicy] = None
+    content: str | None = None
+    content_provider: ContentProvider | None = None
+    directory_provider: DirectoryProvider | None = None
+    children: MutableMapping[str, "ProvidedNode"] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    policy: NodePolicy | None = None
 
     @staticmethod
     def file(
         *,
-        content: Optional[str] = None,
-        content_provider: Optional[ContentProvider] = None,
-        metadata: Optional[Mapping[str, Any]] = None,
-        policy: Optional[NodePolicy] = None,
+        content: str | None = None,
+        content_provider: ContentProvider | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        policy: NodePolicy | None = None,
     ) -> "ProvidedNode":
         return ProvidedNode(
             kind="file",
@@ -56,10 +57,10 @@ class ProvidedNode:
     @staticmethod
     def directory(
         *,
-        children: Optional[Mapping[str, "ProvidedNode"]] = None,
-        directory_provider: Optional[DirectoryProvider] = None,
-        metadata: Optional[Mapping[str, Any]] = None,
-        policy: Optional[NodePolicy] = None,
+        children: Mapping[str, "ProvidedNode"] | None = None,
+        directory_provider: DirectoryProvider | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        policy: NodePolicy | None = None,
     ) -> "ProvidedNode":
         frozen_children = None
         if children is not None:
