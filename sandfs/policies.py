@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import FrozenSet, Iterable, Optional, Set
 
 
 @dataclass
@@ -14,20 +14,20 @@ class NodePolicy:
     writable: bool = True
     append_only: bool = False
     classification: str = "public"
-    principals: Set[str] = field(default_factory=set)
+    principals: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
 class VisibilityView:
     """Filters nodes by classification labels and principals."""
 
-    classifications: Optional[FrozenSet[str]] = None
-    principals: Optional[FrozenSet[str]] = None
+    classifications: frozenset[str] | None = None
+    principals: frozenset[str] | None = None
 
     def __init__(
         self,
-        classifications: Optional[Iterable[str]] = None,
-        principals: Optional[Iterable[str]] = None,
+        classifications: Iterable[str] | None = None,
+        principals: Iterable[str] | None = None,
     ) -> None:
         object.__setattr__(
             self,

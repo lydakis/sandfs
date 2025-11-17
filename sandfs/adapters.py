@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, Optional
 
 
 @dataclass
@@ -19,7 +19,7 @@ class StorageAdapter:
     def write(self, path: str, content: str, *, version: int) -> StorageEntry:
         raise NotImplementedError
 
-    def list(self) -> Dict[str, StorageEntry]:
+    def list(self) -> dict[str, StorageEntry]:
         raise NotImplementedError
 
     def delete(self, path: str) -> None:
@@ -31,7 +31,7 @@ class MemoryStorageAdapter(StorageAdapter):
     initial: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._entries: Dict[str, StorageEntry] = {
+        self._entries: dict[str, StorageEntry] = {
             path: StorageEntry(content=text, version=0)
             for path, text in self.initial.items()
         }
@@ -51,7 +51,7 @@ class MemoryStorageAdapter(StorageAdapter):
         self._entries[path] = entry
         return StorageEntry(content=entry.content, version=entry.version)
 
-    def list(self) -> Dict[str, StorageEntry]:
+    def list(self) -> dict[str, StorageEntry]:
         return {path: StorageEntry(content=entry.content, version=entry.version) for path, entry in self._entries.items()}
 
     def delete(self, path: str) -> None:

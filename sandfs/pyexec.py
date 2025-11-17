@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 from .vfs import VirtualFileSystem
 
@@ -41,7 +41,7 @@ _ALLOWED_BUILTINS = {
 @dataclass
 class PythonExecutionResult:
     stdout: str
-    globals: Dict[str, Any]
+    globals: dict[str, Any]
 
 
 class PythonExecutor:
@@ -49,8 +49,8 @@ class PythonExecutor:
         self,
         vfs: VirtualFileSystem,
         *,
-        builtins: Optional[Dict[str, Any]] = None,
-        globals_template: Optional[Dict[str, Any]] = None,
+        builtins: dict[str, Any] | None = None,
+        globals_template: dict[str, Any] | None = None,
     ) -> None:
         self.vfs = vfs
         self._builtins = dict(_ALLOWED_BUILTINS)
@@ -66,9 +66,9 @@ class PythonExecutor:
         code: str,
         *,
         filename: str = "<sandbox>",
-        extra_globals: Optional[Dict[str, Any]] = None,
+        extra_globals: dict[str, Any] | None = None,
     ) -> PythonExecutionResult:
-        env: Dict[str, Any] = dict(self._globals_template)
+        env: dict[str, Any] = dict(self._globals_template)
         if extra_globals:
             env.update(extra_globals)
         env["__builtins__"] = dict(self._builtins)

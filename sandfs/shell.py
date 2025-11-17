@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from .exceptions import InvalidOperation, SandboxError, NodeNotFound
 from .policies import VisibilityView
@@ -23,7 +23,7 @@ class CommandResult:
     exit_code: int = 0
 
 
-CommandHandler = Callable[[List[str]], CommandResult | str | None]
+CommandHandler = Callable[[list[str]], CommandResult | str | None]
 
 
 class SandboxShell:
@@ -33,22 +33,22 @@ class SandboxShell:
         self,
         vfs: VirtualFileSystem,
         *,
-        python_executor: Optional[PythonExecutor] = None,
-        env: Optional[Dict[str, str]] = None,
-        view: Optional[VisibilityView] = None,
-        allowed_commands: Optional[Iterable[str]] = None,
-        max_output_bytes: Optional[int] = None,
+        python_executor: PythonExecutor | None = None,
+        env: dict[str, str] | None = None,
+        view: VisibilityView | None = None,
+        allowed_commands: Iterable[str] | None = None,
+        max_output_bytes: int | None = None,
         host_fallback: bool = True,
     ) -> None:
         self.vfs = vfs
-        self.env: Dict[str, str] = dict(env or {})
-        self.commands: Dict[str, CommandHandler] = {}
-        self.command_docs: Dict[str, str] = {}
-        self.last_command_name: Optional[str] = None
-        self.command_docs: Dict[str, str] = {}
+        self.env: dict[str, str] = dict(env or {})
+        self.commands: dict[str, CommandHandler] = {}
+        self.command_docs: dict[str, str] = {}
+        self.last_command_name: str | None = None
+        self.command_docs: dict[str, str] = {}
         self.py_exec = python_executor or PythonExecutor(vfs)
         self.view = view or VisibilityView()
-        self.allowed_commands: Optional[Set[str]] = set(allowed_commands) if allowed_commands else None
+        self.allowed_commands: set[str] | None = set(allowed_commands) if allowed_commands else None
         self.max_output_bytes = max_output_bytes
         self.host_fallback = host_fallback
         self._register_builtin_commands()
@@ -61,7 +61,7 @@ class SandboxShell:
         if description:
             self.command_docs[name] = description
 
-    def available_commands(self) -> List[str]:
+    def available_commands(self) -> list[str]:
         return sorted(self.commands)
 
     def _ensure_visible_path(self, path: str) -> None:
@@ -86,7 +86,7 @@ class SandboxShell:
             exit_code=1,
         )
 
-    def _run_host_process(self, command_tokens: List[str], path: Optional[str]) -> CommandResult:
+    def _run_host_process(self, command_tokens: list[str], path: str | None) -> CommandResult:
         if not command_tokens:
             return CommandResult(stderr="Missing host command", exit_code=2)
         target = str(self.vfs._normalize(path or self.vfs.pwd()))
@@ -124,7 +124,7 @@ class SandboxShell:
         rel = sandbox_path.relative_to("/")
         return fs_root.joinpath(*rel.parts)
 
-    def _map_command_tokens(self, tokens: List[str], fs_root: Path) -> List[str]:
+    def _map_command_tokens(self, tokens: list[str], fs_root: Path) -> list[str]:
         return [self._translate_token(token, fs_root) for token in tokens]
 
     def _translate_token(self, token: str, fs_root: Path) -> str:
@@ -143,7 +143,7 @@ class SandboxShell:
 
         return re.sub(r"/[A-Za-z0-9._/\-]+", replacer, token)
 
-    def _eligible_sandbox_path(self, path_str: str) -> Optional[PurePosixPath]:
+    def _eligible_sandbox_path(self, path_str: str) -> PurePosixPath | None:
         try:
             normalized = PurePosixPath(self.vfs._normalize(path_str))
         except InvalidOperation:
@@ -158,8 +158,8 @@ class SandboxShell:
         return None
 
     def _sync_from_host(self, fs_root: Path) -> None:
-        host_dirs: Set[PurePosixPath] = set()
-        host_files: Set[PurePosixPath] = set()
+        host_dirs: set[PurePosixPath] = set()
+        host_files: set[PurePosixPath] = set()
         for path in sorted(fs_root.rglob("*")):
             sandbox_path = PurePosixPath("/").joinpath(*path.relative_to(fs_root).parts)
             if path.is_dir():
@@ -186,9 +186,9 @@ class SandboxShell:
                 self.vfs.write_file(sandbox_path, text)
         self._remove_missing(host_dirs, host_files)
 
-    def _remove_missing(self, host_dirs: Set[PurePosixPath], host_files: Set[PurePosixPath]) -> None:
-        existing_dirs: List[PurePosixPath] = []
-        existing_files: List[PurePosixPath] = []
+    def _remove_missing(self, host_dirs: set[PurePosixPath], host_files: set[PurePosixPath]) -> None:
+        existing_dirs: list[PurePosixPath] = []
+        existing_files: list[PurePosixPath] = []
         for path, node in self.vfs.walk("/"):
             sandbox_path = PurePosixPath(path)
             if isinstance(node, VirtualDirectory):
@@ -270,19 +270,19 @@ class SandboxShell:
         self.register_command("sh", self._cmd_shell_host, description="Run sh via host")
         self.register_command("help", self._cmd_help, description="Show available commands")
 
-    def _cmd_pwd(self, _: List[str]) -> CommandResult:
+    def _cmd_pwd(self, _: list[str]) -> CommandResult:
         return CommandResult(stdout=self.vfs.pwd())
 
-    def _cmd_cd(self, args: List[str]) -> CommandResult:
+    def _cmd_cd(self, args: list[str]) -> CommandResult:
         if len(args) != 1:
             return CommandResult(stderr="cd expects exactly one path", exit_code=2)
         self._ensure_visible_path(args[0])
         new_path = self.vfs.cd(args[0])
         return CommandResult(stdout=new_path)
 
-    def _cmd_ls(self, args: List[str]) -> CommandResult:
+    def _cmd_ls(self, args: list[str]) -> CommandResult:
         long = False
-        targets: List[str] = []
+        targets: list[str] = []
         for arg in args:
             if arg in ("-l", "--long"):
                 long = True
@@ -293,7 +293,7 @@ class SandboxShell:
                 targets.append(arg)
         if not targets:
             targets = [self.vfs.pwd()]
-        blocks: List[str] = []
+        blocks: list[str] = []
         for idx, target in enumerate(targets):
             self._ensure_visible_path(target)
             entries = self.vfs.ls(target, view=self.view)
@@ -304,7 +304,7 @@ class SandboxShell:
                 blocks.append("")
         return CommandResult(stdout="\n".join(filter(None, blocks)))
 
-    def _format_ls(self, entries: List[DirEntry], *, long_format: bool) -> str:
+    def _format_ls(self, entries: list[DirEntry], *, long_format: bool) -> str:
         if not entries:
             return ""
         if long_format:
@@ -317,7 +317,7 @@ class SandboxShell:
             for entry in entries
         )
 
-    def _cmd_cat(self, args: List[str]) -> CommandResult:
+    def _cmd_cat(self, args: list[str]) -> CommandResult:
         if not args:
             return CommandResult(stderr="cat expects at least one file", exit_code=2)
         blobs = []
@@ -326,7 +326,7 @@ class SandboxShell:
             blobs.append(self.vfs.read_file(path))
         return CommandResult(stdout="".join(blobs))
 
-    def _cmd_append(self, args: List[str]) -> CommandResult:
+    def _cmd_append(self, args: list[str]) -> CommandResult:
         if len(args) < 2:
             return CommandResult(stderr="append expects a path and text", exit_code=2)
         path = args[0]
@@ -335,7 +335,7 @@ class SandboxShell:
         self.vfs.append_file(path, text)
         return CommandResult()
 
-    def _cmd_touch(self, args: List[str]) -> CommandResult:
+    def _cmd_touch(self, args: list[str]) -> CommandResult:
         if not args:
             return CommandResult(stderr="touch expects at least one file", exit_code=2)
         for path in args:
@@ -343,9 +343,9 @@ class SandboxShell:
             self.vfs.touch(path)
         return CommandResult()
 
-    def _cmd_mkdir(self, args: List[str]) -> CommandResult:
+    def _cmd_mkdir(self, args: list[str]) -> CommandResult:
         parents = False
-        paths: List[str] = []
+        paths: list[str] = []
         for arg in args:
             if arg in ("-p", "--parents"):
                 parents = True
@@ -358,9 +358,9 @@ class SandboxShell:
             self.vfs.mkdir(path, parents=parents, exist_ok=parents)
         return CommandResult()
 
-    def _cmd_rm(self, args: List[str]) -> CommandResult:
+    def _cmd_rm(self, args: list[str]) -> CommandResult:
         recursive = False
-        targets: List[str] = []
+        targets: list[str] = []
         for arg in args:
             if arg in ("-r", "-rf", "-R", "--recursive"):
                 recursive = True
@@ -373,9 +373,9 @@ class SandboxShell:
             self.vfs.remove(target, recursive=recursive)
         return CommandResult()
 
-    def _cmd_cp(self, args: List[str]) -> CommandResult:
+    def _cmd_cp(self, args: list[str]) -> CommandResult:
         recursive = False
-        operands: List[str] = []
+        operands: list[str] = []
         for arg in args:
             if arg in ("-r", "-R", "--recursive"):
                 recursive = True
@@ -392,7 +392,7 @@ class SandboxShell:
             return CommandResult(stderr=str(exc), exit_code=1)
         return CommandResult()
 
-    def _cmd_mv(self, args: List[str]) -> CommandResult:
+    def _cmd_mv(self, args: list[str]) -> CommandResult:
         if len(args) != 2:
             return CommandResult(stderr="mv expects a source and destination", exit_code=2)
         source, dest = args
@@ -404,18 +404,18 @@ class SandboxShell:
             return CommandResult(stderr=str(exc), exit_code=1)
         return CommandResult()
 
-    def _cmd_tree(self, args: List[str]) -> CommandResult:
+    def _cmd_tree(self, args: list[str]) -> CommandResult:
         target = args[0] if args else None
         if target:
             self._ensure_visible_path(target)
         return CommandResult(stdout=self.vfs.tree(target, view=self.view))
 
-    def _cmd_write(self, args: List[str]) -> CommandResult:
+    def _cmd_write(self, args: list[str]) -> CommandResult:
         if not args:
             return CommandResult(stderr="write expects a target path", exit_code=2)
         path = args[0]
         self._ensure_visible_path(path)
-        text_parts: List[str] = []
+        text_parts: list[str] = []
         append = False
         idx = 1
         while idx < len(args):
@@ -437,15 +437,15 @@ class SandboxShell:
             self.vfs.write_file(path, payload)
         return CommandResult()
 
-    def _cmd_grep(self, args: List[str]) -> CommandResult:
+    def _cmd_grep(self, args: list[str]) -> CommandResult:
         if not args:
             return CommandResult(stderr="grep expects a pattern", exit_code=2)
         recursive = False
         regex = False
         ignore_case = False
         show_numbers = False
-        paths: List[str] = []
-        pattern: Optional[str] = None
+        paths: list[str] = []
+        pattern: str | None = None
         idx = 0
         while idx < len(args):
             token = args[idx]
@@ -479,7 +479,7 @@ class SandboxShell:
         output = self._search(pattern, paths, recursive=recursive, regex=regex, ignore_case=ignore_case, show_numbers=show_numbers)
         return CommandResult(stdout="\n".join(output))
 
-    def _cmd_rg(self, args: List[str]) -> CommandResult:
+    def _cmd_rg(self, args: list[str]) -> CommandResult:
         # ripgrep defaults to recursive search
         return self._cmd_grep(["-r"] + args)
 
@@ -492,8 +492,8 @@ class SandboxShell:
         regex: bool,
         ignore_case: bool,
         show_numbers: bool,
-    ) -> List[str]:
-        results: List[str] = []
+    ) -> list[str]:
+        results: list[str] = []
         flags = re.MULTILINE
         if ignore_case:
             flags |= re.IGNORECASE
@@ -521,7 +521,7 @@ class SandboxShell:
                         results.append(f"{prefix}{line}")
         return results
 
-    def _cmd_python(self, args: List[str]) -> CommandResult:
+    def _cmd_python(self, args: list[str]) -> CommandResult:
         if not args:
             return CommandResult(stderr="python expects code", exit_code=2)
         if args[0] == "-c" and len(args) >= 2:
@@ -531,12 +531,12 @@ class SandboxShell:
         result = self.py_exec.run(code)
         return CommandResult(stdout=result.stdout)
 
-    def _cmd_shell_host(self, args: List[str]) -> CommandResult:
+    def _cmd_shell_host(self, args: list[str]) -> CommandResult:
         # First token is bash/sh command itself; delegate to host with same args
         return self._run_host_process([self.last_command_name] + args, None)
 
-    def _cmd_host(self, args: List[str]) -> CommandResult:
-        path: Optional[str] = None
+    def _cmd_host(self, args: list[str]) -> CommandResult:
+        path: str | None = None
         idx = 0
         while idx < len(args):
             token = args[idx]
@@ -556,7 +556,7 @@ class SandboxShell:
             return CommandResult(stderr="host expects a command to run", exit_code=2)
         return self._run_host_process(command_tokens, path)
 
-    def _cmd_help(self, _: List[str]) -> CommandResult:
+    def _cmd_help(self, _: list[str]) -> CommandResult:
         lines = ["Available commands:"]
         for name in self.available_commands():
             desc = self.command_docs.get(name, "")
