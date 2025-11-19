@@ -5,15 +5,17 @@ from __future__ import annotations
 import contextlib
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .adapters import StorageAdapter
 from .exceptions import InvalidOperation, NodeExists, NodeNotFound
-from .hooks import WriteEvent, WriteHook
-from .integrations import PathEvent, PathHook
+from .hooks import WriteHook
+from .integrations import PathHook
+from .managers import HookManager, StorageManager
 from .nodes import VirtualDirectory, VirtualFile, VirtualNode
+from .path_utils import PathResolverMixin
 from .policies import NodePolicy, VisibilityView
 from .providers import ContentProvider, DirectoryProvider
 
@@ -45,96 +47,14 @@ class VFSSnapshot:
     storage_mounts: dict[str, StorageAdapter]
 
 
-class VirtualFileSystem:
+class VirtualFileSystem(PathResolverMixin):
     """In-memory filesystem that supports dynamic nodes."""
 
     def __init__(self) -> None:
         self.root = VirtualDirectory(name="")
         self.cwd = self.root
-        self._write_hooks: list[tuple[PurePosixPath, WriteHook]] = []
-        self._storage_mounts: dict[PurePosixPath, StorageAdapter] = {}
-        self._path_hooks: list[tuple[PurePosixPath, PathHook]] = []
-
-    # ------------------------------------------------------------------
-    # Path helpers
-    # ------------------------------------------------------------------
-    def _normalize(self, path: str | PurePosixPath | None) -> PurePosixPath:
-        if path is None or str(path) == "":
-            base = self.cwd.path()
-            raw = base
-        else:
-            raw = PurePosixPath(path)
-            if not raw.is_absolute():
-                base = self.cwd.path()
-                raw = base.joinpath(raw)
-        parts: list[str] = []
-        for part in raw.parts:
-            if part in ("", "/", "."):
-                continue
-            if part == "..":
-                if parts:
-                    parts.pop()
-                continue
-            parts.append(part)
-        return PurePosixPath("/" + "/".join(parts)) if parts else PurePosixPath("/")
-
-    def _iterate_parts(self, path: PurePosixPath) -> Iterable[str]:
-        for part in path.parts:
-            if part in ("", "/"):
-                continue
-            yield part
-
-    def _resolve_node(self, path: str | PurePosixPath) -> VirtualNode:
-        target = self._normalize(path)
-        current: VirtualNode = self.root
-        if target == PurePosixPath("/"):
-            return self.root
-        for part in self._iterate_parts(target):
-            if not isinstance(current, VirtualDirectory):
-                raise InvalidOperation(f"{current.path()} is not a directory")
-            current = current.get_child(part, self)
-        return current
-
-    def _resolve_dir(self, path: str | PurePosixPath, *, create: bool = False) -> VirtualDirectory:
-        target = self._normalize(path)
-        if target == PurePosixPath("/"):
-            return self.root
-        current = self.root
-        for part in self._iterate_parts(target):
-            if not isinstance(current, VirtualDirectory):
-                raise InvalidOperation(f"{current.path()} is not a directory")
-            try:
-                next_node = current.get_child(part, self)
-            except NodeNotFound:
-                if not create:
-                    raise
-                next_node = VirtualDirectory(name=part, parent=current)
-                current.add_child(next_node)
-            if not isinstance(next_node, VirtualDirectory):
-                raise InvalidOperation(f"{next_node.path()} is not a directory")
-            current = next_node
-        return current
-
-    def _ensure_file(self, path: str | PurePosixPath, *, create: bool = False) -> VirtualFile:
-        target = self._normalize(path)
-        parent_path = target.parent
-        if parent_path == target:
-            raise InvalidOperation("Cannot create file at root path")
-        parent = self._resolve_dir(parent_path or PurePosixPath("/"), create=create)
-        name = target.name
-        if not name:
-            raise InvalidOperation("Missing file name")
-        try:
-            node = parent.get_child(name, self)
-        except NodeNotFound:
-            if not create:
-                raise
-            node = VirtualFile(name=name, parent=parent)
-            parent.add_child(node)
-            return node
-        if not isinstance(node, VirtualFile):
-            raise InvalidOperation(f"{node.path()} is not a file")
-        return node
+        self.hooks = HookManager(self)
+        self.storage = StorageManager(self)
 
     def _ensure_read_allowed(self, node: VirtualNode) -> None:
         if not node.policy.readable:
@@ -157,34 +77,6 @@ class VirtualFileSystem:
                 )
             )
 
-    def _emit_write_event(self, node: VirtualFile, *, append: bool, event_type: str) -> None:
-        if self._write_hooks:
-            path = node.path()
-            content = node.read(self)
-            event = WriteEvent(path=str(path), content=content, version=node.version, append=append)
-            for prefix, hook in self._write_hooks:
-                if self._path_matches_prefix(path, prefix):
-                    hook(event)
-
-        self._emit_path_event(node.path(), event_type, node.read(self))
-
-    def _emit_path_event(self, path: PurePosixPath, event_type: str, content: str | None) -> None:
-        if not self._path_hooks:
-            return
-        payload = PathEvent(path=str(path), event=event_type, content=content)
-        for prefix, hook in self._path_hooks:
-            if self._path_matches_prefix(path, prefix):
-                hook(payload)
-
-    def _path_matches_prefix(self, path: PurePosixPath, prefix: PurePosixPath) -> bool:
-        if prefix == PurePosixPath("/"):
-            return True
-        try:
-            path.relative_to(prefix)
-            return True
-        except ValueError:
-            return False
-
     def _clone_policy(self, policy: NodePolicy) -> NodePolicy:
         return NodePolicy(
             readable=policy.readable,
@@ -193,51 +85,6 @@ class VirtualFileSystem:
             classification=policy.classification,
             principals=set(policy.principals),
         )
-
-    def _find_storage_mount(
-        self, path: PurePosixPath
-    ) -> tuple[PurePosixPath, StorageAdapter] | None:
-        matches: list[tuple[PurePosixPath, StorageAdapter]] = []
-        for prefix, adapter in self._storage_mounts.items():
-            if self._path_matches_prefix(path, prefix):
-                matches.append((prefix, adapter))
-        if not matches:
-            return None
-        return max(matches, key=lambda item: len(item[0].parts))
-
-    def _relative_storage_path(self, path: PurePosixPath, prefix: PurePosixPath) -> str:
-        rel = path.relative_to(prefix)
-        return rel.as_posix()
-
-    def _persist_storage(self, node: VirtualFile, previous_version: int) -> None:
-        mount = self._find_storage_mount(node.path())
-        if not mount:
-            return
-        prefix, adapter = mount
-        relative = self._relative_storage_path(node.path(), prefix)
-        try:
-            adapter.write(relative, node.read(self), version=previous_version)
-        except ValueError as exc:
-            node.version = previous_version
-            raise InvalidOperation(f"Storage conflict for {node.path()}") from exc
-
-    def _delete_storage_entry(self, node: VirtualFile) -> None:
-        mount = self._find_storage_mount(node.path())
-        if not mount:
-            return
-        prefix, adapter = mount
-        relative = self._relative_storage_path(node.path(), prefix)
-        adapter.delete(relative)
-
-    def _load_storage_mount(self, prefix: PurePosixPath, adapter: StorageAdapter) -> None:
-        directory = self._resolve_dir(prefix)
-        directory.children.clear()
-        directory._loaded = True
-        for rel_path, entry in adapter.list().items():
-            absolute = prefix.joinpath(PurePosixPath(rel_path))
-            file_node = self._ensure_file(absolute, create=True)
-            file_node.write(entry.content)
-            file_node.version = entry.version
 
     # ------------------------------------------------------------------
     # Public API
@@ -320,9 +167,9 @@ class VirtualFileSystem:
         node.write(data, append=append)
         node.version += 1
         node.modified_at = time.time()
-        self._persist_storage(node, previous_version)
+        self.storage.persist(node, previous_version)
         event_type = "create" if previous_version == 0 else "update"
-        self._emit_write_event(node, append=append, event_type=event_type)
+        self.hooks.emit_write_event(node, append=append, event_type=event_type)
         return node
 
     def append_file(
@@ -368,8 +215,8 @@ class VirtualFileSystem:
                 self.remove(child_node.path(), recursive=True)
         parent.remove_child(node.name)
         if isinstance(node, VirtualFile):
-            self._delete_storage_entry(node)
-            self._emit_path_event(node.path(), "delete", None)
+            self.storage.delete_entry(node)
+            self.hooks.emit_path_event(node.path(), "delete", None)
 
     def move(self, source: str | PurePosixPath, target: str | PurePosixPath) -> None:
         src_path = self._normalize(source)
@@ -549,15 +396,15 @@ class VirtualFileSystem:
                 modified_at=node.modified_at,
                 content=content,
             )
-        storage_mounts = {str(path): adapter for path, adapter in self._storage_mounts.items()}
+        storage_mounts = {str(path): adapter for path, adapter in self.storage.mounts.items()}
         return VFSSnapshot(nodes=nodes, cwd=self.cwd.path(), storage_mounts=storage_mounts)
 
     def restore(self, snapshot: VFSSnapshot) -> None:
         self.root = VirtualDirectory(name="")
         self.cwd = self.root
-        self._storage_mounts = {
-            PurePosixPath(path): adapter for path, adapter in snapshot.storage_mounts.items()
-        }
+        self.storage.replace_mounts(
+            {PurePosixPath(path): adapter for path, adapter in snapshot.storage_mounts.items()}
+        )
         ordered = sorted(snapshot.nodes.items(), key=lambda item: len(PurePosixPath(item[0]).parts))
         for path_str, node_state in ordered:
             path = PurePosixPath(path_str)
@@ -680,28 +527,16 @@ class VirtualFileSystem:
         *,
         policy: NodePolicy | None = None,
     ) -> VirtualDirectory:
-        normalized = self._normalize(path)
-        directory = self.mkdir(normalized, parents=True, exist_ok=True)
-        if policy is not None:
-            directory.policy = policy
-        self._storage_mounts[normalized] = adapter
-        self._load_storage_mount(normalized, adapter)
-        return directory
+        return self.storage.mount(path, adapter, policy=policy)
 
     def sync_storage(self, path: str | PurePosixPath) -> None:
-        normalized = self._normalize(path)
-        adapter = self._storage_mounts.get(normalized)
-        if adapter is None:
-            raise InvalidOperation(f"No storage mount at {normalized}")
-        self._load_storage_mount(normalized, adapter)
+        self.storage.sync(path)
 
     def register_write_hook(self, prefix: str | PurePosixPath, hook: WriteHook) -> None:
-        normalized = self._normalize(prefix)
-        self._write_hooks.append((normalized, hook))
+        self.hooks.register_write_hook(prefix, hook)
 
     def register_path_hook(self, prefix: str | PurePosixPath, hook: PathHook) -> None:
-        normalized = self._normalize(prefix)
-        self._path_hooks.append((normalized, hook))
+        self.hooks.register_path_hook(prefix, hook)
 
     def set_policy(self, path: str | PurePosixPath, policy: NodePolicy) -> None:
         node = self._resolve_node(path)
