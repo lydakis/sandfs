@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 from datetime import datetime
 import re
 import shlex
@@ -13,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from .exceptions import InvalidOperation, SandboxError, NodeNotFound
 from .policies import VisibilityView
 from .pyexec import PythonExecutor
-from .nodes import VirtualDirectory, VirtualFile
+from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .vfs import DirEntry, VirtualFileSystem
 
 
@@ -273,6 +274,7 @@ class SandboxShell:
         self.register_command("stat", self._cmd_stat, description="Display file status")
         self.register_command("head", self._cmd_head, description="Output the first part of files")
         self.register_command("tail", self._cmd_tail, description="Output the last part of files")
+        self.register_command("find", self._cmd_find, description="Search for files in a directory hierarchy")
 
     def _cmd_pwd(self, _: list[str]) -> CommandResult:
         return CommandResult(stdout=self.vfs.pwd())
@@ -710,6 +712,71 @@ class SandboxShell:
                 output.append("")
 
         return CommandResult(stdout="\n".join(output))
+
+    def _cmd_find(self, args: list[str]) -> CommandResult:
+        paths: list[str] = []
+        name_pattern: str | None = None
+        type_filter: str | None = None
+
+        idx = 0
+        while idx < len(args):
+            arg = args[idx]
+            if arg == "-name":
+                if idx + 1 >= len(args):
+                    return CommandResult(stderr="find: missing argument to `-name'", exit_code=1)
+                name_pattern = args[idx + 1]
+                idx += 2
+            elif arg == "-type":
+                if idx + 1 >= len(args):
+                    return CommandResult(stderr="find: missing argument to `-type'", exit_code=1)
+                candidate = args[idx + 1]
+                if candidate not in ("f", "d"):
+                    return CommandResult(stderr=f"find: unknown argument to -type: {candidate}", exit_code=1)
+                type_filter = candidate
+                idx += 2
+            elif arg.startswith("-"):
+                return CommandResult(stderr=f"find: unknown predicate `{arg}'", exit_code=1)
+            else:
+                paths.append(arg)
+                idx += 1
+
+        if not paths:
+            paths = [self.vfs.pwd()]
+
+        def walk_visible(node: VirtualNode) -> Iterable[tuple[PurePosixPath, VirtualNode]]:
+            if self.view and not self.view.allows(node.policy):
+                return
+            yield (node.path(), node)
+            if isinstance(node, VirtualDirectory):
+                node.ensure_loaded(self.vfs)
+                for child in node.iter_children(self.vfs):
+                    yield from walk_visible(child)
+
+        results: list[str] = []
+        for start_path in paths:
+            self._ensure_visible_path(start_path)
+            try:
+                start_node = self.vfs.get_node(start_path)
+            except (NodeNotFound, InvalidOperation):
+                return CommandResult(
+                    stderr=f"find: `{start_path}': No such file or directory",
+                    exit_code=1,
+                )
+
+            for path, node in walk_visible(start_node):
+                if type_filter:
+                    is_dir = isinstance(node, VirtualDirectory)
+                    if type_filter == "f" and is_dir:
+                        continue
+                    if type_filter == "d" and not is_dir:
+                        continue
+
+                if name_pattern and not fnmatch.fnmatch(node.name, name_pattern):
+                    continue
+
+                results.append(str(path))
+
+        return CommandResult(stdout="\n".join(results))
 
 
 __all__ = ["SandboxShell", "CommandResult"]
