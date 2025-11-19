@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-if False:  # pragma: no cover - for type checkers only
+if TYPE_CHECKING:
     from .vfs import VirtualFileSystem
+
 from .policies import NodePolicy
 
 
