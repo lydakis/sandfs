@@ -32,8 +32,7 @@ class MemoryStorageAdapter(StorageAdapter):
 
     def __post_init__(self) -> None:
         self._entries: dict[str, StorageEntry] = {
-            path: StorageEntry(content=text, version=0)
-            for path, text in self.initial.items()
+            path: StorageEntry(content=text, version=0) for path, text in self.initial.items()
         }
 
     def read(self, path: str) -> StorageEntry:

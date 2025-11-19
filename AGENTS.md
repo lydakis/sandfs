@@ -13,6 +13,7 @@
 - `uv run python -m sandfs.shell` currently does nothing; use inline examples (`python - <<'PY' …`) to experiment with the API.
 - `uv run ruff check .` – lint for PEP 8 compliance, import hygiene, and general best practices.
 - `uv run mypy sandfs` – run static type checks; keep hints up to date before committing.
+- `pre-commit install` – enables automatic Ruff and MyPy hooks before every commit.
 
 ## Coding Style & Naming Conventions
 - Python 3.11+, 4-space indentation, PEP 8 naming (snake_case for functions, PascalCase for classes). Type hints and dataclasses are expected; prefer `PurePosixPath` for paths.

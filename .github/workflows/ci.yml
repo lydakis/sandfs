@@ -24,6 +24,12 @@ jobs:
       - name: Install dependencies
         run: |
           uv pip install -e .[dev]
+      - name: Run Ruff
+        run: |
+          uv run ruff check .
+      - name: Run MyPy
+        run: |
+          uv run mypy sandfs
       - name: Run pytest
         run: |
           uv run pytest

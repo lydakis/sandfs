@@ -136,6 +136,7 @@ Snapshots capture the entire tree (including storage-backed nodes) so you can ch
 python -m venv .venv
 source .venv/bin/activate
 uv pip install -e .[dev]
+pre-commit install
 uv run pytest
 uv run ruff check .
 uv run mypy sandfs

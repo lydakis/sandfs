@@ -14,6 +14,7 @@ def shell() -> SandboxShell:
     vfs.write_file("/root_file.md", "# Root")
     return SandboxShell(vfs)
 
+
 def test_find_all(shell):
     result = shell.exec("find /")
     assert result.exit_code == 0
@@ -24,6 +25,7 @@ def test_find_all(shell):
     assert "/a/file1.txt" in lines
     assert "/a/b/file2.py" in lines
     assert "/root_file.md" in lines
+
 
 def test_find_name(shell):
     result = shell.exec("find / -name *.py")
@@ -39,6 +41,7 @@ def test_find_name(shell):
     assert lines[0] == "/a/b/file2.py"
     assert lines[1] == "/a/file1.txt"
 
+
 def test_find_type_file(shell):
     result = shell.exec("find / -type f")
     assert result.exit_code == 0
@@ -49,6 +52,7 @@ def test_find_type_file(shell):
     assert "/root_file.md" in lines
     assert "/a" not in lines
 
+
 def test_find_type_dir(shell):
     result = shell.exec("find / -type d")
     assert result.exit_code == 0
@@ -58,6 +62,7 @@ def test_find_type_dir(shell):
     assert "/a/b" in lines
     assert "/a/file1.txt" not in lines
 
+
 def test_find_subdir(shell):
     result = shell.exec("find /a/b")
     assert result.exit_code == 0
@@ -66,10 +71,12 @@ def test_find_subdir(shell):
     assert "/a/b/file2.py" in lines
     assert "/a/file1.txt" not in lines
 
+
 def test_find_missing_path(shell):
     result = shell.exec("find /nonexistent")
     assert result.exit_code == 1
     assert "No such file or directory" in result.stderr
+
 
 def test_find_combined(shell):
     result = shell.exec("find / -type f -name *.txt")

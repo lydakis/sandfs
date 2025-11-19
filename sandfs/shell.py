@@ -137,7 +137,7 @@ class SandboxShell:
     def _translate_token(self, token: str, fs_root: Path) -> str:
         def replacer(match: re.Match[str]) -> str:
             candidate = match.group(0)
-            if match.start() >= 3 and token[match.start()-3:match.start()] == "://":
+            if match.start() >= 3 and token[match.start() - 3 : match.start()] == "://":
                 return candidate
             sandbox_path = self._eligible_sandbox_path(candidate)
             if sandbox_path is None:
@@ -327,14 +327,8 @@ class SandboxShell:
         if not entries:
             return ""
         if long_format:
-            return "\n".join(
-                f"{'d' if entry.is_dir else '-'} {entry.path}"
-                for entry in entries
-            )
-        return "  ".join(
-            f"{entry.name}/" if entry.is_dir else entry.name
-            for entry in entries
-        )
+            return "\n".join(f"{'d' if entry.is_dir else '-'} {entry.path}" for entry in entries)
+        return "  ".join(f"{entry.name}/" if entry.is_dir else entry.name for entry in entries)
 
     def _cmd_cat(self, args: list[str]) -> CommandResult:
         if not args:

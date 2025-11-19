@@ -31,7 +31,7 @@ def test_rg_search():
 
 def test_python_executor():
     shell = setup_shell()
-    res = shell.exec('python -c "print(len(vfs.ls(\'/workspace\')))"')
+    res = shell.exec("python -c \"print(len(vfs.ls('/workspace')))\"")
     assert res.stdout.strip().isdigit()
 
 

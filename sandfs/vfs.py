@@ -549,18 +549,14 @@ class VirtualFileSystem:
                 modified_at=node.modified_at,
                 content=content,
             )
-        storage_mounts = {
-            str(path): adapter
-            for path, adapter in self._storage_mounts.items()
-        }
+        storage_mounts = {str(path): adapter for path, adapter in self._storage_mounts.items()}
         return VFSSnapshot(nodes=nodes, cwd=self.cwd.path(), storage_mounts=storage_mounts)
 
     def restore(self, snapshot: VFSSnapshot) -> None:
         self.root = VirtualDirectory(name="")
         self.cwd = self.root
         self._storage_mounts = {
-            PurePosixPath(path): adapter
-            for path, adapter in snapshot.storage_mounts.items()
+            PurePosixPath(path): adapter for path, adapter in snapshot.storage_mounts.items()
         }
         ordered = sorted(snapshot.nodes.items(), key=lambda item: len(PurePosixPath(item[0]).parts))
         for path_str, node_state in ordered:
