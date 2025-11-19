@@ -8,7 +8,7 @@ from ..common import CommandResult
 from ..host import run_host_process
 from ..registry import COMMAND_REGISTRY
 
-if TYPE_CHECKING:  # pragma: no cover - typing helper
+if TYPE_CHECKING:
     from ..core import SandboxShell
 
 

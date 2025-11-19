@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -31,7 +32,12 @@ class CommandRegistry:
         self._commands.append(CommandSpec(name, handler, description))
         return handler
 
-    def command(self, name: str, *, description: str = ""):
+    def command(
+        self,
+        name: str,
+        *,
+        description: str = "",
+    ) -> Callable[[ShellCommand], ShellCommand]:
         """Decorator variant for registering shell commands."""
 
         def decorator(func: ShellCommand) -> ShellCommand:

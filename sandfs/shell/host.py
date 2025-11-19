@@ -5,10 +5,14 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
-from .common import CommandResult
 from ..exceptions import InvalidOperation, SandboxError
 from ..nodes import VirtualDirectory, VirtualFile
+from .common import CommandResult
+
+if TYPE_CHECKING:
+    from .core import SandboxShell
 
 
 def run_host_process(
@@ -46,9 +50,7 @@ def run_host_process(
     )
 
 
-def sandbox_to_host_path(
-    shell: "SandboxShell", fs_root: Path, sandbox_path: PurePosixPath
-) -> Path:
+def sandbox_to_host_path(shell: "SandboxShell", fs_root: Path, sandbox_path: PurePosixPath) -> Path:
     if not sandbox_path.is_absolute():
         sandbox_path = PurePosixPath(shell.vfs._normalize(sandbox_path))
     if sandbox_path == PurePosixPath("/"):
@@ -57,9 +59,7 @@ def sandbox_to_host_path(
     return fs_root.joinpath(*rel.parts)
 
 
-def map_command_tokens(
-    shell: "SandboxShell", tokens: list[str], fs_root: Path
-) -> list[str]:
+def map_command_tokens(shell: "SandboxShell", tokens: list[str], fs_root: Path) -> list[str]:
     return [translate_token(shell, token, fs_root) for token in tokens]
 
 
@@ -80,9 +80,7 @@ def translate_token(shell: "SandboxShell", token: str, fs_root: Path) -> str:
     return re.sub(r"/[A-Za-z0-9._/\-]+", replacer, token)
 
 
-def eligible_sandbox_path(
-    shell: "SandboxShell", path_str: str
-) -> PurePosixPath | None:
+def eligible_sandbox_path(shell: "SandboxShell", path_str: str) -> PurePosixPath | None:
     try:
         normalized = PurePosixPath(shell.vfs._normalize(path_str))
     except InvalidOperation:

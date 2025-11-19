@@ -5,12 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from ..common import CommandResult
-from ..registry import COMMAND_REGISTRY
 from ...exceptions import InvalidOperation, NodeNotFound
 from ...nodes import VirtualFile
+from ..common import CommandResult
+from ..registry import COMMAND_REGISTRY
 
-if TYPE_CHECKING:  # pragma: no cover - typing helper
+if TYPE_CHECKING:
     from ..core import SandboxShell
 
 

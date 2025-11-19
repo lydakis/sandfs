@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from ..common import CommandResult
 from ..registry import COMMAND_REGISTRY
 
-if TYPE_CHECKING:  # pragma: no cover - typing helper
+if TYPE_CHECKING:
     from ..core import SandboxShell
 
 

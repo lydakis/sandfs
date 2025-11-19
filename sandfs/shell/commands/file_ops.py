@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ...exceptions import InvalidOperation, NodeNotFound
 from ..common import CommandResult
 from ..registry import COMMAND_REGISTRY
-from ...exceptions import InvalidOperation, NodeNotFound
 
-if TYPE_CHECKING:  # pragma: no cover - typing helper
+if TYPE_CHECKING:
     from ..core import SandboxShell
 
 

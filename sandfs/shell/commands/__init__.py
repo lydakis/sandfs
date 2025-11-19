@@ -9,4 +9,4 @@ from . import python_cmds as _python_cmds  # noqa: F401
 from . import search as _search  # noqa: F401
 from . import text as _text  # noqa: F401
 
-__all__ = []
+__all__: list[str] = []

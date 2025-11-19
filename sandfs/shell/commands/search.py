@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from typing import Iterable, TYPE_CHECKING
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Iterable, Iterator
 
-from ..common import CommandResult
-from ..registry import COMMAND_REGISTRY
 from ...exceptions import InvalidOperation, NodeNotFound
 from ...nodes import VirtualDirectory, VirtualNode
 
-if TYPE_CHECKING:  # pragma: no cover - typing helper
+if TYPE_CHECKING:
     from ..core import SandboxShell
+from ..common import CommandResult
+from ..registry import COMMAND_REGISTRY
 
 
 @COMMAND_REGISTRY.command("grep", description="Search files (non-recursive)")
@@ -69,7 +70,12 @@ def grep(shell: "SandboxShell", args: list[str]) -> CommandResult:
 
 @COMMAND_REGISTRY.command("rg", description="Search files recursively")
 def rg(shell: "SandboxShell", args: list[str]) -> CommandResult:
-    return grep(shell, ["-r", *args])
+    result = grep(shell, ["-r", *args])
+    if isinstance(result, CommandResult):
+        return result
+    if result is None:
+        return CommandResult()
+    return CommandResult(stdout=str(result))
 
 
 def _search(
@@ -111,9 +117,7 @@ def _search(
     return results
 
 
-@COMMAND_REGISTRY.command(
-    "find", description="Search for files in a directory hierarchy"
-)
+@COMMAND_REGISTRY.command("find", description="Search for files in a directory hierarchy")
 def find(shell: "SandboxShell", args: list[str]) -> CommandResult:
     paths: list[str] = []
     name_pattern: str | None = None
@@ -153,7 +157,7 @@ def find(shell: "SandboxShell", args: list[str]) -> CommandResult:
     if not paths:
         paths = [shell.vfs.pwd()]
 
-    def walk_visible(node: VirtualNode):
+    def walk_visible(node: VirtualNode) -> Iterator[tuple[PurePosixPath, VirtualNode]]:
         if shell.view and not shell.view.allows(node.policy):
             return
         yield (node.path(), node)

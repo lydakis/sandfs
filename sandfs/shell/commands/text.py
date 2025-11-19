@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ...exceptions import InvalidOperation, NodeNotFound
 from ..common import CommandResult
 from ..registry import COMMAND_REGISTRY
-from ...exceptions import InvalidOperation, NodeNotFound
 
-if TYPE_CHECKING:  # pragma: no cover - typing helper
+if TYPE_CHECKING:
     from ..core import SandboxShell
 
 
@@ -59,9 +59,7 @@ def _slice_content(content: str, *, count: int, mode: str, tail: bool) -> str:
     return content[-count:] if tail else content[:count]
 
 
-def _read_range_command(
-    shell: "SandboxShell", args: list[str], *, tail: bool
-) -> CommandResult:
+def _read_range_command(shell: "SandboxShell", args: list[str], *, tail: bool) -> CommandResult:
     count = 10
     mode = "lines"
     paths: list[str] = []

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ...vfs import DirEntry
 from ..common import CommandResult
 from ..registry import COMMAND_REGISTRY
-from ...vfs import DirEntry
 
-if TYPE_CHECKING:  # pragma: no cover - typing helper
+if TYPE_CHECKING:
     from ..core import SandboxShell
 
 

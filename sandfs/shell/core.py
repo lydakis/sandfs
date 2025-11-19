@@ -5,13 +5,13 @@ from __future__ import annotations
 import shlex
 from collections.abc import Iterable
 
-from .common import CommandHandler, CommandResult, ShellCommand
-from .host import run_host_process
-from .registry import COMMAND_REGISTRY
 from ..exceptions import InvalidOperation, NodeNotFound, SandboxError
 from ..policies import VisibilityView
 from ..pyexec import PythonExecutor
 from ..vfs import VirtualFileSystem
+from .common import CommandHandler, CommandResult, ShellCommand
+from .host import run_host_process
+from .registry import COMMAND_REGISTRY
 
 
 class SandboxShell:
@@ -129,7 +129,7 @@ class SandboxShell:
             result = handler(args)
         except SandboxError as exc:
             return CommandResult(stderr=str(exc), exit_code=1)
-        except Exception as exc:  # pragma: no cover - unexpected failure path
+        except Exception as exc:  # unexpected failure path
             return CommandResult(stderr=f"{name} failed: {exc}", exit_code=1)
         if isinstance(result, CommandResult):
             return self._enforce_output_limit(result)
