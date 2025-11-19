@@ -9,7 +9,6 @@ from typing import Any
 
 from .vfs import VirtualFileSystem
 
-
 _ALLOWED_BUILTINS = {
     "abs": abs,
     "all": all,

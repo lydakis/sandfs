@@ -52,7 +52,10 @@ class MemoryStorageAdapter(StorageAdapter):
         return StorageEntry(content=entry.content, version=entry.version)
 
     def list(self) -> dict[str, StorageEntry]:
-        return {path: StorageEntry(content=entry.content, version=entry.version) for path, entry in self._entries.items()}
+        return {
+            path: StorageEntry(content=entry.content, version=entry.version)
+            for path, entry in self._entries.items()
+        }
 
     def delete(self, path: str) -> None:
         self._entries.pop(path, None)

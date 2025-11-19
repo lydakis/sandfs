@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import fnmatch
-from datetime import datetime
 import re
 import shlex
 import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-from .exceptions import InvalidOperation, SandboxError, NodeNotFound
+from .exceptions import InvalidOperation, NodeNotFound, SandboxError
+from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import VisibilityView
 from .pyexec import PythonExecutor
-from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .vfs import DirEntry, VirtualFileSystem
 
 
@@ -47,7 +47,6 @@ class SandboxShell:
         self.commands: dict[str, CommandHandler] = {}
         self.command_docs: dict[str, str] = {}
         self.last_command_name: str | None = None
-        self.command_docs: dict[str, str] = {}
         self.py_exec = python_executor or PythonExecutor(vfs)
         self.view = view or VisibilityView()
         self.allowed_commands: set[str] | None = set(allowed_commands) if allowed_commands else None
@@ -58,7 +57,13 @@ class SandboxShell:
     # ------------------------------------------------------------------
     # Command registration
     # ------------------------------------------------------------------
-    def register_command(self, name: str, handler: CommandHandler, *, description: str = "") -> None:
+    def register_command(
+        self,
+        name: str,
+        handler: CommandHandler,
+        *,
+        description: str = "",
+    ) -> None:
         self.commands[name] = handler
         if description:
             self.command_docs[name] = description
@@ -188,7 +193,11 @@ class SandboxShell:
                 self.vfs.write_file(sandbox_path, text)
         self._remove_missing(host_dirs, host_files)
 
-    def _remove_missing(self, host_dirs: set[PurePosixPath], host_files: set[PurePosixPath]) -> None:
+    def _remove_missing(
+        self,
+        host_dirs: set[PurePosixPath],
+        host_files: set[PurePosixPath],
+    ) -> None:
         existing_dirs: list[PurePosixPath] = []
         existing_files: list[PurePosixPath] = []
         for path, node in self.vfs.walk("/"):
@@ -251,30 +260,34 @@ class SandboxShell:
     # Builtin commands
     # ------------------------------------------------------------------
     def _register_builtin_commands(self) -> None:
-        self.register_command("pwd", self._cmd_pwd, description="Print working directory")
-        self.register_command("cd", self._cmd_cd, description="Change directory")
-        self.register_command("ls", self._cmd_ls, description="List directory contents")
-        self.register_command("cat", self._cmd_cat, description="Print file contents")
-        self.register_command("touch", self._cmd_touch, description="Create empty file")
-        self.register_command("mkdir", self._cmd_mkdir, description="Create directories")
-        self.register_command("rm", self._cmd_rm, description="Remove files or directories")
-        self.register_command("cp", self._cmd_cp, description="Copy files and directories")
-        self.register_command("mv", self._cmd_mv, description="Move or rename files and directories")
-        self.register_command("tree", self._cmd_tree, description="Render tree view")
-        self.register_command("write", self._cmd_write, description="Write text to file")
-        self.register_command("append", self._cmd_append, description="Append text to file")
-        self.register_command("grep", self._cmd_grep, description="Search files (non-recursive)")
-        self.register_command("rg", self._cmd_rg, description="Search files recursively")
-        self.register_command("python", self._cmd_python, description="Execute Python snippet")
-        self.register_command("python3", self._cmd_python, description="Execute Python snippet")
-        self.register_command("host", self._cmd_host, description="Run host command in materialized tree")
-        self.register_command("bash", self._cmd_shell_host, description="Run bash via host")
-        self.register_command("sh", self._cmd_shell_host, description="Run sh via host")
-        self.register_command("help", self._cmd_help, description="Show available commands")
-        self.register_command("stat", self._cmd_stat, description="Display file status")
-        self.register_command("head", self._cmd_head, description="Output the first part of files")
-        self.register_command("tail", self._cmd_tail, description="Output the last part of files")
-        self.register_command("find", self._cmd_find, description="Search for files in a directory hierarchy")
+        builtin_commands = [
+            ("pwd", self._cmd_pwd, "Print working directory"),
+            ("cd", self._cmd_cd, "Change directory"),
+            ("ls", self._cmd_ls, "List directory contents"),
+            ("cat", self._cmd_cat, "Print file contents"),
+            ("touch", self._cmd_touch, "Create empty file"),
+            ("mkdir", self._cmd_mkdir, "Create directories"),
+            ("rm", self._cmd_rm, "Remove files or directories"),
+            ("cp", self._cmd_cp, "Copy files and directories"),
+            ("mv", self._cmd_mv, "Move or rename files and directories"),
+            ("tree", self._cmd_tree, "Render tree view"),
+            ("write", self._cmd_write, "Write text to file"),
+            ("append", self._cmd_append, "Append text to file"),
+            ("grep", self._cmd_grep, "Search files (non-recursive)"),
+            ("rg", self._cmd_rg, "Search files recursively"),
+            ("python", self._cmd_python, "Execute Python snippet"),
+            ("python3", self._cmd_python, "Execute Python snippet"),
+            ("host", self._cmd_host, "Run host command in materialized tree"),
+            ("bash", self._cmd_shell_host, "Run bash via host"),
+            ("sh", self._cmd_shell_host, "Run sh via host"),
+            ("help", self._cmd_help, "Show available commands"),
+            ("stat", self._cmd_stat, "Display file status"),
+            ("head", self._cmd_head, "Output the first part of files"),
+            ("tail", self._cmd_tail, "Output the last part of files"),
+            ("find", self._cmd_find, "Search for files in a directory hierarchy"),
+        ]
+        for name, handler, description in builtin_commands:
+            self.register_command(name, handler, description=description)
 
     def _cmd_pwd(self, _: list[str]) -> CommandResult:
         return CommandResult(stdout=self.vfs.pwd())
@@ -482,7 +495,14 @@ class SandboxShell:
             paths = [self.vfs.pwd()]
         for target in paths:
             self._ensure_visible_path(target)
-        output = self._search(pattern, paths, recursive=recursive, regex=regex, ignore_case=ignore_case, show_numbers=show_numbers)
+        output = self._search(
+            pattern,
+            paths,
+            recursive=recursive,
+            regex=regex,
+            ignore_case=ignore_case,
+            show_numbers=show_numbers,
+        )
         return CommandResult(stdout="\n".join(output))
 
     def _cmd_rg(self, args: list[str]) -> CommandResult:
@@ -539,7 +559,10 @@ class SandboxShell:
 
     def _cmd_shell_host(self, args: list[str]) -> CommandResult:
         # First token is bash/sh command itself; delegate to host with same args
-        return self._run_host_process([self.last_command_name] + args, None)
+        command = self.last_command_name
+        if command is None:
+            return CommandResult(stderr="host shell command unavailable", exit_code=1)
+        return self._run_host_process([command, *args], None)
 
     def _cmd_host(self, args: list[str]) -> CommandResult:
         path: str | None = None
@@ -609,24 +632,38 @@ class SandboxShell:
             arg = args[idx]
             if arg == "-n":
                 if idx + 1 >= len(args):
-                    return CommandResult(stderr="head: option requires an argument -- 'n'", exit_code=1)
+                    return CommandResult(
+                        stderr="head: option requires an argument -- 'n'",
+                        exit_code=1,
+                    )
+                arg_value = args[idx + 1]
                 try:
-                    count = int(args[idx + 1])
+                    count = int(arg_value)
                     mode = "lines"
                     idx += 2
                     continue
                 except ValueError:
-                    return CommandResult(stderr=f"head: invalid number: '{args[idx+1]}'", exit_code=1)
+                    return CommandResult(
+                        stderr=f"head: invalid number: '{arg_value}'",
+                        exit_code=1,
+                    )
             elif arg == "-c":
                 if idx + 1 >= len(args):
-                    return CommandResult(stderr="head: option requires an argument -- 'c'", exit_code=1)
+                    return CommandResult(
+                        stderr="head: option requires an argument -- 'c'",
+                        exit_code=1,
+                    )
+                arg_value = args[idx + 1]
                 try:
-                    count = int(args[idx + 1])
+                    count = int(arg_value)
                     mode = "bytes"
                     idx += 2
                     continue
                 except ValueError:
-                    return CommandResult(stderr=f"head: invalid number: '{args[idx+1]}'", exit_code=1)
+                    return CommandResult(
+                        stderr=f"head: invalid number: '{arg_value}'",
+                        exit_code=1,
+                    )
             else:
                 paths.append(arg)
                 idx += 1
@@ -666,24 +703,38 @@ class SandboxShell:
             arg = args[idx]
             if arg == "-n":
                 if idx + 1 >= len(args):
-                    return CommandResult(stderr="tail: option requires an argument -- 'n'", exit_code=1)
+                    return CommandResult(
+                        stderr="tail: option requires an argument -- 'n'",
+                        exit_code=1,
+                    )
+                arg_value = args[idx + 1]
                 try:
-                    count = int(args[idx + 1])
+                    count = int(arg_value)
                     mode = "lines"
                     idx += 2
                     continue
                 except ValueError:
-                    return CommandResult(stderr=f"tail: invalid number: '{args[idx+1]}'", exit_code=1)
+                    return CommandResult(
+                        stderr=f"tail: invalid number: '{arg_value}'",
+                        exit_code=1,
+                    )
             elif arg == "-c":
                 if idx + 1 >= len(args):
-                    return CommandResult(stderr="tail: option requires an argument -- 'c'", exit_code=1)
+                    return CommandResult(
+                        stderr="tail: option requires an argument -- 'c'",
+                        exit_code=1,
+                    )
+                arg_value = args[idx + 1]
                 try:
-                    count = int(args[idx + 1])
+                    count = int(arg_value)
                     mode = "bytes"
                     idx += 2
                     continue
                 except ValueError:
-                    return CommandResult(stderr=f"tail: invalid number: '{args[idx+1]}'", exit_code=1)
+                    return CommandResult(
+                        stderr=f"tail: invalid number: '{arg_value}'",
+                        exit_code=1,
+                    )
             else:
                 paths.append(arg)
                 idx += 1
@@ -723,15 +774,24 @@ class SandboxShell:
             arg = args[idx]
             if arg == "-name":
                 if idx + 1 >= len(args):
-                    return CommandResult(stderr="find: missing argument to `-name'", exit_code=1)
+                    return CommandResult(
+                        stderr="find: missing argument to `-name'",
+                        exit_code=1,
+                    )
                 name_pattern = args[idx + 1]
                 idx += 2
             elif arg == "-type":
                 if idx + 1 >= len(args):
-                    return CommandResult(stderr="find: missing argument to `-type'", exit_code=1)
+                    return CommandResult(
+                        stderr="find: missing argument to `-type'",
+                        exit_code=1,
+                    )
                 candidate = args[idx + 1]
                 if candidate not in ("f", "d"):
-                    return CommandResult(stderr=f"find: unknown argument to -type: {candidate}", exit_code=1)
+                    return CommandResult(
+                        stderr=f"find: unknown argument to -type: {candidate}",
+                        exit_code=1,
+                    )
                 type_filter = candidate
                 idx += 2
             elif arg.startswith("-"):

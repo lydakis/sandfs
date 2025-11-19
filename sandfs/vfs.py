@@ -151,7 +151,10 @@ class VirtualFileSystem:
             return
         if node.version != expected_version:
             raise InvalidOperation(
-                f"Version mismatch for {node.path()}: expected {expected_version}, current {node.version}"
+                (
+                    f"Version mismatch for {node.path()}: "
+                    f"expected {expected_version}, current {node.version}"
+                )
             )
 
     def _emit_write_event(self, node: VirtualFile, *, append: bool, event_type: str) -> None:
@@ -390,7 +393,7 @@ class VirtualFileSystem:
             self._ensure_write_allowed(dest_parent)
             dest_name = dest_path.name
             if not dest_name:
-                raise InvalidOperation("Destination path missing file name")
+                raise InvalidOperation("Destination path missing file name") from None
         else:
             if isinstance(dest_node, VirtualDirectory):
                 self._ensure_write_allowed(dest_node)
@@ -420,7 +423,13 @@ class VirtualFileSystem:
         node.name = dest_name
         dest_parent.add_child(node)
 
-    def copy(self, source: str | PurePosixPath, target: str | PurePosixPath, *, recursive: bool = False) -> None:
+    def copy(
+        self,
+        source: str | PurePosixPath,
+        target: str | PurePosixPath,
+        *,
+        recursive: bool = False,
+    ) -> None:
         src_path = self._normalize(source)
         node = self._resolve_node(src_path)
         if isinstance(node, VirtualDirectory) and not recursive:
@@ -438,20 +447,21 @@ class VirtualFileSystem:
             self._ensure_write_allowed(dest_parent)
             dest_name = dest_path.name
             if not dest_name:
-                raise InvalidOperation("Destination path missing file name")
+                raise InvalidOperation("Destination path missing file name") from None
         else:
             if isinstance(dest_node, VirtualDirectory):
                 self._ensure_write_allowed(dest_node)
                 dest_parent = dest_node
                 dest_name = node.name
             else:
-                dest_parent = dest_node.parent
-                if dest_parent is None:
+                parent_node = dest_node.parent
+                if parent_node is None:
                     raise InvalidOperation("Cannot overwrite root directory")
-                self._ensure_write_allowed(dest_parent)
+                self._ensure_write_allowed(parent_node)
                 self._ensure_write_allowed(dest_node)
-                dest_parent.remove_child(dest_node.name)
+                parent_node.remove_child(dest_node.name)
                 dest_name = dest_node.name
+                dest_parent = parent_node
 
         if isinstance(node, VirtualDirectory):
             dest_parent_path = dest_parent.path()
@@ -468,22 +478,25 @@ class VirtualFileSystem:
 
     def _clone_node(self, node: VirtualNode, *, recursive: bool) -> VirtualNode:
         if isinstance(node, VirtualFile):
-            clone = VirtualFile(name=node.name, metadata=dict(node.metadata))
-            clone.policy = self._clone_policy(node.policy)
-            clone.write(node.read(self))
+            file_clone = VirtualFile(name=node.name, metadata=dict(node.metadata))
+            file_clone.policy = self._clone_policy(node.policy)
+            file_clone.write(node.read(self))
             # Timestamps are left as-is since the new node is initialized with current time.
-            return clone
+            return file_clone
         if isinstance(node, VirtualDirectory):
             node.ensure_loaded(self)
-            clone = VirtualDirectory(name=node.name, metadata=dict(node.metadata))
-            clone.policy = self._clone_policy(node.policy)
+            directory_clone = VirtualDirectory(name=node.name, metadata=dict(node.metadata))
+            directory_clone.policy = self._clone_policy(node.policy)
             for child in node.iter_children(self):
                 child_clone = self._clone_node(child, recursive=recursive)
-                clone.add_child(child_clone)
-            return clone
+                directory_clone.add_child(child_clone)
+            return directory_clone
         raise InvalidOperation("Unsupported node type for copy")
 
-    def walk(self, path: str | PurePosixPath | None = None) -> Iterator[tuple[PurePosixPath, VirtualNode]]:
+    def walk(
+        self,
+        path: str | PurePosixPath | None = None,
+    ) -> Iterator[tuple[PurePosixPath, VirtualNode]]:
         start_node = self._resolve_node(path or self.cwd.path())
 
         def _walk(node: VirtualNode) -> Iterator[tuple[PurePosixPath, VirtualNode]]:
@@ -536,13 +549,19 @@ class VirtualFileSystem:
                 modified_at=node.modified_at,
                 content=content,
             )
-        storage_mounts = {str(path): adapter for path, adapter in self._storage_mounts.items()}
+        storage_mounts = {
+            str(path): adapter
+            for path, adapter in self._storage_mounts.items()
+        }
         return VFSSnapshot(nodes=nodes, cwd=self.cwd.path(), storage_mounts=storage_mounts)
 
     def restore(self, snapshot: VFSSnapshot) -> None:
         self.root = VirtualDirectory(name="")
         self.cwd = self.root
-        self._storage_mounts = {PurePosixPath(path): adapter for path, adapter in snapshot.storage_mounts.items()}
+        self._storage_mounts = {
+            PurePosixPath(path): adapter
+            for path, adapter in snapshot.storage_mounts.items()
+        }
         ordered = sorted(snapshot.nodes.items(), key=lambda item: len(PurePosixPath(item[0]).parts))
         for path_str, node_state in ordered:
             path = PurePosixPath(path_str)
@@ -584,7 +603,10 @@ class VirtualFileSystem:
         return target
 
     @contextlib.contextmanager
-    def materialize(self, path: str | PurePosixPath | None = None):
+    def materialize(
+        self,
+        path: str | PurePosixPath | None = None,
+    ) -> Iterator[Path]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.export_to_path(root, source=path)
@@ -597,9 +619,11 @@ class VirtualFileSystem:
             target = dest / child.name
             if isinstance(child, VirtualDirectory):
                 self._export_directory(child, target)
-            else:
+            elif isinstance(child, VirtualFile):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(child.read(self))
+            else:
+                raise InvalidOperation(f"Unsupported node type during export: {type(child)!r}")
 
     def exists(self, path: str | PurePosixPath) -> bool:
         try:
@@ -715,7 +739,11 @@ class VirtualFileSystem:
             )
             for idx, node in enumerate(entries):
                 connector = "└──" if idx == len(entries) - 1 else "├──"
-                lines.append(f"{prefix}{connector} {node.name}/" if isinstance(node, VirtualDirectory) else f"{prefix}{connector} {node.name}")
+                if isinstance(node, VirtualDirectory):
+                    label = f"{prefix}{connector} {node.name}/"
+                else:
+                    label = f"{prefix}{connector} {node.name}"
+                lines.append(label)
                 if isinstance(node, VirtualDirectory):
                     extension = "    " if idx == len(entries) - 1 else "│   "
                     render(node, prefix + extension)

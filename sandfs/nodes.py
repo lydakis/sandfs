@@ -138,16 +138,16 @@ def instantiate_provided_node(
     parent: VirtualDirectory | None,
 ) -> VirtualNode:
     if provided.kind == "file":
-        node = VirtualFile(name=name, parent=parent, metadata=provided.metadata)
+        file_node = VirtualFile(name=name, parent=parent, metadata=provided.metadata)
         if provided.content_provider:
-            node.set_provider(provided.content_provider)
+            file_node.set_provider(provided.content_provider)
         else:
-            node.write(provided.content or "")
+            file_node.write(provided.content or "")
         if provided.policy is not None:
-            node.policy = provided.policy
-        return node
+            file_node.policy = provided.policy
+        return file_node
     if provided.kind == "dir":
-        node = VirtualDirectory(
+        directory = VirtualDirectory(
             name=name,
             parent=parent,
             loader=provided.directory_provider,
@@ -155,10 +155,10 @@ def instantiate_provided_node(
         )
         if provided.children:
             for child_name, child in provided.children.items():
-                node.add_child(instantiate_provided_node(child_name, child, parent=node))
+                directory.add_child(instantiate_provided_node(child_name, child, parent=directory))
         if provided.policy is not None:
-            node.policy = provided.policy
-        return node
+            directory.policy = provided.policy
+        return directory
     raise InvalidOperation(f"Unknown provided node kind: {provided.kind}")
 
 

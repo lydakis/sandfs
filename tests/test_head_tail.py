@@ -1,6 +1,7 @@
 import pytest
 
-from sandfs import VirtualFileSystem, SandboxShell
+from sandfs import SandboxShell, VirtualFileSystem
+
 
 @pytest.fixture
 def shell() -> SandboxShell:
