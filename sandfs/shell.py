@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import re
 import shlex
 import subprocess
@@ -269,6 +270,9 @@ class SandboxShell:
         self.register_command("bash", self._cmd_shell_host, description="Run bash via host")
         self.register_command("sh", self._cmd_shell_host, description="Run sh via host")
         self.register_command("help", self._cmd_help, description="Show available commands")
+        self.register_command("stat", self._cmd_stat, description="Display file status")
+        self.register_command("head", self._cmd_head, description="Output the first part of files")
+        self.register_command("tail", self._cmd_tail, description="Output the last part of files")
 
     def _cmd_pwd(self, _: list[str]) -> CommandResult:
         return CommandResult(stdout=self.vfs.pwd())
@@ -566,6 +570,146 @@ class SandboxShell:
                 lines.append(f"  {name}")
         lines.append("Use host <cmd> (or run unknown commands directly) for full GNU tools.")
         return CommandResult(stdout="\n".join(lines))
+
+    def _cmd_stat(self, args: list[str]) -> CommandResult:
+        if not args:
+            return CommandResult(stderr="stat expects a file path", exit_code=2)
+        path = args[0]
+        self._ensure_visible_path(path)
+        try:
+            node = self.vfs.get_node(path)
+        except (NodeNotFound, InvalidOperation) as exc:
+            return CommandResult(stderr=str(exc), exit_code=1)
+
+        lines = [f"  File: {node.path()}"]
+        if isinstance(node, VirtualFile):
+            size = len(node.read(self.vfs))
+            kind = "regular file"
+        else:
+            size = 0  # Directories do not have a serialized size in this VFS
+            kind = "directory"
+
+        lines.append(f"  Size: {size:<10} Type: {kind}")
+        lines.append(f"  Vers: {node.version:<10} Policy: {node.policy}")
+        created = datetime.fromtimestamp(node.created_at).strftime("%Y-%m-%d %H:%M:%S")
+        modified = datetime.fromtimestamp(node.modified_at).strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f" Birth: {created}")
+        lines.append(f"Modify: {modified}")
+        return CommandResult(stdout="\n".join(lines))
+
+    def _cmd_head(self, args: list[str]) -> CommandResult:
+        count = 10
+        mode = "lines"  # or "bytes"
+        paths: list[str] = []
+
+        idx = 0
+        while idx < len(args):
+            arg = args[idx]
+            if arg == "-n":
+                if idx + 1 >= len(args):
+                    return CommandResult(stderr="head: option requires an argument -- 'n'", exit_code=1)
+                try:
+                    count = int(args[idx + 1])
+                    mode = "lines"
+                    idx += 2
+                    continue
+                except ValueError:
+                    return CommandResult(stderr=f"head: invalid number: '{args[idx+1]}'", exit_code=1)
+            elif arg == "-c":
+                if idx + 1 >= len(args):
+                    return CommandResult(stderr="head: option requires an argument -- 'c'", exit_code=1)
+                try:
+                    count = int(args[idx + 1])
+                    mode = "bytes"
+                    idx += 2
+                    continue
+                except ValueError:
+                    return CommandResult(stderr=f"head: invalid number: '{args[idx+1]}'", exit_code=1)
+            else:
+                paths.append(arg)
+                idx += 1
+
+        if not paths:
+            return CommandResult(stderr="head: missing file operand", exit_code=1)
+
+        output: list[str] = []
+        for i, path in enumerate(paths):
+            self._ensure_visible_path(path)
+            try:
+                content = self.vfs.read_file(path)
+            except (NodeNotFound, InvalidOperation) as exc:
+                return CommandResult(stderr=str(exc), exit_code=1)
+
+            if len(paths) > 1:
+                output.append(f"==> {path} <==")
+
+            if mode == "lines":
+                lines = content.splitlines(keepends=True)
+                output.append("".join(lines[:count]))
+            else:
+                output.append(content[:count])
+
+            if i < len(paths) - 1:
+                output.append("")
+
+        return CommandResult(stdout="\n".join(output))
+
+    def _cmd_tail(self, args: list[str]) -> CommandResult:
+        count = 10
+        mode = "lines"
+        paths: list[str] = []
+
+        idx = 0
+        while idx < len(args):
+            arg = args[idx]
+            if arg == "-n":
+                if idx + 1 >= len(args):
+                    return CommandResult(stderr="tail: option requires an argument -- 'n'", exit_code=1)
+                try:
+                    count = int(args[idx + 1])
+                    mode = "lines"
+                    idx += 2
+                    continue
+                except ValueError:
+                    return CommandResult(stderr=f"tail: invalid number: '{args[idx+1]}'", exit_code=1)
+            elif arg == "-c":
+                if idx + 1 >= len(args):
+                    return CommandResult(stderr="tail: option requires an argument -- 'c'", exit_code=1)
+                try:
+                    count = int(args[idx + 1])
+                    mode = "bytes"
+                    idx += 2
+                    continue
+                except ValueError:
+                    return CommandResult(stderr=f"tail: invalid number: '{args[idx+1]}'", exit_code=1)
+            else:
+                paths.append(arg)
+                idx += 1
+
+        if not paths:
+            return CommandResult(stderr="tail: missing file operand", exit_code=1)
+
+        output: list[str] = []
+        for i, path in enumerate(paths):
+            self._ensure_visible_path(path)
+            try:
+                content = self.vfs.read_file(path)
+            except (NodeNotFound, InvalidOperation) as exc:
+                return CommandResult(stderr=str(exc), exit_code=1)
+
+            if len(paths) > 1:
+                output.append(f"==> {path} <==")
+
+            if mode == "lines":
+                lines = content.splitlines(keepends=True)
+                output.append("".join(lines[-count:]))
+            else:
+                output.append(content[-count:])
+
+            if i < len(paths) - 1:
+                output.append("")
+
+        return CommandResult(stdout="\n".join(output))
 
 
 __all__ = ["SandboxShell", "CommandResult"]

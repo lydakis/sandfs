@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import contextlib
 import tempfile
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from .adapters import StorageAdapter
 from .exceptions import InvalidOperation, NodeExists, NodeNotFound
 from .hooks import WriteEvent, WriteHook
 from .integrations import PathEvent, PathHook
 from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import NodePolicy, VisibilityView
 from .providers import ContentProvider, DirectoryProvider
-from .adapters import StorageAdapter
 
 
 @dataclass
@@ -32,6 +33,8 @@ class NodeSnapshot:
     metadata: dict[str, object]
     policy: NodePolicy
     version: int
+    created_at: float
+    modified_at: float
     content: str | None = None
 
 
@@ -313,6 +316,7 @@ class VirtualFileSystem:
         previous_version = node.version
         node.write(data, append=append)
         node.version += 1
+        node.modified_at = time.time()
         self._persist_storage(node, previous_version)
         event_type = "create" if previous_version == 0 else "update"
         self._emit_write_event(node, append=append, event_type=event_type)
@@ -335,6 +339,7 @@ class VirtualFileSystem:
     def touch(self, path: str | PurePosixPath) -> VirtualFile:
         node = self._ensure_file(path, create=True)
         self._ensure_write_allowed(node, append=True)
+        node.modified_at = time.time()
         return node
 
     def remove(self, path: str | PurePosixPath, *, recursive: bool = False) -> None:
@@ -466,6 +471,7 @@ class VirtualFileSystem:
             clone = VirtualFile(name=node.name, metadata=dict(node.metadata))
             clone.policy = self._clone_policy(node.policy)
             clone.write(node.read(self))
+            # Timestamps are left as-is since the new node is initialized with current time.
             return clone
         if isinstance(node, VirtualDirectory):
             node.ensure_loaded(self)
@@ -526,6 +532,8 @@ class VirtualFileSystem:
                 metadata=dict(node.metadata),
                 policy=self._clone_policy(node.policy),
                 version=node.version,
+                created_at=node.created_at,
+                modified_at=node.modified_at,
                 content=content,
             )
         storage_mounts = {str(path): adapter for path, adapter in self._storage_mounts.items()}
@@ -543,19 +551,26 @@ class VirtualFileSystem:
                 target.metadata = dict(node_state.metadata)
                 target.policy = self._clone_policy(node_state.policy)
                 target.version = node_state.version
+                target.created_at = node_state.created_at
+                target.modified_at = node_state.modified_at
                 continue
             if node_state.is_dir:
                 directory = self.mkdir(path, parents=True, exist_ok=True)
                 directory.metadata = dict(node_state.metadata)
                 directory.policy = self._clone_policy(node_state.policy)
                 directory.version = node_state.version
+                directory.created_at = node_state.created_at
+                directory.modified_at = node_state.modified_at
             else:
                 file_node = self._ensure_file(path, create=True)
                 file_node.metadata = dict(node_state.metadata)
                 file_node.policy = self._clone_policy(node_state.policy)
                 file_node.write(node_state.content or "")
                 file_node.version = node_state.version
+                file_node.created_at = node_state.created_at
+                file_node.modified_at = node_state.modified_at
         self.cwd = self._resolve_dir(snapshot.cwd)
+
     def export_to_path(
         self,
         target: Path,

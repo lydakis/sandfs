@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -24,6 +25,8 @@ class VirtualNode:
     metadata: dict[str, object] = field(default_factory=dict)
     policy: NodePolicy = field(default_factory=NodePolicy)
     version: int = 0
+    created_at: float = field(default_factory=time.time)
+    modified_at: float = field(default_factory=time.time)
 
     def path(self) -> PurePosixPath:
         if self.parent is None:
