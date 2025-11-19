@@ -12,7 +12,7 @@ from .exceptions import InvalidOperation, NodeExists, NodeNotFound, ProviderErro
 from .policies import NodePolicy
 from .providers import ContentProvider, DirectoryProvider, NodeContext, ProvidedNode
 
-if TYPE_CHECKING:  # pragma: no cover
+if TYPE_CHECKING:
     from .vfs import VirtualFileSystem
 
 
@@ -64,7 +64,7 @@ class VirtualFile(VirtualNode):
         ctx = self.build_context(vfs)
         try:
             return self._provider(ctx)
-        except Exception as exc:  # pragma: no cover - rewrap provider failures
+        except Exception as exc:
             raise ProviderError(str(exc)) from exc
 
     def write(self, data: str, *, append: bool = False) -> None:

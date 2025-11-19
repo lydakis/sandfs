@@ -248,7 +248,7 @@ class SandboxShell:
             result = handler(args)
         except SandboxError as exc:
             return CommandResult(stderr=str(exc), exit_code=1)
-        except Exception as exc:  # pragma: no cover - unexpected failure path
+        except Exception as exc:
             return CommandResult(stderr=f"{name} failed: {exc}", exit_code=1)
         if isinstance(result, CommandResult):
             return self._enforce_output_limit(result)
