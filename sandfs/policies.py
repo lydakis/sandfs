@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .nodes import VirtualNode
 
 
 @dataclass
@@ -23,11 +28,15 @@ class VisibilityView:
 
     classifications: frozenset[str] | None = None
     principals: frozenset[str] | None = None
+    path_prefixes: frozenset[PurePosixPath] | None = None
+    metadata_filters: Mapping[str, object] | None = None
 
     def __init__(
         self,
         classifications: Iterable[str] | None = None,
         principals: Iterable[str] | None = None,
+        path_prefixes: Iterable[str | PurePosixPath] | None = None,
+        metadata_filters: Mapping[str, object] | None = None,
     ) -> None:
         object.__setattr__(
             self,
@@ -38,6 +47,18 @@ class VisibilityView:
             self,
             "principals",
             frozenset(principals) if principals is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "path_prefixes",
+            frozenset(PurePosixPath(prefix) for prefix in path_prefixes)
+            if path_prefixes is not None
+            else None,
+        )
+        object.__setattr__(
+            self,
+            "metadata_filters",
+            dict(metadata_filters) if metadata_filters is not None else None,
         )
 
     def allows(self, policy: NodePolicy) -> bool:
@@ -50,6 +71,22 @@ class VisibilityView:
         if self.classifications is None:
             return True
         return policy.classification in self.classifications
+
+    def allows_node(self, node: "VirtualNode") -> bool:
+        if not self.allows(node.policy):
+            return False
+        if self.path_prefixes is not None:
+            node_path = node.path()
+            if not any(
+                node_path.is_relative_to(prefix) or prefix.is_relative_to(node_path)
+                for prefix in self.path_prefixes
+            ):
+                return False
+        if self.metadata_filters is not None:
+            for key, value in self.metadata_filters.items():
+                if node.metadata.get(key) != value:
+                    return False
+        return True
 
 
 __all__ = ["NodePolicy", "VisibilityView"]

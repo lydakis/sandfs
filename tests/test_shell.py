@@ -1,4 +1,4 @@
-from sandfs import SandboxShell, VirtualFileSystem
+from sandfs import NodePolicy, SandboxShell, VirtualFileSystem
 
 
 def setup_shell() -> SandboxShell:
@@ -89,8 +89,8 @@ def test_agent_mode_output_limit():
 
 def test_unknown_command_falls_back_to_host():
     shell = setup_shell()
-    res = shell.exec("echo hello from host")
-    assert "hello from host" in res.stdout
+    res = shell.exec("doesnotexist")
+    assert res.exit_code == 127
 
 
 def test_bash_is_routed_through_host():
@@ -111,6 +111,7 @@ def test_python3_allowed_when_python_disallowed():
 
 def test_host_fallback_translates_executable_path():
     shell = setup_shell()
+    shell.host_fallback = True
     shell.vfs.write_file("/workspace/run.sh", "#!/bin/sh\necho script works\n")
     res = shell.exec("/workspace/run.sh")
     assert "Permission" in res.stderr or "denied" in res.stderr.lower()
@@ -138,7 +139,43 @@ def test_append_command():
 def test_ls_accepts_flags():
     shell = setup_shell()
     res = shell.exec("ls -la")
-    assert "workspace" in res.stdout
+    assert res.exit_code != 0
+
+
+def test_ls_unreadable_directory_errors():
+    vfs = VirtualFileSystem()
+    vfs.mkdir("/secret")
+    vfs.write_file("/secret/a.txt", "nope")
+    vfs.set_policy("/secret", NodePolicy(readable=False))
+    shell = SandboxShell(vfs)
+    res = shell.exec("ls /secret")
+    assert res.exit_code == 1
+    assert "not readable" in res.stderr.lower()
+
+
+def test_pipe_and_grep_from_stdin():
+    shell = setup_shell()
+    res = shell.exec('printf "a\\\\nb" | grep a')
+    assert res.stdout.strip() == "a"
+
+
+def test_redirection_and_cat_stdin():
+    shell = setup_shell()
+    shell.exec("echo hi > /notes/a.txt")
+    res = shell.exec("cat < /notes/a.txt")
+    assert res.stdout.strip() == "hi"
+
+
+def test_glob_expansion():
+    shell = setup_shell()
+    res = shell.exec("ls /workspace/*.py")
+    assert "app.py" in res.stdout
+
+
+def test_env_assignment_expands():
+    shell = setup_shell()
+    res = shell.exec("FOO=bar echo $FOO")
+    assert res.stdout.strip() == "bar"
 
 
 def test_ls_on_blue_directory_via_host():

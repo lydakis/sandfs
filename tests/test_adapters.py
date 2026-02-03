@@ -1,7 +1,7 @@
 import pytest
 
 from sandfs import NodePolicy, VirtualFileSystem
-from sandfs.adapters import MemoryStorageAdapter
+from sandfs.adapters import FileSystemAdapter, MemoryStorageAdapter
 from sandfs.exceptions import InvalidOperation
 
 
@@ -63,3 +63,31 @@ def test_storage_adapter_sync_refreshes_vfs():
     adapter.write("a.txt", "external", version=current.version)
     vfs.sync_storage("/sync")
     assert vfs.read_file("/sync/a.txt") == "external"
+
+
+def test_filesystem_adapter_read_write_list(tmp_path):
+    root = tmp_path / "fs"
+    root.mkdir()
+    (root / "a.txt").write_text("hello")
+    adapter = FileSystemAdapter(root)
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/data", adapter, policy=NodePolicy(writable=True))
+
+    assert vfs.read_file("/data/a.txt") == "hello"
+    vfs.write_file("/data/a.txt", "world")
+    assert (root / "a.txt").read_text() == "world"
+    listing = adapter.list()
+    assert "a.txt" in listing
+
+
+def test_filesystem_adapter_sync_refreshes_vfs(tmp_path):
+    root = tmp_path / "fs"
+    root.mkdir()
+    (root / "a.txt").write_text("hello")
+    adapter = FileSystemAdapter(root)
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/data", adapter, policy=NodePolicy(writable=True))
+
+    (root / "a.txt").write_text("external")
+    vfs.sync_storage("/data")
+    assert vfs.read_file("/data/a.txt") == "external"

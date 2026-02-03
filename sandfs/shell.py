@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
+import inspect
+import os
 import re
-import shlex
 import subprocess
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -15,6 +17,8 @@ from .exceptions import InvalidOperation, NodeNotFound, SandboxError
 from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import VisibilityView
 from .pyexec import PythonExecutor
+from .search import SearchQuery
+from .shell_parser import CommandSpec, Pipeline, parse_pipeline
 from .vfs import DirEntry, VirtualFileSystem
 
 
@@ -25,7 +29,23 @@ class CommandResult:
     exit_code: int = 0
 
 
-CommandHandler = Callable[[list[str]], CommandResult | str | None]
+@dataclass
+class CommandContext:
+    stdin: str
+    env: dict[str, str]
+    cwd: str
+    vfs: VirtualFileSystem
+    view: VisibilityView | None
+
+
+@dataclass(frozen=True)
+class ParsedSearchPath:
+    base: PurePosixPath
+    query: SearchQuery
+    nav: PurePosixPath | None
+
+
+CommandHandler = Callable[..., CommandResult | str | None]
 
 
 class SandboxShell:
@@ -40,7 +60,7 @@ class SandboxShell:
         view: VisibilityView | None = None,
         allowed_commands: Iterable[str] | None = None,
         max_output_bytes: int | None = None,
-        host_fallback: bool = True,
+        host_fallback: bool = False,
     ) -> None:
         self.vfs = vfs
         self.env: dict[str, str] = dict(env or {})
@@ -52,6 +72,7 @@ class SandboxShell:
         self.allowed_commands: set[str] | None = set(allowed_commands) if allowed_commands else None
         self.max_output_bytes = max_output_bytes
         self.host_fallback = host_fallback
+        self._handler_accepts_ctx: dict[str, bool] = {}
         self._register_builtin_commands()
 
     # ------------------------------------------------------------------
@@ -65,6 +86,14 @@ class SandboxShell:
         description: str = "",
     ) -> None:
         self.commands[name] = handler
+        params = list(inspect.signature(handler).parameters.values())
+        accepts_ctx = False
+        if params:
+            if len(params) >= 2:
+                accepts_ctx = True
+            elif params[0].kind == inspect.Parameter.VAR_POSITIONAL:
+                accepts_ctx = True
+        self._handler_accepts_ctx[name] = accepts_ctx
         if description:
             self.command_docs[name] = description
 
@@ -74,11 +103,22 @@ class SandboxShell:
     def _ensure_visible_path(self, path: str) -> None:
         if self.view is None:
             return
+        if self.view.path_prefixes is not None:
+            normalized = self.vfs._normalize(path)
+            if not any(
+                normalized.is_relative_to(prefix) or prefix.is_relative_to(normalized)
+                for prefix in self.view.path_prefixes
+            ):
+                raise InvalidOperation(f"Path {path} is hidden for this view")
         try:
-            policy = self.vfs.get_policy(path)
+            node = self.vfs.get_node(path)
         except NodeNotFound:
             return
-        if not self.view.allows(policy):
+        if not self.view.allows(node.policy):
+            raise InvalidOperation(f"Path {path} is hidden for this view")
+        if self.view.metadata_filters and isinstance(node, VirtualDirectory):
+            return
+        if not self.view.allows_node(node):
             raise InvalidOperation(f"Path {path} is hidden for this view")
 
     def _enforce_output_limit(self, result: CommandResult) -> CommandResult:
@@ -93,12 +133,22 @@ class SandboxShell:
             exit_code=1,
         )
 
-    def _run_host_process(self, command_tokens: list[str], path: str | None) -> CommandResult:
+    def _run_host_process(
+        self,
+        command_tokens: list[str],
+        path: str | None,
+        *,
+        stdin: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> CommandResult:
         if not command_tokens:
             return CommandResult(stderr="Missing host command", exit_code=2)
         target = str(self.vfs._normalize(path or self.vfs.pwd()))
         self._ensure_visible_path(target)
         sandbox_cwd = PurePosixPath(target)
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update(env)
         try:
             with self.vfs.materialize("/") as fs_root:
                 host_cwd = self._sandbox_to_host_path(fs_root, sandbox_cwd)
@@ -106,9 +156,11 @@ class SandboxShell:
                 completed = subprocess.run(
                     mapped,
                     cwd=str(host_cwd),
+                    input=stdin,
                     capture_output=True,
                     text=True,
                     check=False,
+                    env=merged_env,
                 )
                 self._sync_from_host(fs_root)
         except SandboxError as exc:
@@ -221,31 +273,89 @@ class SandboxShell:
     def exec(self, command: str) -> CommandResult:
         last_result = CommandResult()
         for segment in filter(None, (line.strip() for line in command.splitlines())):
-            last_result = self._exec_one(segment)
+            last_result = self._exec_pipeline(segment)
             if last_result.exit_code != 0:
                 return last_result
         return last_result
 
-    def _exec_one(self, command: str) -> CommandResult:
+    def _exec_pipeline(self, command: str) -> CommandResult:
         if not command.strip():
             return CommandResult()
         try:
-            tokens = shlex.split(command)
+            pipeline = parse_pipeline(command)
         except ValueError as exc:
             return CommandResult(stderr=str(exc), exit_code=2)
-        if not tokens:
+        if not pipeline.commands:
             return CommandResult()
-        name, *args = tokens
+
+        if len(pipeline.commands) == 1 and pipeline.commands[0].name is None:
+            assignments = pipeline.commands[0].assignments
+            for key, value in assignments.items():
+                self.env[key] = self._expand_vars(value, self.env)
+            return CommandResult()
+
+        stdout_pipe = ""
+        stderr_chunks: list[str] = []
+        for spec in pipeline.commands:
+            if spec.name is None:
+                return CommandResult(stderr="Missing command in pipeline", exit_code=2)
+
+            env = dict(self.env)
+            expanded_assignments = {
+                key: self._expand_vars(value, env) for key, value in spec.assignments.items()
+            }
+            env.update(expanded_assignments)
+            name = self._expand_vars(spec.name, env)
+            args = self._expand_args(spec.args, env, command_name=name)
+
+            stdin_data = stdout_pipe
+            if spec.stdin is not None:
+                stdin_path = self._expand_vars(spec.stdin, env)
+                stdin_data = self._read_from_path(stdin_path)
+
+            ctx = CommandContext(
+                stdin=stdin_data,
+                env=env,
+                cwd=self.vfs.pwd(),
+                vfs=self.vfs,
+                view=self.view,
+            )
+            result = self._run_command(name, args, ctx)
+            stderr_chunks.append(result.stderr)
+            if result.exit_code != 0:
+                return self._enforce_output_limit(
+                    CommandResult(
+                        stdout=result.stdout,
+                        stderr="".join(filter(None, stderr_chunks)),
+                        exit_code=result.exit_code,
+                    )
+                )
+
+            output = result.stdout
+            if spec.stdout is not None:
+                out_path = self._expand_vars(spec.stdout, env)
+                self._write_to_path(out_path, output, append=spec.append)
+                output = ""
+            stdout_pipe = output
+
+        return self._enforce_output_limit(
+            CommandResult(stdout=stdout_pipe, stderr="".join(filter(None, stderr_chunks)))
+        )
+
+    def _run_command(self, name: str, args: list[str], ctx: CommandContext) -> CommandResult:
         self.last_command_name = name
         handler = self.commands.get(name)
         if handler is None:
             if self.host_fallback:
-                return self._run_host_process(tokens, None)
+                return self._run_host_process([name, *args], None, stdin=ctx.stdin, env=ctx.env)
             return CommandResult(stderr=f"Unknown command: {name}", exit_code=127)
         if self.allowed_commands is not None and name not in self.allowed_commands:
             return CommandResult(stderr=f"Command '{name}' is disabled in this shell", exit_code=1)
         try:
-            result = handler(args)
+            if self._handler_accepts_ctx.get(name):
+                result = handler(args, ctx)
+            else:
+                result = handler(args)
         except SandboxError as exc:
             return CommandResult(stderr=str(exc), exit_code=1)
         except Exception as exc:  # pragma: no cover - unexpected failure path
@@ -255,6 +365,129 @@ class SandboxShell:
         if result is None:
             return self._enforce_output_limit(CommandResult())
         return self._enforce_output_limit(CommandResult(stdout=str(result)))
+
+    def _expand_vars(self, token: str, env: dict[str, str]) -> str:
+        pattern = re.compile(r"\$(\w+)|\${([^}]+)}")
+
+        def replacer(match: re.Match[str]) -> str:
+            name = match.group(1) or match.group(2)
+            if not name:
+                return ""
+            return env.get(name, "")
+
+        return pattern.sub(replacer, token)
+
+    def _expand_args(self, args: list[str], env: dict[str, str], *, command_name: str) -> list[str]:
+        expanded: list[str] = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                expanded.append(arg)
+                skip_next = False
+                continue
+            if command_name in {"bash", "sh"} and arg in {"-c", "-lc"}:
+                expanded.append(arg)
+                skip_next = True
+                continue
+            expanded.append(self._expand_vars(arg, env))
+        return self._expand_globs(expanded)
+
+    def _expand_globs(self, args: list[str]) -> list[str]:
+        expanded: list[str] = []
+        for arg in args:
+            if any(ch in arg for ch in "*?[]"):
+                matches = self.vfs.glob(arg, cwd=self.vfs.pwd(), view=self.view)
+                if matches:
+                    expanded.extend(matches)
+                else:
+                    expanded.append(arg)
+            else:
+                expanded.append(arg)
+        return expanded
+
+    def _read_from_path(self, path: str) -> str:
+        parsed = self._parse_search_path(path)
+        if parsed is None:
+            self._ensure_visible_path(path)
+            return self.vfs.read_file(path)
+        resolved = self._resolve_search_nav(parsed)
+        with self.vfs.search_view_context(parsed.query, view=self.view):
+            self.vfs._reset_directory(parsed.base)
+            return self.vfs.read_file(resolved)
+
+    def _write_to_path(self, path: str, content: str, *, append: bool) -> None:
+        parsed = self._parse_search_path(path)
+        if parsed is not None:
+            raise InvalidOperation("Cannot write to search view paths")
+        self._ensure_visible_path(path)
+        if append:
+            self.vfs.append_file(path, content)
+        else:
+            self.vfs.write_file(path, content)
+
+    def _resolve_search_nav(self, parsed: "ParsedSearchPath") -> str:
+        if parsed.nav is None:
+            return str(parsed.base)
+        return str(parsed.base.joinpath(parsed.nav))
+
+    def _parse_search_path(self, path: str) -> "ParsedSearchPath | None":
+        prefix = self.vfs._search_view_prefix
+        if prefix is None or "?" not in path:
+            return None
+        raw = path
+        if not raw.startswith("/"):
+            raw = str(PurePosixPath(self.vfs.pwd()).joinpath(raw))
+        base_str, tail = raw.split("?", 1)
+        base = PurePosixPath(base_str.rstrip("/") or "/")
+        if base != prefix:
+            return None
+
+        query_part = tail
+        nav_part: str | None = None
+        if "/" in tail:
+            candidate, remainder = tail.split("/", 1)
+            if "path=" in candidate and "=" not in remainder:
+                query_part = f"{candidate}{remainder}"
+                nav_part = None
+            else:
+                query_part = candidate
+                nav_part = remainder
+
+        from urllib.parse import parse_qs, unquote
+
+        params = parse_qs(query_part, keep_blank_values=True)
+        query_text = params.get("q", [""])[0]
+        regex = self._parse_bool(params.get("regex", ["0"])[0])
+        ignore_case = self._parse_bool(params.get("ignore_case", ["0"])[0])
+        path_prefix_raw = params.get("path", [None])[0]
+        path_prefix = None
+        if path_prefix_raw:
+            path_prefix = PurePosixPath(unquote(path_prefix_raw))
+            if not path_prefix.is_absolute():
+                path_prefix = PurePosixPath("/").joinpath(path_prefix)
+
+        query = SearchQuery(
+            query=query_text,
+            regex=regex,
+            ignore_case=ignore_case,
+            path_prefix=path_prefix,
+        )
+        nav = PurePosixPath(nav_part) if nav_part else None
+        return ParsedSearchPath(base=base, query=query, nav=nav)
+
+    def _parse_bool(self, value: str) -> bool:
+        return value.lower() in {"1", "true", "yes", "on"}
+
+    @contextlib.contextmanager
+    def _maybe_search_context(self, path: str) -> Iterator[str]:
+        parsed = self._parse_search_path(path)
+        if parsed is None:
+            yield path
+            return
+        resolved = self._resolve_search_nav(parsed)
+        with self.vfs.search_view_context(parsed.query, view=self.view):
+            self.vfs._reset_directory(parsed.base)
+            yield resolved
 
     # ------------------------------------------------------------------
     # Builtin commands
@@ -273,8 +506,12 @@ class SandboxShell:
             ("tree", self._cmd_tree, "Render tree view"),
             ("write", self._cmd_write, "Write text to file"),
             ("append", self._cmd_append, "Append text to file"),
+            ("echo", self._cmd_echo, "Echo arguments"),
+            ("printf", self._cmd_printf, "Format and print text"),
+            ("wc", self._cmd_wc, "Count lines or bytes"),
             ("grep", self._cmd_grep, "Search files (non-recursive)"),
             ("rg", self._cmd_rg, "Search files recursively"),
+            ("search", self._cmd_search, "Search files (rg-like)"),
             ("python", self._cmd_python, "Execute Python snippet"),
             ("python3", self._cmd_python, "Execute Python snippet"),
             ("host", self._cmd_host, "Run host command in materialized tree"),
@@ -289,33 +526,59 @@ class SandboxShell:
         for name, handler, description in builtin_commands:
             self.register_command(name, handler, description=description)
 
-    def _cmd_pwd(self, _: list[str]) -> CommandResult:
+    def _cmd_pwd(self, _: list[str], ctx: CommandContext | None = None) -> CommandResult:
         return CommandResult(stdout=self.vfs.pwd())
 
-    def _cmd_cd(self, args: list[str]) -> CommandResult:
+    def _cmd_cd(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if len(args) != 1:
             return CommandResult(stderr="cd expects exactly one path", exit_code=2)
-        self._ensure_visible_path(args[0])
-        new_path = self.vfs.cd(args[0])
+        with self._maybe_search_context(args[0]) as resolved:
+            self._ensure_visible_path(resolved)
+            new_path = self.vfs.cd(resolved)
         return CommandResult(stdout=new_path)
 
-    def _cmd_ls(self, args: list[str]) -> CommandResult:
+    def _cmd_ls(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         long = False
         targets: list[str] = []
         for arg in args:
             if arg in ("-l", "--long"):
                 long = True
             elif arg.startswith("-"):
+                if not self.host_fallback:
+                    return CommandResult(stderr=f"ls: unsupported flag {arg}", exit_code=2)
                 # fallback for other flags via host
-                return self._run_host_process(["ls", *args], None)
+                return self._run_host_process(
+                    ["ls", *args],
+                    None,
+                    stdin=ctx.stdin if ctx else None,
+                )
             else:
                 targets.append(arg)
         if not targets:
             targets = [self.vfs.pwd()]
         blocks: list[str] = []
         for idx, target in enumerate(targets):
-            self._ensure_visible_path(target)
-            entries = self.vfs.ls(target, view=self.view)
+            with self._maybe_search_context(target) as resolved:
+                self._ensure_visible_path(resolved)
+                try:
+                    entries = self.vfs.ls(resolved, view=self.view)
+                except InvalidOperation:
+                    node = self.vfs.get_node(resolved)
+                    if isinstance(node, VirtualDirectory):
+                        raise
+                    if not node.policy.readable:
+                        raise InvalidOperation(f"{node.path()} is not readable") from None
+                    if self.view and not self.view.allows_node(node):
+                        raise InvalidOperation(f"Path {resolved} is hidden for this view") from None
+                    entries = [
+                        DirEntry(
+                            name=node.name,
+                            path=node.path(),
+                            is_dir=False,
+                            metadata=node.metadata,
+                            policy=node.policy,
+                        )
+                    ]
             if len(targets) > 1:
                 blocks.append(f"{target}:")
             blocks.append(self._format_ls(entries, long_format=long))
@@ -330,33 +593,41 @@ class SandboxShell:
             return "\n".join(f"{'d' if entry.is_dir else '-'} {entry.path}" for entry in entries)
         return "  ".join(f"{entry.name}/" if entry.is_dir else entry.name for entry in entries)
 
-    def _cmd_cat(self, args: list[str]) -> CommandResult:
-        if not args:
-            return CommandResult(stderr="cat expects at least one file", exit_code=2)
-        blobs = []
+    def _cmd_cat(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
+        if not args or args == ["-"]:
+            return CommandResult(stdout=ctx.stdin if ctx else "")
+        blobs: list[str] = []
         for path in args:
-            self._ensure_visible_path(path)
-            blobs.append(self.vfs.read_file(path))
+            if path == "-":
+                blobs.append(ctx.stdin if ctx else "")
+                continue
+            with self._maybe_search_context(path) as resolved:
+                self._ensure_visible_path(resolved)
+                blobs.append(self.vfs.read_file(resolved))
         return CommandResult(stdout="".join(blobs))
 
-    def _cmd_append(self, args: list[str]) -> CommandResult:
+    def _cmd_append(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if len(args) < 2:
             return CommandResult(stderr="append expects a path and text", exit_code=2)
         path = args[0]
-        self._ensure_visible_path(path)
         text = " ".join(args[1:])
-        self.vfs.append_file(path, text)
+        try:
+            self._write_to_path(path, text, append=True)
+        except InvalidOperation as exc:
+            return CommandResult(stderr=str(exc), exit_code=1)
         return CommandResult()
 
-    def _cmd_touch(self, args: list[str]) -> CommandResult:
+    def _cmd_touch(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if not args:
             return CommandResult(stderr="touch expects at least one file", exit_code=2)
         for path in args:
+            if self._parse_search_path(path) is not None:
+                return CommandResult(stderr="touch: cannot touch search view paths", exit_code=1)
             self._ensure_visible_path(path)
             self.vfs.touch(path)
         return CommandResult()
 
-    def _cmd_mkdir(self, args: list[str]) -> CommandResult:
+    def _cmd_mkdir(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         parents = False
         paths: list[str] = []
         for arg in args:
@@ -367,11 +638,13 @@ class SandboxShell:
         if not paths:
             return CommandResult(stderr="mkdir expects a path", exit_code=2)
         for path in paths:
+            if self._parse_search_path(path) is not None:
+                return CommandResult(stderr="mkdir: cannot create search view paths", exit_code=1)
             self._ensure_visible_path(path)
             self.vfs.mkdir(path, parents=parents, exist_ok=parents)
         return CommandResult()
 
-    def _cmd_rm(self, args: list[str]) -> CommandResult:
+    def _cmd_rm(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         recursive = False
         targets: list[str] = []
         for arg in args:
@@ -382,11 +655,13 @@ class SandboxShell:
         if not targets:
             return CommandResult(stderr="rm expects a target", exit_code=2)
         for target in targets:
+            if self._parse_search_path(target) is not None:
+                return CommandResult(stderr="rm: cannot remove search view paths", exit_code=1)
             self._ensure_visible_path(target)
             self.vfs.remove(target, recursive=recursive)
         return CommandResult()
 
-    def _cmd_cp(self, args: list[str]) -> CommandResult:
+    def _cmd_cp(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         recursive = False
         operands: list[str] = []
         for arg in args:
@@ -397,6 +672,8 @@ class SandboxShell:
         if len(operands) != 2:
             return CommandResult(stderr="cp expects a source and destination", exit_code=2)
         source, dest = operands
+        if self._parse_search_path(source) is not None or self._parse_search_path(dest) is not None:
+            return CommandResult(stderr="cp: cannot use search view paths", exit_code=1)
         self._ensure_visible_path(source)
         self._ensure_visible_path(dest)
         try:
@@ -405,10 +682,12 @@ class SandboxShell:
             return CommandResult(stderr=str(exc), exit_code=1)
         return CommandResult()
 
-    def _cmd_mv(self, args: list[str]) -> CommandResult:
+    def _cmd_mv(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if len(args) != 2:
             return CommandResult(stderr="mv expects a source and destination", exit_code=2)
         source, dest = args
+        if self._parse_search_path(source) is not None or self._parse_search_path(dest) is not None:
+            return CommandResult(stderr="mv: cannot use search view paths", exit_code=1)
         self._ensure_visible_path(source)
         self._ensure_visible_path(dest)
         try:
@@ -417,17 +696,18 @@ class SandboxShell:
             return CommandResult(stderr=str(exc), exit_code=1)
         return CommandResult()
 
-    def _cmd_tree(self, args: list[str]) -> CommandResult:
+    def _cmd_tree(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         target = args[0] if args else None
         if target:
-            self._ensure_visible_path(target)
+            with self._maybe_search_context(target) as resolved:
+                self._ensure_visible_path(resolved)
+                return CommandResult(stdout=self.vfs.tree(resolved, view=self.view))
         return CommandResult(stdout=self.vfs.tree(target, view=self.view))
 
-    def _cmd_write(self, args: list[str]) -> CommandResult:
+    def _cmd_write(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if not args:
             return CommandResult(stderr="write expects a target path", exit_code=2)
         path = args[0]
-        self._ensure_visible_path(path)
         text_parts: list[str] = []
         append = False
         idx = 1
@@ -444,13 +724,95 @@ class SandboxShell:
             text_parts.append(token)
             idx += 1
         payload = " ".join(text_parts)
-        if append:
-            self.vfs.append_file(path, payload)
-        else:
-            self.vfs.write_file(path, payload)
+        try:
+            self._write_to_path(path, payload, append=append)
+        except InvalidOperation as exc:
+            return CommandResult(stderr=str(exc), exit_code=1)
         return CommandResult()
 
-    def _cmd_grep(self, args: list[str]) -> CommandResult:
+    def _cmd_echo(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
+        newline = True
+        if args and args[0] == "-n":
+            newline = False
+            args = args[1:]
+        output = " ".join(args)
+        if newline:
+            output += "\n"
+        return CommandResult(stdout=output)
+
+    def _cmd_printf(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
+        if not args:
+            return CommandResult(stdout="")
+        fmt = args[0]
+        values = tuple(args[1:])
+        try:
+            rendered = fmt % values if "%s" in fmt else fmt
+        except TypeError:
+            rendered = fmt + (" " + " ".join(values) if values else "")
+        rendered = (
+            rendered.replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\r", "\r")
+            .replace("\\\\", "\\")
+        )
+        return CommandResult(stdout=rendered)
+
+    def _cmd_wc(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
+        count_lines = False
+        count_bytes = False
+        paths: list[str] = []
+        for token in args:
+            if token == "-l":
+                count_lines = True
+            elif token == "-c":
+                count_bytes = True
+            else:
+                paths.append(token)
+        if not count_lines and not count_bytes:
+            count_lines = True
+            count_bytes = True
+
+        def format_counts(lines: int, bytes_count: int, label: str | None = None) -> str:
+            parts: list[str] = []
+            if count_lines:
+                parts.append(str(lines))
+            if count_bytes:
+                parts.append(str(bytes_count))
+            if label:
+                parts.append(label)
+            return " ".join(parts)
+
+        outputs: list[str] = []
+        if not paths:
+            content = ctx.stdin if ctx else ""
+            outputs.append(
+                format_counts(len(content.splitlines()), len(content.encode("utf-8")))
+            )
+            return CommandResult(stdout="\n".join(outputs))
+
+        for path in paths:
+            if path == "-":
+                content = ctx.stdin if ctx else ""
+                outputs.append(
+                    format_counts(len(content.splitlines()), len(content.encode("utf-8")), "-")
+                )
+                continue
+            with self._maybe_search_context(path) as resolved:
+                try:
+                    self._ensure_visible_path(resolved)
+                    content = self.vfs.read_file(resolved)
+                except (NodeNotFound, InvalidOperation) as exc:
+                    return CommandResult(stderr=str(exc), exit_code=1)
+            outputs.append(
+                format_counts(
+                    len(content.splitlines()),
+                    len(content.encode("utf-8")),
+                    path,
+                )
+            )
+        return CommandResult(stdout="\n".join(outputs))
+
+    def _cmd_grep(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if not args:
             return CommandResult(stderr="grep expects a pattern", exit_code=2)
         recursive = False
@@ -485,23 +847,92 @@ class SandboxShell:
             idx += 1
         if pattern is None:
             return CommandResult(stderr="Missing pattern", exit_code=2)
+        output: list[str] = []
         if not paths:
+            if ctx is not None:
+                output = self._search_text(
+                    pattern,
+                    ctx.stdin,
+                    regex=regex,
+                    ignore_case=ignore_case,
+                    show_numbers=show_numbers,
+                )
+                return CommandResult(stdout="\n".join(output))
             paths = [self.vfs.pwd()]
         for target in paths:
-            self._ensure_visible_path(target)
-        output = self._search(
-            pattern,
-            paths,
-            recursive=recursive,
-            regex=regex,
-            ignore_case=ignore_case,
-            show_numbers=show_numbers,
-        )
+            if target == "-":
+                output.extend(
+                    self._search_text(
+                        pattern,
+                        ctx.stdin if ctx else "",
+                        regex=regex,
+                        ignore_case=ignore_case,
+                        show_numbers=show_numbers,
+                    )
+                )
+                continue
+            with self._maybe_search_context(target) as resolved:
+                self._ensure_visible_path(resolved)
+                output.extend(
+                    self._search(
+                        pattern,
+                        [resolved],
+                        recursive=recursive,
+                        regex=regex,
+                        ignore_case=ignore_case,
+                        show_numbers=show_numbers,
+                    )
+                )
         return CommandResult(stdout="\n".join(output))
 
-    def _cmd_rg(self, args: list[str]) -> CommandResult:
+    def _cmd_rg(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         # ripgrep defaults to recursive search
-        return self._cmd_grep(["-r"] + args)
+        return self._cmd_grep(["-r"] + args, ctx=ctx)
+
+    def _cmd_search(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
+        if not args:
+            return CommandResult(stderr="search expects a pattern", exit_code=2)
+        regex = False
+        ignore_case = False
+        show_numbers = True
+        paths: list[str] = []
+        pattern: str | None = None
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token in ("-i", "--ignore-case"):
+                ignore_case = True
+            elif token in ("-e", "--regex"):
+                regex = True
+            elif token in ("-n", "--line-number"):
+                show_numbers = True
+            elif token == "--no-line-number":
+                show_numbers = False
+            elif pattern is None:
+                pattern = token
+            else:
+                paths.append(token)
+            idx += 1
+        if pattern is None:
+            return CommandResult(stderr="Missing pattern", exit_code=2)
+        if not paths:
+            paths = [self.vfs.pwd()]
+
+        results: list[str] = []
+        for path in paths:
+            normalized = self.vfs._normalize(path)
+            query = SearchQuery(
+                query=pattern,
+                regex=regex,
+                ignore_case=ignore_case,
+                path_prefix=normalized,
+            )
+            for match in self.vfs.search(query, view=self.view):
+                if show_numbers:
+                    results.append(f"{match.path}:{match.line_no}:{match.line_text}")
+                else:
+                    results.append(f"{match.path}:{match.line_text}")
+        return CommandResult(stdout="\\n".join(results))
 
     def _search(
         self,
@@ -521,7 +952,7 @@ class SandboxShell:
         lowered = pattern.lower() if ignore_case and not regex else None
         for target in paths:
             for file_path, file_node in self.vfs.iter_files(target, recursive=recursive):
-                if self.view and not self.view.allows(file_node.policy):
+                if self.view and not self.view.allows_node(file_node):
                     continue
                 text = file_node.read(self.vfs)
                 lines = text.splitlines()
@@ -541,7 +972,38 @@ class SandboxShell:
                         results.append(f"{prefix}{line}")
         return results
 
-    def _cmd_python(self, args: list[str]) -> CommandResult:
+    def _search_text(
+        self,
+        pattern: str,
+        text: str,
+        *,
+        regex: bool,
+        ignore_case: bool,
+        show_numbers: bool,
+    ) -> list[str]:
+        results: list[str] = []
+        flags = re.MULTILINE
+        if ignore_case:
+            flags |= re.IGNORECASE
+        compiled = re.compile(pattern, flags) if regex else None
+        lowered = pattern.lower() if ignore_case and not regex else None
+        for idx, line in enumerate(text.splitlines(), start=1):
+            matched = False
+            if regex:
+                if compiled and compiled.search(line):
+                    matched = True
+            elif ignore_case:
+                if lowered and lowered in line.lower():
+                    matched = True
+            else:
+                if pattern in line:
+                    matched = True
+            if matched:
+                prefix = f"{idx}:" if show_numbers else ""
+                results.append(f"{prefix}{line}" if prefix else line)
+        return results
+
+    def _cmd_python(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if not args:
             return CommandResult(stderr="python expects code", exit_code=2)
         if args[0] == "-c" and len(args) >= 2:
@@ -551,14 +1013,19 @@ class SandboxShell:
         result = self.py_exec.run(code)
         return CommandResult(stdout=result.stdout)
 
-    def _cmd_shell_host(self, args: list[str]) -> CommandResult:
+    def _cmd_shell_host(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         # First token is bash/sh command itself; delegate to host with same args
         command = self.last_command_name
         if command is None:
             return CommandResult(stderr="host shell command unavailable", exit_code=1)
-        return self._run_host_process([command, *args], None)
+        return self._run_host_process(
+            [command, *args],
+            None,
+            stdin=ctx.stdin if ctx else None,
+            env=ctx.env if ctx else None,
+        )
 
-    def _cmd_host(self, args: list[str]) -> CommandResult:
+    def _cmd_host(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         path: str | None = None
         idx = 0
         while idx < len(args):
@@ -577,9 +1044,14 @@ class SandboxShell:
         command_tokens = args[idx:]
         if not command_tokens:
             return CommandResult(stderr="host expects a command to run", exit_code=2)
-        return self._run_host_process(command_tokens, path)
+        return self._run_host_process(
+            command_tokens,
+            path,
+            stdin=ctx.stdin if ctx else None,
+            env=ctx.env if ctx else None,
+        )
 
-    def _cmd_help(self, _: list[str]) -> CommandResult:
+    def _cmd_help(self, _: list[str], ctx: CommandContext | None = None) -> CommandResult:
         lines = ["Available commands:"]
         for name in self.available_commands():
             desc = self.command_docs.get(name, "")
@@ -587,16 +1059,17 @@ class SandboxShell:
                 lines.append(f"  {name} - {desc}")
             else:
                 lines.append(f"  {name}")
-        lines.append("Use host <cmd> (or run unknown commands directly) for full GNU tools.")
+        lines.append("Use host <cmd> for full GNU tools.")
         return CommandResult(stdout="\n".join(lines))
 
-    def _cmd_stat(self, args: list[str]) -> CommandResult:
+    def _cmd_stat(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         if not args:
             return CommandResult(stderr="stat expects a file path", exit_code=2)
         path = args[0]
-        self._ensure_visible_path(path)
         try:
-            node = self.vfs.get_node(path)
+            with self._maybe_search_context(path) as resolved:
+                self._ensure_visible_path(resolved)
+                node = self.vfs.get_node(resolved)
         except (NodeNotFound, InvalidOperation) as exc:
             return CommandResult(stderr=str(exc), exit_code=1)
 
@@ -616,7 +1089,7 @@ class SandboxShell:
         lines.append(f"Modify: {modified}")
         return CommandResult(stdout="\n".join(lines))
 
-    def _cmd_head(self, args: list[str]) -> CommandResult:
+    def _cmd_head(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         count = 10
         mode = "lines"  # or "bytes"
         paths: list[str] = []
@@ -663,15 +1136,21 @@ class SandboxShell:
                 idx += 1
 
         if not paths:
-            return CommandResult(stderr="head: missing file operand", exit_code=1)
+            if ctx is None:
+                return CommandResult(stderr="head: missing file operand", exit_code=1)
+            paths = ["-"]
 
         output: list[str] = []
         for i, path in enumerate(paths):
-            self._ensure_visible_path(path)
-            try:
-                content = self.vfs.read_file(path)
-            except (NodeNotFound, InvalidOperation) as exc:
-                return CommandResult(stderr=str(exc), exit_code=1)
+            if path == "-":
+                content = ctx.stdin if ctx else ""
+            else:
+                with self._maybe_search_context(path) as resolved:
+                    self._ensure_visible_path(resolved)
+                    try:
+                        content = self.vfs.read_file(resolved)
+                    except (NodeNotFound, InvalidOperation) as exc:
+                        return CommandResult(stderr=str(exc), exit_code=1)
 
             if len(paths) > 1:
                 output.append(f"==> {path} <==")
@@ -687,7 +1166,7 @@ class SandboxShell:
 
         return CommandResult(stdout="\n".join(output))
 
-    def _cmd_tail(self, args: list[str]) -> CommandResult:
+    def _cmd_tail(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         count = 10
         mode = "lines"
         paths: list[str] = []
@@ -734,15 +1213,21 @@ class SandboxShell:
                 idx += 1
 
         if not paths:
-            return CommandResult(stderr="tail: missing file operand", exit_code=1)
+            if ctx is None:
+                return CommandResult(stderr="tail: missing file operand", exit_code=1)
+            paths = ["-"]
 
         output: list[str] = []
         for i, path in enumerate(paths):
-            self._ensure_visible_path(path)
-            try:
-                content = self.vfs.read_file(path)
-            except (NodeNotFound, InvalidOperation) as exc:
-                return CommandResult(stderr=str(exc), exit_code=1)
+            if path == "-":
+                content = ctx.stdin if ctx else ""
+            else:
+                with self._maybe_search_context(path) as resolved:
+                    self._ensure_visible_path(resolved)
+                    try:
+                        content = self.vfs.read_file(resolved)
+                    except (NodeNotFound, InvalidOperation) as exc:
+                        return CommandResult(stderr=str(exc), exit_code=1)
 
             if len(paths) > 1:
                 output.append(f"==> {path} <==")
@@ -758,7 +1243,7 @@ class SandboxShell:
 
         return CommandResult(stdout="\n".join(output))
 
-    def _cmd_find(self, args: list[str]) -> CommandResult:
+    def _cmd_find(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:
         paths: list[str] = []
         name_pattern: str | None = None
         type_filter: str | None = None
@@ -798,7 +1283,7 @@ class SandboxShell:
             paths = [self.vfs.pwd()]
 
         def walk_visible(node: VirtualNode) -> Iterable[tuple[PurePosixPath, VirtualNode]]:
-            if self.view and not self.view.allows(node.policy):
+            if self.view and not self.view.allows_node(node):
                 return
             yield (node.path(), node)
             if isinstance(node, VirtualDirectory):
@@ -808,9 +1293,10 @@ class SandboxShell:
 
         results: list[str] = []
         for start_path in paths:
-            self._ensure_visible_path(start_path)
             try:
-                start_node = self.vfs.get_node(start_path)
+                with self._maybe_search_context(start_path) as resolved:
+                    self._ensure_visible_path(resolved)
+                    start_node = self.vfs.get_node(resolved)
             except (NodeNotFound, InvalidOperation):
                 return CommandResult(
                     stderr=f"find: `{start_path}': No such file or directory",

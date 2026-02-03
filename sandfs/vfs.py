@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fnmatch
+import re
 import contextlib
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -15,7 +17,8 @@ from .hooks import WriteEvent, WriteHook
 from .integrations import PathEvent, PathHook
 from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import NodePolicy, VisibilityView
-from .providers import ContentProvider, DirectoryProvider
+from .providers import ContentProvider, DirectoryProvider, NodeContext, ProvidedNode
+from .search import FullTextIndex, SearchQuery, SearchResult
 
 
 @dataclass
@@ -45,6 +48,12 @@ class VFSSnapshot:
     storage_mounts: dict[str, StorageAdapter]
 
 
+@dataclass(frozen=True)
+class SearchViewContext:
+    query: SearchQuery
+    view: VisibilityView | None
+
+
 class VirtualFileSystem:
     """In-memory filesystem that supports dynamic nodes."""
 
@@ -54,6 +63,9 @@ class VirtualFileSystem:
         self._write_hooks: list[tuple[PurePosixPath, WriteHook]] = []
         self._storage_mounts: dict[PurePosixPath, StorageAdapter] = {}
         self._path_hooks: list[tuple[PurePosixPath, PathHook]] = []
+        self._full_text_index: FullTextIndex | None = None
+        self._search_view_prefix: PurePosixPath | None = None
+        self._search_view_context: SearchViewContext | None = None
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -239,6 +251,97 @@ class VirtualFileSystem:
             file_node.write(entry.content)
             file_node.version = entry.version
 
+    def _rebuild_index(self) -> None:
+        if self._full_text_index is None:
+            return
+        entries = []
+        for path, file_node in self.iter_files(
+            "/", recursive=True, skip_prefixes=[self._search_view_prefix] if self._search_view_prefix else None
+        ):
+            try:
+                content = file_node.read(self)
+            except InvalidOperation:
+                continue
+            entries.append((path, content))
+        self._full_text_index.build(entries)
+
+    def _index_file(self, node: VirtualFile) -> None:
+        if self._full_text_index is None:
+            return
+        try:
+            self._full_text_index.index_file(node.path(), node.read(self))
+        except InvalidOperation:
+            return
+
+    def _remove_index_entry(self, path: PurePosixPath) -> None:
+        if self._full_text_index is None:
+            return
+        self._full_text_index.remove_file(path)
+
+    def enable_full_text_index(self, index: FullTextIndex | None = None) -> FullTextIndex:
+        self._full_text_index = index or FullTextIndex()
+        self._rebuild_index()
+        return self._full_text_index
+
+    def enable_search_view(self, prefix: str | PurePosixPath = "/@search") -> None:
+        normalized = self._normalize(prefix)
+        self._search_view_prefix = normalized
+
+        def provider(_: NodeContext) -> Mapping[str, ProvidedNode]:
+            return self._search_view_provider()
+
+        self.mount_directory(normalized, provider)
+
+    @contextlib.contextmanager
+    def search_view_context(
+        self,
+        query: SearchQuery,
+        *,
+        view: VisibilityView | None = None,
+    ) -> Iterator[None]:
+        previous = self._search_view_context
+        self._search_view_context = SearchViewContext(query=query, view=view)
+        try:
+            yield
+        finally:
+            self._search_view_context = previous
+
+    def _reset_directory(self, path: str | PurePosixPath) -> None:
+        directory = self._resolve_dir(path)
+        directory.children.clear()
+        directory._loaded = False
+
+    def _search_view_provider(self) -> Mapping[str, ProvidedNode]:
+        if self._search_view_context is None:
+            return {}
+        query = self._search_view_context.query
+        view = self._search_view_context.view
+        results = self.search(query, view=view)
+        return self._build_search_tree(results)
+
+    def _build_search_tree(self, results: Iterable[SearchResult]) -> Mapping[str, ProvidedNode]:
+        files: dict[PurePosixPath, list[SearchResult]] = {}
+        for result in results:
+            files.setdefault(result.path, []).append(result)
+        root: dict[str, ProvidedNode] = {}
+
+        for path, matches in files.items():
+            parts = [part for part in path.parts if part not in ("/", "")]
+            cursor = root
+            for part in parts[:-1]:
+                node = cursor.get(part)
+                if node is None:
+                    node = ProvidedNode.directory(children={})
+                    cursor[part] = node
+                if node.children is None:
+                    node.children = {}
+                cursor = node.children
+            content_lines = [
+                f"{path}:{match.line_no}:{match.line_text}" for match in matches
+            ]
+            cursor[parts[-1]] = ProvidedNode.file(content="\n".join(content_lines))
+        return root
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -264,7 +367,7 @@ class VirtualFileSystem:
         directory.ensure_loaded(self)
         entries: list[DirEntry] = []
         for child in directory.iter_children(self):
-            if view and not view.allows(child.policy):
+            if view and not view.allows_node(child):
                 continue
             entries.append(
                 DirEntry(
@@ -277,6 +380,98 @@ class VirtualFileSystem:
             )
         entries.sort(key=lambda entry: (not entry.is_dir, entry.name))
         return entries
+
+    def search(
+        self,
+        query: SearchQuery,
+        *,
+        view: VisibilityView | None = None,
+    ) -> list[SearchResult]:
+        if self._full_text_index is not None:
+            results = self._full_text_index.search(query)
+            if view is None:
+                if self._search_view_prefix is None:
+                    return results
+                return [
+                    result
+                    for result in results
+                    if not result.path.is_relative_to(self._search_view_prefix)
+                ]
+            filtered: list[SearchResult] = []
+            for result in results:
+                if self._search_view_prefix and result.path.is_relative_to(self._search_view_prefix):
+                    continue
+                try:
+                    node = self.get_node(result.path)
+                except (NodeNotFound, InvalidOperation):
+                    continue
+                if view.allows_node(node):
+                    filtered.append(result)
+            return filtered
+
+        results: list[SearchResult] = []
+        try:
+            files = self.iter_files(
+                query.path_prefix or "/",
+                recursive=True,
+                skip_prefixes=[self._search_view_prefix] if self._search_view_prefix else None,
+            )
+        except (NodeNotFound, InvalidOperation):
+            return results
+        flags = re.MULTILINE | (re.IGNORECASE if query.ignore_case else 0)
+        compiled = re.compile(query.query, flags) if query.regex else None
+        lowered = query.query.lower() if query.ignore_case and not query.regex else None
+        for path, node in files:
+            if self._search_view_prefix and path.is_relative_to(self._search_view_prefix):
+                continue
+            if view and not view.allows_node(node):
+                continue
+            text = node.read(self)
+            for idx, line in enumerate(text.splitlines(), start=1):
+                matched = False
+                if query.regex:
+                    if compiled and compiled.search(line):
+                        matched = True
+                elif query.ignore_case:
+                    if lowered and lowered in line.lower():
+                        matched = True
+                else:
+                    if query.query in line:
+                        matched = True
+                if matched:
+                    results.append(SearchResult(path=path, line_no=idx, line_text=line))
+        return results
+
+    def glob(
+        self,
+        pattern: str,
+        *,
+        cwd: str | PurePosixPath | None = None,
+        view: VisibilityView | None = None,
+    ) -> list[str]:
+        if not pattern:
+            return []
+        cwd_path = self._normalize(cwd) if cwd is not None else self.cwd.path()
+        if "/" not in pattern and not pattern.startswith("/"):
+            entries = self.ls(cwd_path, view=view)
+            return [
+                str(entry.path)
+                for entry in entries
+                if fnmatch.fnmatchcase(entry.name, pattern)
+            ]
+
+        if pattern.startswith("/"):
+            pattern_path = PurePosixPath(pattern)
+        else:
+            pattern_path = cwd_path.joinpath(PurePosixPath(pattern))
+
+        matches: list[str] = []
+        for path, node in self.walk("/"):
+            if view and not view.allows_node(node):
+                continue
+            if fnmatch.fnmatchcase(str(path), str(pattern_path)):
+                matches.append(str(path))
+        return sorted(matches)
 
     def mkdir(
         self,
@@ -321,6 +516,7 @@ class VirtualFileSystem:
         node.version += 1
         node.modified_at = time.time()
         self._persist_storage(node, previous_version)
+        self._index_file(node)
         event_type = "create" if previous_version == 0 else "update"
         self._emit_write_event(node, append=append, event_type=event_type)
         return node
@@ -369,6 +565,7 @@ class VirtualFileSystem:
         parent.remove_child(node.name)
         if isinstance(node, VirtualFile):
             self._delete_storage_entry(node)
+            self._remove_index_entry(node.path())
             self._emit_path_event(node.path(), "delete", None)
 
     def move(self, source: str | PurePosixPath, target: str | PurePosixPath) -> None:
@@ -376,6 +573,7 @@ class VirtualFileSystem:
         if src_path == PurePosixPath("/"):
             raise InvalidOperation("Cannot move root directory")
         node = self._resolve_node(src_path)
+        original_path = node.path()
         parent = node.parent
         if parent is None:
             raise InvalidOperation("Cannot move node without parent")
@@ -422,6 +620,11 @@ class VirtualFileSystem:
         parent.remove_child(node.name)
         node.name = dest_name
         dest_parent.add_child(node)
+        if isinstance(node, VirtualFile):
+            self._remove_index_entry(original_path)
+            self._index_file(node)
+        else:
+            self._rebuild_index()
 
     def copy(
         self,
@@ -475,6 +678,10 @@ class VirtualFileSystem:
         clone = self._clone_node(node, recursive=recursive)
         clone.name = dest_name
         dest_parent.add_child(clone)
+        if isinstance(clone, VirtualFile):
+            self._index_file(clone)
+        else:
+            self._rebuild_index()
 
     def _clone_node(self, node: VirtualNode, *, recursive: bool) -> VirtualNode:
         if isinstance(node, VirtualFile):
@@ -513,21 +720,35 @@ class VirtualFileSystem:
         path: str | PurePosixPath | None = None,
         *,
         recursive: bool = True,
+        skip_prefixes: Iterable[PurePosixPath] | None = None,
     ) -> Iterator[tuple[PurePosixPath, VirtualFile]]:
         start_node = self._resolve_node(path or self.cwd.path())
         self._ensure_read_allowed(start_node)
+        prefixes = list(skip_prefixes or [])
+
+        def should_skip(target: PurePosixPath) -> bool:
+            return any(target.is_relative_to(prefix) for prefix in prefixes)
+
         if isinstance(start_node, VirtualFile):
-            yield (start_node.path(), start_node)
+            if not should_skip(start_node.path()):
+                yield (start_node.path(), start_node)
             return
 
         directory = self._resolve_dir(start_node.path())
+        if should_skip(directory.path()):
+            return
         directory.ensure_loaded(self)
 
         def _walk_dir(dir_node: VirtualDirectory) -> Iterator[tuple[PurePosixPath, VirtualFile]]:
+            if should_skip(dir_node.path()):
+                return
             for child in dir_node.iter_children(self):
                 if isinstance(child, VirtualFile):
-                    yield (child.path(), child)
+                    if not should_skip(child.path()):
+                        yield (child.path(), child)
                 elif isinstance(child, VirtualDirectory) and recursive:
+                    if should_skip(child.path()):
+                        continue
                     child.ensure_loaded(self)
                     yield from _walk_dir(child)
 
@@ -585,6 +806,7 @@ class VirtualFileSystem:
                 file_node.created_at = node_state.created_at
                 file_node.modified_at = node_state.modified_at
         self.cwd = self._resolve_dir(snapshot.cwd)
+        self._rebuild_index()
 
     def export_to_path(
         self,
@@ -686,6 +908,7 @@ class VirtualFileSystem:
             directory.policy = policy
         self._storage_mounts[normalized] = adapter
         self._load_storage_mount(normalized, adapter)
+        self._rebuild_index()
         return directory
 
     def sync_storage(self, path: str | PurePosixPath) -> None:
@@ -694,6 +917,7 @@ class VirtualFileSystem:
         if adapter is None:
             raise InvalidOperation(f"No storage mount at {normalized}")
         self._load_storage_mount(normalized, adapter)
+        self._rebuild_index()
 
     def register_write_hook(self, prefix: str | PurePosixPath, hook: WriteHook) -> None:
         normalized = self._normalize(prefix)
@@ -729,7 +953,7 @@ class VirtualFileSystem:
                 (
                     child
                     for child in directory.iter_children(self)
-                    if not view or view.allows(child.policy)
+                    if not view or view.allows_node(child)
                 ),
                 key=lambda node: (not isinstance(node, VirtualDirectory), node.name),
             )

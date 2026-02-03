@@ -34,6 +34,9 @@ dev = [
 Homepage = "https://example.com/sandfs"
 Repository = "https://example.com/sandfs.git"
 
+[project.scripts]
+sandfs = "sandfs.cli:main"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 

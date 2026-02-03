@@ -40,3 +40,43 @@ def test_principal_only_file_hidden_without_principal_view():
     res = shell.exec("cat /blue/public.txt")
     assert res.exit_code == 1
     assert "hidden" in res.stderr.lower()
+
+
+def test_view_path_prefix_filters():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/blue/allowed.txt", "ok")
+    vfs.write_file("/workspace/hidden.txt", "nope")
+    view = VisibilityView(path_prefixes={"/blue"})
+    shell = SandboxShell(vfs, view=view)
+    listing = shell.exec("ls /").stdout
+    assert "blue" in listing
+    assert "workspace" not in listing
+
+
+def test_view_metadata_filters():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/blue/keep.txt", "keep")
+    vfs.write_file("/blue/drop.txt", "drop")
+    keep_node = vfs.get_node("/blue/keep.txt")
+    drop_node = vfs.get_node("/blue/drop.txt")
+    keep_node.metadata["tag"] = "keep"
+    drop_node.metadata["tag"] = "drop"
+
+    view = VisibilityView(metadata_filters={"tag": "keep"})
+    shell = SandboxShell(vfs, view=view)
+    listing = shell.exec("ls /blue").stdout
+    assert "keep.txt" in listing
+    assert "drop.txt" not in listing
+
+
+def test_metadata_filters_do_not_bypass_classification_for_dirs():
+    vfs = VirtualFileSystem()
+    vfs.mkdir("/secret")
+    vfs.write_file("/secret/file.txt", "hidden")
+    vfs.set_policy("/secret", NodePolicy(classification="secret"))
+
+    view = VisibilityView(classifications={"public"}, metadata_filters={"tag": "keep"})
+    shell = SandboxShell(vfs, view=view)
+    res = shell.exec("ls /secret")
+    assert res.exit_code == 1
+    assert "hidden" in res.stderr.lower()

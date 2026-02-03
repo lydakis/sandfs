@@ -12,9 +12,10 @@ Agent builders frequently need a scratch filesystem for planning, iterating on g
 
 - In-memory directories and files that never touch the host disk unless exported.
 - Dynamic nodes backed by callables (e.g., query a DB, fetch from an API, or generate text on the fly).
-- Pure-Python shell/executor that understands a handful of GNU-style commands and can be extended with your own.
+- Pure-Python shell/executor with a bash-like subset (pipelines, redirection, env vars) and a curated command set.
 - Optional Python execution helper that evaluates snippets against the sandbox state only.
 - Bridge to real GNU utilities via `host -p <path> <command>` which materializes the subtree and runs the host binary against it.
+- Optional full-text search view mounted at `/@search` for queryable result trees.
 - Node policies (read-only, append-only, visibility labels) plus shell views so different agents see only the nodes they are allowed to.
 - Write hooks and optimistic versions so hosts can flush files to external stores with conflict detection.
 - Storage adapters and snapshots so you can mount external state and roll forward/back within a turn.
@@ -71,7 +72,35 @@ host -p /workspace grep -n TODO app.py
 
 The example above exports `/workspace` into a temporary directory, runs the system `grep` inside it, then discards the files.
 
-> Tip: unknown commands automatically fall back to the host runner, so `echo`, `python3`, or `bash -lc '…'` work even if they are not native sandfs commands.
+> Tip: host fallback is disabled by default. To allow unknown commands to run on the host, set `SandboxShell(..., host_fallback=True)`.
+
+### Search views
+
+Enable the search view to surface results as a virtual directory tree:
+
+```python
+from sandfs import VirtualFileSystem
+
+vfs = VirtualFileSystem()
+vfs.write_file("/workspace/README.md", "hello world\n")
+vfs.enable_search_view()
+```
+
+You can then query it via the shell:
+
+```
+ls /@search?q=hello
+cat /@search?q=hello/workspace/README.md
+```
+
+### CLI / REPL
+
+`sandfs` ships a minimal local CLI for interactive use:
+
+```
+sandfs exec "ls /"
+sandfs shell --mount /Users/me/project:/workspace
+```
 
 ### Policies & views
 
