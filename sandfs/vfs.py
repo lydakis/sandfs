@@ -7,7 +7,7 @@ import fnmatch
 import re
 import tempfile
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -326,15 +326,17 @@ class VirtualFileSystem:
 
         for path, matches in files.items():
             parts = [part for part in path.parts if part not in ("/", "")]
-            cursor = root
+            cursor: MutableMapping[str, ProvidedNode] = root
             for part in parts[:-1]:
                 node = cursor.get(part)
                 if node is None:
                     node = ProvidedNode.directory(children={})
                     cursor[part] = node
-                if node.children is None:
-                    node.children = {}
-                cursor = node.children
+                children = node.children
+                if children is None:
+                    children = {}
+                    node.children = children
+                cursor = children
             content_lines = [
                 f"{path}:{match.line_no}:{match.line_text}" for match in matches
             ]
@@ -410,7 +412,7 @@ class VirtualFileSystem:
                     filtered.append(result)
             return filtered
 
-        results: list[SearchResult] = []
+        file_results: list[SearchResult] = []
         try:
             files = self.iter_files(
                 query.path_prefix or "/",
@@ -418,7 +420,7 @@ class VirtualFileSystem:
                 skip_prefixes=[self._search_view_prefix] if self._search_view_prefix else None,
             )
         except (NodeNotFound, InvalidOperation):
-            return results
+            return file_results
         flags = re.MULTILINE | (re.IGNORECASE if query.ignore_case else 0)
         compiled = re.compile(query.query, flags) if query.regex else None
         lowered = query.query.lower() if query.ignore_case and not query.regex else None
@@ -440,8 +442,10 @@ class VirtualFileSystem:
                     if query.query in line:
                         matched = True
                 if matched:
-                    results.append(SearchResult(path=path, line_no=idx, line_text=line))
-        return results
+                    file_results.append(
+                        SearchResult(path=path, line_no=idx, line_text=line)
+                    )
+        return file_results
 
     def glob(
         self,
