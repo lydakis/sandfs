@@ -18,7 +18,7 @@ from .nodes import VirtualDirectory, VirtualFile, VirtualNode
 from .policies import VisibilityView
 from .pyexec import PythonExecutor
 from .search import SearchQuery
-from .shell_parser import CommandSpec, Pipeline, parse_pipeline
+from .shell_parser import parse_pipeline
 from .vfs import DirEntry, VirtualFileSystem
 
 

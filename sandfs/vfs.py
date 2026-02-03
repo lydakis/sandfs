@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import re
-import contextlib
 import tempfile
 import time
 from collections.abc import Iterable, Iterator, Mapping
@@ -255,9 +255,8 @@ class VirtualFileSystem:
         if self._full_text_index is None:
             return
         entries = []
-        for path, file_node in self.iter_files(
-            "/", recursive=True, skip_prefixes=[self._search_view_prefix] if self._search_view_prefix else None
-        ):
+        skip_prefixes = [self._search_view_prefix] if self._search_view_prefix else None
+        for path, file_node in self.iter_files("/", recursive=True, skip_prefixes=skip_prefixes):
             try:
                 content = file_node.read(self)
             except InvalidOperation:
@@ -399,7 +398,9 @@ class VirtualFileSystem:
                 ]
             filtered: list[SearchResult] = []
             for result in results:
-                if self._search_view_prefix and result.path.is_relative_to(self._search_view_prefix):
+                if self._search_view_prefix and result.path.is_relative_to(
+                    self._search_view_prefix
+                ):
                     continue
                 try:
                     node = self.get_node(result.path)
