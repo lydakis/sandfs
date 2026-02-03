@@ -91,3 +91,34 @@ def test_filesystem_adapter_sync_refreshes_vfs(tmp_path):
     (root / "a.txt").write_text("external")
     vfs.sync_storage("/data")
     assert vfs.read_file("/data/a.txt") == "external"
+
+
+def test_filesystem_adapter_blocks_path_escape(tmp_path):
+    root = tmp_path / "fs"
+    root.mkdir()
+    adapter = FileSystemAdapter(root)
+
+    with pytest.raises(ValueError):
+        adapter.write("../escape.txt", "nope", version=0)
+
+
+def test_filesystem_adapter_version_mismatch(tmp_path):
+    root = tmp_path / "fs"
+    root.mkdir()
+    adapter = FileSystemAdapter(root)
+
+    adapter.write("a.txt", "one", version=0)
+    with pytest.raises(ValueError):
+        adapter.write("a.txt", "two", version=0)
+
+
+def test_filesystem_adapter_delete_removes_file(tmp_path):
+    root = tmp_path / "fs"
+    root.mkdir()
+    adapter = FileSystemAdapter(root)
+
+    adapter.write("a.txt", "hello", version=0)
+    adapter.delete("a.txt")
+    assert not (root / "a.txt").exists()
+    with pytest.raises(FileNotFoundError):
+        adapter.read("a.txt")
