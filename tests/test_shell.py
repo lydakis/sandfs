@@ -5,6 +5,22 @@ def setup_shell() -> SandboxShell:
     vfs = VirtualFileSystem()
     vfs.write_file("/workspace/app.py", "print('hi')\n")
     vfs.write_file("/workspace/README.md", "hello world\n")
+    vfs.write_file(
+        "/workspace/notes.txt",
+        "\n".join(
+            [
+                "first line",
+                "pattern line",
+                "Another PATTERN entry",
+            ]
+        )
+        + "\n",
+    )
+    vfs.write_file("/workspace/docs/guide.txt", "regex123\nmore text\n")
+    vfs.write_file(
+        "/workspace/docs/reference/spec.txt",
+        "prefix regex999 suffix\n",
+    )
     return SandboxShell(vfs)
 
 
@@ -27,6 +43,26 @@ def test_rg_search():
     shell = setup_shell()
     res = shell.exec("rg hello /workspace")
     assert "/workspace/README.md:" in res.stdout
+
+
+def test_grep_line_numbers():
+    shell = setup_shell()
+    res = shell.exec("grep -n pattern /workspace/notes.txt")
+    assert "2:pattern line" in res.stdout
+
+
+def test_grep_case_insensitive():
+    shell = setup_shell()
+    res = shell.exec("grep -i PATTERN /workspace/notes.txt")
+    assert "pattern line" in res.stdout
+    assert "Another PATTERN entry" in res.stdout
+
+
+def test_grep_recursive_regex():
+    shell = setup_shell()
+    res = shell.exec("grep -E -e 'regex[0-9]+' -r /workspace/docs")
+    assert "/workspace/docs/guide.txt:regex123" in res.stdout
+    assert "/workspace/docs/reference/spec.txt:prefix regex999 suffix" in res.stdout
 
 
 def test_python_executor():
