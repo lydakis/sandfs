@@ -840,6 +840,10 @@ class SandboxShell:
                 regex = True
                 idx += 1
                 continue
+            if token in ("-E", "--extended-regexp"):
+                regex = True
+                idx += 1
+                continue
             if pattern is None:
                 pattern = token
             else:
