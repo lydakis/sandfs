@@ -260,3 +260,15 @@ fn unknown_tools_and_bad_arguments() {
     assert!(fails(&mut s, "read", json!({ "path": "/data/README.md", "limit": -1 })).contains("non-negative integer"));
     assert!(fails(&mut s, "delete", json!({ "path": "/x", "recursive": "yes" })).contains("true or false"));
 }
+
+#[test]
+fn grep_cut_short_by_context_is_not_reported_as_no_matches() {
+    let mut s = server();
+    let dir = (0..30).map(|i| format!("{i:0>100}")).collect::<Vec<_>>().join("/");
+    let path = format!("/data/{dir}/wide.txt");
+    let text = format!("{}needle\n", format!("{}\n", "x".repeat(500)).repeat(20));
+    ok(&mut s, "write", json!({ "path": path, "content": text }));
+    let out = ok(&mut s, "grep", json!({ "pattern": "needle", "path": "/data", "context": 20 }));
+    assert!(!out.starts_with("No matches"), "{}", &out[out.len() - 200..]);
+    assert!(out.ends_with("output cut short, narrow the path or glob]"), "{}", &out[out.len() - 200..]);
+}

@@ -226,7 +226,9 @@ impl Tools {
             search.file(&self.workspace, &root);
         }
 
-        if search.matches == 0 {
+        // Context lines can fill the output before the first hit is printed, which is
+        // still a match, not "No matches".
+        if search.matches == 0 && !search.truncated {
             let unread = match search.unreadable {
                 0 => String::new(),
                 n => format!(" ({n} files could not be read)"),
