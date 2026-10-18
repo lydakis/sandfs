@@ -86,6 +86,8 @@ sandfs unmount ~/ws/cleanup                      # changes stay saved
 sandfs mount cleanup ~/ws/cleanup                # and come back
 ```
 
+`sandfs serve --mcp NAME` gives an unmounted workspace to an agent as MCP file tools instead, with the source's files under `/mnt`; whatever the agent changes is saved for the next `mount` or `changes`.
+
 A workspace keeps its source from when it was created. Changes live in memory and are saved under `$SANDFS_HOME` (default `~/.local/share/sandfs`) shortly after each write. `git:<path or url>[@rev]` mounts a commit instead of a folder; for a remote repository sandfs keeps a partial clone and fetches a directory's files in one request when it is first listed.
 
 ## What sandfs is not

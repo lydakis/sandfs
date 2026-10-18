@@ -150,6 +150,7 @@ fn a_directory_source_is_never_written() {
     let ws = dirs.path().join("data");
     let source = data.path().to_str().unwrap();
     sandfs.mount(&["mount", source, ws.to_str().unwrap()], &ws);
+    assert!(!sandfs.try_run(&["serve", "--mcp", "data"]).status.success(), "one writer at a time");
 
     let mut rows = std::fs::read_to_string(ws.join("raw/rows.csv")).unwrap();
     rows.push_str("2,20\n");

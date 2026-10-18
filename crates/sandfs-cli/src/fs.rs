@@ -633,7 +633,7 @@ impl Inner {
 }
 
 /// The keys of `map` equal to `prefix` or below it.
-fn subtree_keys<T>(map: &BTreeMap<String, T>, prefix: &VPath) -> Vec<String> {
+pub(crate) fn subtree_keys<T>(map: &BTreeMap<String, T>, prefix: &VPath) -> Vec<String> {
     let p = prefix.as_str();
     let mut keys: Vec<String> = map.contains_key(p).then(|| p.to_owned()).into_iter().collect();
     // '0' is the byte after '/', so this range is exactly the paths below `prefix`.

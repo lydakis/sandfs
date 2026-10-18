@@ -15,6 +15,8 @@ sandfs list                                      # workspaces and where they are
 sandfs rm cleanup                                # forget a workspace and its changes
 ```
 
+`sandfs serve --mcp NAME` hands an unmounted workspace to an agent as MCP file tools over stdin and stdout (read, list, glob, grep, write, edit, move, delete, changes), with the source's files under `/mnt`. Each change is saved before its reply, so a later `mount` or `changes` sees it.
+
 A workspace keeps its source from when it was created. Changes are saved under `$SANDFS_HOME` (default `~/.local/share/sandfs`) shortly after each write. `git:<path or url>[@rev]` mounts a commit instead of a folder; for a remote repository sandfs keeps a partial clone and fetches file contents when they are first read.
 
 See the [repository](https://github.com/lydakis/sandfs) for the design.
