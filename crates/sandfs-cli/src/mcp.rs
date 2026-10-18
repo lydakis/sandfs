@@ -6,10 +6,11 @@
 
 use std::io::{BufRead, Write};
 
+use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use anyhow::{Result, bail};
-use sandfs_core::VPath;
+use sandfs_core::{VPath, Workspace};
 use sandfs_mcp::Server;
 use serde_json::{Value, json};
 
@@ -53,15 +54,19 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             None => server.handle(&line),
         };
         if reply.as_deref().is_some_and(succeeded) {
-            // Changes reports files only: record touched directories and deletions so
-            // they are saved too, and give changed paths a new modification time.
+            // Changes reports files only, so record the directories a call may have
+            // created (parents, a moved subtree) and the paths it removed, and give
+            // changed paths a new modification time.
             let ws = server.workspace();
             for path in &touched {
+                for parent in path.ancestors().into_iter().filter(|p| p.starts_with(&root) && *p != root) {
+                    dirs.insert(parent.to_string());
+                }
                 match ws.stat(path.as_str()) {
                     Ok(meta) => {
                         times.insert(path.to_string(), SystemTime::now());
                         if meta.kind.is_dir() {
-                            dirs.insert(path.to_string());
+                            add_subtree(ws, path, &mut dirs);
                         }
                     }
                     Err(_) => {
@@ -95,6 +100,16 @@ fn touched_paths(request: &Value) -> Option<Vec<VPath>> {
     };
     // A malformed path is left to the tool to reject.
     Some(keys.iter().filter_map(|key| VPath::parse(params["arguments"][key].as_str()?).ok()).collect())
+}
+
+/// Add `dir` and every directory below it to `dirs`.
+fn add_subtree(ws: &Workspace, dir: &VPath, dirs: &mut BTreeSet<String>) {
+    dirs.insert(dir.to_string());
+    for entry in ws.list(dir.as_str()).unwrap_or_default() {
+        if let (true, Ok(child)) = (entry.kind.is_dir(), dir.join(&entry.name)) {
+            add_subtree(ws, &child, dirs);
+        }
+    }
 }
 
 /// Whether a reply reports a tool call that succeeded.
@@ -156,6 +171,7 @@ mod tests {
     fn later_sessions_keep_earlier_changes_and_directory_removals() {
         let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         std::fs::create_dir_all(data.path().join("old/empty")).unwrap();
+        std::fs::create_dir_all(data.path().join("keep/inner")).unwrap();
         std::fs::write(data.path().join("old/rows.csv"), "1\n").unwrap();
         let home = Home::at(state.path());
         home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
@@ -167,6 +183,9 @@ mod tests {
                 call(1, "write", json!({ "path": "/mnt/b.txt", "content": "second\n" })),
                 call(2, "delete", json!({ "path": "/mnt/old", "recursive": true })),
                 call(3, "write", json!({ "path": "/outside.txt", "content": "x" })),
+                call(4, "move", json!({ "from": "/mnt/keep", "to": "/mnt/moved" })),
+                call(5, "write", json!({ "path": "/mnt/deep/er/c.txt", "content": "c" })),
+                call(6, "delete", json!({ "path": "/mnt/deep/er/c.txt" })),
             ]
             .concat(),
         );
@@ -177,6 +196,9 @@ mod tests {
         assert_eq!(reopened.ws.read_text("/mnt/a.txt").unwrap(), "first\n", "an earlier object is not overwritten");
         assert_eq!(reopened.ws.read_text("/mnt/b.txt").unwrap(), "second\n");
         assert!(!reopened.ws.exists("/mnt/old"), "a removed directory stays removed");
+        assert!(reopened.ws.exists("/mnt/moved/inner"), "an empty directory moves with its parent");
+        assert!(!reopened.ws.exists("/mnt/keep"));
+        assert!(reopened.ws.exists("/mnt/deep/er"), "parents a write created are kept");
         assert!(reopened.restored.times.contains_key("/mnt/b.txt"), "changed files get a modification time");
     }
 }
