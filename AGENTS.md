@@ -28,7 +28,7 @@
 ## Commit & Pull Request Guidelines
 - Write commits in imperative present tense ("Fix version reuse after delete"). Each commit should include or reference updated tests.
 - Pull requests should describe the behavior change, note any API changes, and mention how to run the new tests.
-- Tag releases (`v0.x.y`) and let GitHub Actions build the wheels and publish via the trusted PyPI workflow; the tag must match the `Cargo.toml` version. Publish the crates by hand, as `docs/publishing.md` describes.
+- Tag releases (`v0.x.y`) and let GitHub Actions build the wheels and publish via the trusted PyPI workflow; the tag must match the `Cargo.toml` version. The same tag publishes the crates to crates.io; `docs/publishing.md` has the one-time setup.
 
 ## Scope
 - sandfs is a general-purpose sandbox filesystem: files are bytes of any kind, and code is one use case among many. Don't add features that only make sense for source code to the core; text tools belong in the MCP crate.
