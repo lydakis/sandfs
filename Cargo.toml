@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sandfs-core", "crates/sandfs-git"]
+members = ["crates/sandfs-core", "crates/sandfs-git", "crates/sandfs-mcp"]
 
 [workspace.package]
 version = "0.1.0"
