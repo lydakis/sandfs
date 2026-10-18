@@ -151,6 +151,8 @@ impl Saved {
         let p = path.as_str();
         let current = match ws.stat(p) {
             Ok(meta) => Some(meta.kind),
+            // Below a file that replaced a directory: the file already hides it.
+            Err(Error::NotFound(_) | Error::NotADirectory(_)) if *entry == Entry::Absent => None,
             Err(Error::NotFound(_)) => None,
             Err(err) => return Err(err.into()),
         };
@@ -412,6 +414,21 @@ mod tests {
         reopened.collect_garbage();
         assert_eq!(objects(state.path()), ["3"], "the serving process clears what the index no longer uses");
         assert_eq!(reopened.next_object, 4);
+    }
+
+    #[test]
+    fn a_file_that_replaced_a_directory_is_restored() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.remove("/mnt/dir", true).unwrap();
+        ws.write("/mnt/dir", "now a file").unwrap();
+        let snap = Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: ["/mnt/dir".to_owned()].into() };
+        Saved::new(state.path()).save(&snap, &root()).unwrap();
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/dir").unwrap(), "now a file");
+        assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
     }
 
     #[test]

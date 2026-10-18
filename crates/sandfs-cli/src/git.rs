@@ -73,25 +73,30 @@ fn clone_or_fetch(repos: &Path, url: &str) -> Result<PathBuf> {
         let _ = std::fs::remove_dir_all(&tmp);
         bail!("git clone {url} failed");
     }
-    std::fs::rename(&tmp, &dest).context("moving the clone into place")?;
+    if let Err(err) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Another mount of the same URL may have finished its clone first.
+        if !dest.join("HEAD").exists() {
+            return Err(err).context("moving the clone into place");
+        }
+    }
     Ok(dest)
 }
 
-/// Split a trailing `@rev`. Only an `@` after the last `/` counts, so the `git@` of an
-/// scp-style URL or the user of an https URL is left alone.
+/// Split a trailing `@rev`, which may contain slashes (`@feature/x`). The `@` of a
+/// URL's user (`git@host:repo`, `https://me@host/repo`) is left alone.
 fn split_rev(spec: &str) -> (&str, Option<String>) {
-    let tail = spec.rfind('/').map_or(0, |idx| idx + 1);
-    match spec[tail..].rfind('@') {
-        // Ref names cannot contain ':', which also rules out the host of `user@host:repo`.
-        Some(at) if tail + at > 0 && !spec[tail + at..].contains(':') => {
-            (&spec[..tail + at], Some(spec[tail + at + 1..].to_owned()))
-        }
-        _ => (spec, None),
-    }
+    let Some(at) = spec.rfind('@') else { return (spec, None) };
+    let (location, rev) = (&spec[..at], &spec[at + 1..]);
+    // Ref names cannot contain ':', which rules out the host of `user@host:repo`, and
+    // an https user is followed by a host with no path before it.
+    let user_of_url = location.split_once("://").is_some_and(|(_, rest)| !rest.contains('/'));
+    if at == 0 || rev.contains(':') || user_of_url { (spec, None) } else { (location, Some(rev.to_owned())) }
 }
 
+/// A URL, or scp-style `[user@]host:path`, as git reads it: a ':' before any '/'.
 fn is_url(location: &str) -> bool {
-    location.contains("://") || (location.contains('@') && location.contains(':') && !location.starts_with('/'))
+    location.contains("://") || location.find(':').is_some_and(|colon| !location[..colon].contains('/'))
 }
 
 /// `https://github.com/owner/repo.git` becomes `github.com/owner/repo.git`.
@@ -145,6 +150,8 @@ mod tests {
         assert_eq!(split("git@github.com:o/r.git@dev"), ("git@github.com:o/r.git".into(), Some("dev".into())));
         assert_eq!(split("https://u@host/r"), ("https://u@host/r".into(), None));
         assert_eq!(split("git@host:repo"), ("git@host:repo".into(), None));
+        assert_eq!(split("/srv/repo@feature/foo"), ("/srv/repo".into(), Some("feature/foo".into())));
+        assert_eq!(split("https://u@host/r@release/1.0"), ("https://u@host/r".into(), Some("release/1.0".into())));
         assert!(resolve(Path::new("/nonexistent"), "repo@").is_err());
     }
 
@@ -156,7 +163,7 @@ mod tests {
         );
         assert_eq!(cache_path("git@github.com:o/r.git").unwrap(), Path::new("github.com/o/r.git"));
         assert!(cache_path("https://host/../x").is_err());
-        assert!(is_url("https://github.com/o/r") && is_url("git@github.com:o/r"));
-        assert!(!is_url("/home/me/repo") && !is_url("~/src/repo"));
+        assert!(is_url("https://github.com/o/r") && is_url("git@github.com:o/r") && is_url("github.com:o/r"));
+        assert!(!is_url("/home/me/repo") && !is_url("~/src/repo") && !is_url("./a:b"));
     }
 }

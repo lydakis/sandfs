@@ -38,12 +38,12 @@ impl Sandfs {
         Sandfs { home: tempfile::tempdir().unwrap(), mounts: Vec::new() }
     }
 
+    fn try_run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_sandfs")).env("SANDFS_HOME", self.home.path()).args(args).output().unwrap()
+    }
+
     fn run(&self, args: &[&str]) -> Output {
-        let output = Command::new(env!("CARGO_BIN_EXE_sandfs"))
-            .env("SANDFS_HOME", self.home.path())
-            .args(args)
-            .output()
-            .unwrap();
+        let output = self.try_run(args);
         assert!(output.status.success(), "sandfs {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         output
     }
@@ -143,6 +143,9 @@ fn a_directory_source_is_never_written() {
     std::fs::write(data.path().join("raw/rows.csv"), "id,value\n1,10\n").unwrap();
 
     let mut sandfs = Sandfs::new();
+    let inside = data.path().join("ws");
+    let refused = sandfs.try_run(&["mount", data.path().to_str().unwrap(), inside.to_str().unwrap()]);
+    assert!(!refused.status.success() && !inside.exists(), "a mount inside its own source is refused");
     let dirs = tempfile::tempdir().unwrap();
     let ws = dirs.path().join("data");
     let source = data.path().to_str().unwrap();

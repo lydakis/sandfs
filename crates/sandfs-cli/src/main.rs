@@ -21,7 +21,7 @@ use sandfs_core::{ChangeKind, VPath};
 
 use crate::fs::{Inner, SandFs, Shared};
 use crate::persist::Saved;
-use crate::store::{Home, MountInfo, ROOT, check_name, is_mounted};
+use crate::store::{Base, Home, MountInfo, ROOT, check_name, is_mounted};
 
 #[derive(Parser)]
 #[command(name = "sandfs", version, about = "Lazy, copy-on-write workspaces mounted with FUSE")]
@@ -190,6 +190,14 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
     if let Some(info) = home.mount_info(name) {
         bail!("{name} is already mounted at {}", info.mountpoint.display());
     }
+    // The source is read through its host path, so a mount on top of it or inside it
+    // would read itself (and create the mount point inside a read-only source).
+    if let Base::Dir { path } = home.record(name)?.base {
+        let target = resolve_new(dir)?;
+        if target.starts_with(&path) || path.starts_with(&target) {
+            bail!("{} overlaps the source folder {}; mount it somewhere else", target.display(), path.display());
+        }
+    }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let dir = dir.canonicalize()?;
     if is_mounted(&dir) {
@@ -228,6 +236,21 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
     }
     let _ = child.kill();
     bail!("timed out waiting for the mount at {}", dir.display())
+}
+
+/// The canonical path `dir` will have once created: its nearest existing ancestor,
+/// resolved, plus the components that do not exist yet.
+fn resolve_new(dir: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(dir)?;
+    let mut rest = Vec::new();
+    let mut existing = absolute.as_path();
+    while !existing.exists() {
+        rest.push(existing.file_name().context("no existing parent directory")?);
+        existing = existing.parent().context("no existing parent directory")?;
+    }
+    let mut resolved = existing.canonicalize()?;
+    resolved.extend(rest.into_iter().rev());
+    Ok(resolved)
 }
 
 /// Serve `name` at `dir` until it is unmounted, then save its changes.
@@ -271,7 +294,10 @@ fn unmount(info: &MountInfo, mount_file: &Path) -> Result<()> {
     }
     let proc = PathBuf::from(format!("/proc/{}", info.pid));
     let deadline = Instant::now() + Duration::from_secs(60);
-    while mount_file.exists() && proc.exists() && Instant::now() < deadline {
+    while mount_file.exists() && proc.exists() {
+        if Instant::now() >= deadline {
+            bail!("unmounted, but process {} is still saving the workspace's changes", info.pid);
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())

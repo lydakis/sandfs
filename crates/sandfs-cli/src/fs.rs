@@ -540,6 +540,12 @@ impl Inner {
 
     /// Move a file's write buffer into the workspace. A removed file's buffer stays
     /// where it is: it belongs to nobody but the handles still open on it.
+    /// Commit every open file's buffer, so a save includes writes not yet flushed.
+    pub fn commit_all(&mut self) -> FsResult<()> {
+        let inos: Vec<u64> = self.buffers.keys().copied().collect();
+        inos.into_iter().try_for_each(|ino| self.commit(ino))
+    }
+
     pub fn commit(&mut self, ino: u64) -> FsResult<()> {
         let Ok(path) = self.path(ino) else { return Ok(()) };
         let Some(buffer) = self.buffers.remove(&ino) else { return Ok(()) };
@@ -879,7 +885,8 @@ impl Filesystem for SandFs {
     /// `fsync` on a directory saves the whole workspace; the CLI uses it to make sure
     /// a fork or `changes` sees everything written so far.
     fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        let result = self.0.save().map_err(|err| log_io(&err));
+        let committed = self.0.lock().commit_all();
+        let result = committed.and_then(|()| self.0.save().map_err(|err| log_io(&err)));
         self.reply_empty(reply, result);
     }
 
@@ -968,6 +975,20 @@ mod tests {
         fs.release(fh).unwrap();
         assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\nworld\n");
         assert!(fs.unsaved);
+    }
+
+    #[test]
+    fn syncing_the_directory_commits_open_files() {
+        let mut fs = fs();
+        let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let fh = fs.open(ino, false).unwrap();
+        fs.write(ino, 6, b"world\n").unwrap();
+        fs.commit_all().unwrap();
+        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\nworld\n");
+        fs.write(ino, 12, b"!\n").unwrap();
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\nworld\n!\n", "writes go on after a commit");
+        fs.release(fh).unwrap();
+        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\nworld\n!\n");
     }
 
     #[test]
