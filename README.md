@@ -4,6 +4,8 @@
 
 > **Status**: design prototype. APIs are subject to change.
 
+> **Direction**: the core is being rewritten in Rust under `crates/` as a lean primitive: lazy mounts (a git commit, a host directory), a copy-on-write workspace that forks in O(1), and a diff of what changed. Python 0.3 is the last release of the design below; the shell, host bridge, Python executor and storage adapters are not carried forward. See [the roadmap](docs/roadmap.md).
+
 ## Why?
 
 Agent builders frequently need a scratch filesystem for planning, iterating on generated code, and testing hypotheses. Shipping a simple `exec` tool that proxies every bash command to the host disk is unsafe. `sandfs` keeps those operations inside a controlled, in-memory sandbox while still feeling like a mini Linux environment.
@@ -116,7 +118,7 @@ sandfs shell --mount /Users/me/project:/workspace
 
 ```python
 vfs.set_policy(
-    "/blue/identity/persona.md",
+    "/agent/identity/persona.md",
     NodePolicy(writable=False, classification="private", principals={"alice", "bob"}),
 )
 shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}, principals={"alice"}))
@@ -164,9 +166,12 @@ Snapshots capture the entire tree (including storage-backed nodes) so you can ch
 
 ```
 .
-├── docs/               # design/vision notes
-├── sandfs/             # library sources
-└── tests/              # runtime smoke tests
+├── crates/
+│   ├── sandfs-core/    # Rust core: workspaces, sources, overlay, diff
+│   └── sandfs-git/     # lazy git commit mounts
+├── docs/               # roadmap and notes
+├── sandfs/             # Python library (0.3 design)
+└── tests/              # Python tests
 ```
 
 ## Local development
@@ -194,9 +199,9 @@ vfs = VirtualFileSystem()
 def flush(event: WriteEvent) -> None:
     save_to_db(event.path, event.content, event.version)
 
-vfs.register_write_hook("/blue/work", flush)
-vfs.write_file("/blue/work/note.md", "draft")
-vfs.write_file("/blue/work/note.md", "final", expected_version=1)
+vfs.register_write_hook("/agent/work", flush)
+vfs.write_file("/agent/work/note.md", "draft")
+vfs.write_file("/agent/work/note.md", "final", expected_version=1)
 ```
 
 ### Integration hooks
@@ -205,7 +210,7 @@ vfs.write_file("/blue/work/note.md", "final", expected_version=1)
 from sandfs.integrations import InboxRecorder
 
 recorder = InboxRecorder()
-recorder.attach(vfs, "/blue/inbox")
+recorder.attach(vfs, "/agent/inbox")
 ```
 
 `PathEvent` (used under the hood) carries the path, event type (`create`, `update`, `delete`), and latest content so you can fan writes into staging queues or audit logs.
@@ -216,5 +221,5 @@ MIT
 
 ## Further reading
 
-- [Using sandfs with Blue](docs/blue.md)
+- [Roadmap](docs/roadmap.md)
 - [Publishing sandfs](docs/publishing.md)
