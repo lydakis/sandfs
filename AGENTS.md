@@ -4,8 +4,8 @@
 - `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `changes()` reports) plus the directory and in-memory sources, `sandfs-git` is an optional lazy git source, and `sandfs-py` is the PyO3 extension, including sources written in Python. New capabilities land here.
 - `sandfs/` is the Python package: re-exports from the `sandfs._core` extension, its type stubs (`_core.pyi`) and the `Source` protocol (`source.py`). Keep it thin; logic belongs in Rust.
 - `tests/` contains the pytest suites for the Python surface; Rust tests live next to each crate (`crates/*/tests`).
-- `docs/` tracks the roadmap and release notes. Keep repository-wide guidance in README and this file.
-- `pyproject.toml` holds the package metadata and the version that drives the release workflow; update it before tagging.
+- `docs/` tracks the roadmap, changelog and release steps (`docs/publishing.md`). Keep repository-wide guidance in README and this file.
+- The version lives once, in the root `Cargo.toml` (`[workspace.package]`); the crates inherit it and maturin copies it into the Python package. `pyproject.toml` holds the rest of the package metadata.
 
 ## Build, Test, and Development Commands
 - `uv pip install -e .[dev]` – build the extension with maturin and install sandfs in editable mode inside `.venv`. Re-run it after changing Rust code.
@@ -28,7 +28,7 @@
 ## Commit & Pull Request Guidelines
 - Write commits in imperative present tense ("Fix version reuse after delete"). Each commit should include or reference updated tests.
 - Pull requests should describe the behavior change, note any API changes, and mention how to run the new tests.
-- Tag releases (`v0.x.y`) and let GitHub Actions build the wheels and publish via the trusted PyPI workflow; keep `pyproject.toml` in sync with the tag.
+- Tag releases (`v0.x.y`) and let GitHub Actions build the wheels and publish via the trusted PyPI workflow; the tag must match the `Cargo.toml` version. Publish the crates by hand, as `docs/publishing.md` describes.
 
 ## Scope
 - sandfs is a general-purpose sandbox filesystem: files are bytes of any kind, and code is one use case among many. Don't add features that only make sense for source code to the core; text tools belong in the MCP crate.

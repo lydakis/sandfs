@@ -11,7 +11,7 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 - **Changes are files, not patches.** The harness walks `changes()` and writes each changed file back to wherever its data lives.
 - **Execution stays out of scope.** Real tools run in a container or on the host against a FUSE mount.
 
-Python 0.3 was the last release of the original design. Its shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are symlinks and core text edits, which only code needed.
+0.2.2 was the last published release of the original design, and 0.4.0 is the first of this one. The original design's shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are symlinks and core text edits, which only code needed.
 
 ## Build order
 

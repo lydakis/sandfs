@@ -4,14 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "sandfs"
-version = "0.4.0.dev0"
+dynamic = ["version"]
 description = "A lazy, copy-on-write sandbox filesystem for agents: mount any data, fork in O(1), see what changed"
 requires-python = ">=3.11"
 authors = [
   { name = "sandfs contributors" }
 ]
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["virtual filesystem", "sandbox", "agents", "copy-on-write", "workspace"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -22,7 +23,6 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
-  "License :: OSI Approved :: MIT License",
   "Topic :: System :: Filesystems",
   "Topic :: Software Development :: Libraries",
   "Typing :: Typed",

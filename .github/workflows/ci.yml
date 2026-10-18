@@ -51,3 +51,5 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace
+      - name: Check the crates package
+        run: cargo package --workspace --exclude sandfs-py
