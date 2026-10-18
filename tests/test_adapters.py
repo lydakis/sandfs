@@ -204,3 +204,19 @@ def test_copy_and_move_emit_path_events():
         ("/src/b.txt", "delete"),
         ("/src/c.txt", "create"),
     ]
+
+
+def test_move_of_storage_mount_root_is_rejected():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.mkdir("/outer")
+    vfs.mount_storage("/outer/inner", MemoryStorageAdapter(initial={"b.txt": "B"}))
+
+    with pytest.raises(InvalidOperation):
+        vfs.move("/d", "/renamed")
+    with pytest.raises(InvalidOperation):
+        vfs.move("/outer", "/elsewhere")
+
+    assert sorted(adapter.list()) == ["a.txt"]
+    assert vfs.read_file("/d/a.txt") == "A"

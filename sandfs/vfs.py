@@ -706,6 +706,10 @@ class VirtualFileSystem:
         if dest_parent is node:
             raise InvalidOperation("Cannot move a node into itself")
 
+        # Storage mounts are registered by path; moving one would orphan its adapter.
+        if any(mount == node_path or node_path in mount.parents for mount in self._storage_mounts):
+            raise InvalidOperation(f"Cannot move {node_path}: it is or contains a storage mount")
+
         moved_files = [(file_node.path(), file_node) for file_node in self._loaded_files(node)]
         parent.remove_child(node.name)
         node.name = dest_name
@@ -927,7 +931,8 @@ class VirtualFileSystem:
         node = self._resolve_dir(source or self.cwd.path())
         target = Path(target)
         target.mkdir(parents=True, exist_ok=True)
-        self._export_directory(node, target, view)
+        if self._export_allows(node, view):
+            self._export_directory(node, target, view)
         return target
 
     @contextlib.contextmanager

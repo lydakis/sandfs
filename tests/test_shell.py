@@ -383,3 +383,13 @@ def test_host_fallback_implies_host_commands():
 
     assert result.exit_code == 0
     assert result.stdout == "hi"
+
+
+def test_enabling_host_fallback_later_registers_host_commands():
+    shell = SandboxShell(VirtualFileSystem())
+    assert "host" not in shell.available_commands()
+
+    shell.host_fallback = True
+
+    assert {"host", "bash", "sh"} <= set(shell.available_commands())
+    assert shell.exec("host echo hi").stdout.strip() == "hi"

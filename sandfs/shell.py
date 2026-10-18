@@ -78,10 +78,35 @@ class SandboxShell:
         self.view = view or VisibilityView()
         self.allowed_commands: set[str] | None = set(allowed_commands) if allowed_commands else None
         self.max_output_bytes = max_output_bytes
-        self.host_fallback = host_fallback
-        self.host_commands = host_commands or host_fallback
+        self.host_commands = False
+        self._host_fallback = False
         self._handler_accepts_ctx: dict[str, bool] = {}
         self._register_builtin_commands()
+        if host_commands:
+            self._enable_host_commands()
+        self.host_fallback = host_fallback
+
+    @property
+    def host_fallback(self) -> bool:
+        """Whether unknown commands run on the host; enabling it also enables host commands."""
+        return self._host_fallback
+
+    @host_fallback.setter
+    def host_fallback(self, value: bool) -> None:
+        self._host_fallback = value
+        if value:
+            self._enable_host_commands()
+
+    def _enable_host_commands(self) -> None:
+        if self.host_commands:
+            return
+        self.host_commands = True
+        for name, handler, description in (
+            ("host", self._cmd_host, "Run host command in materialized tree"),
+            ("bash", self._cmd_shell_host, "Run bash via host"),
+            ("sh", self._cmd_shell_host, "Run sh via host"),
+        ):
+            self.register_command(name, handler, description=description)
 
     # ------------------------------------------------------------------
     # Command registration
@@ -245,8 +270,11 @@ class SandboxShell:
         skipped: list[PurePosixPath] = []
         for path in sorted(fs_root.rglob("*")):
             sandbox_path = PurePosixPath("/").joinpath(*path.relative_to(fs_root).parts)
+            if any(parent in skipped for parent in sandbox_path.parents):
+                continue
             if sandbox_path not in exported and self.vfs.exists(sandbox_path):
-                # The host created a path that shadows a node it was never shown.
+                # The host created a path that shadows a node it was never shown;
+                # everything beneath it is skipped too.
                 skipped.append(sandbox_path)
                 continue
             if path.is_dir():
@@ -282,9 +310,11 @@ class SandboxShell:
     ) -> None:
         existing_dirs: list[PurePosixPath] = []
         existing_files: list[PurePosixPath] = []
+        unexported: list[PurePosixPath] = []
         for path, node in self.vfs.walk("/"):
             sandbox_path = PurePosixPath(path)
             if sandbox_path not in exported:
+                unexported.append(sandbox_path)
                 continue
             if isinstance(node, VirtualDirectory):
                 existing_dirs.append(sandbox_path)
@@ -296,8 +326,12 @@ class SandboxShell:
         for dir_path in sorted(existing_dirs, key=lambda p: len(p.parts), reverse=True):
             if dir_path == PurePosixPath("/"):
                 continue
-            if dir_path not in host_dirs and str(dir_path) != "/":
-                self.vfs.remove(str(dir_path), recursive=True)
+            if dir_path in host_dirs:
+                continue
+            # Keep a directory that still holds nodes the host was never shown.
+            if any(dir_path in hidden.parents for hidden in unexported):
+                continue
+            self.vfs.remove(str(dir_path), recursive=True)
 
     # ------------------------------------------------------------------
     # Dispatcher
@@ -553,12 +587,6 @@ class SandboxShell:
             ("tail", self._cmd_tail, "Output the last part of files"),
             ("find", self._cmd_find, "Search for files in a directory hierarchy"),
         ]
-        if self.host_commands:
-            builtin_commands += [
-                ("host", self._cmd_host, "Run host command in materialized tree"),
-                ("bash", self._cmd_shell_host, "Run bash via host"),
-                ("sh", self._cmd_shell_host, "Run sh via host"),
-            ]
         for name, handler, description in builtin_commands:
             self.register_command(name, handler, description=description)
 

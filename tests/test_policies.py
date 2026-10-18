@@ -83,3 +83,39 @@ def test_host_sync_keeps_files_it_did_not_export():
     assert result.exit_code == 0
     assert vfs.read_file("/work/private.txt") == "PRIVATE"
     assert vfs.exists("/work/b.txt")
+
+
+def test_host_sync_rejects_writes_beneath_hidden_directories():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/secret/key.txt", "TOPSECRET")
+    vfs.write_file("/work/a.txt", "a")
+    vfs.set_policy("/secret", NodePolicy(readable=False))
+    shell = SandboxShell(vfs, host_commands=True)
+
+    result = shell.exec("host -p / sh -c 'mkdir secret; echo hacked > secret/new.txt'")
+
+    assert not vfs.exists("/secret/new.txt")
+    assert "did not sync /secret" in result.stderr
+
+
+def test_host_sync_keeps_hidden_children_of_deleted_directories():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/work/a.txt", "a")
+    vfs.write_file("/work/private/notes.txt", "PRIVATE")
+    vfs.set_policy("/work/private", NodePolicy(readable=False))
+    shell = SandboxShell(vfs, host_commands=True)
+
+    shell.exec("host -p / rm -rf work")
+
+    assert not vfs.exists("/work/a.txt")
+    assert vfs.exists("/work/private/notes.txt")
+
+
+def test_export_skips_an_unreadable_root(tmp_path):
+    vfs = VirtualFileSystem()
+    vfs.write_file("/secret/key.txt", "TOPSECRET")
+    vfs.set_policy("/secret", NodePolicy(readable=False))
+    vfs.set_policy("/secret/key.txt", NodePolicy(readable=True))
+
+    with vfs.materialize("/secret") as root:
+        assert list(root.iterdir()) == []
