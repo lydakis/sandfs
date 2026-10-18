@@ -14,6 +14,8 @@ const DEFAULT_READ_LINES: usize = 2000;
 const MAX_READ_LINE_CHARS: usize = 2000;
 const DEFAULT_READ_BYTES: u64 = 20_000;
 const MAX_READ_BYTES: u64 = 60_000;
+/// How much of a file's start decides whether a byte read treats it as text.
+const SNIFF_BYTES: u64 = 8192;
 const MAX_GREP_LINE_CHARS: usize = 500;
 const MAX_ENTRIES: usize = 1000;
 const DEFAULT_GREP_MATCHES: usize = 200;
@@ -144,38 +146,45 @@ impl Tools {
     }
 
     /// Show a byte range of a text file as raw text, read without loading the whole file.
+    ///
+    /// Nothing here needs the file's size or version, since getting those can mean
+    /// reading the whole file from a source that does not report sizes.
     fn read_bytes(&self, path: &str, offset: u64, length: u64) -> ToolResult {
         if length > MAX_READ_BYTES {
             return Err(format!("byte_length must be at most {MAX_READ_BYTES}"));
         }
-        // A UTF-8 character is at most 4 bytes, so any range this long holds a whole one.
-        let length = length.max(4);
-        let stat = self.workspace.stat(path).map_err(err)?;
-        let (version, size) = (stat.version, stat.size);
-        if offset >= size {
-            return Err(format!("{path}: byte_offset {offset} is past the end of the file ({size} bytes)"));
+        let length = length.max(1);
+        // Decide whether the file is text from its start, as `git` and `file` do, so an
+        // ASCII stretch inside a binary file is not shown.
+        let head = self.workspace.read_range(path, 0, SNIFF_BYTES).map_err(err)?;
+        if head.contains(&0) || detect_type(&head) != UNKNOWN_BINARY {
+            return Err(format!("{path}: {}; not text, so not shown", detect_type(&head)));
         }
         let bytes = self.workspace.read_range(path, offset, length).map_err(err)?;
+        if bytes.is_empty() {
+            return Err(format!("{path}: byte_offset {offset} is at or past the end of the file"));
+        }
+        let at_end = (bytes.len() as u64) < length;
         // Move the range onto character boundaries: skip a split character at the start
-        // and drop one at the end, unless the file ends there.
+        // and drop one at the end. A file cannot end inside a character and be text.
         let skip = bytes.iter().take(3).take_while(|&&b| b & 0xC0 == 0x80).count();
         let slice = &bytes[skip..];
         let text = match std::str::from_utf8(slice) {
             Ok(text) => Some(text),
-            Err(e) if e.error_len().is_none() => std::str::from_utf8(&slice[..e.valid_up_to()]).ok(),
+            Err(e) if e.error_len().is_none() && !at_end => std::str::from_utf8(&slice[..e.valid_up_to()]).ok(),
             Err(_) => None,
         };
+        let range = || format!("bytes {offset}-{}", offset + bytes.len() as u64);
         let Some(text) = text.filter(|text| !text.contains('\0')) else {
-            return Err(format!("{path}: bytes {offset}-{} are not text, so not shown", offset + bytes.len() as u64));
+            return Err(format!("{path}: {} are not text, so not shown", range()));
         };
+        if text.is_empty() {
+            return Err(format!("{path}: {} hold no whole character; read a longer range", range()));
+        }
         let start = offset + skip as u64;
         let end = start + text.len() as u64;
-        let mut out = format!("{text}\n[version {version} · bytes {start}-{end} of {size}");
-        if end < size {
-            out.push_str(&format!(" · continue with byte_offset={end}"));
-        }
-        out.push(']');
-        Ok(out)
+        let more = if at_end { "end of file".to_owned() } else { format!("continue with byte_offset={end}") };
+        Ok(format!("{text}\n[bytes {start}-{end} · {more}]"))
     }
 
     fn list(&self, args: &Args) -> ToolResult {
@@ -577,6 +586,9 @@ fn glob_matcher(pattern: &str) -> Result<GlobMatcher, String> {
 }
 
 /// A short description of a non-text file, sniffed from its first bytes.
+/// What [`detect_type`] calls a file with no known signature.
+const UNKNOWN_BINARY: &str = "binary file";
+
 fn detect_type(bytes: &[u8]) -> &'static str {
     const SIGNATURES: &[(&[u8], &str)] = &[
         (b"\x89PNG\r\n\x1a\n", "PNG image"),
@@ -591,7 +603,7 @@ fn detect_type(bytes: &[u8]) -> &'static str {
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return "WebP image";
     }
-    SIGNATURES.iter().find(|(magic, _)| bytes.starts_with(magic)).map_or("binary file", |(_, name)| name)
+    SIGNATURES.iter().find(|(magic, _)| bytes.starts_with(magic)).map_or(UNKNOWN_BINARY, |(_, name)| name)
 }
 
 /// Text if the bytes are UTF-8 without NUL bytes; anything else is treated as binary.
@@ -664,7 +676,7 @@ pub(crate) fn definitions() -> Vec<Value> {
                 "offset": { "type": "integer", "minimum": 1, "description": "First line to show (1-based)." },
                 "limit": { "type": "integer", "minimum": 1, "description": "Number of lines to show." },
                 "byte_offset": { "type": "integer", "minimum": 0,
-                    "description": "Read raw text from this byte position instead of by line." },
+                    "description": "Read raw text from this byte position instead of by line. Byte reads show no version." },
                 "byte_length": { "type": "integer", "minimum": 1, "maximum": 60000,
                     "description": "Bytes to read from byte_offset (default 20000)." },
             }, "required": ["path"] },
