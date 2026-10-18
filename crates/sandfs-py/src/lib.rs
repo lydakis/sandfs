@@ -222,8 +222,9 @@ impl PyGitSource {
 }
 
 /// A source written in Python: any object with `list(path)` returning `DirEntry`s and
-/// `read(path)` returning bytes or str. Paths are absolute within the source, so the
-/// root is `"/"`, and they double as the source keys.
+/// `read(path)` returning bytes or str, and optionally `read_range(path, offset, length)`
+/// for sources that can read part of a file. Paths are absolute within the source, so
+/// the root is `"/"`, and they double as the source keys.
 struct PySource {
     object: Py<PyAny>,
 }
@@ -276,6 +277,28 @@ impl Source for PySource {
             let data = data.extract::<Data>().map_err(|err| source_error(py, key, err))?;
             Ok(Bytes::from(data))
         })
+    }
+
+    fn read_range(&self, key: &str, offset: u64, len: u64) -> sandfs_core::Result<Bytes> {
+        let ranged = Python::attach(|py| -> sandfs_core::Result<Option<Bytes>> {
+            let object = self.object.bind(py);
+            let fail = |err| source_error(py, key, err);
+            if !object.hasattr("read_range").map_err(fail)? {
+                return Ok(None);
+            }
+            let data = object.call_method1("read_range", (key, offset, len)).map_err(fail)?;
+            Ok(Some(Bytes::from(data.extract::<Data>().map_err(fail)?)))
+        })?;
+        match ranged {
+            // A source may return more than asked; never hand back more than the range.
+            Some(data) => Ok(data.slice(..data.len().min(usize::try_from(len).unwrap_or(usize::MAX)))),
+            None => {
+                let data = self.read_file(key)?;
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+                let end = start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX)).min(data.len());
+                Ok(data.slice(start..end))
+            }
+        }
     }
 }
 
@@ -350,9 +373,23 @@ impl Workspace {
         })
     }
 
-    /// The contents of the file at `path`.
-    fn read<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyBytes>> {
-        let data = py.detach(|| self.inner.read(path)).or_raise()?;
+    /// The contents of the file at `path`, or with `offset` or `length` only that part
+    /// of it. A part of a file that has not been read whole is read from its source
+    /// and not cached, so a large file is never held in memory whole.
+    #[pyo3(signature = (path, *, offset = 0, length = None))]
+    fn read<'py>(
+        &self,
+        py: Python<'py>,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let data = py
+            .detach(|| match (offset, length) {
+                (0, None) => self.inner.read(path),
+                (offset, length) => self.inner.read_range(path, offset, length.unwrap_or(u64::MAX)),
+            })
+            .or_raise()?;
         Ok(PyBytes::new(py, &data))
     }
 

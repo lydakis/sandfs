@@ -13,6 +13,10 @@ class Source(Protocol):
     ``list`` the first time something in a directory is touched and ``read`` the first
     time a file is read, then caches both and shares them with forks, so a source must
     return the same answer every time. An exception raised here surfaces as ``OSError``.
+
+    A source that can read part of a file (an object store with range requests) may
+    also define ``read_range(path, offset, length)``. Without it, a ranged read of a
+    file not yet read whole calls ``read`` and slices the result.
     """
 
     def list(self, path: str) -> Iterable[DirEntry]:

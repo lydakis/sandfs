@@ -50,6 +50,8 @@ for change in attempt.changes():
 
 A source must return the same answer every time, because what it returns is cached and shared between forks. Sizes in `DirEntry` are optional; `stat` reads a file once to find a size the source left out.
 
+Large files can be read in pieces: `read(path, offset=..., length=...)` asks the source for just that range and doesn't cache it, so a multi-gigabyte data set or video is never held in memory whole. `DirSource` seeks on disk, and a Python source can define `read_range(path, offset, length)`; without it, the range is sliced from a whole read.
+
 `sandfs.GitSource(repo, rev="HEAD")` mounts a commit of a local repository without a checkout. In a partial clone (`git clone --filter=blob:none`), git fetches a file's contents only when it is first read.
 
 ## API
@@ -58,7 +60,7 @@ A source must return the same answer every time, because what it returns is cach
 | --- | --- |
 | `mount(path, source)` | Mount a `DirSource(root)`, `MemorySource({name: str or bytes})`, `GitSource(repo, rev)`, or any object with `list(path)` and `read(path)` |
 | `fork()` | A new workspace with the same mounts and changes, in O(1) |
-| `read(path)`, `read_text(path)` | File contents as bytes, or as UTF-8 text |
+| `read(path, *, offset=0, length=None)`, `read_text(path)` | File contents as bytes (all of it, or one range), or as UTF-8 text |
 | `list(path="/")`, `stat(path)`, `exists(path)` | Entries (name, kind, size), and kind, size and version |
 | `write(path, data, *, expected_version=None)` | Write str or bytes, creating parents, and return the new version |
 | `mkdir`, `remove`, `copy`, `move` | File operations; base files are copied by reference |

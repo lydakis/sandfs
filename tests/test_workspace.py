@@ -239,3 +239,40 @@ def test_copy_move_and_mkdir() -> None:
         ws.copy("/base/photos", "/other")
     with pytest.raises(FileExistsError):
         ws.move("/work/b.jpg", "/work/renamed.jpg")
+
+
+def test_ranged_reads_use_read_range_when_a_source_has_it(tmp_path: Path) -> None:
+    class Video:
+        def __init__(self) -> None:
+            self.ranges: list[tuple[str, int, int]] = []
+
+        def list(self, path: str) -> Iterable[DirEntry]:
+            return [DirEntry("clip.mp4", size=1_000_000)]
+
+        def read(self, path: str) -> bytes:
+            raise AssertionError("a ranged read must not fetch the whole file")
+
+        def read_range(self, path: str, offset: int, length: int) -> bytes:
+            self.ranges.append((path, offset, length))
+            return bytes(range(256))[offset % 256 :][:length]
+
+    video = Video()
+    ws = Workspace()
+    ws.mount("/media", video)
+    (tmp_path / "data.bin").write_bytes(bytes(range(10)))
+    ws.mount("/disk", DirSource(tmp_path))
+
+    assert ws.read("/media/clip.mp4", offset=4, length=3) == b"\x04\x05\x06"
+    assert video.ranges == [("/clip.mp4", 4, 3)]
+    assert ws.read("/disk/data.bin", offset=8) == b"\x08\x09"
+    assert ws.read("/disk/data.bin", length=2) == b"\x00\x01"
+
+
+def test_ranged_reads_slice_whole_reads_for_simple_sources() -> None:
+    ws = Workspace()
+    ws.mount("/tickets", Tickets({"T-1": {"title": "x"}}))
+    ws.write("/notes.txt", "0123456789")
+
+    assert ws.read("/tickets/README.txt", offset=1, length=3) == b"ell"
+    assert ws.read("/notes.txt", offset=8, length=10) == b"89"
+    assert ws.read("/notes.txt", offset=20) == b""

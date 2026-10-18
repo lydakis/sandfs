@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -62,6 +63,23 @@ pub trait Source: Send + Sync + fmt::Debug {
     fn read_dir(&self, key: &str) -> Result<Listing>;
     /// Read the file with this key.
     fn read_file(&self, key: &str) -> Result<Bytes>;
+
+    /// Read up to `len` bytes of the file with this key, starting at `offset`. Fewer
+    /// bytes come back near the end of the file, and none past it.
+    ///
+    /// The default reads the whole file and slices it. A source that can read part of
+    /// a file (a disk, an object store with range requests) should override it, so a
+    /// large file is never held in memory whole.
+    fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
+        Ok(slice(&self.read_file(key)?, offset, len))
+    }
+}
+
+/// The part of `bytes` a ranged read asks for, clamped to its end.
+pub(crate) fn slice(bytes: &Bytes, offset: u64, len: u64) -> Bytes {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+    let end = start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX)).min(bytes.len());
+    bytes.slice(start..end)
 }
 
 /// An in-memory source, mostly for tests and for seeding workspaces from data.
@@ -172,6 +190,18 @@ impl DirSource {
     fn host_path(&self, key: &str) -> PathBuf {
         if key.is_empty() { self.root.clone() } else { self.root.join(key) }
     }
+
+    /// The host path of a regular file inside `root`.
+    fn file_path(&self, key: &str) -> Result<PathBuf> {
+        let path = self.host_path(key);
+        // A symlink in the final component is refused below, so only the parent needs
+        // checking.
+        self.check_inside(path.parent().unwrap_or(&self.root))?;
+        if !path.symlink_metadata().map_err(io_error)?.is_file() {
+            return Err(Error::Source(format!("{} is not a regular file", path.display())));
+        }
+        Ok(path)
+    }
 }
 
 impl Source for DirSource {
@@ -205,14 +235,16 @@ impl Source for DirSource {
     }
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
-        let path = self.host_path(key);
-        // A symlink in the final component is refused below, so only the parent needs
-        // checking.
-        self.check_inside(path.parent().unwrap_or(&self.root))?;
-        if !path.symlink_metadata().map_err(io_error)?.is_file() {
-            return Err(Error::Source(format!("{} is not a regular file", path.display())));
-        }
+        let path = self.file_path(key)?;
         std::fs::read(path).map(Bytes::from).map_err(io_error)
+    }
+
+    fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
+        let mut file = std::fs::File::open(self.file_path(key)?).map_err(io_error)?;
+        file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        let mut data = Vec::new();
+        file.take(len).read_to_end(&mut data).map_err(io_error)?;
+        Ok(Bytes::from(data))
     }
 }
 
