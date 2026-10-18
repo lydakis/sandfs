@@ -199,7 +199,7 @@ impl Workspace {
 
     /// Mount the host directory `root`, read-only. Writes go to the overlay, never to disk.
     fn mount_dir(&mut self, py: Python<'_>, path: &str, root: PathBuf) -> PyResult<()> {
-        let source = DirSource::new(root).or_raise()?;
+        let source = py.detach(|| DirSource::new(root)).or_raise()?;
         self.mount_source(py, path, Arc::new(source))
     }
 
