@@ -35,3 +35,51 @@ def test_visibility_view_hides_nodes_from_shell():
     hidden = shell.exec("cat /blue/private.txt")
     assert hidden.exit_code == 1
     assert "hidden" in hidden.stderr.lower()
+
+
+def test_read_only_directory_blocks_new_files():
+    vfs = VirtualFileSystem()
+    vfs.mkdir("/ro")
+    vfs.set_policy("/ro", NodePolicy(writable=False))
+
+    with pytest.raises(InvalidOperation):
+        vfs.write_file("/ro/new.txt", "x")
+    with pytest.raises(InvalidOperation):
+        vfs.write_file("/ro/nested/new.txt", "x")
+    with pytest.raises(InvalidOperation):
+        vfs.touch("/ro/touched.txt")
+
+    assert not vfs.exists("/ro/new.txt")
+    assert not vfs.exists("/ro/nested")
+    assert not vfs.exists("/ro/touched.txt")
+
+
+def test_host_does_not_export_hidden_or_unreadable_files():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/work/a.txt", "a")
+    vfs.write_file("/secret/key.txt", "TOPSECRET")
+    vfs.write_file("/work/private.txt", "PRIVATE")
+    vfs.set_policy("/secret/key.txt", NodePolicy(readable=False))
+    vfs.set_policy("/work/private.txt", NodePolicy(classification="private"))
+    shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}))
+
+    leaked = shell.exec("host -p /work cat /secret/key.txt")
+    listing = shell.exec("host -p /work ls")
+
+    assert "TOPSECRET" not in leaked.stdout
+    assert leaked.exit_code != 0
+    assert listing.stdout.split() == ["a.txt"]
+
+
+def test_host_sync_keeps_files_it_did_not_export():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/work/a.txt", "a")
+    vfs.write_file("/work/private.txt", "PRIVATE")
+    vfs.set_policy("/work/private.txt", NodePolicy(classification="private"))
+    shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}))
+
+    result = shell.exec("host -p /work touch b.txt")
+
+    assert result.exit_code == 0
+    assert vfs.read_file("/work/private.txt") == "PRIVATE"
+    assert vfs.exists("/work/b.txt")

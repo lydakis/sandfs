@@ -323,3 +323,44 @@ def test_cp_copies_directory_with_recursive_flag():
     assert result.exit_code == 0
     assert shell.vfs.read_file("/workspace/archive/inbox/note.txt") == "hi"
     assert shell.vfs.exists("/blue/inbox/note.txt")
+
+
+def test_allowed_commands_apply_to_host_fallback():
+    vfs = VirtualFileSystem()
+    shell = SandboxShell(vfs, allowed_commands={"ls"}, host_fallback=True)
+
+    result = shell.exec("uname -s")
+
+    assert result.exit_code == 1
+    assert "disabled" in result.stderr
+    assert result.stdout == ""
+
+
+def test_host_relative_path_tokens_are_not_rewritten():
+    shell = setup_shell()
+
+    result = shell.exec("host -p / cat ./workspace/README.md")
+
+    assert result.exit_code == 0
+    assert result.stdout == "hello world\n"
+
+
+def test_host_option_paths_are_rewritten():
+    shell = setup_shell()
+
+    result = shell.exec("host -p / grep --file=/workspace/README.md /workspace/README.md")
+
+    assert result.exit_code == 0
+    assert "hello world" in result.stdout
+
+
+def test_search_command_separates_results_with_newlines():
+    shell = setup_shell()
+    shell.exec("write /workspace/notes.txt hello again")
+
+    result = shell.exec("search hello /workspace")
+
+    assert result.stdout.splitlines() == [
+        "/workspace/README.md:1:hello world",
+        "/workspace/notes.txt:1:hello again",
+    ]

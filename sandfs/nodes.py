@@ -77,6 +77,13 @@ class VirtualFile(VirtualNode):
     def set_provider(self, provider: ContentProvider) -> None:
         self._provider = provider
 
+    def content_state(self) -> tuple[str, ContentProvider | None]:
+        """Opaque copy of the file's content source, for rolling back a failed write."""
+        return (self._content, self._provider)
+
+    def restore_content_state(self, state: tuple[str, ContentProvider | None]) -> None:
+        self._content, self._provider = state
+
 
 class VirtualDirectory(VirtualNode):
     """Directories store children lazily when a loader is present."""

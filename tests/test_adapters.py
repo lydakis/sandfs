@@ -122,3 +122,85 @@ def test_filesystem_adapter_delete_removes_file(tmp_path):
     assert not (root / "a.txt").exists()
     with pytest.raises(FileNotFoundError):
         adapter.read("a.txt")
+
+
+def test_storage_conflict_rolls_back_content_and_version():
+    adapter = MemoryStorageAdapter(initial={"f.txt": "orig"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    adapter.write("f.txt", "external", version=0)
+
+    with pytest.raises(InvalidOperation):
+        vfs.write_file("/d/f.txt", "mine")
+
+    assert vfs.read_file("/d/f.txt") == "orig"
+    assert vfs.get_version("/d/f.txt") == 0
+
+
+def test_storage_conflict_on_new_file_removes_it():
+    class RejectingAdapter(MemoryStorageAdapter):
+        def write(self, path, content, *, version):
+            raise ValueError("version mismatch")
+
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", RejectingAdapter())
+
+    with pytest.raises(InvalidOperation):
+        vfs.write_file("/d/new.txt", "x")
+
+    assert not vfs.exists("/d/new.txt")
+
+
+def test_move_within_storage_mount_persists():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A", "dir/b.txt": "B"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+
+    vfs.move("/d/a.txt", "/d/renamed.txt")
+    vfs.move("/d/dir", "/d/moved")
+
+    assert sorted(adapter.list()) == ["moved/b.txt", "renamed.txt"]
+    assert adapter.read("renamed.txt").content == "A"
+
+
+def test_move_out_of_storage_mount_deletes_entry():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+
+    vfs.move("/d/a.txt", "/scratch.txt")
+
+    assert adapter.list() == {}
+    assert vfs.read_file("/scratch.txt") == "A"
+
+
+def test_copy_into_storage_mount_persists():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/outside/c.txt", "C")
+
+    vfs.copy("/d/a.txt", "/d/b.txt")
+    vfs.copy("/outside", "/d/imported", recursive=True)
+    vfs.copy("/outside/c.txt", "/d/a.txt")
+
+    entries = adapter.list()
+    assert sorted(entries) == ["a.txt", "b.txt", "imported/c.txt"]
+    assert entries["a.txt"].content == "C"
+    assert entries["b.txt"].content == "A"
+
+
+def test_copy_and_move_emit_path_events():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/src/a.txt", "A")
+    events = []
+    vfs.register_path_hook("/", events.append)
+
+    vfs.copy("/src/a.txt", "/src/b.txt")
+    vfs.move("/src/b.txt", "/src/c.txt")
+
+    assert [(e.path, e.event) for e in events] == [
+        ("/src/b.txt", "create"),
+        ("/src/b.txt", "delete"),
+        ("/src/c.txt", "create"),
+    ]
