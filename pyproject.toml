@@ -5,18 +5,19 @@ build-backend = "maturin"
 [project]
 name = "sandfs"
 version = "0.4.0.dev0"
-description = "Composable virtual filesystem sandbox with a UNIX-like command surface for agents"
+description = "A lazy, copy-on-write filesystem for agents: mount a git commit, fork in O(1), diff what changed"
 requires-python = ">=3.11"
 authors = [
   { name = "sandfs contributors" }
 ]
 readme = "README.md"
 license = { text = "MIT" }
-keywords = ["virtual filesystem", "agents", "sandbox", "in-memory"]
+keywords = ["virtual filesystem", "agents", "copy-on-write", "git", "workspace"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -40,9 +41,6 @@ dev = [
 Homepage = "https://github.com/lydakis/sandfs"
 Repository = "https://github.com/lydakis/sandfs"
 Issues = "https://github.com/lydakis/sandfs/issues"
-
-[project.scripts]
-sandfs = "sandfs.cli:main"
 
 [tool.maturin]
 manifest-path = "crates/sandfs-py/Cargo.toml"

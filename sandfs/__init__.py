@@ -1,18 +1,15 @@
 """sandfs: a lazy, copy-on-write filesystem for agents.
 
-``Workspace`` is the Rust-backed core. The other names are the 0.3 pure-Python design.
+A ``Workspace`` mounts read-only sources (a git commit, a host directory, in-memory
+files), keeps every change in a copy-on-write overlay, forks in O(1) and reports what
+changed with ``diff()``. The implementation is the Rust core in ``sandfs._core``.
 """
 
+from importlib.metadata import version
+
 from ._core import Change, DirEntry, EditFailed, Stat, VersionMismatch, Workspace
-from .adapters import FileSystemAdapter, MemoryStorageAdapter, StorageAdapter
-from .hooks import WriteEvent, WriteHook
-from .integrations import PathEvent, PathHook
-from .policies import NodePolicy, VisibilityView
-from .providers import ContentProvider, DirectoryProvider, NodeContext, ProvidedNode
-from .pyexec import PythonExecutionResult, PythonExecutor
-from .search import FullTextIndex, SearchQuery, SearchResult
-from .shell import CommandResult, SandboxShell
-from .vfs import VirtualFileSystem
+
+__version__ = version("sandfs")
 
 __all__ = [
     "Workspace",
@@ -21,25 +18,5 @@ __all__ = [
     "Change",
     "VersionMismatch",
     "EditFailed",
-    "VirtualFileSystem",
-    "SandboxShell",
-    "CommandResult",
-    "PythonExecutor",
-    "PythonExecutionResult",
-    "ContentProvider",
-    "DirectoryProvider",
-    "NodeContext",
-    "ProvidedNode",
-    "NodePolicy",
-    "VisibilityView",
-    "WriteEvent",
-    "WriteHook",
-    "PathEvent",
-    "PathHook",
-    "StorageAdapter",
-    "MemoryStorageAdapter",
-    "FileSystemAdapter",
-    "SearchQuery",
-    "SearchResult",
-    "FullTextIndex",
+    "__version__",
 ]
