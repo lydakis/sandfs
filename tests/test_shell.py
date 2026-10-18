@@ -5,7 +5,7 @@ def setup_shell() -> SandboxShell:
     vfs = VirtualFileSystem()
     vfs.write_file("/workspace/app.py", "print('hi')\n")
     vfs.write_file("/workspace/README.md", "hello world\n")
-    return SandboxShell(vfs)
+    return SandboxShell(vfs, host_commands=True)
 
 
 def test_ls_and_cd():
@@ -364,3 +364,22 @@ def test_search_command_separates_results_with_newlines():
         "/workspace/README.md:1:hello world",
         "/workspace/notes.txt:1:hello again",
     ]
+
+
+def test_host_commands_are_off_by_default():
+    shell = SandboxShell(VirtualFileSystem())
+
+    for command in ("bash -c 'echo hi'", "sh -c 'echo hi'", "host echo hi"):
+        result = shell.exec(command)
+        assert result.exit_code == 127
+        assert result.stdout == ""
+    assert "host" not in shell.exec("help").stdout
+
+
+def test_host_fallback_implies_host_commands():
+    shell = SandboxShell(VirtualFileSystem(), host_fallback=True)
+
+    result = shell.exec("bash -c 'printf hi'")
+
+    assert result.exit_code == 0
+    assert result.stdout == "hi"

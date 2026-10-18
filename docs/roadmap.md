@@ -7,7 +7,7 @@ This document captures the practical roadmap for `sandfs` so we can measure prog
 - **Core VFS** – in-memory directories, provider-backed nodes, optimistic versions, snapshots, host export/import helpers.
 - **Policy layer** – read/write/append policies plus visibility views and path hooks so hosts can mirror activity elsewhere.
 - **Command surface** – built-in shell commands: `pwd`, `cd`, `ls`, `tree`, `cat`, `touch`, `mkdir`, `rm`, `cp`, `mv`, `write`, `append`, `echo`, `printf`, `wc`, `grep`, `rg`, `search`, `stat`, `head`, `tail`, `find`, `python`, `python3`, `host`, `bash`, `sh`, and `help`, with pipes, `<`/`>`/`>>` redirection and env vars.
-- **Host bridge** – `host` materializes the visible tree to a temp dir and runs native binaries; host fallback for unknown commands is opt-in. Host commands are not isolated from the host.
+- **Host bridge** – `host` (plus `bash`/`sh`) materializes the visible tree to a temp dir and runs native binaries; both these commands (`host_commands=True`) and host fallback for unknown commands are opt-in. Host commands are not isolated from the host.
 - **Search** – optional full-text index and a `/@search?q=` view.
 - **CLI** – `sandfs exec` and `sandfs shell` with host directory mounts.
 

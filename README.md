@@ -63,7 +63,7 @@ print(shell.exec("tree").stdout)
 
 ### Running host GNU tools
 
-`SandboxShell` exposes `host` to materialize a subtree onto the host disk and invoke any installed command:
+With `host_commands=True`, `SandboxShell` exposes `host` to materialize a subtree onto the host disk and invoke any installed command:
 
 ```
 host -p /workspace grep -n TODO app.py
@@ -71,13 +71,13 @@ host -p /workspace grep -n TODO app.py
 
 The example above exports `/workspace` into a temporary directory, runs the system `grep` inside it, then discards the files.
 
-> Tip: host fallback for *unknown* commands is disabled by default. To allow unknown commands to run on the host, set `SandboxShell(..., host_fallback=True)`. The `host`, `bash` and `sh` commands are always registered; see [Security model](#security-model).
+> `host`, `bash` and `sh` are off by default. Enable them with `SandboxShell(..., host_commands=True)`, or set `host_fallback=True` to also send unknown commands to the host. See [Security model](#security-model).
 
 ## Security model
 
 `sandfs` enforces policies on the virtual tree. It does **not** isolate code execution:
 
-- `host`, `bash` and `sh` run real host processes with the host user's permissions and environment. They are registered by default; remove them with `allowed_commands` for untrusted agents.
+- `host`, `bash` and `sh` run real host processes with the host user's permissions and environment. They exist only when you pass `host_commands=True` or `host_fallback=True`.
 - `python`/`python3` run `exec()` with a reduced set of builtins. That is a convenience, not a sandbox: sandboxed code can reach the host through the objects it is given.
 - Host commands only see nodes the shell's `view` may read; hidden and unreadable nodes are never exported, and sync-back never touches them.
 - `allowed_commands` is checked before host fallback, so an allowlist cannot be bypassed by an unknown command.

@@ -61,7 +61,7 @@ def test_host_does_not_export_hidden_or_unreadable_files():
     vfs.write_file("/work/private.txt", "PRIVATE")
     vfs.set_policy("/secret/key.txt", NodePolicy(readable=False))
     vfs.set_policy("/work/private.txt", NodePolicy(classification="private"))
-    shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}))
+    shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}), host_commands=True)
 
     leaked = shell.exec("host -p /work cat /secret/key.txt")
     listing = shell.exec("host -p /work ls")
@@ -76,7 +76,7 @@ def test_host_sync_keeps_files_it_did_not_export():
     vfs.write_file("/work/a.txt", "a")
     vfs.write_file("/work/private.txt", "PRIVATE")
     vfs.set_policy("/work/private.txt", NodePolicy(classification="private"))
-    shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}))
+    shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}), host_commands=True)
 
     result = shell.exec("host -p /work touch b.txt")
 

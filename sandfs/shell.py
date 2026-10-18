@@ -61,7 +61,14 @@ class SandboxShell:
         allowed_commands: Iterable[str] | None = None,
         max_output_bytes: int | None = None,
         host_fallback: bool = False,
+        host_commands: bool = False,
     ) -> None:
+        """Create a shell over ``vfs``.
+
+        ``host_commands`` registers ``host``, ``bash`` and ``sh``, which run real host
+        processes. ``host_fallback`` sends unknown commands to the host and implies
+        ``host_commands``. Both are off by default so a plain shell never leaves the VFS.
+        """
         self.vfs = vfs
         self.env: dict[str, str] = dict(env or {})
         self.commands: dict[str, CommandHandler] = {}
@@ -72,6 +79,7 @@ class SandboxShell:
         self.allowed_commands: set[str] | None = set(allowed_commands) if allowed_commands else None
         self.max_output_bytes = max_output_bytes
         self.host_fallback = host_fallback
+        self.host_commands = host_commands or host_fallback
         self._handler_accepts_ctx: dict[str, bool] = {}
         self._register_builtin_commands()
 
@@ -539,15 +547,18 @@ class SandboxShell:
             ("search", self._cmd_search, "Search files (rg-like)"),
             ("python", self._cmd_python, "Execute Python snippet"),
             ("python3", self._cmd_python, "Execute Python snippet"),
-            ("host", self._cmd_host, "Run host command in materialized tree"),
-            ("bash", self._cmd_shell_host, "Run bash via host"),
-            ("sh", self._cmd_shell_host, "Run sh via host"),
             ("help", self._cmd_help, "Show available commands"),
             ("stat", self._cmd_stat, "Display file status"),
             ("head", self._cmd_head, "Output the first part of files"),
             ("tail", self._cmd_tail, "Output the last part of files"),
             ("find", self._cmd_find, "Search for files in a directory hierarchy"),
         ]
+        if self.host_commands:
+            builtin_commands += [
+                ("host", self._cmd_host, "Run host command in materialized tree"),
+                ("bash", self._cmd_shell_host, "Run bash via host"),
+                ("sh", self._cmd_shell_host, "Run sh via host"),
+            ]
         for name, handler, description in builtin_commands:
             self.register_command(name, handler, description=description)
 
@@ -1082,7 +1093,8 @@ class SandboxShell:
                 lines.append(f"  {name} - {desc}")
             else:
                 lines.append(f"  {name}")
-        lines.append("Use host <cmd> for full GNU tools.")
+        if self.host_commands:
+            lines.append("Use host <cmd> for full GNU tools.")
         return CommandResult(stdout="\n".join(lines))
 
     def _cmd_stat(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:

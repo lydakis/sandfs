@@ -31,5 +31,5 @@
 - Tag releases after meaningful fixes (`v0.x.y`) and let GitHub Actions publish via the trusted PyPI workflow; keep `pyproject.toml` version in sync with the tag.
 
 ## Agent & Host Integration Tips
-- Host commands are not sandboxed: they run as the host user. Host fallback materializes only what the shell's view may read under a temporary directory. Commands like `host -p /workspace …` or `bash -lc '…'` are the preferred way to use GNU utilities without re-implementing them.
+- Host commands are not sandboxed: they run as the host user, and exist only with `SandboxShell(..., host_commands=True)` (or `host_fallback=True`). Host fallback materializes only what the shell's view may read under a temporary directory. Commands like `host -p /workspace …` or `bash -lc '…'` are the preferred way to use GNU utilities without re-implementing them.
 - Always ensure writes stay inside the sandbox hierarchy (`/blue`, `/workspace`). If you need host IO beyond that scope, add explicit adapters/policies rather than bypassing the VFS.

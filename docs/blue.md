@@ -39,6 +39,7 @@ shell = SandboxShell(
     view=view,
     allowed_commands={"ls", "cat", "rg", "python"},
     max_output_bytes=8_000,
+    # host_commands=True,  # only if this runtime needs `host`/`bash -lc` (runs on the host)
 )
 ```
 
