@@ -182,18 +182,18 @@ fn move_and_delete_change_the_tree() {
 }
 
 #[test]
-fn diff_lists_changed_files_with_sizes() {
+fn changes_lists_changed_files_with_sizes() {
     let mut s = server();
-    assert_eq!(ok(&mut s, "diff", json!({})), "No changes under /");
+    assert_eq!(ok(&mut s, "changes", json!({})), "No changes under /");
     ok(&mut s, "edit", json!({ "path": "/data/README.md", "edits": [{ "old": "world", "new": "sandfs" }] }));
     ok(&mut s, "write", json!({ "path": "/data/summary.csv", "content": "total,345\n" }));
     ok(&mut s, "delete", json!({ "path": "/data/docs/guide.md" }));
     assert_eq!(
-        ok(&mut s, "diff", json!({})),
+        ok(&mut s, "changes", json!({})),
         "M /data/README.md (23 bytes)\nD /data/docs/guide.md\nA /data/summary.csv (10 bytes)\n\
          [A added, M modified, D deleted; read a file to see its contents]"
     );
-    assert!(ok(&mut s, "diff", json!({ "path": "/data/docs" })).starts_with("D /data/docs/guide.md\n["));
+    assert!(ok(&mut s, "changes", json!({ "path": "/data/docs" })).starts_with("D /data/docs/guide.md\n["));
 }
 
 #[test]

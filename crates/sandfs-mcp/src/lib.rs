@@ -1,7 +1,7 @@
 //! An MCP server that hands an agent a sandfs workspace as file tools.
 //!
 //! Instead of a bash tool, the agent gets `read`, `list`, `glob`, `grep`, `write`,
-//! `edit`, `move`, `delete` and `diff`, shaped like the file tools models already know.
+//! `edit`, `move`, `delete` and `changes`, shaped like the file tools models already know.
 //! Every call works on one copy-on-write [`Workspace`]: mounts stay read-only, writes
 //! land in the overlay, and the harness collects the result with
 //! [`Server::into_workspace`] and [`Workspace::diff`]. Forking, checkpoints and commits
@@ -67,7 +67,7 @@ impl Server {
         &self.tools.workspace
     }
 
-    /// End the session and take the workspace back, for example to diff it.
+    /// End the session and take the workspace back, for example to list its changes.
     pub fn into_workspace(self) -> Workspace {
         self.tools.workspace
     }

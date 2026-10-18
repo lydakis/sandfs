@@ -47,7 +47,7 @@ impl Tools {
             "edit" => self.edit(&args),
             "move" => self.rename(&args),
             "delete" => self.delete(&args),
-            "diff" => self.diff(&args),
+            "changes" => self.changes(&args),
             _ => return None,
         };
         Some(result.map(cap).map_err(cap))
@@ -66,7 +66,7 @@ impl Tools {
         };
         format!(
             "These tools are your filesystem: a private copy-on-write workspace. {layout} Paths are absolute. \
-             Mounted sources are never modified; every write stays in this workspace, and `diff` shows what you \
+             Mounted sources are never modified; every write stays in this workspace, and `changes` shows what you \
              changed."
         )
     }
@@ -292,7 +292,7 @@ impl Tools {
         Ok(format!("Deleted {path}"))
     }
 
-    fn diff(&self, args: &Args) -> ToolResult {
+    fn changes(&self, args: &Args) -> ToolResult {
         let scope = VPath::parse(&args.opt_path("path")?).map_err(err)?;
         let mut lines = Vec::new();
         for change in self.workspace.diff().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
@@ -301,10 +301,8 @@ impl Tools {
                 ChangeKind::Deleted => format!("D {path}"),
                 kind => {
                     let mark = if kind == ChangeKind::Added { 'A' } else { 'M' };
-                    match self.workspace.stat(path).map_err(err)?.size {
-                        Some(size) => format!("{mark} {path} ({size} bytes)"),
-                        None => format!("{mark} {path}"),
-                    }
+                    let size = self.workspace.stat(path).map_err(err)?.size;
+                    format!("{mark} {path} ({size} bytes)")
                 }
             });
         }
@@ -646,7 +644,7 @@ pub(crate) fn definitions() -> Vec<Value> {
             }, "required": ["path"] },
         }),
         json!({
-            "name": "diff",
+            "name": "changes",
             "description": "List the files changed against the mounted sources: added (A), modified (M) or deleted \
                 (D), with their size. Read a file to see its new contents.",
             "inputSchema": { "type": "object", "properties": {

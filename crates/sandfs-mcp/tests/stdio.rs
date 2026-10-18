@@ -63,7 +63,7 @@ fn a_session_over_a_mounted_directory() {
 
     let names: Vec<&str> =
         replies[1]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read", "list", "glob", "grep", "write", "edit", "move", "delete", "diff"]);
+    assert_eq!(names, ["read", "list", "glob", "grep", "write", "edit", "move", "delete", "changes"]);
 
     assert_eq!(replies[2]["result"]["isError"], false);
     assert_eq!(replies[2]["result"]["content"][0]["text"], "Edited /work/hello.txt, version 1");
