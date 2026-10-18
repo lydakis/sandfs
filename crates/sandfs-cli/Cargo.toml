@@ -1,11 +1,15 @@
 [package]
 name = "sandfs-cli"
 description = "The sandfs command: mount, fork and list the changes of workspaces over FUSE"
+readme = "README.md"
+keywords = ["fuse", "filesystem", "sandbox", "copy-on-write", "agents"]
+categories = ["filesystem", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "sandfs"

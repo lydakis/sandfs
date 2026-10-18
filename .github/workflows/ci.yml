@@ -55,3 +55,5 @@ jobs:
         run: cargo test --workspace
         env:
           SANDFS_REQUIRE_FUSE: "1"
+      - name: Check the crates package
+        run: cargo package --workspace --exclude sandfs-py

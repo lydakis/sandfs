@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "sandfs-cli"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "sandfs-core"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "imbl",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "sandfs-git"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "sandfs-core",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "sandfs-mcp"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "globset",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "sandfs-py"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "pyo3",

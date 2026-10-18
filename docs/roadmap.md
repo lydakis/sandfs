@@ -11,14 +11,14 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 - **Changes are files, not patches.** The harness walks `changes()` and writes each changed file back to wherever its data lives.
 - **Execution stays out of scope.** Real tools run in a container or on the host against a FUSE mount.
 
-Python 0.3 was the last release of the original design. Its shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are symlinks and core text edits, which only code needed.
+0.2.2 was the last published release of the original design, and 0.4.0 is the first of this one. The original design's shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are symlinks and core text edits, which only code needed.
 
 ## Build order
 
 1. **Core** (`sandfs-core`): sources, overlay, fork, changes. Done.
 2. **Python bindings** (`sandfs-py`, PyO3 and maturin): `sandfs.Workspace`, built-in directory, in-memory and git sources, and sources written in Python. Done.
-3. **MCP server**: read, list, glob, grep, write, edit, move, delete and changes over one workspace. Text edit, glob and search live here, built from read and a versioned write.
-4. **CLI and FUSE** (`sandfs-cli`, Linux): `sandfs mount`, `sandfs fork`, `sandfs changes`. `sandfs serve --mcp` lands with the MCP server.
+3. **MCP server**: read, list, glob, grep, write, edit, move, delete and changes over one workspace. Text edit, glob and search live here, built from read and a versioned write. Done (`sandfs-mcp`).
+4. **CLI and FUSE** (`sandfs-cli`, Linux): `sandfs mount`, `sandfs fork`, `sandfs changes`. Done; `sandfs serve --mcp` is next.
 5. **Ranged reads**: `read_range` on sources and workspaces, so a large file is read in pieces instead of whole. Done.
 6. **TypeScript bindings**, when a caller needs them.
 

@@ -273,3 +273,8 @@ impl Drop for Batch {
         let _ = self.child.wait();
     }
 }
+
+// Keeps the README example compiling.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExample;

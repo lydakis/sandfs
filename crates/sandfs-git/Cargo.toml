@@ -1,11 +1,15 @@
 [package]
 name = "sandfs-git"
-description = "Lazy git commit mounts for sandfs workspaces"
+description = "An optional sandfs source that mounts a git commit lazily, without a checkout"
+readme = "README.md"
+keywords = ["filesystem", "sandbox", "git", "lazy", "agents"]
+categories = ["filesystem"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 bytes.workspace = true

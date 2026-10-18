@@ -15,8 +15,12 @@ Everything else is a composition. A snapshot is a fork nobody writes to, a worki
 ## Installation
 
 ```bash
-pip install git+https://github.com/lydakis/sandfs.git   # builds the Rust extension; needs a Rust toolchain
+pip install "sandfs>=0.4"   # prebuilt wheels for Linux, macOS and Windows, Python 3.11+
+cargo add sandfs-core       # the Rust core; sandfs-git adds the git source
+cargo install sandfs-mcp    # an MCP server with file tools over a workspace
 ```
+
+Until 0.4.0 is published, install from git instead with `pip install git+https://github.com/lydakis/sandfs.git`, which builds the extension and needs a Rust toolchain.
 
 ## Quickstart
 
@@ -86,7 +90,7 @@ A workspace keeps its source from when it was created. Changes live in memory an
 
 ## What sandfs is not
 
-sandfs does not run commands. Commands an agent wants to run belong in a real sandbox (a container or microVM) pointed at the files, for example through a FUSE mount of a workspace. It also has no symlinks and no text-editing or patch tools in the core; those are code concerns that live in the MCP tools, if anywhere. The 0.3 releases had a bash-like shell, a host-command bridge, a Python executor, access policies and storage adapters. They were dropped to keep the primitive small; 0.3 remains in git history.
+sandfs does not run commands. Commands an agent wants to run belong in a real sandbox (a container or microVM) pointed at the files, for example through a FUSE mount of a workspace. It also has no symlinks and no text-editing or patch tools in the core; those are code concerns that live in the MCP tools, if anywhere. Earlier versions had a bash-like shell, a host-command bridge, a Python executor, access policies and storage adapters. They were dropped to keep the primitive small.
 
 ## Repository layout
 
@@ -96,8 +100,9 @@ sandfs does not run commands. Commands an agent wants to run belong in a real sa
 │   ├── sandfs-core/    # workspaces, overlay, changes, directory and in-memory sources
 │   ├── sandfs-git/     # optional lazy git source
 │   ├── sandfs-cli/     # the sandfs command: mount, fork and changes over FUSE
+│   ├── sandfs-mcp/     # MCP server: file tools over one workspace
 │   └── sandfs-py/      # Python bindings (the sandfs._core extension)
-├── docs/               # roadmap and publishing notes
+├── docs/               # roadmap, changelog and publishing notes
 ├── sandfs/             # Python package: re-exports and type stubs
 └── tests/              # Python tests
 ```
@@ -123,5 +128,6 @@ MIT
 
 ## Further reading
 
-- [Roadmap](docs/roadmap.md)
-- [Publishing sandfs](docs/publishing.md)
+- [Roadmap](https://github.com/lydakis/sandfs/blob/main/docs/roadmap.md)
+- [Changelog](https://github.com/lydakis/sandfs/blob/main/docs/changelog.md)
+- [Publishing sandfs](https://github.com/lydakis/sandfs/blob/main/docs/publishing.md)

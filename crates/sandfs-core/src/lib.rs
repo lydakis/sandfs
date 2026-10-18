@@ -18,3 +18,8 @@ pub use error::{Error, Result};
 pub use path::VPath;
 pub use source::{DirSource, Kind, Listing, MemorySource, Source, SourceEntry, SourceKey};
 pub use workspace::{DirEntry, Metadata, Workspace};
+
+// Keeps the README example compiling.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExample;

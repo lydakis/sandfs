@@ -165,3 +165,8 @@ impl Server {
 fn error_response(id: Value, code: i64, message: &str) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }).to_string()
 }
+
+// Keeps the README example compiling.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExample;

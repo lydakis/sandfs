@@ -1,11 +1,15 @@
 [package]
 name = "sandfs-mcp"
 description = "MCP file tools over a sandfs workspace: the filesystem you give an agent instead of a bash tool"
+readme = "README.md"
+keywords = ["mcp", "filesystem", "sandbox", "agents", "copy-on-write"]
+categories = ["filesystem", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 base64 = "0.22"
