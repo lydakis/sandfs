@@ -12,6 +12,10 @@ use serde_json::{Map, Value, json};
 pub const MAX_OUTPUT: usize = 64 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_READ_LINE_CHARS: usize = 2000;
+const DEFAULT_READ_BYTES: u64 = 20_000;
+const MAX_READ_BYTES: u64 = 60_000;
+/// How much of a file's start decides whether a byte read treats it as text.
+const SNIFF_BYTES: u64 = 8192;
 const MAX_GREP_LINE_CHARS: usize = 500;
 const MAX_ENTRIES: usize = 1000;
 const DEFAULT_GREP_MATCHES: usize = 200;
@@ -73,6 +77,14 @@ impl Tools {
 
     fn read(&self, args: &Args) -> ToolResult {
         let path = args.path("path")?;
+        let byte_offset = args.opt_u64("byte_offset")?;
+        let byte_length = args.opt_u64("byte_length")?;
+        if byte_offset.is_some() || byte_length.is_some() {
+            if args.has("offset") || args.has("limit") {
+                return Err("use either offset/limit (lines) or byte_offset/byte_length, not both".to_owned());
+            }
+            return self.read_bytes(&path, byte_offset.unwrap_or(0), byte_length.unwrap_or(DEFAULT_READ_BYTES));
+        }
         let offset = args.opt_u64("offset")?.unwrap_or(1).max(1) as usize;
         let limit = args.opt_u64("limit")?.map_or(DEFAULT_READ_LINES, |n| n as usize).max(1);
         let version = self.workspace.stat(&path).map_err(err)?.version;
@@ -95,7 +107,18 @@ impl Tools {
             if full || idx < offset - 1 || idx >= (offset - 1).saturating_add(limit) {
                 continue;
             }
-            let entry = format!("{:>6}\t{}\n", idx + 1, clip(line, MAX_READ_LINE_CHARS));
+            // A cut line says where its rest starts, so a byte read can fetch it.
+            let shown = match line.char_indices().nth(MAX_READ_LINE_CHARS) {
+                Some((cut, _)) => {
+                    let rest = line.as_ptr() as usize - text.as_ptr() as usize + cut;
+                    format!(
+                        "{}… [line cut at {MAX_READ_LINE_CHARS} characters; rest from byte_offset={rest}]",
+                        &line[..cut]
+                    )
+                }
+                None => line.to_owned(),
+            };
+            let entry = format!("{:>6}\t{shown}\n", idx + 1);
             // Leave room for the footer, but always show at least one line.
             if !out.is_empty() && out.len() + entry.len() > MAX_OUTPUT - 200 {
                 full = true;
@@ -120,6 +143,50 @@ impl Tools {
         }
         out.push(']');
         Ok(out)
+    }
+
+    /// Show a byte range of a text file as raw text, read without loading the whole file.
+    ///
+    /// Nothing here needs the file's size or version, since getting those can mean
+    /// reading the whole file from a source that does not report sizes.
+    fn read_bytes(&self, path: &str, offset: u64, length: u64) -> ToolResult {
+        if length > MAX_READ_BYTES {
+            return Err(format!("byte_length must be at most {MAX_READ_BYTES}"));
+        }
+        let length = length.max(1);
+        // Decide whether the file is text from its start, as `git` and `file` do, so an
+        // ASCII stretch inside a binary file is not shown.
+        let head = self.workspace.read_range(path, 0, SNIFF_BYTES).map_err(err)?;
+        if head.contains(&0) || detect_type(&head) != UNKNOWN_BINARY {
+            return Err(format!("{path}: {}; not text, so not shown", detect_type(&head)));
+        }
+        // One byte past the range says whether the file goes on.
+        let mut bytes = self.workspace.read_range(path, offset, length + 1).map_err(err)?;
+        if bytes.is_empty() {
+            return Err(format!("{path}: byte_offset {offset} is at or past the end of the file"));
+        }
+        let at_end = bytes.len() as u64 <= length;
+        bytes.truncate(length as usize);
+        // Move the range onto character boundaries: skip a split character at the start
+        // and drop one at the end. A file cannot end inside a character and be text.
+        let skip = bytes.iter().take(3).take_while(|&&b| b & 0xC0 == 0x80).count();
+        let slice = &bytes[skip..];
+        let text = match std::str::from_utf8(slice) {
+            Ok(text) => Some(text),
+            Err(e) if e.error_len().is_none() && !at_end => std::str::from_utf8(&slice[..e.valid_up_to()]).ok(),
+            Err(_) => None,
+        };
+        let range = || format!("bytes {offset}-{}", offset + bytes.len() as u64);
+        let Some(text) = text.filter(|text| !text.contains('\0')) else {
+            return Err(format!("{path}: {} are not text, so not shown", range()));
+        };
+        if text.is_empty() {
+            return Err(format!("{path}: {} hold no whole character; read a longer range", range()));
+        }
+        let start = offset + skip as u64;
+        let end = start + text.len() as u64;
+        let more = if at_end { "end of file".to_owned() } else { format!("continue with byte_offset={end}") };
+        Ok(format!("{text}\n[bytes {start}-{end} · {more}]"))
     }
 
     fn list(&self, args: &Args) -> ToolResult {
@@ -428,6 +495,10 @@ impl Args<'_> {
         }
     }
 
+    fn has(&self, key: &str) -> bool {
+        !matches!(self.0.get(key), None | Some(Value::Null))
+    }
+
     fn opt_bool(&self, key: &str) -> Result<bool, String> {
         match self.0.get(key) {
             None | Some(Value::Null) => Ok(false),
@@ -517,6 +588,9 @@ fn glob_matcher(pattern: &str) -> Result<GlobMatcher, String> {
 }
 
 /// A short description of a non-text file, sniffed from its first bytes.
+/// What [`detect_type`] calls a file with no known signature.
+const UNKNOWN_BINARY: &str = "binary file";
+
 fn detect_type(bytes: &[u8]) -> &'static str {
     const SIGNATURES: &[(&[u8], &str)] = &[
         (b"\x89PNG\r\n\x1a\n", "PNG image"),
@@ -531,7 +605,7 @@ fn detect_type(bytes: &[u8]) -> &'static str {
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return "WebP image";
     }
-    SIGNATURES.iter().find(|(magic, _)| bytes.starts_with(magic)).map_or("binary file", |(_, name)| name)
+    SIGNATURES.iter().find(|(magic, _)| bytes.starts_with(magic)).map_or(UNKNOWN_BINARY, |(_, name)| name)
 }
 
 /// Text if the bytes are UTF-8 without NUL bytes; anything else is treated as binary.
@@ -595,12 +669,18 @@ pub(crate) fn definitions() -> Vec<Value> {
         json!({
             "name": "read",
             "description": "Read a file, with its version for `write`/`edit`. Text files come back with line numbers \
-                (like `cat -n`), up to 2000 lines; use offset and limit for more. Other files report their \
-                detected type and size, not their bytes.",
+                (like `cat -n`), up to 2000 lines; use offset and limit for more. Lines over 2000 characters are \
+                cut; byte_offset and byte_length read raw text by byte position instead, for the rest of a long \
+                line or any part of a large file. Other files report their detected type and size, not their \
+                bytes.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute path of the file."),
                 "offset": { "type": "integer", "minimum": 1, "description": "First line to show (1-based)." },
                 "limit": { "type": "integer", "minimum": 1, "description": "Number of lines to show." },
+                "byte_offset": { "type": "integer", "minimum": 0,
+                    "description": "Read raw text from this byte position instead of by line. Byte reads show no version." },
+                "byte_length": { "type": "integer", "minimum": 1, "maximum": 60000,
+                    "description": "Bytes to read from byte_offset (default 20000)." },
             }, "required": ["path"] },
             "annotations": read_only,
         }),
