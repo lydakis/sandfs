@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `diff()` reports) plus the directory and in-memory sources, `sandfs-git` is an optional lazy git source, and `sandfs-py` is the PyO3 extension, including sources written in Python. New capabilities land here.
+- `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `changes()` reports) plus the directory and in-memory sources, `sandfs-git` is an optional lazy git source, and `sandfs-py` is the PyO3 extension, including sources written in Python. New capabilities land here.
 - `sandfs/` is the Python package: re-exports from the `sandfs._core` extension, its type stubs (`_core.pyi`) and the `Source` protocol (`source.py`). Keep it thin; logic belongs in Rust.
 - `tests/` contains the pytest suites for the Python surface; Rust tests live next to each crate (`crates/*/tests`).
 - `docs/` tracks the roadmap and release notes. Keep repository-wide guidance in README and this file.
@@ -16,7 +16,7 @@
 - `pre-commit install` – enables automatic Ruff and MyPy hooks before every commit.
 
 ## Coding Style & Naming Conventions
-- Rust: edition 2024, `rustfmt.toml` settings, no `unsafe`, doc comments on public items. Prefer small, composable functions over new concepts; a feature that can be built from fork, mount and diff should be.
+- Rust: edition 2024, `rustfmt.toml` settings, no `unsafe`, doc comments on public items. Prefer small, composable functions over new concepts; a feature that can be built from mount, fork and changes should be.
 - Python 3.11+, 4-space indentation, PEP 8 naming, type hints everywhere.
 - Keep comments meaningful: a brief rationale before non-trivial logic. Avoid repository-specific jargon unless defined.
 

@@ -61,9 +61,9 @@ fn mounts_a_commit_without_a_checkout() {
     }
 
     ws.write("/head/src/lib.rs", "changed\n").unwrap();
-    let diff = ws.diff().unwrap();
-    assert_eq!(diff.len(), 1);
-    assert_eq!((diff[0].path.as_str(), diff[0].kind), ("/head/src/lib.rs", ChangeKind::Modified));
+    let changes = ws.changes().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!((changes[0].path.as_str(), changes[0].kind), ("/head/src/lib.rs", ChangeKind::Modified));
 }
 
 #[test]

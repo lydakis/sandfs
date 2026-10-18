@@ -8,9 +8,9 @@
 
 - **Source**: a read-only tree, read only when a path below it is touched. sandfs ships a host directory, in-memory files and an optional git source; anything else is two methods you write, `list` and `read`.
 - **Workspace**: sources mounted at paths, plus a copy-on-write overlay that holds every write, directory and deletion. Sources are never modified.
-- **Change**: one file that differs from the mounts, returned by `diff()`.
+- **Change**: one file that differs from the mounts, returned by `changes()`.
 
-Everything else is a composition. A snapshot is a fork nobody writes to, a worktree is a fork mounted on disk, and saving is the harness walking `diff()` and writing each changed file wherever its data lives.
+Everything else is a composition. A snapshot is a fork nobody writes to, a working copy on disk is a fork mounted over FUSE, and saving is the harness walking `changes()` and writing each changed file wherever its data lives.
 
 ## Installation
 
@@ -42,7 +42,7 @@ version = attempt.write("/reports/summary.md", "# Open tickets\n")
 attempt.write("/reports/summary.md", "# Open tickets (2)\n", expected_version=version)
 attempt.write("/reports/chart.png", png_bytes)
 
-for change in attempt.diff():
+for change in attempt.changes():
     print(change.kind, change.path)                      # added /reports/chart.png, added /reports/summary.md
 ```
 
@@ -62,7 +62,7 @@ A source must return the same answer every time, because what it returns is cach
 | `list(path="/")`, `stat(path)`, `exists(path)` | Entries (name, kind, size), and kind, size and version |
 | `write(path, data, *, expected_version=None)` | Write str or bytes, creating parents, and return the new version |
 | `mkdir`, `remove`, `copy`, `move` | File operations; base files are copied by reference |
-| `diff()` | `Change(path, kind)` for every added, modified or deleted file |
+| `changes()` | `Change(path, kind)` for every added, modified or deleted file |
 
 Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`. An exception raised inside a Python source surfaces as `OSError`. Calls into the core release the GIL, so a slow source never blocks other threads. A workspace is not meant to be shared between threads; fork one per thread instead.
 
@@ -75,7 +75,7 @@ sandfs does not run commands. Commands an agent wants to run belong in a real sa
 ```
 .
 ├── crates/
-│   ├── sandfs-core/    # workspaces, overlay, diff, directory and in-memory sources
+│   ├── sandfs-core/    # workspaces, overlay, changes, directory and in-memory sources
 │   ├── sandfs-git/     # optional lazy git source
 │   └── sandfs-py/      # Python bindings (the sandfs._core extension)
 ├── docs/               # roadmap and publishing notes

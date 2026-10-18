@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use imbl::OrdMap;
 
-use crate::diff::{Change, ChangeKind};
+use crate::change::{Change, ChangeKind};
 use crate::error::{Error, Result};
 use crate::path::VPath;
 use crate::source::{Kind, Listing, Source, SourceEntry, SourceKey};
@@ -351,7 +351,7 @@ impl Workspace {
     ///
     /// Only files are reported; an empty directory is not a change. The cost is
     /// proportional to the overlay, plus listing any base directories that were deleted.
-    pub fn diff(&self) -> Result<Vec<Change>> {
+    pub fn changes(&self) -> Result<Vec<Change>> {
         let mut changes: BTreeMap<VPath, ChangeKind> = BTreeMap::new();
         // First every base file the overlay hides: below whiteouts, recreated
         // directories, and files written where a base directory used to be.

@@ -1,4 +1,4 @@
-//! Behavior tests for workspaces: laziness, forks, overlays and diffs.
+//! Behavior tests for workspaces: laziness, forks, overlays and changes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,7 +110,7 @@ fn names(ws: &Workspace, path: &str) -> Vec<String> {
 }
 
 fn changes(ws: &Workspace) -> Vec<(String, ChangeKind)> {
-    ws.diff().unwrap().into_iter().map(|Change { path, kind }| (path.to_string(), kind)).collect()
+    ws.changes().unwrap().into_iter().map(|Change { path, kind }| (path.to_string(), kind)).collect()
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn copies_and_renames_of_base_files_stay_lazy() {
 }
 
 #[test]
-fn diff_reports_file_level_changes() {
+fn changes_are_reported_per_file() {
     let (mut ws, _) = workspace();
     assert!(changes(&ws).is_empty());
 
@@ -259,7 +259,7 @@ fn diff_reports_file_level_changes() {
 }
 
 #[test]
-fn diff_sees_a_directory_replaced_by_a_file() {
+fn changes_include_a_directory_replaced_by_a_file() {
     let (mut ws, _) = workspace();
     ws.remove("/repo/src", true).unwrap();
     ws.write("/repo/src", "now a file").unwrap();

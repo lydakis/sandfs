@@ -13,7 +13,7 @@ pub enum ChangeKind {
     Deleted,
 }
 
-/// One changed file, as returned by [`crate::Workspace::diff`].
+/// One changed file, as returned by [`crate::Workspace::changes`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Change {
     /// Workspace path of the file.

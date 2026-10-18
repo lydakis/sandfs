@@ -139,7 +139,7 @@ def test_memory_source_and_binary_files() -> None:
         ws.read_text("/out/chart.png")
 
 
-def test_fork_is_isolated_and_diff_lists_changed_files() -> None:
+def test_fork_is_isolated_and_changes_lists_changed_files() -> None:
     base = Workspace()
     base.mount("/docs", MemorySource({"plan.md": "draft\n", "old/notes.txt": "n\n"}))
 
@@ -149,8 +149,8 @@ def test_fork_is_isolated_and_diff_lists_changed_files() -> None:
     attempt.remove("/docs/old", recursive=True)
 
     assert base.read_text("/docs/plan.md") == "draft\n"
-    assert base.diff() == []
-    assert [(c.path, c.kind) for c in attempt.diff()] == [
+    assert base.changes() == []
+    assert [(c.path, c.kind) for c in attempt.changes()] == [
         ("/docs/figure.png", "added"),
         ("/docs/old/notes.txt", "deleted"),
         ("/docs/plan.md", "modified"),

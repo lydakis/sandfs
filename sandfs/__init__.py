@@ -2,7 +2,7 @@
 
 A ``Workspace`` mounts read-only sources (a host directory, in-memory files, a git
 commit, or any object with ``list`` and ``read`` methods), keeps every change in a
-copy-on-write overlay, forks in O(1) and reports which files changed with ``diff()``.
+copy-on-write overlay, forks in O(1) and reports which files changed with ``changes()``.
 Files are bytes of any kind. The implementation is the Rust core in ``sandfs._core``.
 """
 

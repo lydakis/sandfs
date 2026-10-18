@@ -297,7 +297,7 @@ fn as_source(source: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Source>> {
 
 /// A copy-on-write filesystem: read-only mounts plus an overlay of changes.
 ///
-/// Mounts are read lazily, `fork()` is O(1), and `diff()` lists what changed. A
+/// Mounts are read lazily, `fork()` is O(1), and `changes()` lists what changed. A
 /// workspace is not meant to be shared between threads; fork one per thread instead.
 #[pyclass(module = "sandfs")]
 struct Workspace {
@@ -419,8 +419,8 @@ impl Workspace {
     }
 
     /// The files that differ from the mounts, sorted by path.
-    fn diff(&self, py: Python<'_>) -> PyResult<Vec<Change>> {
-        let changes = py.detach(|| self.inner.diff()).or_raise()?;
+    fn changes(&self, py: Python<'_>) -> PyResult<Vec<Change>> {
+        let changes = py.detach(|| self.inner.changes()).or_raise()?;
         Ok(changes
             .into_iter()
             .map(|change| Change {
