@@ -92,7 +92,7 @@ impl Tools {
         let mut total = 0;
         for (idx, line) in text.lines().enumerate() {
             total = idx + 1;
-            if full || idx < offset - 1 || idx >= offset - 1 + limit {
+            if full || idx < offset - 1 || idx >= (offset - 1).saturating_add(limit) {
                 continue;
             }
             let entry = format!("{:>6}\t{}\n", idx + 1, clip(line, MAX_READ_LINE_CHARS));
@@ -187,7 +187,11 @@ impl Tools {
         let root = args.opt_path("path")?;
         let filter = args.opt_str("glob")?.map(|glob| Ok::<_, String>((glob_matcher(glob)?, glob.contains('/'))));
         let filter = filter.transpose()?;
-        let context = args.opt_u64("context")?.unwrap_or(0).min(MAX_CONTEXT) as usize;
+        let context = args.opt_u64("context")?.unwrap_or(0);
+        if context > MAX_CONTEXT {
+            return Err(format!("context must be at most {MAX_CONTEXT}"));
+        }
+        let context = context as usize;
         let max = args.opt_u64("max")?.map_or(DEFAULT_GREP_MATCHES, |n| n as usize).max(1);
         let regex = RegexBuilder::new(pattern)
             .case_insensitive(args.opt_bool("ignore_case")?)
@@ -368,8 +372,13 @@ impl Search<'_> {
                 self.out.push_str("--\n");
             }
             for (n, text) in lines.iter().enumerate().take(end + 1).skip(start) {
-                let sep = if hit_set.contains(&n) { ':' } else { '-' };
-                let line = format!("{path}{sep}{}{sep}{}\n", n + 1, clip(text, MAX_GREP_LINE_CHARS));
+                let hit = hit_set.contains(&n);
+                let sep = if hit { ':' } else { '-' };
+                let shown = match regex.find(text).filter(|_| hit) {
+                    Some(m) => clip_around(text, m.start(), MAX_GREP_LINE_CHARS),
+                    None => clip(text, MAX_GREP_LINE_CHARS),
+                };
+                let line = format!("{path}{sep}{}{sep}{shown}\n", n + 1);
                 if self.out.len() + line.len() > MAX_OUTPUT - 200 {
                     self.truncated = true;
                     self.matches += hit_set.range(..n).count();
@@ -535,6 +544,22 @@ fn clip(line: &str, max_chars: usize) -> String {
     }
 }
 
+/// Like [`clip`], but when the match starts past the cut, show a window that begins
+/// shortly before it so the matching text stays visible.
+fn clip_around(line: &str, match_start: usize, max_chars: usize) -> String {
+    let before = line[..match_start].chars().count();
+    if before + 40 < max_chars {
+        return clip(line, max_chars);
+    }
+    let skip = before - 40;
+    let start = line.char_indices().nth(skip).map_or(match_start, |(idx, _)| idx);
+    let rest = &line[start..];
+    match rest.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("[{skip} characters cut] …{}… [line cut]", &rest[..idx]),
+        None => format!("[{skip} characters cut] …{rest}"),
+    }
+}
+
 /// Cut a result at [`MAX_OUTPUT`] bytes on a line boundary, saying so.
 fn cap(mut text: String) -> String {
     if text.len() <= MAX_OUTPUT {
@@ -606,7 +631,7 @@ pub(crate) fn definitions() -> Vec<Value> {
                 "path": path("File or directory to search. Defaults to /."),
                 "glob": { "type": "string", "description": "Only search matching files, e.g. `*.json` (file name) or `logs/**/*.txt` (path below `path`)." },
                 "ignore_case": { "type": "boolean", "description": "Case-insensitive search." },
-                "context": { "type": "integer", "minimum": 0, "description": "Lines of context around each match." },
+                "context": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Lines of context around each match (at most 20)." },
                 "max": { "type": "integer", "minimum": 1, "description": "Stop after this many matches (default 200)." },
             }, "required": ["pattern"] },
             "annotations": read_only,

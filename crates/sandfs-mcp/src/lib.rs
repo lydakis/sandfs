@@ -4,7 +4,7 @@
 //! `edit`, `move`, `delete` and `changes`, shaped like the file tools models already know.
 //! Every call works on one copy-on-write [`Workspace`]: mounts stay read-only, writes
 //! land in the overlay, and the harness collects the result with
-//! [`Server::into_workspace`] and [`Workspace::diff`]. Forking, checkpoints and commits
+//! [`Server::into_workspace`] and [`Workspace::changes`]. Forking, checkpoints and commits
 //! stay with the harness, so there are no tools for them.
 //!
 //! The `sandfs-mcp` binary serves a workspace built from command-line mounts. For an
@@ -92,6 +92,9 @@ impl Server {
             return Some(error_response(Value::Null, INVALID_REQUEST, "expected a JSON-RPC request object"));
         }
         let id = request.get("id").cloned();
+        if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Some(error_response(id.unwrap_or(Value::Null), INVALID_REQUEST, "expected \"jsonrpc\": \"2.0\""));
+        }
         let Some(method) = request.get("method").and_then(Value::as_str) else {
             // This server sends no requests, so a response addressed to it is ignored.
             if request.get("result").is_some() || request.get("error").is_some() {

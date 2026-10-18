@@ -120,6 +120,19 @@ fn grep_searches_text_files_with_context_and_filters() {
     assert_eq!(capped, "/data/sales/2026.csv:2:north,120\n[1 matches in 1 file; stopped at max=1]");
     assert!(ok(&mut s, "grep", json!({ "pattern": "zzz" })).starts_with("No matches"));
     assert!(fails(&mut s, "grep", json!({ "pattern": "(" })).contains("invalid regex"));
+    assert_eq!(fails(&mut s, "grep", json!({ "pattern": "x", "context": 21 })), "context must be at most 20");
+}
+
+#[test]
+fn grep_shows_matches_past_the_line_cut_and_read_takes_huge_limits() {
+    let mut s = server();
+    let wide = format!("{}needle{}", "a".repeat(600), "b".repeat(600));
+    ok(&mut s, "write", json!({ "path": "/data/wide.json", "content": wide }));
+    let hit = ok(&mut s, "grep", json!({ "pattern": "needle", "path": "/data/wide.json" }));
+    assert!(hit.starts_with("/data/wide.json:1:[560 characters cut] …aaaa"), "{hit}");
+    assert!(hit.contains("needlebbb") && hit.contains("… [line cut]"), "{hit}");
+    let page = ok(&mut s, "read", json!({ "path": "/data/sales/2026.csv", "offset": 2, "limit": u64::MAX }));
+    assert!(page.ends_with("[version 0 · lines 2-4 of 4]"), "{page}");
 }
 
 #[test]

@@ -51,10 +51,11 @@ fn a_session_over_a_mounted_directory() {
             json!({ "jsonrpc": "2.0", "method": 1 }),
             json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
                 "name": "read", "arguments": { "path": "/work/dot.gif" } } }),
+            json!({ "id": 10, "method": "ping" }),
         ],
     );
     // Every request plus the trailing unparseable line; only the notification gets no reply.
-    assert_eq!(replies.len(), 10, "{replies:#?}");
+    assert_eq!(replies.len(), 11, "{replies:#?}");
 
     let init = &replies[0]["result"];
     assert_eq!(init["protocolVersion"], "2025-06-18");
@@ -82,7 +83,9 @@ fn a_session_over_a_mounted_directory() {
     let gif = &replies[8]["result"]["content"];
     assert_eq!(gif.as_array().unwrap().len(), 1, "non-text files are described, never sent as bytes");
     assert_eq!(gif[0]["text"], "/work/dot.gif: GIF image, 8 bytes, version 0; not text, so not shown");
-    assert_eq!(replies[9]["error"]["code"], -32700);
+    assert_eq!(replies[9]["error"]["code"], -32600, "the jsonrpc member is required");
+    assert_eq!(replies[9]["id"], 10);
+    assert_eq!(replies[10]["error"]["code"], -32700);
 }
 
 #[test]
