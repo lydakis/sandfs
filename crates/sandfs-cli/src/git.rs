@@ -83,10 +83,13 @@ fn clone_or_fetch(repos: &Path, url: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Split a trailing `@rev`, which may contain slashes (`@feature/x`). The `@` of a
-/// URL's user (`git@host:repo`, `https://me@host/repo`) is left alone.
+/// Split a trailing `@rev`, which may contain slashes (`@feature/x`) or a reflog
+/// selector (`@HEAD@{1}`). The `@` of a URL's user (`git@host:repo`,
+/// `https://me@host/repo`) is left alone.
 fn split_rev(spec: &str) -> (&str, Option<String>) {
-    let Some(at) = spec.rfind('@') else { return (spec, None) };
+    let Some(at) = spec.match_indices('@').map(|(i, _)| i).rfind(|&i| !spec[i + 1..].starts_with('{')) else {
+        return (spec, None);
+    };
     let (location, rev) = (&spec[..at], &spec[at + 1..]);
     // Ref names cannot contain ':', which rules out the host of `user@host:repo`, and
     // an https user is followed by a host with no path before it.
@@ -152,6 +155,8 @@ mod tests {
         assert_eq!(split("git@host:repo"), ("git@host:repo".into(), None));
         assert_eq!(split("/srv/repo@feature/foo"), ("/srv/repo".into(), Some("feature/foo".into())));
         assert_eq!(split("https://u@host/r@release/1.0"), ("https://u@host/r".into(), Some("release/1.0".into())));
+        assert_eq!(split("/srv/repo@HEAD@{1}"), ("/srv/repo".into(), Some("HEAD@{1}".into())));
+        assert_eq!(split("/srv/repo@main@{2.days.ago}"), ("/srv/repo".into(), Some("main@{2.days.ago}".into())));
         assert!(resolve(Path::new("/nonexistent"), "repo@").is_err());
     }
 

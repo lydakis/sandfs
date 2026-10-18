@@ -105,7 +105,11 @@ impl Home {
             }
             Err(err) => return Err(err).context("creating the workspace"),
         }
-        std::fs::write(dir.join("workspace.json"), serde_json::to_vec_pretty(record)?)?;
+        if let Err(err) = std::fs::write(dir.join("workspace.json"), serde_json::to_vec_pretty(record)?) {
+            // Without its record the directory is not a workspace, and would block the name.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(err).context("creating the workspace");
+        }
         Ok(dir)
     }
 
@@ -145,7 +149,8 @@ impl Home {
     pub fn attached_mount(&self, name: &str) -> Option<MountInfo> {
         let data = std::fs::read(self.workspace_dir(name).join("mount.json")).ok()?;
         let info: MountInfo = serde_json::from_slice(&data).ok()?;
-        is_mounted(&info.mountpoint).then_some(info)
+        // Only this workspace's mount: another filesystem may have taken the path since.
+        (mount_source(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
     }
 
     pub fn set_mount_info(&self, name: &str, info: Option<&MountInfo>) -> Result<()> {
@@ -207,6 +212,14 @@ impl Home {
             if !path.is_dir() {
                 bail!("{} is not a folder", path.display());
             }
+            // Saving into the source would change the folder that is meant to stay untouched.
+            if crate::resolve_new(&self.root)?.starts_with(&path) {
+                bail!(
+                    "{} contains sandfs's own state ({}); set SANDFS_HOME to a folder outside it",
+                    path.display(),
+                    self.root.display()
+                );
+            }
             Base::Dir { path }
         };
         Ok(Record { source: source.to_owned(), base, created })
@@ -232,13 +245,19 @@ pub fn check_name(name: &str) -> Result<()> {
 
 /// Whether a FUSE filesystem is mounted at `dir`, from `/proc/self/mountinfo`.
 pub fn is_mounted(dir: &Path) -> bool {
-    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else { return false };
-    table.lines().any(|line| {
+    mount_source(dir).is_some()
+}
+
+/// The source of the topmost FUSE mount at `dir` (`sandfs:<name>` for a workspace).
+fn mount_source(dir: &Path) -> Option<String> {
+    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    table.lines().rev().find_map(|line| {
         let fields: Vec<&str> = line.split(' ').collect();
-        // Field 5 is the mount point; the filesystem type follows the " - " separator.
-        let fstype = fields.iter().position(|f| *f == "-").and_then(|i| fields.get(i + 1));
-        fields.get(4).is_some_and(|point| Path::new(&unescape(point)) == dir)
-            && fstype.is_some_and(|t| t.starts_with("fuse"))
+        // Field 5 is the mount point; the type and source follow the " - " separator.
+        let sep = fields.iter().position(|f| *f == "-")?;
+        let (fstype, source) = (fields.get(sep + 1)?, fields.get(sep + 2)?);
+        (fields.get(4).is_some_and(|point| Path::new(&unescape(point)) == dir) && fstype.starts_with("fuse"))
+            .then(|| unescape(source))
     })
 }
 
@@ -296,5 +315,10 @@ mod tests {
         assert_eq!(opened.ws.read_text("/mnt/f.txt").unwrap(), "f");
         home.remove("one").unwrap();
         assert!(home.names().unwrap().is_empty());
+
+        // A folder that holds the home itself would have workspaces saved into it.
+        let inside = Home::at(data.path().join(".local/share/sandfs"));
+        assert!(inside.resolve(data.path().to_str().unwrap()).is_err());
+        assert!(!data.path().join(".local").exists(), "nothing is created in the source");
     }
 }

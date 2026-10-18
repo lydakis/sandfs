@@ -533,7 +533,12 @@ impl Inner {
     /// The write buffer for `ino`, filled from the workspace on first use.
     fn buffer(&mut self, ino: u64) -> FsResult<&mut Vec<u8>> {
         if !self.buffers.contains_key(&ino) {
-            let data = self.ws.read(self.path(ino)?.as_str()).fs()?;
+            let path = self.path(ino)?;
+            // Check before reading: a large source file would otherwise be read whole.
+            if self.ws.stat(path.as_str()).fs()?.size > MAX_FILE_SIZE as u64 {
+                return Err(Errno::EFBIG);
+            }
+            let data = self.ws.read(path.as_str()).fs()?;
             self.buffers.insert(ino, data.to_vec());
         }
         self.buffers.get_mut(&ino).ok_or(Errno::EIO)
