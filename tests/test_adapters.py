@@ -246,3 +246,21 @@ def test_copy_of_directory_over_stored_file_replaces_entry():
     assert sorted(adapter.list()) == ["target/a.txt"]
     vfs.sync_storage("/d")
     assert vfs.read_file("/d/target/a.txt") == "A"
+
+
+def test_copy_into_storage_rejects_files_with_policies():
+    adapter = MemoryStorageAdapter()
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/src/public.txt", "ok")
+    vfs.write_file("/src/private.txt", "SECRET")
+    vfs.set_policy("/src/private.txt", NodePolicy(classification="private"))
+
+    with pytest.raises(InvalidOperation):
+        vfs.copy("/src", "/d/src", recursive=True)
+    with pytest.raises(InvalidOperation):
+        vfs.move("/src", "/d/src")
+
+    assert adapter.list() == {}
+    assert not vfs.exists("/d/src")
+    assert vfs.read_file("/src/private.txt") == "SECRET"

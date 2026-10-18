@@ -287,6 +287,20 @@ class VirtualFileSystem:
             raise InvalidOperation(f"Storage conflict for {node.path()}") from exc
         node.version = entry.version
 
+    def _ensure_storable(self, files: list[VirtualFile], dest: PurePosixPath) -> None:
+        """Refuse to place files with policies under a storage mount.
+
+        Adapters store content only, so a private file would come back public after a
+        reload; failing is better than silently dropping the policy.
+        """
+        if self._find_storage_mount(dest) is None:
+            return
+        for file_node in files:
+            if file_node.policy != NodePolicy():
+                raise InvalidOperation(
+                    f"Cannot store {file_node.path()} under {dest}: storage does not keep policies"
+                )
+
     def _loaded_files(self, node: VirtualNode) -> list[VirtualFile]:
         """Files already materialized under ``node``, without hydrating lazy directories."""
         if isinstance(node, VirtualFile):
@@ -715,6 +729,9 @@ class VirtualFileSystem:
             for _ in self.walk(node_path):
                 pass
         moved_files = [(file_node.path(), file_node) for file_node in self._loaded_files(node)]
+        self._ensure_storable(
+            [file_node for _, file_node in moved_files], dest_parent.path().joinpath(dest_name)
+        )
         parent.remove_child(node.name)
         node.name = dest_name
         dest_parent.add_child(node)
@@ -785,6 +802,7 @@ class VirtualFileSystem:
 
         clone = self._clone_node(node, recursive=recursive)
         clone.name = dest_name
+        self._ensure_storable(self._loaded_files(clone), dest_parent.path().joinpath(dest_name))
         if replaced and isinstance(clone, VirtualDirectory):
             # The stored file becomes a directory, so its adapter entry has to go.
             self._delete_storage_entry(dest_parent.path().joinpath(dest_name))
