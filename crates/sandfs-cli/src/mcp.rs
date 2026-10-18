@@ -47,6 +47,14 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             }
             continue;
         };
+        // What exists before the call, to tell which entries it creates or removes.
+        let below_root = |p: &VPath| p.starts_with(&root) && *p != root;
+        let existed: Vec<bool> = touched.iter().map(|p| server.workspace().exists(p.as_str())).collect();
+        let missing: Vec<VPath> = touched
+            .iter()
+            .flat_map(VPath::ancestors)
+            .filter(|p| below_root(p) && !server.workspace().exists(p.as_str()))
+            .collect();
         // Only changes inside the source's mount can be saved, so refuse the rest.
         let reply = match touched.iter().find(|path| !path.starts_with(&root) || **path == root) {
             Some(outside) => {
@@ -59,6 +67,16 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             // created (parents, a moved subtree) and the paths it removed, and give
             // changed paths a new modification time.
             let ws = server.workspace();
+            let now = SystemTime::now();
+            // A directory changes when an entry in it appears or goes, as on a real filesystem.
+            for path in missing.iter().filter(|p| ws.exists(p.as_str())) {
+                times.insert(path.to_string(), now);
+            }
+            for (path, existed) in touched.iter().zip(existed) {
+                if let Some(parent) = path.parent().filter(|p| existed != ws.exists(path.as_str()) && below_root(p)) {
+                    times.insert(parent.to_string(), now);
+                }
+            }
             // Only `move` touches two paths; its files keep their times at the new place.
             if let [from, to] = touched.as_slice() {
                 for old in subtree_keys(&times, from) {
@@ -68,12 +86,12 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
                 }
             }
             for path in &touched {
-                for parent in path.ancestors().into_iter().filter(|p| p.starts_with(&root) && *p != root) {
+                for parent in path.ancestors().into_iter().filter(below_root) {
                     dirs.insert(parent.to_string());
                 }
                 match ws.stat(path.as_str()) {
                     Ok(meta) => {
-                        times.insert(path.to_string(), SystemTime::now());
+                        times.insert(path.to_string(), now);
                         if meta.kind.is_dir() {
                             add_subtree(ws, path, &mut dirs);
                         }
@@ -191,6 +209,26 @@ mod tests {
         let times = home.open("ws").unwrap().restored.times;
         assert_eq!(times.get("/mnt/moved/f.txt"), Some(&written));
         assert!(!times.contains_key("/mnt/dir/f.txt"));
+    }
+
+    #[test]
+    fn folders_get_a_time_when_their_entries_change() {
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir(data.path().join("old")).unwrap();
+        std::fs::write(data.path().join("old/a.txt"), "a").unwrap();
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+
+        let calls = [
+            call(1, "write", json!({ "path": "/mnt/new/deeper/f.txt", "content": "f" })),
+            call(2, "delete", json!({ "path": "/mnt/old/a.txt" })),
+        ];
+        session(&home, &calls.concat());
+
+        let times = home.open("ws").unwrap().restored.times;
+        for dir in ["/mnt/new", "/mnt/new/deeper", "/mnt/old"] {
+            assert!(times.contains_key(dir), "{dir} has a saved time");
+        }
     }
 
     #[test]
