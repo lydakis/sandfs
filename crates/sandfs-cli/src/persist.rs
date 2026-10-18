@@ -126,6 +126,9 @@ impl Saved {
                 }
             }
         }
+        // New objects must never reuse the name of one the index still names.
+        let last = self.objects.values().filter_map(|(_, object)| object.parse::<u64>().ok()).max();
+        self.next_object = self.next_object.max(last.unwrap_or(0) + 1);
         Ok(restored)
     }
 
