@@ -349,3 +349,22 @@ fn byte_reads_never_load_the_whole_file() {
     let tail = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 9 }));
     assert_eq!(tail, "line two\n\n[bytes 9-18 · end of file]");
 }
+
+#[test]
+fn paths_with_control_characters_are_shown_quoted() {
+    // A newline in a name would otherwise split one path over two lines.
+    let source =
+        MemorySource::from_files([("odd\nname.txt", b"needle\n".to_vec()), ("plain.txt", b"needle\n".to_vec())])
+            .unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/d", Arc::new(source)).unwrap();
+    let mut s = Server::new(ws);
+    assert_eq!(ok(&mut s, "list", json!({ "path": "/d" })), "\"odd\\nname.txt\" (7 bytes)\nplain.txt (7 bytes)");
+    assert_eq!(ok(&mut s, "glob", json!({ "pattern": "*.txt", "path": "/d" })), "\"/d/odd\\nname.txt\"\n/d/plain.txt");
+    assert!(
+        ok(&mut s, "grep", json!({ "pattern": "needle", "path": "/d" }))
+            .starts_with("\"/d/odd\\nname.txt\":1:needle\n")
+    );
+    ok(&mut s, "write", json!({ "path": "/d/odd\nname.txt", "content": "x" }));
+    assert!(ok(&mut s, "changes", json!({})).starts_with("M \"/d/odd\\nname.txt\" (1 bytes)\n"));
+}

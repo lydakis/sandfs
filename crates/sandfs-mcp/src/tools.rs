@@ -60,7 +60,10 @@ impl Tools {
     /// What the agent is told at `initialize`: the top-level layout and how to work.
     pub(crate) fn instructions(&self) -> String {
         let top: Vec<String> = match self.workspace.list("/") {
-            Ok(entries) => entries.iter().map(|entry| format!("/{}{}", entry.name, suffix(entry.kind))).collect(),
+            Ok(entries) => entries
+                .iter()
+                .map(|entry| format!("{}{}", shown(&format!("/{}", entry.name)), suffix(entry.kind)))
+                .collect(),
             Err(_) => Vec::new(),
         };
         let layout = if top.is_empty() {
@@ -71,7 +74,7 @@ impl Tools {
         format!(
             "These tools are your filesystem: a private copy-on-write workspace. {layout} Paths are absolute. \
              Mounted sources are never modified; every write stays in this workspace, and `changes` shows what you \
-             changed."
+             changed. A path holding a control character, such as a newline, is shown as a quoted JSON string."
         )
     }
 
@@ -203,6 +206,7 @@ impl Tools {
                 truncated = true;
                 return false;
             }
+            let rel = shown(rel);
             lines.push(match (entry.kind, entry.size) {
                 (Kind::Dir, _) => format!("{rel}/"),
                 (_, Some(size)) => format!("{rel} ({size} bytes)"),
@@ -236,7 +240,7 @@ impl Tools {
                 truncated = true;
                 return false;
             }
-            found.push(abs.to_owned());
+            found.push(shown(abs).into_owned());
             true
         })?;
         if found.is_empty() {
@@ -382,11 +386,11 @@ impl Tools {
         for change in self.workspace.changes().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
             let path = change.path.as_str();
             lines.push(match change.kind {
-                ChangeKind::Deleted => format!("D {path}"),
+                ChangeKind::Deleted => format!("D {}", shown(path)),
                 kind => {
                     let mark = if kind == ChangeKind::Added { 'A' } else { 'M' };
                     let size = self.workspace.stat(path).map_err(err)?.size;
-                    format!("{mark} {path} ({size} bytes)")
+                    format!("{mark} {} ({size} bytes)", shown(path))
                 }
             });
         }
@@ -436,6 +440,7 @@ impl Search<'_> {
         }
         let hit_set: BTreeSet<usize> = hits.iter().copied().collect();
         self.files += 1;
+        let path = shown(path);
         for (start, end) in ranges {
             if self.context > 0 && !self.out.is_empty() {
                 self.out.push_str("--\n");
@@ -651,6 +656,13 @@ fn cap(mut text: String) -> String {
     text.truncate(cut);
     text.push_str("[output cut at 64 KiB; narrow the request, e.g. with a path, offset or limit]");
     text
+}
+
+/// A path as tool output shows it: as is, or as a quoted JSON string when it holds a
+/// control character, so a newline in a name cannot split it over two lines. The quoted
+/// form is what the agent passes back as a JSON argument.
+fn shown(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.chars().any(char::is_control) { Value::from(path).to_string().into() } else { path.into() }
 }
 
 fn suffix(kind: Kind) -> &'static str {
