@@ -1,0 +1,18 @@
+[package]
+name = "sandfs-git"
+description = "Lazy git commit mounts for sandfs workspaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+sandfs-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

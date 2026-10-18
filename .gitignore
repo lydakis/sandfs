@@ -2,3 +2,6 @@ __pycache__/
 .pytest_cache/
 .hypothesis/
 .venv/
+
+# Rust
+target/

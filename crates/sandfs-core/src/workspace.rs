@@ -1,0 +1,717 @@
+//! Copy-on-write workspaces over lazily read sources.
+//!
+//! A [`Workspace`] is a set of mounts (the read-only base) plus an overlay holding
+//! everything written, created or deleted since. Both live in persistent maps, so
+//! [`Workspace::fork`] is a cheap clone that shares all structure, and the overlay is
+//! exactly the change set. Base content is read through a cache shared by every fork,
+//! so a file fetched once is never fetched again.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use imbl::OrdMap;
+
+use crate::diff::{Change, ChangeKind};
+use crate::error::{Error, Result};
+use crate::path::VPath;
+use crate::source::{Kind, Listing, Source, SourceEntry, SourceKey};
+
+/// Symlink hops followed before reads give up, as on Linux.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+
+struct Mount {
+    id: u64,
+    source: Arc<dyn Source>,
+    root: SourceKey,
+}
+
+impl fmt::Debug for Mount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mount").field("id", &self.id).field("source", &self.source).finish()
+    }
+}
+
+/// Listings and blobs fetched from sources; keys are immutable, so forks share it.
+#[derive(Default)]
+struct Cache {
+    dirs: Mutex<HashMap<(u64, SourceKey), Arc<Listing>>>,
+    blobs: Mutex<HashMap<(u64, SourceKey), Bytes>>,
+}
+
+/// File content: bytes written into the overlay, or a reference to a base file that
+/// has not been (or need not be) read. References let copies and renames of base files
+/// stay lazy.
+#[derive(Clone, Debug)]
+enum Content {
+    Bytes(Bytes),
+    Base { mount: Arc<Mount>, key: SourceKey, size: Option<u64> },
+}
+
+#[derive(Clone, Debug)]
+enum Overlay {
+    File {
+        content: Content,
+        kind: Kind,
+        version: u64,
+    },
+    /// `opaque` directories were deleted and recreated: base entries below are hidden.
+    Dir {
+        opaque: bool,
+    },
+    Deleted,
+}
+
+/// Where a path's base (pre-overlay) node comes from.
+#[derive(Clone, Debug)]
+enum BaseNode {
+    MountRoot(Arc<Mount>),
+    Entry(Arc<Mount>, SourceEntry),
+    /// A directory that exists only because a mount point lies below it.
+    Implicit,
+}
+
+impl BaseNode {
+    fn kind(&self) -> Kind {
+        match self {
+            BaseNode::MountRoot(_) | BaseNode::Implicit => Kind::Dir,
+            BaseNode::Entry(_, entry) => entry.kind,
+        }
+    }
+}
+
+/// A path as the workspace currently sees it.
+#[derive(Clone, Debug)]
+enum Resolved {
+    Dir { base: Option<BaseNode> },
+    File { content: Content, kind: Kind, version: u64 },
+}
+
+/// One entry returned by [`Workspace::list`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    /// Entry name.
+    pub name: String,
+    /// What the entry is.
+    pub kind: Kind,
+    /// Size in bytes, when known without reading the file.
+    pub size: Option<u64>,
+}
+
+/// File metadata returned by [`Workspace::stat`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Metadata {
+    /// What the path is.
+    pub kind: Kind,
+    /// Size in bytes, when known without reading the file.
+    pub size: Option<u64>,
+    /// Optimistic version: 0 for untouched base files, incremented on every write.
+    pub version: u64,
+}
+
+/// One exact-string replacement for [`Workspace::edit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Edit {
+    /// Text to find. Must match exactly once unless `replace_all` is set.
+    pub old: String,
+    /// Replacement text.
+    pub new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    pub replace_all: bool,
+}
+
+impl Edit {
+    /// A replacement that must match exactly once.
+    pub fn new(old: impl Into<String>, new: impl Into<String>) -> Self {
+        Edit { old: old.into(), new: new.into(), replace_all: false }
+    }
+}
+
+/// A copy-on-write filesystem view: read-only mounts plus an overlay of changes.
+#[derive(Clone, Default)]
+pub struct Workspace {
+    mounts: OrdMap<VPath, Arc<Mount>>,
+    overlay: OrdMap<VPath, Overlay>,
+    cache: Arc<Cache>,
+}
+
+impl fmt::Debug for Workspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Workspace")
+            .field("mounts", &self.mounts.keys().collect::<Vec<_>>())
+            .field("overlay_entries", &self.overlay.len())
+            .finish()
+    }
+}
+
+impl Workspace {
+    /// An empty workspace: just the root directory.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mount `source` read-only at `path`. The path must not exist yet, except as a
+    /// directory implied by another mount.
+    pub fn mount(&mut self, path: &str, source: Arc<dyn Source>) -> Result<()> {
+        let path = VPath::parse(path)?;
+        if path.is_root() {
+            return Err(Error::Unsupported(path.to_string(), "cannot mount at the root"));
+        }
+        match self.resolve(&path) {
+            Err(Error::NotFound(_)) => {}
+            Ok(Resolved::Dir { base: Some(BaseNode::Implicit) }) => {}
+            Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
+            Err(err) => return Err(err),
+        }
+        let root = source.root()?;
+        let mount = Mount { id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed), source, root };
+        self.mounts.insert(path, Arc::new(mount));
+        Ok(())
+    }
+
+    /// An independent copy that shares all unchanged structure and the source cache.
+    ///
+    /// Forking costs O(1); later writes to either copy are invisible to the other.
+    /// A fork is also how snapshots work: keep one and assign it back to roll back.
+    pub fn fork(&self) -> Workspace {
+        self.clone()
+    }
+
+    /// True if the path exists.
+    pub fn exists(&self, path: &str) -> bool {
+        VPath::parse(path).is_ok_and(|path| self.resolve(&path).is_ok())
+    }
+
+    /// Metadata for a path, without following a final symlink.
+    pub fn stat(&self, path: &str) -> Result<Metadata> {
+        let path = VPath::parse(path)?;
+        Ok(match self.resolve(&path)? {
+            Resolved::Dir { .. } => Metadata { kind: Kind::Dir, size: None, version: 0 },
+            Resolved::File { content, kind, version } => Metadata { kind, size: content_size(&content), version },
+        })
+    }
+
+    /// Read a file's bytes, following symlinks inside the workspace.
+    pub fn read(&self, path: &str) -> Result<Bytes> {
+        let path = self.follow(VPath::parse(path)?)?;
+        match self.resolve(&path)? {
+            Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
+            Resolved::File { content, .. } => self.content_bytes(&content),
+        }
+    }
+
+    /// Read a file as UTF-8 text.
+    pub fn read_text(&self, path: &str) -> Result<String> {
+        let bytes = self.read(path)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| Error::NotText(path.to_owned()))
+    }
+
+    /// The target of a symlink.
+    pub fn read_link(&self, path: &str) -> Result<String> {
+        let path = VPath::parse(path)?;
+        match self.resolve(&path)? {
+            Resolved::File { content, kind: Kind::Symlink, .. } => {
+                let target = self.content_bytes(&content)?;
+                Ok(String::from_utf8_lossy(&target).into_owned())
+            }
+            _ => Err(Error::Unsupported(path.to_string(), "not a symbolic link")),
+        }
+    }
+
+    /// The entries of a directory, sorted by name.
+    pub fn list(&self, path: &str) -> Result<Vec<DirEntry>> {
+        let path = VPath::parse(path)?;
+        let base = match self.resolve(&path)? {
+            Resolved::Dir { base } => base,
+            Resolved::File { .. } => return Err(Error::NotADirectory(path.to_string())),
+        };
+        let mut entries: BTreeMap<String, DirEntry> = BTreeMap::new();
+        if let Some(base) = &base {
+            for (name, entry) in self.base_listing(base)?.iter() {
+                let kind = entry.kind;
+                entries.insert(name.clone(), DirEntry { name: name.clone(), kind, size: entry.size });
+            }
+        }
+        // Mount points and the directories leading to them are part of the structure.
+        for mount_path in self.mounts.keys() {
+            if let Some(rest) = mount_path.strip_prefix(&path) {
+                if let Some(first) = rest.first() {
+                    let name = (*first).to_owned();
+                    entries.insert(name.clone(), DirEntry { name, kind: Kind::Dir, size: None });
+                }
+            }
+        }
+        let depth = path.depth() + 1;
+        for (child, entry) in self.overlay_descendants(&path) {
+            if child.depth() != depth {
+                continue;
+            }
+            let name = child.name().unwrap_or_default().to_owned();
+            match entry {
+                Overlay::Deleted => {
+                    entries.remove(&name);
+                }
+                Overlay::Dir { .. } => {
+                    entries.insert(name.clone(), DirEntry { name, kind: Kind::Dir, size: None });
+                }
+                Overlay::File { content, kind, .. } => {
+                    let size = content_size(content);
+                    entries.insert(name.clone(), DirEntry { name, kind: *kind, size });
+                }
+            }
+        }
+        Ok(entries.into_values().collect())
+    }
+
+    /// Write a file, creating missing parent directories. Returns the new version.
+    pub fn write(&mut self, path: &str, data: impl Into<Bytes>) -> Result<u64> {
+        self.write_checked(path, data, None)
+    }
+
+    /// Write a file only if its current version is `expected` (0 for a new file).
+    pub fn write_versioned(&mut self, path: &str, data: impl Into<Bytes>, expected: u64) -> Result<u64> {
+        self.write_checked(path, data, Some(expected))
+    }
+
+    fn write_checked(&mut self, path: &str, data: impl Into<Bytes>, expected: Option<u64>) -> Result<u64> {
+        // Writes go through symlinks to their target, as with open(2).
+        let path = self.follow(VPath::parse(path)?)?;
+        let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
+        let (kind, version) = match self.resolve(&path) {
+            Ok(Resolved::Dir { .. }) => return Err(Error::IsADirectory(path.to_string())),
+            Ok(Resolved::File { kind, version, .. }) => (kind, version),
+            Err(Error::NotFound(_)) => (Kind::File { executable: false }, 0),
+            Err(err) => return Err(err),
+        };
+        if let Some(expected) = expected {
+            if expected != version {
+                return Err(Error::VersionMismatch { path: path.to_string(), expected, actual: version });
+            }
+        }
+        self.ensure_dir(&parent)?;
+        let content = Content::Bytes(data.into());
+        self.overlay.insert(path, Overlay::File { content, kind, version: version + 1 });
+        Ok(version + 1)
+    }
+
+    /// Apply exact-string edits to a text file atomically. Returns the new version.
+    ///
+    /// Each edit's `old` text must match exactly once (or `replace_all` must be set);
+    /// if any edit fails, nothing is written.
+    pub fn edit(&mut self, path: &str, edits: &[Edit]) -> Result<u64> {
+        let target = self.follow(VPath::parse(path)?)?;
+        let version = self.stat(target.as_str())?.version;
+        let mut text = self.read_text(target.as_str())?;
+        for edit in edits {
+            let fail = |reason: String| Error::EditFailed { path: path.to_owned(), reason };
+            if edit.old.is_empty() {
+                return Err(fail("old text is empty".to_owned()));
+            }
+            let count = text.matches(edit.old.as_str()).count();
+            match (count, edit.replace_all) {
+                (0, _) => return Err(fail(format!("text not found: {:?}", edit.old))),
+                (1, _) | (_, true) => text = text.replace(edit.old.as_str(), &edit.new),
+                (n, false) => {
+                    return Err(fail(format!("text matches {n} times; add context or set replace_all")));
+                }
+            }
+        }
+        self.write_versioned(target.as_str(), text, version)
+    }
+
+    /// Create a symlink at `path` pointing to `target`.
+    pub fn symlink(&mut self, path: &str, target: &str) -> Result<()> {
+        let path = VPath::parse(path)?;
+        if self.resolve(&path).is_ok() {
+            return Err(Error::AlreadyExists(path.to_string()));
+        }
+        let parent = path.parent().ok_or_else(|| Error::AlreadyExists(path.to_string()))?;
+        self.ensure_dir(&parent)?;
+        let content = Content::Bytes(Bytes::from(target.to_owned()));
+        self.overlay.insert(path, Overlay::File { content, kind: Kind::Symlink, version: 1 });
+        Ok(())
+    }
+
+    /// Create a directory. With `parents`, missing ancestors are created and an
+    /// existing directory is not an error, like `mkdir -p`.
+    pub fn mkdir(&mut self, path: &str, parents: bool) -> Result<()> {
+        let path = VPath::parse(path)?;
+        match self.resolve(&path) {
+            Ok(Resolved::Dir { .. }) if parents => return Ok(()),
+            Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
+            Err(Error::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+        let parent = path.parent().unwrap_or_else(VPath::root);
+        if parents {
+            self.ensure_dir(&parent)?;
+        } else if !matches!(self.resolve(&parent)?, Resolved::Dir { .. }) {
+            return Err(Error::NotADirectory(parent.to_string()));
+        }
+        self.insert_dir(path);
+        Ok(())
+    }
+
+    /// Remove a file, symlink or (with `recursive`) a directory tree.
+    pub fn remove(&mut self, path: &str, recursive: bool) -> Result<()> {
+        let path = VPath::parse(path)?;
+        self.check_removable(&path)?;
+        if let Resolved::Dir { .. } = self.resolve(&path)? {
+            if !recursive && !self.list(path.as_str())?.is_empty() {
+                return Err(Error::DirectoryNotEmpty(path.to_string()));
+            }
+        }
+        self.remove_unchecked(&path);
+        Ok(())
+    }
+
+    /// Copy a file, or a directory tree with `recursive`. Base files are copied by
+    /// reference, so nothing is read until the copy is.
+    pub fn copy(&mut self, from: &str, to: &str, recursive: bool) -> Result<()> {
+        let from = VPath::parse(from)?;
+        let to = VPath::parse(to)?;
+        let source = self.resolve(&from)?;
+        if source_is_dir(&source) && !recursive {
+            return Err(Error::IsADirectory(from.to_string()));
+        }
+        self.check_destination(&from, &to)?;
+        self.copy_tree(&from, &to)
+    }
+
+    /// Move or rename a file or directory tree. The destination must not exist.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let from_path = VPath::parse(from)?;
+        let to_path = VPath::parse(to)?;
+        self.check_removable(&from_path)?;
+        self.resolve(&from_path)?;
+        self.check_destination(&from_path, &to_path)?;
+        self.copy_tree(&from_path, &to_path)?;
+        self.remove_unchecked(&from_path);
+        Ok(())
+    }
+
+    /// Files added, modified or deleted relative to the mounts, sorted by path.
+    ///
+    /// Directories are not reported (git does not track them). The cost is
+    /// proportional to the overlay, plus listing any base directories that were deleted.
+    pub fn diff(&self) -> Result<Vec<Change>> {
+        let mut changes: BTreeMap<VPath, ChangeKind> = BTreeMap::new();
+        // First every base file the overlay hides: below whiteouts, recreated
+        // directories, and files written where a base directory used to be.
+        for (path, entry) in self.overlay.iter() {
+            let hides_base = match entry {
+                Overlay::Deleted | Overlay::Dir { opaque: true } => true,
+                Overlay::File { .. } => self.base_node(path)?.is_some_and(|node| node.kind().is_dir()),
+                Overlay::Dir { opaque: false } => false,
+            };
+            if hides_base {
+                for file in self.base_files_under(path)? {
+                    changes.insert(file, ChangeKind::Deleted);
+                }
+            }
+        }
+        for (path, entry) in self.overlay.iter() {
+            let Overlay::File { content, kind, .. } = entry else { continue };
+            match self.base_node(path)? {
+                Some(BaseNode::Entry(mount, base)) if !base.kind.is_dir() => {
+                    if self.same_as_base(content, *kind, &mount, &base)? {
+                        changes.remove(path);
+                    } else {
+                        changes.insert(path.clone(), ChangeKind::Modified);
+                    }
+                }
+                _ => {
+                    changes.insert(path.clone(), ChangeKind::Added);
+                }
+            }
+        }
+        Ok(changes.into_iter().map(|(path, kind)| Change { path, kind }).collect())
+    }
+
+    // ------------------------------------------------------------------
+    // Resolution
+    // ------------------------------------------------------------------
+
+    /// Follow symlinks in the final component. Intermediate components are not
+    /// followed, so a path through a directory symlink is not found.
+    fn follow(&self, mut path: VPath) -> Result<VPath> {
+        for _ in 0..MAX_SYMLINK_HOPS {
+            match self.resolve(&path) {
+                Ok(Resolved::File { content, kind: Kind::Symlink, .. }) => {
+                    let target = self.content_bytes(&content)?;
+                    path = resolve_link(&path, &target)?;
+                }
+                _ => return Ok(path),
+            }
+        }
+        Err(Error::Unsupported(path.to_string(), "too many levels of symbolic links"))
+    }
+
+    fn resolve(&self, path: &VPath) -> Result<Resolved> {
+        let mut base_hidden = false;
+        for ancestor in path.ancestors() {
+            match self.overlay.get(&ancestor) {
+                Some(Overlay::Deleted) => return Err(Error::NotFound(path.to_string())),
+                Some(Overlay::File { .. }) => return Err(Error::NotADirectory(ancestor.to_string())),
+                Some(Overlay::Dir { opaque: true }) => base_hidden = true,
+                Some(Overlay::Dir { opaque: false }) | None => {}
+            }
+        }
+        let base = || -> Result<Option<BaseNode>> {
+            if base_hidden { Ok(self.structural_node(path)) } else { self.base_node(path) }
+        };
+        match self.overlay.get(path) {
+            Some(Overlay::Deleted) => Err(Error::NotFound(path.to_string())),
+            Some(Overlay::File { content, kind, version }) => {
+                Ok(Resolved::File { content: content.clone(), kind: *kind, version: *version })
+            }
+            Some(Overlay::Dir { opaque: true }) => Ok(Resolved::Dir { base: self.structural_node(path) }),
+            Some(Overlay::Dir { opaque: false }) => {
+                Ok(Resolved::Dir { base: base()?.filter(|node| node.kind().is_dir()) })
+            }
+            None if path.is_root() => Ok(Resolved::Dir { base: Some(BaseNode::Implicit) }),
+            None => match base()? {
+                None => Err(Error::NotFound(path.to_string())),
+                Some(node) => match node {
+                    BaseNode::Entry(mount, entry) if !entry.kind.is_dir() => Ok(Resolved::File {
+                        content: Content::Base { mount, key: entry.key.clone(), size: entry.size },
+                        kind: entry.kind,
+                        version: 0,
+                    }),
+                    node => Ok(Resolved::Dir { base: Some(node) }),
+                },
+            },
+        }
+    }
+
+    /// Mount points and the directories leading to them, which no overlay can hide.
+    fn structural_node(&self, path: &VPath) -> Option<BaseNode> {
+        if let Some(mount) = self.mounts.get(path) {
+            return Some(BaseNode::MountRoot(mount.clone()));
+        }
+        self.mounts.keys().any(|mount| mount.starts_with(path)).then_some(BaseNode::Implicit)
+    }
+
+    /// The node at `path` in the mounts alone, ignoring the overlay.
+    fn base_node(&self, path: &VPath) -> Result<Option<BaseNode>> {
+        if let Some(mount) = self.mounts.get(path) {
+            return Ok(Some(BaseNode::MountRoot(mount.clone())));
+        }
+        let implicit = self.structural_node(path);
+        // The deepest mount above `path` owns it; a directory there keeps its base
+        // entries even when another mount sits further down.
+        let owner = self
+            .mounts
+            .iter()
+            .filter(|(mount_path, _)| path.starts_with(mount_path))
+            .max_by_key(|(mount_path, _)| mount_path.depth());
+        let Some((mount_path, mount)) = owner else { return Ok(implicit) };
+        let rest = path.strip_prefix(mount_path).unwrap_or_default();
+        let mut key = mount.root.clone();
+        for (idx, part) in rest.iter().enumerate() {
+            let listing = self.cached_listing(mount, &key)?;
+            let Some(entry) = listing.get(*part) else { return Ok(implicit) };
+            if idx + 1 == rest.len() {
+                if implicit.is_some() && !entry.kind.is_dir() {
+                    return Ok(implicit);
+                }
+                return Ok(Some(BaseNode::Entry(mount.clone(), entry.clone())));
+            }
+            if !entry.kind.is_dir() {
+                return Ok(implicit);
+            }
+            key = entry.key.clone();
+        }
+        Ok(implicit)
+    }
+
+    fn base_listing(&self, node: &BaseNode) -> Result<Arc<Listing>> {
+        match node {
+            BaseNode::MountRoot(mount) => self.cached_listing(mount, &mount.root),
+            BaseNode::Entry(mount, entry) if entry.kind.is_dir() => self.cached_listing(mount, &entry.key),
+            _ => Ok(Arc::new(Listing::new())),
+        }
+    }
+
+    fn cached_listing(&self, mount: &Arc<Mount>, key: &SourceKey) -> Result<Arc<Listing>> {
+        let cache_key = (mount.id, key.clone());
+        if let Some(listing) = self.cache.dirs.lock().expect("cache lock").get(&cache_key) {
+            return Ok(listing.clone());
+        }
+        let listing = Arc::new(mount.source.read_dir(key)?);
+        self.cache.dirs.lock().expect("cache lock").insert(cache_key, listing.clone());
+        Ok(listing)
+    }
+
+    fn content_bytes(&self, content: &Content) -> Result<Bytes> {
+        match content {
+            Content::Bytes(bytes) => Ok(bytes.clone()),
+            Content::Base { mount, key, .. } => {
+                let cache_key = (mount.id, key.clone());
+                if let Some(bytes) = self.cache.blobs.lock().expect("cache lock").get(&cache_key) {
+                    return Ok(bytes.clone());
+                }
+                let bytes = mount.source.read_file(key)?;
+                self.cache.blobs.lock().expect("cache lock").insert(cache_key, bytes.clone());
+                Ok(bytes)
+            }
+        }
+    }
+
+    fn same_as_base(&self, content: &Content, kind: Kind, mount: &Arc<Mount>, base: &SourceEntry) -> Result<bool> {
+        if kind != base.kind {
+            return Ok(false);
+        }
+        if let Content::Base { mount: from, key, .. } = content {
+            if from.id == mount.id && *key == base.key {
+                return Ok(true);
+            }
+        }
+        let original = Content::Base { mount: mount.clone(), key: base.key.clone(), size: base.size };
+        if let (Some(a), Some(b)) = (content_size(content), content_size(&original)) {
+            if a != b {
+                return Ok(false);
+            }
+        }
+        Ok(self.content_bytes(content)? == self.content_bytes(&original)?)
+    }
+
+    /// Every base file at or below `path`, listing directories but reading no files.
+    fn base_files_under(&self, path: &VPath) -> Result<Vec<VPath>> {
+        let mut files = Vec::new();
+        let mut stack = vec![(path.clone(), self.base_node(path)?)];
+        while let Some((current, node)) = stack.pop() {
+            match node {
+                None => {}
+                Some(BaseNode::Entry(_, ref entry)) if !entry.kind.is_dir() => files.push(current),
+                Some(node) => {
+                    for (name, entry) in self.base_listing(&node)?.iter() {
+                        let child = current.join(name)?;
+                        stack.push((child, Some(self.child_node(&node, entry))));
+                    }
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn child_node(&self, parent: &BaseNode, entry: &SourceEntry) -> BaseNode {
+        match parent {
+            BaseNode::MountRoot(mount) | BaseNode::Entry(mount, _) => BaseNode::Entry(mount.clone(), entry.clone()),
+            BaseNode::Implicit => BaseNode::Implicit,
+        }
+    }
+
+    fn overlay_descendants(&self, path: &VPath) -> impl Iterator<Item = (&VPath, &Overlay)> {
+        self.overlay.range(path.descendants_start()..path.descendants_end())
+    }
+
+    // ------------------------------------------------------------------
+    // Mutation helpers
+    // ------------------------------------------------------------------
+
+    fn ensure_dir(&mut self, path: &VPath) -> Result<()> {
+        let mut chain = path.ancestors();
+        chain.push(path.clone());
+        for dir in chain {
+            match self.resolve(&dir) {
+                Ok(Resolved::Dir { .. }) => {}
+                Ok(Resolved::File { .. }) => return Err(Error::NotADirectory(dir.to_string())),
+                Err(Error::NotFound(_)) => self.insert_dir(dir),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_dir(&mut self, path: VPath) {
+        // Recreating a deleted directory must not bring its old base children back.
+        let opaque = matches!(self.overlay.get(&path), Some(Overlay::Deleted));
+        self.overlay.insert(path, Overlay::Dir { opaque });
+    }
+
+    fn check_removable(&self, path: &VPath) -> Result<()> {
+        if path.is_root() {
+            return Err(Error::Unsupported(path.to_string(), "cannot remove the root"));
+        }
+        if self.mounts.keys().any(|mount| mount.starts_with(path)) {
+            return Err(Error::Unsupported(path.to_string(), "contains a mount point"));
+        }
+        Ok(())
+    }
+
+    fn check_destination(&self, from: &VPath, to: &VPath) -> Result<()> {
+        if to.starts_with(from) {
+            return Err(Error::Unsupported(to.to_string(), "cannot copy or move a directory into itself"));
+        }
+        match self.resolve(to) {
+            Err(Error::NotFound(_)) => {}
+            Ok(_) => return Err(Error::AlreadyExists(to.to_string())),
+            Err(err) => return Err(err),
+        }
+        let parent = to.parent().ok_or_else(|| Error::AlreadyExists(to.to_string()))?;
+        match self.resolve(&parent)? {
+            Resolved::Dir { .. } => Ok(()),
+            Resolved::File { .. } => Err(Error::NotADirectory(parent.to_string())),
+        }
+    }
+
+    fn copy_tree(&mut self, from: &VPath, to: &VPath) -> Result<()> {
+        match self.resolve(from)? {
+            Resolved::File { content, kind, .. } => {
+                self.overlay.insert(to.clone(), Overlay::File { content, kind, version: 1 });
+            }
+            Resolved::Dir { .. } => {
+                self.insert_dir(to.clone());
+                for entry in self.list(from.as_str())? {
+                    self.copy_tree(&from.join(&entry.name)?, &to.join(&entry.name)?)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_unchecked(&mut self, path: &VPath) {
+        let doomed: Vec<VPath> = self.overlay_descendants(path).map(|(key, _)| key.clone()).collect();
+        for key in doomed {
+            self.overlay.remove(&key);
+        }
+        // A whiteout is only needed when the base still has something to hide.
+        let in_base = !self.base_hidden(path) && matches!(self.base_node(path), Ok(Some(_)));
+        if in_base {
+            self.overlay.insert(path.clone(), Overlay::Deleted);
+        } else {
+            self.overlay.remove(path);
+        }
+    }
+
+    fn base_hidden(&self, path: &VPath) -> bool {
+        path.ancestors()
+            .iter()
+            .any(|ancestor| matches!(self.overlay.get(ancestor), Some(Overlay::Dir { opaque: true })))
+    }
+}
+
+fn source_is_dir(resolved: &Resolved) -> bool {
+    matches!(resolved, Resolved::Dir { .. })
+}
+
+fn content_size(content: &Content) -> Option<u64> {
+    match content {
+        Content::Bytes(bytes) => Some(bytes.len() as u64),
+        Content::Base { size, .. } => *size,
+    }
+}
+
+fn resolve_link(link: &VPath, target: &[u8]) -> Result<VPath> {
+    let target = String::from_utf8_lossy(target);
+    if target.starts_with('/') {
+        return VPath::parse(&target);
+    }
+    let parent = link.parent().unwrap_or_else(VPath::root);
+    VPath::parse(&format!("{}/{}", parent.as_str().trim_end_matches('/'), target))
+}
