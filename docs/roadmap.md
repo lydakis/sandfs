@@ -18,7 +18,7 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 1. **Core** (`sandfs-core`): sources, overlay, fork, changes. Done.
 2. **Python bindings** (`sandfs-py`, PyO3 and maturin): `sandfs.Workspace`, built-in directory, in-memory and git sources, and sources written in Python. Done.
 3. **MCP server**: read, list, glob, grep, write, edit, move, delete and changes over one workspace. Text edit, glob and search live here, built from read and a versioned write. Done (`sandfs-mcp`).
-4. **CLI and FUSE**: `sandfs mount`, `sandfs fork`, `sandfs changes`, `sandfs serve --mcp`.
+4. **CLI and FUSE** (`sandfs-cli`, Linux): `sandfs mount`, `sandfs fork`, `sandfs changes`. Done; `sandfs serve --mcp` is next.
 5. **Ranged reads**: `read_range` on sources and workspaces, so a large file is read in pieces instead of whole. Done.
 6. **TypeScript bindings**, when a caller needs them.
 
@@ -27,3 +27,10 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 - Directory renames copy entries by reference, so they cost one overlay entry per file in the subtree.
 - A whole read of a base file is cached for the workspace's lifetime, so reading a multi-gigabyte file whole (not in ranges) keeps it in memory. Writes always replace a whole file.
 - A source that leaves out sizes (git does) makes `stat` read the file to answer.
+
+## Known gaps in the CLI
+
+- A mounted workspace holds its writes in memory until they are saved, so it costs memory in proportion to what was written.
+- Only the executable bit of a file's mode is kept; owners, other mode bits and extended attributes are not.
+- No hard links, symlinks or special files, matching the core.
+- Linux only; macOS would need macFUSE or FSKit.

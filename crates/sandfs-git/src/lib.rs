@@ -8,6 +8,10 @@
 //! partial clone (`git clone --filter=blob:none`) git fetches each blob from the
 //! remote only when a file is first read, so mounting a large repository costs the
 //! commit and tree objects plus whatever the agent actually opens.
+//!
+//! Listings carry no file sizes by default, because git keeps a blob's size inside the
+//! blob. [`GitSource::with_sizes`] turns them on for callers that must report sizes
+//! up front, such as a FUSE mount answering `stat`.
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,6 +28,10 @@ pub struct GitSource {
     tree: SourceKey,
     hash_len: usize,
     batch: Mutex<Batch>,
+    /// Set by [`GitSource::with_sizes`]: a `cat-file --batch-check` process for sizes.
+    sizes: Option<Mutex<Batch>>,
+    /// The remote a partial clone fetches missing blobs from.
+    promisor: Option<String>,
 }
 
 impl fmt::Debug for GitSource {
@@ -48,13 +56,74 @@ impl GitSource {
             "sha256" => 32,
             other => return Err(Error::Source(format!("unsupported object format {other:?}"))),
         };
-        let batch = Batch::spawn(&repo)?;
-        Ok(GitSource { repo, tree: tree.as_str().into(), hash_len, batch: Mutex::new(batch) })
+        let batch = Batch::spawn(&repo, "--batch")?;
+        Ok(GitSource {
+            repo,
+            tree: tree.as_str().into(),
+            hash_len,
+            batch: Mutex::new(batch),
+            sizes: None,
+            promisor: None,
+        })
+    }
+
+    /// Report the size of every file in directory listings.
+    ///
+    /// Sizes are looked up when a directory is first listed. In a partial clone that
+    /// means the directory's blobs are fetched then, all in one request, rather than one
+    /// request per file on first read. Directories that are never listed cost nothing.
+    pub fn with_sizes(mut self) -> Result<Self> {
+        self.promisor = promisor_remote(&self.repo);
+        self.sizes = Some(Mutex::new(Batch::spawn(&self.repo, "--batch-check")?));
+        Ok(self)
     }
 
     /// The id of the mounted tree.
     pub fn tree_id(&self) -> &str {
         &self.tree
+    }
+
+    /// Fill in sizes for the files of the tree `id`.
+    fn fill_sizes(&self, id: &str, listing: &mut Listing, sizes: &Mutex<Batch>) -> Result<()> {
+        if listing.values().all(|entry| entry.kind.is_dir()) {
+            return Ok(());
+        }
+        if let Some(remote) = &self.promisor {
+            self.fetch_missing(id, remote);
+        }
+        let mut sizes = sizes.lock().map_err(|_| Error::Source("git reader poisoned".into()))?;
+        for entry in listing.values_mut().filter(|entry| !entry.kind.is_dir()) {
+            entry.size = Some(sizes.header(&entry.key)?.1 as u64);
+        }
+        Ok(())
+    }
+
+    /// Fetch the blobs directly inside the tree `id` that a partial clone lacks, in one
+    /// request. Best effort: whatever this misses, git still fetches one blob at a time.
+    fn fetch_missing(&self, id: &str, remote: &str) {
+        // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
+        // `tree:1` stops the walk at the tree's direct children.
+        let Ok(objects) = git_output(&self.repo, &["rev-list", "--objects", "--missing=print", "--filter=tree:1", id])
+        else {
+            return;
+        };
+        let missing: Vec<&str> = objects.lines().filter_map(|line| line.strip_prefix('?')).collect();
+        if missing.is_empty() {
+            return;
+        }
+        // The same request git makes for a single missing object, with every id at once.
+        let fetch = git(&self.repo)
+            .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", remote, "--no-tags", "--no-write-fetch-head"])
+            .args(["--recurse-submodules=no", "--filter=blob:none", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut fetch) = fetch else { return };
+        if let Some(mut stdin) = fetch.stdin.take() {
+            let _ = stdin.write_all(missing.join("\n").as_bytes()).and_then(|()| stdin.write_all(b"\n"));
+        }
+        let _ = fetch.wait();
     }
 
     fn object(&self, id: &str, expected: &str) -> Result<Bytes> {
@@ -73,7 +142,11 @@ impl Source for GitSource {
     }
 
     fn read_dir(&self, key: &str) -> Result<Listing> {
-        parse_tree(&self.object(key, "tree")?, self.hash_len)
+        let mut listing = parse_tree(&self.object(key, "tree")?, self.hash_len)?;
+        if let Some(sizes) = &self.sizes {
+            self.fill_sizes(key, &mut listing, sizes)?;
+        }
+        Ok(listing)
     }
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
@@ -123,6 +196,15 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// The remote a partial clone was made from, if `repo` is one.
+fn promisor_remote(repo: &Path) -> Option<String> {
+    let config = git_output(repo, &["config", "--get-regexp", r"^remote\..*\.promisor$"]).ok()?;
+    config.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (value == "true").then(|| key.strip_prefix("remote.")?.strip_suffix(".promisor").map(str::to_owned))?
+    })
+}
+
 fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     // Never stop to ask for credentials while fetching blobs of a partial clone.
@@ -134,7 +216,8 @@ fn io_error(err: std::io::Error) -> Error {
     Error::Source(format!("git: {err}"))
 }
 
-/// A `git cat-file --batch` process: write an object id, read a header and its bytes.
+/// A `git cat-file --batch` (or `--batch-check`) process: write an object id, read a
+/// header and, in `--batch` mode, the object's bytes.
 struct Batch {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -142,9 +225,9 @@ struct Batch {
 }
 
 impl Batch {
-    fn spawn(repo: &Path) -> Result<Self> {
+    fn spawn(repo: &Path, mode: &str) -> Result<Self> {
         let mut child = git(repo)
-            .args(["cat-file", "--batch"])
+            .args(["cat-file", mode])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -155,7 +238,8 @@ impl Batch {
         Ok(Batch { child, stdin, stdout })
     }
 
-    fn read(&mut self, id: &str) -> Result<(String, Bytes)> {
+    /// Ask for an object and read its header: the object's type and size.
+    fn header(&mut self, id: &str) -> Result<(String, usize)> {
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::Source(format!("invalid object id {id:?}")));
         }
@@ -170,10 +254,15 @@ impl Batch {
             [_, "missing"] => return Err(Error::Source(format!("object {id} is missing"))),
             _ => return Err(Error::Source(format!("git: unexpected reply {header:?}"))),
         };
+        Ok((kind.to_owned(), size))
+    }
+
+    fn read(&mut self, id: &str) -> Result<(String, Bytes)> {
+        let (kind, size) = self.header(id)?;
         let mut data = vec![0; size + 1]; // the content is followed by a newline
         self.stdout.read_exact(&mut data).map_err(io_error)?;
         data.truncate(size);
-        Ok((kind.to_owned(), Bytes::from(data)))
+        Ok((kind, Bytes::from(data)))
     }
 }
 

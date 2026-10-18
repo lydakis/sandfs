@@ -72,9 +72,25 @@ Large files can be read in pieces: `read(path, offset=..., length=...)` asks the
 
 Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`. An exception raised inside a Python source surfaces as `OSError`. Calls into the core release the GIL, so a slow source never blocks other threads. A workspace is not meant to be shared between threads; fork one per thread instead.
 
+## Mounting a workspace on disk
+
+The `sandfs` command (crate `sandfs-cli`) mounts a workspace as a real directory with FUSE, so any program can read and write it: a data pipeline, a notebook, a build, an agent's tools. The folder underneath is never modified, and forking is O(1). It needs Linux with FUSE 3 (`fusermount3`, package `fuse3`).
+
+```bash
+cargo install --path crates/sandfs-cli
+sandfs mount ~/datasets/survey ~/ws/survey       # a host folder, never written to
+sandfs fork ~/ws/survey ~/ws/cleanup             # O(1): a copy with survey's changes so far
+python clean.py ~/ws/cleanup                     # real files, any tool
+sandfs changes ~/ws/cleanup                      # A/M/D against the source
+sandfs unmount ~/ws/cleanup                      # changes stay saved
+sandfs mount cleanup ~/ws/cleanup                # and come back
+```
+
+A workspace keeps its source from when it was created. Changes live in memory and are saved under `$SANDFS_HOME` (default `~/.local/share/sandfs`) shortly after each write. `git:<path or url>[@rev]` mounts a commit instead of a folder; for a remote repository sandfs keeps a partial clone and fetches a directory's files in one request when it is first listed.
+
 ## What sandfs is not
 
-sandfs does not run commands. Commands an agent wants to run belong in a real sandbox (a container or microVM) pointed at the files, and a FUSE mount of a workspace is on the roadmap for that. It also has no symlinks and no text-editing or patch tools in the core; those are code concerns that live in the MCP tools, if anywhere. Earlier versions had a bash-like shell, a host-command bridge, a Python executor, access policies and storage adapters. They were dropped to keep the primitive small.
+sandfs does not run commands. Commands an agent wants to run belong in a real sandbox (a container or microVM) pointed at the files, for example through a FUSE mount of a workspace. It also has no symlinks and no text-editing or patch tools in the core; those are code concerns that live in the MCP tools, if anywhere. Earlier versions had a bash-like shell, a host-command bridge, a Python executor, access policies and storage adapters. They were dropped to keep the primitive small.
 
 ## Repository layout
 
@@ -83,6 +99,7 @@ sandfs does not run commands. Commands an agent wants to run belong in a real sa
 ├── crates/
 │   ├── sandfs-core/    # workspaces, overlay, changes, directory and in-memory sources
 │   ├── sandfs-git/     # optional lazy git source
+│   ├── sandfs-cli/     # the sandfs command: mount, fork and changes over FUSE
 │   ├── sandfs-mcp/     # MCP server: file tools over one workspace
 │   └── sandfs-py/      # Python bindings (the sandfs._core extension)
 ├── docs/               # roadmap, changelog and publishing notes

@@ -411,6 +411,21 @@ fn dir_source_skips_symlinks() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn executable_bits_change_through_the_overlay() {
+    let (mut ws, source) = workspace();
+    let version = ws.set_executable("/repo/README.md", true).unwrap();
+    assert!(version > 0);
+    assert_eq!(ws.stat("/repo/README.md").unwrap().kind, Kind::File { executable: true });
+    assert_eq!(source.reads().1, 0, "changing the mode reads nothing");
+    assert_eq!(changes(&ws), [("/repo/README.md".to_owned(), ChangeKind::Modified)]);
+
+    assert_eq!(ws.set_executable("/repo/README.md", true).unwrap(), version, "no change, same version");
+    ws.set_executable("/repo/README.md", false).unwrap();
+    assert!(changes(&ws).is_empty(), "back to the base mode");
+    assert!(matches!(ws.set_executable("/repo/src", true), Err(Error::IsADirectory(_))));
+}
+
 /// A source that can only be read in ranges, counting each ranged read.
 #[derive(Debug)]
 struct Ranged {
