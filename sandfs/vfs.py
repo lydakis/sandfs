@@ -710,6 +710,10 @@ class VirtualFileSystem:
         if any(mount == node_path or node_path in mount.parents for mount in self._storage_mounts):
             raise InvalidOperation(f"Cannot move {node_path}: it is or contains a storage mount")
 
+        if self._find_storage_mount(dest_parent.path().joinpath(dest_name)) is not None:
+            # Storage only receives loaded files, so hydrate lazy directories first.
+            for _ in self.walk(node_path):
+                pass
         moved_files = [(file_node.path(), file_node) for file_node in self._loaded_files(node)]
         parent.remove_child(node.name)
         node.name = dest_name
@@ -781,6 +785,9 @@ class VirtualFileSystem:
 
         clone = self._clone_node(node, recursive=recursive)
         clone.name = dest_name
+        if replaced and isinstance(clone, VirtualDirectory):
+            # The stored file becomes a directory, so its adapter entry has to go.
+            self._delete_storage_entry(dest_parent.path().joinpath(dest_name))
         dest_parent.add_child(clone)
         for file_node in self._loaded_files(clone):
             self._persist_placed_file(file_node)

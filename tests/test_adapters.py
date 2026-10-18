@@ -220,3 +220,29 @@ def test_move_of_storage_mount_root_is_rejected():
 
     assert sorted(adapter.list()) == ["a.txt"]
     assert vfs.read_file("/d/a.txt") == "A"
+
+
+def test_move_of_unloaded_provider_directory_into_storage_persists():
+    from sandfs.providers import ProvidedNode
+
+    adapter = MemoryStorageAdapter()
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.mount_directory("/lazy/pkg", lambda ctx: {"a.txt": ProvidedNode.file(content="A")})
+
+    vfs.move("/lazy/pkg", "/d/pkg")
+
+    assert adapter.read("pkg/a.txt").content == "A"
+
+
+def test_copy_of_directory_over_stored_file_replaces_entry():
+    adapter = MemoryStorageAdapter(initial={"target": "old"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/src/a.txt", "A")
+
+    vfs.copy("/src", "/d/target", recursive=True)
+
+    assert sorted(adapter.list()) == ["target/a.txt"]
+    vfs.sync_storage("/d")
+    assert vfs.read_file("/d/target/a.txt") == "A"
