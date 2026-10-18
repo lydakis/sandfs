@@ -13,7 +13,7 @@ fn server() -> Server {
         ("src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    2\n}\n"),
         ("src/util/mod.rs", "// TODO: helpers\n"),
         ("docs/guide.md", "Hello again\n"),
-        (".git/config", "[core]\nhello\n"),
+        ("data/cities.csv", "city,population\nAthens,664046\nOslo,709037\n"),
     ])
     .unwrap();
     source.insert("logo.png", Bytes::from_static(b"\x89PNG\0\0"), Kind::File { executable: false }).unwrap();
@@ -69,7 +69,7 @@ fn list_shows_kinds_sizes_and_depth() {
     assert_eq!(ok(&mut s, "list", json!({})), "repo/");
     assert_eq!(
         ok(&mut s, "list", json!({ "path": "/repo" })),
-        ".git/\nREADME.md (19 bytes)\ndocs/\nlatest -> README.md\nlogo.png (6 bytes)\nsrc/"
+        "README.md (19 bytes)\ndata/\ndocs/\nlatest -> README.md\nlogo.png (6 bytes)\nsrc/"
     );
     let deep = ok(&mut s, "list", json!({ "path": "/repo/src", "depth": 3 }));
     assert_eq!(deep, "lib.rs (61 bytes)\nutil/\nutil/mod.rs (17 bytes)");
@@ -91,7 +91,7 @@ fn glob_matches_relative_and_absolute_patterns() {
 #[test]
 fn grep_finds_matches_with_context_and_filters() {
     let mut s = server();
-    // .git, the symlink to README.md and the binary file are skipped.
+    // The symlink to README.md and the binary file are skipped.
     assert_eq!(
         ok(&mut s, "grep", json!({ "pattern": "hello", "ignore_case": true })),
         "/repo/README.md:2:hello world\n/repo/docs/guide.md:1:Hello again\n[2 matches in 2 files]"
@@ -202,6 +202,10 @@ fn large_results_are_cut_with_a_note() {
 fn unknown_tools_and_bad_arguments() {
     let mut s = server();
     assert!(s.call_tool("bash", &json!({})).is_none());
+    assert_eq!(
+        ok(&mut s, "grep", json!({ "pattern": "^Oslo,", "glob": "*.csv" })),
+        "/repo/data/cities.csv:3:Oslo,709037\n[1 matches in 1 file]"
+    );
     assert!(fails(&mut s, "read", json!(["/repo/README.md"])).contains("must be a JSON object"));
     assert!(fails(&mut s, "read", json!({ "path": "/repo/README.md", "limit": -1 })).contains("non-negative integer"));
     assert!(fails(&mut s, "delete", json!({ "path": "/x", "recursive": "yes" })).contains("true or false"));
@@ -242,4 +246,20 @@ fn grep_reports_unreadable_files_when_nothing_matches() {
         ok(&mut s, "grep", json!({ "pattern": "x", "path": "/d" })),
         "No matches for x under /d (1 files could not be read)"
     );
+}
+
+#[test]
+fn read_returns_images_as_images() {
+    let mut s = server();
+    let png = b"\x89PNG\r\n\x1a\nrest of the image";
+    let mut ws = s.workspace().fork();
+    ws.write("/chart.png", Bytes::from_static(png)).unwrap();
+    s = Server::new(ws);
+    let out = s.call_tool("read", &json!({ "path": "/chart.png" })).unwrap();
+    assert!(!out.is_error);
+    assert_eq!(out.text, "/chart.png: image/png image, 25 bytes, version 1");
+    let image = out.image.expect("an image");
+    assert_eq!((image.mime_type, image.data.as_ref()), ("image/png", &png[..]));
+    // Files that only look a little like images stay binary.
+    assert!(s.call_tool("read", &json!({ "path": "/repo/logo.png" })).unwrap().image.is_none());
 }

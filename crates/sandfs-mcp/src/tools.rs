@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
 use globset::{GlobBuilder, GlobMatcher};
 use regex::RegexBuilder;
 use sandfs_core::{ChangeKind, DirEntry, Edit, Error, Kind, VPath, Workspace};
@@ -10,6 +11,8 @@ use similar::TextDiff;
 
 /// Results longer than this many bytes are cut, with a note saying how to see the rest.
 pub const MAX_OUTPUT: usize = 64 * 1024;
+/// Images up to this size are returned as image content; larger ones only by size.
+pub const MAX_IMAGE: usize = 5 * 1024 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_READ_LINE_CHARS: usize = 2000;
 const MAX_GREP_LINE_CHARS: usize = 500;
@@ -22,6 +25,15 @@ const MAX_SYMLINK_HOPS: usize = 40;
 const MAX_DIFF_INPUT: usize = 1024 * 1024;
 
 type ToolResult = Result<String, String>;
+
+/// Image bytes returned by `read`, with their MIME type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime_type: &'static str,
+    /// The raw file bytes.
+    pub data: Bytes,
+}
 
 /// The workspace an MCP session works on.
 pub(crate) struct Tools {
@@ -72,6 +84,22 @@ impl Tools {
              Mounted sources are never modified; every write stays in this workspace, and `diff` shows what you \
              changed."
         )
+    }
+
+    /// For `read` of a PNG, JPEG, GIF or WebP file within [`MAX_IMAGE`]: the image and a
+    /// caption. Anything else, errors included, is left to the text read.
+    pub(crate) fn read_image(&self, arguments: &Value) -> Option<(Image, String)> {
+        let Value::Object(map) = arguments else { return None };
+        let path = Args(map).path("path").ok()?;
+        let target = follow(&self.workspace, &path).ok()?;
+        let bytes = self.workspace.read(&target).ok()?;
+        let mime_type = image_type(&bytes)?;
+        if bytes.len() > MAX_IMAGE {
+            return None;
+        }
+        let version = self.workspace.stat(&target).ok()?.version;
+        let caption = format!("{path}: {mime_type} image, {} bytes, version {version}", bytes.len());
+        Some((Image { mime_type, data: bytes }, caption))
     }
 
     fn read(&self, args: &Args) -> ToolResult {
@@ -499,7 +527,7 @@ fn kind_name(kind: Kind) -> &'static str {
 }
 
 /// Visit everything below `root` depth-first in name order, up to `max_depth` levels.
-/// Symlinks are reported but not followed, and `.git` directories are not entered.
+/// Symlinks are reported but not followed.
 /// The visitor gets the absolute path, the path relative to `root` and the entry, and
 /// returns false to stop the walk.
 fn walk(
@@ -521,7 +549,7 @@ fn walk(
             if !visit(&abs, &child_rel, &entry) {
                 return Ok(false);
             }
-            let descend = entry.kind.is_dir() && depth_left > 1 && entry.name != ".git";
+            let descend = entry.kind.is_dir() && depth_left > 1;
             if descend && !walk_dir(workspace, &abs, &child_rel, depth_left - 1, visit)? {
                 return Ok(false);
             }
@@ -559,6 +587,21 @@ fn glob_matcher(pattern: &str) -> Result<GlobMatcher, String> {
         .build()
         .map(|glob| glob.compile_matcher())
         .map_err(|e| format!("invalid glob {pattern:?}: {e}"))
+}
+
+/// The MIME type of an image MCP clients can show, sniffed from its first bytes.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 /// Text if the bytes are UTF-8 without NUL bytes; anything else is treated as binary.
@@ -605,9 +648,9 @@ pub(crate) fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "read",
-            "description": "Read a text file with line numbers (like `cat -n`), plus its version for \
-                `write`/`edit`. Reads up to 2000 lines; use offset and limit for more. Binary files \
-                report their size only.",
+            "description": "Read a file, with its version for `write`/`edit`. Text comes back with line \
+                numbers (like `cat -n`), up to 2000 lines; use offset and limit for more. PNG, JPEG, GIF \
+                and WebP images come back as images. Other binary files report their size only.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute path of the file."),
                 "offset": { "type": "integer", "minimum": 1, "description": "First line to show (1-based)." },
@@ -627,7 +670,7 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "glob",
-            "description": "Find files by glob pattern, such as `**/*.rs` or `src/*.py`. `*` stays within \
+            "description": "Find files by glob pattern, such as `**/*.csv` or `reports/*.md`. `*` stays within \
                 one directory and `**` crosses directories. Relative patterns match below `path`; \
                 absolute ones match whole paths.",
             "inputSchema": { "type": "object", "properties": {
@@ -638,13 +681,13 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "grep",
-            "description": "Search file contents with a regular expression (Rust/ripgrep syntax). Prints \
-                `path:line:text` for matches and `path-line-text` for context lines. `.git` \
-                directories, symlinks and binary files are skipped.",
+            "description": "Search file contents with a regular expression (ripgrep syntax). Prints \
+                `path:line:text` for matches and `path-line-text` for context lines. Symlinks and \
+                binary files are skipped.",
             "inputSchema": { "type": "object", "properties": {
                 "pattern": { "type": "string", "description": "Regular expression." },
                 "path": path("File or directory to search. Defaults to /."),
-                "glob": { "type": "string", "description": "Only search matching files, e.g. `*.rs` (file name) or `src/**/*.rs` (path below `path`)." },
+                "glob": { "type": "string", "description": "Only search matching files, e.g. `*.json` (file name) or `logs/**/*.txt` (path below `path`)." },
                 "ignore_case": { "type": "boolean", "description": "Case-insensitive search." },
                 "context": { "type": "integer", "minimum": 0, "description": "Lines of context around each match." },
                 "max": { "type": "integer", "minimum": 1, "description": "Stop after this many matches (default 200)." },

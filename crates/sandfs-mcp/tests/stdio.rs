@@ -31,6 +31,7 @@ fn exchange(args: &[&str], requests: &[Value]) -> Vec<Value> {
 fn a_session_over_a_mounted_directory() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join("dot.gif"), b"GIF89a\x01\x00").unwrap();
     let mount = format!("/work={}", dir.path().display());
 
     let replies = exchange(
@@ -48,10 +49,12 @@ fn a_session_over_a_mounted_directory() {
             json!({ "jsonrpc": "2.0", "id": "six", "method": "resources/list" }),
             json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }),
             json!({ "jsonrpc": "2.0", "method": 1 }),
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+                "name": "read", "arguments": { "path": "/work/dot.gif" } } }),
         ],
     );
     // Every request plus the trailing unparseable line; only the notification gets no reply.
-    assert_eq!(replies.len(), 9, "{replies:#?}");
+    assert_eq!(replies.len(), 10, "{replies:#?}");
 
     let init = &replies[0]["result"];
     assert_eq!(init["protocolVersion"], "2025-06-18");
@@ -76,7 +79,10 @@ fn a_session_over_a_mounted_directory() {
     assert_eq!(replies[6]["id"], 7);
     assert_eq!(replies[7]["error"]["code"], -32600, "a request without an id is still validated");
     assert_eq!(replies[7]["id"], Value::Null);
-    assert_eq!(replies[8]["error"]["code"], -32700);
+    let image = &replies[8]["result"]["content"];
+    assert_eq!(image[0], json!({ "type": "image", "data": "R0lGODlhAQA=", "mimeType": "image/gif" }));
+    assert_eq!(image[1]["text"], "/work/dot.gif: image/gif image, 8 bytes, version 0");
+    assert_eq!(replies[9]["error"]["code"], -32700);
 }
 
 #[test]
