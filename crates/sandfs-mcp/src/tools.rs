@@ -74,7 +74,7 @@ impl Tools {
         format!(
             "These tools are your filesystem: a private copy-on-write workspace. {layout} Paths are absolute. \
              Mounted sources are never modified; every write stays in this workspace, and `changes` shows what you \
-             changed. A path holding a control character, such as a newline, is shown as a quoted JSON string."
+             changed. A path holding a control character or line separator, such as a newline, is shown as a quoted JSON string."
         )
     }
 
@@ -658,14 +658,16 @@ fn cap(mut text: String) -> String {
 }
 
 /// A path as tool output shows it: as is, or as a quoted JSON string when it holds a
-/// control character, so a newline in a name cannot split it over two lines. The quoted
-/// form is what the agent passes back as a JSON argument.
+/// control character or line separator, so a newline in a name cannot split it over
+/// two lines. The quoted form is what the agent passes back as a JSON argument. A path
+/// that itself starts with `"` is quoted too, so the two forms never look alike.
 fn shown(path: &str) -> std::borrow::Cow<'_, str> {
-    if !path.chars().any(char::is_control) {
+    let breaks = |c: char| c.is_control() || c == '\u{2028}' || c == '\u{2029}';
+    if !path.starts_with('"') && !path.chars().any(breaks) {
         return path.into();
     }
     // JSON serializers escape only ASCII controls, so U+0080..U+009F (such as NEXT
-    // LINE) are escaped here too. Every control character fits in one `\uXXXX`.
+    // LINE) and the Unicode line separators are escaped here too, each as `\uXXXX`.
     let mut quoted = String::from('"');
     for c in path.chars() {
         match c {
@@ -674,7 +676,7 @@ fn shown(path: &str) -> std::borrow::Cow<'_, str> {
             '\n' => quoted.push_str("\\n"),
             '\t' => quoted.push_str("\\t"),
             '\r' => quoted.push_str("\\r"),
-            c if c.is_control() => quoted.push_str(&format!("\\u{:04x}", c as u32)),
+            c if breaks(c) => quoted.push_str(&format!("\\u{:04x}", c as u32)),
             c => quoted.push(c),
         }
     }

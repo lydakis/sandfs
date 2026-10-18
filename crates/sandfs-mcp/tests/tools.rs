@@ -358,6 +358,8 @@ fn paths_with_control_characters_are_shown_quoted() {
         ("plain.txt", b"needle\n".to_vec()),
         ("sub\ndir/f.txt", b"x".to_vec()),
         ("next\u{85}line.txt", b"x".to_vec()),
+        ("para\u{2029}sep", b"x".to_vec()),
+        ("\"odd\\nname.txt\"", b"x".to_vec()),
     ])
     .unwrap();
     let mut ws = Workspace::new();
@@ -365,7 +367,17 @@ fn paths_with_control_characters_are_shown_quoted() {
     let mut s = Server::new(ws);
     assert_eq!(
         ok(&mut s, "list", json!({ "path": "/d" })),
-        "\"next\\u0085line.txt\" (1 bytes)\n\"odd\\nname.txt\" (7 bytes)\nplain.txt (7 bytes)\n\"sub\\ndir/\""
+        concat!(
+            r#""\"odd\\nname.txt\"" (1 bytes)"#,
+            "\n",
+            r#""next\u0085line.txt" (1 bytes)"#,
+            "\n",
+            r#""odd\nname.txt" (7 bytes)"#,
+            "\n",
+            r#""para\u2029sep" (1 bytes)"#,
+            "\nplain.txt (7 bytes)\n",
+            r#""sub\ndir/""#,
+        )
     );
     assert_eq!(
         ok(&mut s, "glob", json!({ "pattern": "*e*.txt", "path": "/d" })),
