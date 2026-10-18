@@ -475,3 +475,56 @@ fn dir_source_reads_ranges_from_disk() {
     assert_eq!(ws.read_range("/host/big.bin", 1000, 10).unwrap(), Bytes::new());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A slow source that counts file reads and fails the first one when asked to.
+#[derive(Debug)]
+struct Slow {
+    inner: MemorySource,
+    reads: AtomicUsize,
+    fail_first: bool,
+}
+
+impl Source for Slow {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        self.inner.root()
+    }
+
+    fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+        self.inner.read_dir(key)
+    }
+
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        let attempt = self.reads.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if self.fail_first && attempt == 0 {
+            return Err(Error::Source("network blip".into()));
+        }
+        self.inner.read_file(key)
+    }
+}
+
+#[test]
+fn concurrent_reads_of_one_file_fetch_it_once() {
+    let source = Arc::new(Slow { inner: repo(), reads: AtomicUsize::new(0), fail_first: false });
+    let mut ws = Workspace::new();
+    ws.mount("/data", source.clone()).unwrap();
+    ws.list("/data").unwrap();
+
+    let forks: Vec<Workspace> = (0..8).map(|_| ws.fork()).collect();
+    std::thread::scope(|scope| {
+        for fork in &forks {
+            scope.spawn(move || assert_eq!(fork.read_text("/data/README.md").unwrap(), "hello\n"));
+        }
+    });
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_fetches_are_retried_not_cached() {
+    let source = Arc::new(Slow { inner: repo(), reads: AtomicUsize::new(0), fail_first: true });
+    let mut ws = Workspace::new();
+    ws.mount("/data", source.clone()).unwrap();
+    assert!(matches!(ws.read("/data/README.md"), Err(Error::Source(_))));
+    assert_eq!(ws.read_text("/data/README.md").unwrap(), "hello\n");
+    assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+}
