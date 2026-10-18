@@ -31,13 +31,13 @@ The FUSE fork and changes run the `sandfs` command, so they include starting a p
 
 The data set is generated once per run from a fixed seed, and it is not code: arbitrary bytes in four shapes. At the default scale: 10,000 files of 1 to 16 KiB in 100 directories, one directory of 10,000 files, a chain of 64 nested directories, and a 256 MiB file.
 
-Every timed run starts from a fresh view (a new workspace or a new mount), so sandfs's caches start empty while the kernel's page cache is warm for every target alike. A workload's untimed setup runs first on that view; tearing a fork down (an unmount) is not timed. Each workload checks its result (bytes read, files listed, changes found), so a target that silently does less fails instead of looking fast.
+Every timed run starts from a fresh view (a new workspace or a new mount), so sandfs's caches start empty while the kernel's page cache is warm for every target alike. A workload's untimed setup runs first on that view; tearing a fork down (an unmount) is not timed. Each workload checks its result (bytes read, files listed, changes found, and after the timer stops, that every write and delete landed), so a target that silently does less fails instead of looking fast. The host fork copies the whole data set, large file included.
 
 | workload | timed operation |
 |---|---|
 | small/read-cold | read every small file once |
 | small/read-warm | read them all again |
-| small/stat | stat every small file, listings already read |
+| small/stat | stat every small file, after listing their directories |
 | small/walk | list every directory of the small-file tree |
 | wide/list | list the 10,000-entry directory, already read once |
 | deep/stat | stat the file at the bottom of the chain 10,000 times |

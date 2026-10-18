@@ -30,6 +30,14 @@ enum ScaleArg {
     Tiny,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum TargetArg {
+    Host,
+    Sandfs,
+    Overlayfs,
+    Fuse,
+}
+
 #[derive(Parser)]
 #[command(name = "sandfs-bench", about = "Benchmark sandfs against the host filesystem and overlayfs")]
 struct Args {
@@ -38,14 +46,14 @@ struct Args {
     scale: ScaleArg,
     /// Targets to run, comma-separated: host, sandfs, overlayfs, fuse. Default: every
     /// target available here.
-    #[arg(long, value_delimiter = ',')]
-    targets: Option<Vec<String>>,
+    #[arg(long, value_enum, value_delimiter = ',')]
+    targets: Option<Vec<TargetArg>>,
     /// Only run workloads whose name contains this.
     #[arg(long)]
     only: Option<String>,
     /// Timed runs per workload (default depends on the scale).
-    #[arg(long)]
-    iters: Option<usize>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    iters: Option<u64>,
     /// Delay per call of the slow source, in microseconds.
     #[arg(long, default_value_t = 1000)]
     latency_us: u64,
@@ -74,40 +82,40 @@ fn run(args: Args) -> Result<()> {
         ScaleArg::Tiny => Scale::TINY,
     };
     if let Some(iters) = args.iters {
-        scale.iters = iters;
+        scale.iters = iters as usize;
     }
     let scratch = args.scratch.clone().unwrap_or_else(std::env::temp_dir);
     eprintln!("generating the data set in {}", scratch.display());
     let data = Data::generate(scale, &scratch)?;
     let root = data.root().to_owned();
 
-    let wanted = |name: &str| args.targets.as_ref().is_none_or(|list| list.iter().any(|t| t == name));
-    let explicit = |name: &str| args.targets.as_ref().is_some_and(|list| list.iter().any(|t| t == name));
+    let wanted = |target: TargetArg| args.targets.as_ref().is_none_or(|list| list.contains(&target));
+    let explicit = |target: TargetArg| args.targets.as_ref().is_some_and(|list| list.contains(&target));
     let mut targets: Vec<Box<dyn Target>> = Vec::new();
     let mut skipped = Vec::new();
-    if wanted("host") {
+    if wanted(TargetArg::Host) {
         targets.push(Box::new(Host { data: root.clone(), scratch: scratch.clone() }));
     }
-    if wanted("sandfs") {
+    if wanted(TargetArg::Sandfs) {
         targets.push(Box::new(Sandfs { data: root.clone() }));
     }
-    if wanted("overlayfs") {
+    if wanted(TargetArg::Overlayfs) {
         if Overlay::available(&scratch) {
             targets.push(Box::new(Overlay { data: root.clone(), scratch: scratch.clone() }));
-        } else if explicit("overlayfs") {
+        } else if explicit(TargetArg::Overlayfs) {
             bail!("overlayfs cannot be mounted here (it needs root)");
         } else {
             skipped.push("overlayfs (needs root)".to_owned());
         }
     }
-    if wanted("fuse") {
+    if wanted(TargetArg::Fuse) {
         let bin = match &args.sandfs_bin {
             Some(bin) => bin.clone(),
             None => std::env::current_exe()?.with_file_name("sandfs"),
         };
         match Fuse::new(root.clone(), scratch.clone(), bin) {
             Ok(fuse) => targets.push(Box::new(fuse)),
-            Err(err) if explicit("fuse") => return Err(err),
+            Err(err) if explicit(TargetArg::Fuse) => return Err(err),
             Err(err) => skipped.push(format!("sandfs FUSE ({err})")),
         }
     }
@@ -123,12 +131,7 @@ fn run(args: Args) -> Result<()> {
         }
         table.push(row);
     }
-    let lazy = if selected("lazy/") {
-        eprintln!("lazy source");
-        lazy::run(&data, Duration::from_micros(args.latency_us), scale.iters)?
-    } else {
-        Vec::new()
-    };
+    let lazy = lazy::run(&data, Duration::from_micros(args.latency_us), scale.iters, &selected)?;
 
     print_report(&args, &data, &targets, &skipped, &workloads, &table, &lazy);
     if let Some(path) = &args.json {
@@ -171,6 +174,7 @@ fn measure(target: &dyn Target, workload: &workloads::Workload, data: &Data) -> 
         let leftover = (workload.run)(data, view.as_mut());
         let elapsed = start.elapsed();
         drop(leftover?);
+        (workload.check)(data, view.as_mut())?;
         drop(view);
         times.push(elapsed);
     }

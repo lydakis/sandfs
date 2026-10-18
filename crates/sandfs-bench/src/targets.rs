@@ -127,9 +127,9 @@ impl Target for Host {
         if !writable {
             return Ok(Box::new(DirView { root: self.data.clone(), backend: Backend::HostOriginal }));
         }
-        // Writable workloads only touch `small/`, so only that is copied (untimed).
+        // A writable view is a copy of the whole data set, made untimed.
         let copy = tempfile::Builder::new().prefix("host-").tempdir_in(&self.scratch)?;
-        copy_tree(&self.data.join("small"), &copy.path().join("small"))?;
+        copy_tree(&self.data, copy.path())?;
         Ok(Box::new(DirView {
             root: copy.path().to_owned(),
             backend: Backend::HostCopy { original: self.data.clone(), scratch: self.scratch.clone(), _copy: copy },
@@ -324,7 +324,7 @@ impl View for DirView {
             Backend::HostOriginal => bail!("read-only view"),
             Backend::HostCopy { original, scratch, .. } => {
                 let copy = tempfile::Builder::new().prefix("host-").tempdir_in(scratch)?;
-                copy_tree(&self.root.join("small"), &copy.path().join("small"))?;
+                copy_tree(&self.root, copy.path())?;
                 Ok(Box::new(DirView {
                     root: copy.path().to_owned(),
                     backend: Backend::HostCopy { original: original.clone(), scratch: scratch.clone(), _copy: copy },
@@ -344,7 +344,7 @@ impl View for DirView {
     fn changes(&mut self) -> Result<usize> {
         match &self.backend {
             Backend::HostOriginal => Ok(0),
-            Backend::HostCopy { original, .. } => compare_trees(&original.join("small"), &self.root.join("small")),
+            Backend::HostCopy { original, .. } => compare_trees(original, &self.root),
             Backend::Overlay { upper, data, .. } => overlay_changes(upper, data),
             Backend::Fuse { fuse, mountpoint, .. } => {
                 let output = fuse.command().arg("changes").arg(mountpoint).output()?;

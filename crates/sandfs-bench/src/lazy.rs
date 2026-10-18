@@ -147,7 +147,10 @@ fn eager_concurrent(setup: &Setup, paths: &[String]) -> Result<(Duration, usize)
 }
 
 /// Run the lazy-source workloads over the first `scale.lazy_files` small files.
-pub fn run(data: &Data, latency: Duration, iters: usize) -> Result<Vec<LazyResult>> {
+pub fn run(data: &Data, latency: Duration, iters: usize, selected: &dyn Fn(&str) -> bool) -> Result<Vec<LazyResult>> {
+    if !["lazy/read-1%", "lazy/read-all", "lazy/forks"].iter().any(|name| selected(name)) {
+        return Ok(Vec::new());
+    }
     let n = data.scale.lazy_files.min(data.small.len());
     let files = data.small[..n]
         .iter()
@@ -178,8 +181,8 @@ pub fn run(data: &Data, latency: Duration, iters: usize) -> Result<Vec<LazyResul
         ),
     ];
     let mut results = Vec::new();
-    for (name, what, paths, lazy, eager) in cases {
-        eprintln!("  {name}");
+    for (name, what, paths, lazy, eager) in cases.into_iter().filter(|case| selected(case.0)) {
+        eprintln!("{name}");
         let mut result = LazyResult { name, what, lazy: Vec::new(), eager: Vec::new() };
         for _ in 0..iters {
             result.lazy.push(lazy(&setup, paths)?);

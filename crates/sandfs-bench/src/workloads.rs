@@ -11,7 +11,8 @@ pub type Leftover = Option<Box<dyn View>>;
 
 type Step = Box<dyn Fn(&Data, &mut dyn View) -> Result<Leftover>>;
 
-/// One benchmark: `prepare` runs untimed on a fresh view, then `run` is timed.
+/// One benchmark: `prepare` runs untimed on a fresh view, then `run` is timed, then
+/// `check` confirms untimed that the run did all its work.
 pub struct Workload {
     /// Short name, `group/name`.
     pub name: &'static str,
@@ -21,6 +22,7 @@ pub struct Workload {
     pub writable: bool,
     pub prepare: Step,
     pub run: Step,
+    pub check: Step,
 }
 
 fn step(f: impl Fn(&Data, &mut dyn View) -> Result<()> + 'static) -> Step {
@@ -80,6 +82,23 @@ fn overwrite(data: &Data, view: &mut dyn View) -> Result<()> {
     Ok(())
 }
 
+fn check_created(data: &Data, view: &mut dyn View) -> Result<()> {
+    for i in 0..data.scale.ops {
+        let dir = &data.small_dirs[1 + i % (data.small_dirs.len() - 1)];
+        let size = view.stat(&format!("{dir}/new{i:05}.bin"))?;
+        ensure!(size == 4096, "new file {i} has {size} bytes");
+    }
+    Ok(())
+}
+
+fn check_overwritten(data: &Data, view: &mut dyn View) -> Result<()> {
+    for path in data.spread(data.scale.ops) {
+        let size = view.read(path)?;
+        ensure!(size == 4096, "{path} has {size} bytes after the overwrite");
+    }
+    Ok(())
+}
+
 /// Files to delete: offset by one from the overwritten ones, so the sets never meet.
 fn doomed(data: &Data, n: usize) -> Vec<&str> {
     let step = (data.small.len() / data.scale.ops.max(1)).max(2);
@@ -101,6 +120,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
             writable: false,
             prepare: nothing(),
             run: step(read_all),
+            check: nothing(),
         },
         Workload {
             name: "small/read-warm",
@@ -108,13 +128,15 @@ pub fn all(data: &Data) -> Vec<Workload> {
             writable: false,
             prepare: step(read_all),
             run: step(read_all),
+            check: nothing(),
         },
         Workload {
             name: "small/stat",
-            what: format!("stat the {files} files (listings already read)"),
+            what: format!("stat the {files} files, after listing their directories"),
             writable: false,
-            prepare: step(stat_all),
+            prepare: step(|_, view| walk(view, "small").map(drop)),
             run: step(stat_all),
+            check: nothing(),
         },
         Workload {
             name: "small/walk",
@@ -126,6 +148,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 ensure!(found == files, "walk found {found} files, expected {files}");
                 Ok(())
             }),
+            check: nothing(),
         },
         Workload {
             name: "wide/list",
@@ -137,6 +160,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 ensure!(found == data.scale.wide, "listed {found} entries");
                 Ok(())
             }),
+            check: nothing(),
         },
         Workload {
             name: "deep/stat",
@@ -149,6 +173,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 }
                 Ok(())
             }),
+            check: nothing(),
         },
         Workload {
             name: "large/read-whole",
@@ -160,6 +185,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 ensure!(read == data.large_size, "read {read} bytes");
                 Ok(())
             }),
+            check: nothing(),
         },
         Workload {
             name: "large/read-ranges",
@@ -176,6 +202,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 }
                 Ok(())
             }),
+            check: nothing(),
         },
         Workload {
             name: "write/create",
@@ -183,6 +210,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
             writable: true,
             prepare: nothing(),
             run: step(create),
+            check: step(check_created),
         },
         Workload {
             name: "write/overwrite",
@@ -190,6 +218,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
             writable: true,
             prepare: nothing(),
             run: step(overwrite),
+            check: step(check_overwritten),
         },
         Workload {
             name: "write/delete",
@@ -202,6 +231,12 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 }
                 Ok(())
             }),
+            check: step(|data, view| {
+                for path in doomed(data, data.scale.ops) {
+                    ensure!(view.stat(path).is_err(), "{path} still exists");
+                }
+                Ok(())
+            }),
         },
         Workload {
             name: "fork/clean",
@@ -209,6 +244,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
             writable: true,
             prepare: nothing(),
             run: Box::new(|_, view| view.fork().map(Some)),
+            check: nothing(),
         },
         Workload {
             name: "fork/changed",
@@ -219,6 +255,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 overwrite(data, view)
             }),
             run: Box::new(|_, view| view.fork().map(Some)),
+            check: nothing(),
         },
         Workload {
             name: "changes",
@@ -238,6 +275,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 ensure!(found == expected, "found {found} changes, expected {expected}");
                 Ok(())
             }),
+            check: nothing(),
         },
     ]
 }
