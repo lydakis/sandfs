@@ -181,31 +181,74 @@ def main() -> None:
             "sandfs + Python source": sandfs_py,
         }
 
-        def read_all(view: View) -> None:
-            for path in paths:
-                view.read(path)
+        n, w = args.files, args.writes
+        total = sum((data / path).stat().st_size for path in paths)
+        created = [f"d{i % (n // 100 or 1):03}/new{i:05}.bin" for i in range(w)]
+
+        def read_all(view: View) -> int:
+            return sum(view.read(path) for path in paths)
 
         def create(view: View) -> None:
-            for i in range(args.writes):
-                view.write(f"d{i % (args.files // 100 or 1):03}/new{i:05}.bin", payload)
+            for path in created:
+                view.write(path, payload)
 
         def nothing(view: View) -> None:
             pass
 
-        n, w = args.files, args.writes
-        workloads: list[tuple[str, bool, Callable[[View], object], Callable[[View], object]]] = [
-            (f"read {n} files, fresh view", False, nothing, read_all),
-            (f"read the {n} files again", False, read_all, read_all),
-            ("list every directory, fresh view", False, nothing, lambda v: v.walk(".")),
-            (f"create {w} 4 KiB files", True, nothing, create),
-            ("fork", True, nothing, lambda v: v.fork()),
-            (f"changes after {w} creates", True, create, lambda v: v.changes()),
+        def expect(what: str, found: object, expected: object) -> None:
+            if found != expected:
+                raise SystemExit(f"{what}: got {found}, expected {expected}")
+
+        def check_created(view: View, _: object) -> None:
+            expect("created bytes", sum(view.read(path) for path in created), w * len(payload))
+
+        def check_fork(_: View, fork: object) -> None:
+            assert isinstance(fork, HostView | SandfsView)
+            expect("files in the fork", fork.walk("."), n)
+            expect("changes in the fork", fork.changes(), 0)
+
+        # Each workload: name, writable, untimed setup, the timed run, and an untimed
+        # check of the run's result, so a target that does less fails instead.
+        Check = Callable[[View, object], None]
+        workloads: list[
+            tuple[str, bool, Callable[[View], object], Callable[[View], object], Check]
+        ] = [
+            (
+                f"read {n} files, fresh view",
+                False,
+                nothing,
+                read_all,
+                lambda _, r: expect("bytes read", r, total),
+            ),
+            (
+                f"read the {n} files again",
+                False,
+                read_all,
+                read_all,
+                lambda _, r: expect("bytes read", r, total),
+            ),
+            (
+                "list every directory, fresh view",
+                False,
+                nothing,
+                lambda v: v.walk("."),
+                lambda _, r: expect("files listed", r, n),
+            ),
+            (f"create {w} 4 KiB files", True, nothing, create, check_created),
+            ("fork", True, nothing, lambda v: v.fork(), check_fork),
+            (
+                f"changes after {w} creates",
+                True,
+                create,
+                lambda v: v.changes(),
+                lambda _, r: expect("changes", r, w),
+            ),
         ]
 
         print(f"{n} files, median of {args.iters} runs.\n")
         print("| workload | " + " | ".join(targets) + " |")
         print("|---|" + "---:|" * len(targets))
-        for name, writable, prepare, run in workloads:
+        for name, writable, prepare, run, check in workloads:
             cells = []
             for open_view in targets.values():
                 times = []
@@ -215,9 +258,12 @@ def main() -> None:
                     start = time.perf_counter()
                     result = run(view)
                     times.append(time.perf_counter() - start)
+                    check(view, result)
                     if isinstance(result, HostView | SandfsView):
                         result.close()
                     view.close()
+                    # Drop both now, so freeing a workspace is never timed in the next run.
+                    del result, view
                 cells.append(fmt(statistics.median(times)))
             print(f"| {name} | " + " | ".join(cells) + " |")
 
