@@ -1,7 +1,6 @@
 """Type stubs for the Rust extension module."""
 
 import builtins
-from collections.abc import Mapping
 from os import PathLike
 from typing import Literal, final
 
@@ -58,7 +57,7 @@ class DirSource:
 
 @final
 class MemorySource:
-    def __init__(self, files: Mapping[str, str | bytes]) -> None: ...
+    def __init__(self, files: dict[str, str | bytes]) -> None: ...
 
 @final
 class GitSource:

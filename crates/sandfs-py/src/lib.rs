@@ -191,9 +191,10 @@ struct PyMemorySource {
 #[pymethods]
 impl PyMemorySource {
     #[new]
-    fn new(files: HashMap<String, Data>) -> PyResult<Self> {
+    fn new(py: Python<'_>, files: HashMap<String, Data>) -> PyResult<Self> {
         let files = files.into_iter().map(|(name, data)| (name, Bytes::from(data)));
-        Ok(PyMemorySource { inner: Arc::new(MemorySource::from_files(files).or_raise()?) })
+        let source = py.detach(|| MemorySource::from_files(files)).or_raise()?;
+        Ok(PyMemorySource { inner: Arc::new(source) })
     }
 }
 
