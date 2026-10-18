@@ -97,3 +97,31 @@ fn partial_clone_fetches_only_the_blobs_that_are_read() {
     assert_eq!(ws.read_text("/repo/src/lib.rs").unwrap(), "fn main() {}\n");
     assert_eq!(missing(clone.path()), before - 1, "exactly one blob was fetched");
 }
+
+#[test]
+fn sizes_fetch_a_directory_of_a_partial_clone_in_one_request() {
+    let origin = tempfile::tempdir().unwrap();
+    make_repo(origin.path());
+    git(origin.path(), &["config", "uploadpack.allowFilter", "true"]);
+    git(origin.path(), &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    let clone = tempfile::tempdir().unwrap();
+    let url = format!("file://{}", origin.path().display());
+    git(clone.path(), &["clone", "-q", "--bare", "--filter=blob:none", &url, "."]);
+    let missing = |clone: &Path| {
+        git(clone, &["rev-list", "--objects", "--missing=print", "HEAD"]).lines().filter(|l| l.starts_with('?')).count()
+    };
+    let before = missing(clone.path());
+
+    let mut ws = Workspace::new();
+    ws.mount("/repo", Arc::new(GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap())).unwrap();
+    let src = ws.list("/repo/src").unwrap();
+    assert_eq!(src.iter().find(|e| e.name == "lib.rs").unwrap().size, Some(13));
+    assert_eq!(ws.stat("/repo/src/lib.rs").unwrap().size, 13);
+    // Reaching /repo/src lists /repo too: its three blobs and lib.rs were fetched, while
+    // src/deep, never listed, still has its blob missing.
+    assert_eq!(missing(clone.path()), before - 4);
+
+    let root = ws.list("/repo").unwrap();
+    assert_eq!(root.iter().find(|e| e.name == "README.md").unwrap().size, Some(7));
+    assert_eq!(root.iter().find(|e| e.name == "src").unwrap().size, None);
+}

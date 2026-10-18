@@ -287,6 +287,21 @@ impl Workspace {
         Ok(version)
     }
 
+    /// Set or clear a file's executable bit. Returns the file's version, which changes
+    /// only when the bit does.
+    pub fn set_executable(&mut self, path: &str, executable: bool) -> Result<u64> {
+        let path = VPath::parse(path)?;
+        match self.resolve(&path)? {
+            Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
+            Resolved::File { kind, version, .. } if kind == (Kind::File { executable }) => Ok(version),
+            Resolved::File { content, .. } => {
+                let version = self.tick();
+                self.overlay.insert(path, Overlay::File { content, kind: Kind::File { executable }, version });
+                Ok(version)
+            }
+        }
+    }
+
     /// Create a directory. With `parents`, missing ancestors are created and an
     /// existing directory is not an error, like `mkdir -p`.
     pub fn mkdir(&mut self, path: &str, parents: bool) -> Result<()> {
