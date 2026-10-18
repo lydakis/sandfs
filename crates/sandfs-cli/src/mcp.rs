@@ -14,6 +14,7 @@ use sandfs_core::{VPath, Workspace};
 use sandfs_mcp::Server;
 use serde_json::{Value, json};
 
+use crate::fs::subtree_keys;
 use crate::persist::{Restored, Snapshot};
 use crate::store::{Home, ROOT};
 
@@ -58,6 +59,14 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             // created (parents, a moved subtree) and the paths it removed, and give
             // changed paths a new modification time.
             let ws = server.workspace();
+            // Only `move` touches two paths; its files keep their times at the new place.
+            if let [from, to] = touched.as_slice() {
+                for old in subtree_keys(&times, from) {
+                    if let Some(time) = times.remove(&old) {
+                        times.insert(format!("{to}{}", &old[from.as_str().len()..]), time);
+                    }
+                }
+            }
             for path in &touched {
                 for parent in path.ancestors().into_iter().filter(|p| p.starts_with(&root) && *p != root) {
                     dirs.insert(parent.to_string());
@@ -70,7 +79,9 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
                         }
                     }
                     Err(_) => {
-                        times.remove(path.as_str());
+                        for gone in subtree_keys(&times, path) {
+                            times.remove(&gone);
+                        }
                         dirs.insert(path.to_string());
                     }
                 }
@@ -165,6 +176,21 @@ mod tests {
         let mut output = Vec::new();
         serve_on(home, "ws", input.as_bytes(), &mut output).unwrap();
         String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn moved_files_keep_their_saved_times() {
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+
+        session(&home, &call(1, "write", json!({ "path": "/mnt/dir/f.txt", "content": "f" })));
+        let written = home.open("ws").unwrap().restored.times["/mnt/dir/f.txt"];
+        session(&home, &call(1, "move", json!({ "from": "/mnt/dir", "to": "/mnt/moved" })));
+
+        let times = home.open("ws").unwrap().restored.times;
+        assert_eq!(times.get("/mnt/moved/f.txt"), Some(&written));
+        assert!(!times.contains_key("/mnt/dir/f.txt"));
     }
 
     #[test]
