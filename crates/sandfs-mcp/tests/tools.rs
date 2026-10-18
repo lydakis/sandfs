@@ -225,7 +225,48 @@ fn large_results_are_cut_with_a_note() {
     assert!(grep.ends_with("output cut short, narrow the path or glob]"));
 
     ok(&mut s, "write", json!({ "path": "/long.txt", "content": "y".repeat(5000) }));
-    assert!(ok(&mut s, "read", json!({ "path": "/long.txt" })).contains("… [line cut at 2000 characters]"));
+    let cut = ok(&mut s, "read", json!({ "path": "/long.txt" }));
+    assert!(cut.contains("… [line cut at 2000 characters; rest from byte_offset=2000]"), "{cut}");
+}
+
+#[test]
+fn byte_reads_reach_the_rest_of_long_lines() {
+    let mut s = server();
+    // A wide record: 3000 two-byte characters, then a marker past the line cut.
+    let record = format!("{}END,42\nnext\n", "é".repeat(3000));
+    ok(&mut s, "write", json!({ "path": "/data/wide.csv", "content": record }));
+    let page = ok(&mut s, "read", json!({ "path": "/data/wide.csv" }));
+    assert!(page.contains("rest from byte_offset=4000]"), "{page}");
+
+    let rest = ok(&mut s, "read", json!({ "path": "/data/wide.csv", "byte_offset": 4000 }));
+    assert!(rest.starts_with(&"é".repeat(1000)), "{rest}");
+    assert!(rest.ends_with("END,42\nnext\n\n[bytes 4000-6012 · end of file]"), "{rest}");
+    // Text found by bytes is exact, so it can be edited.
+    ok(&mut s, "edit", json!({ "path": "/data/wide.csv", "edits": [{ "old": "éEND,42", "new": "éEND,43" }] }));
+
+    // A range that starts or ends inside a character moves onto its boundaries.
+    let mid = ok(&mut s, "read", json!({ "path": "/data/wide.csv", "byte_offset": 1, "byte_length": 6 }));
+    assert_eq!(mid, "éé\n[bytes 2-6 · continue with byte_offset=6]");
+
+    // Mounted files are read by range too.
+    let head = ok(&mut s, "read", json!({ "path": "/data/sales/2026.csv", "byte_length": "12" }));
+    assert_eq!(head, "region,total\n[bytes 0-12 · continue with byte_offset=12]");
+
+    let err = |s: &mut Server, args| fails(s, "read", args);
+    assert!(err(&mut s, json!({ "path": "/data/README.md", "byte_offset": 22 })).contains("past the end"));
+    // A binary file stays hidden even where a range of it happens to be ASCII.
+    let png = json!({ "path": "/data/chart.png", "byte_offset": 12, "byte_length": 4 });
+    assert_eq!(err(&mut s, png), "/data/chart.png: PNG image; not text, so not shown");
+    assert!(err(&mut s, json!({ "path": "/data/sales", "byte_offset": 0 })).contains("is a directory"));
+    let split = json!({ "path": "/data/wide.csv", "byte_offset": 0, "byte_length": 1 });
+    assert!(err(&mut s, split).contains("hold no whole character"));
+    let ascii = ok(&mut s, "read", json!({ "path": "/data/README.md", "byte_length": 1 }));
+    assert_eq!(ascii, "#\n[bytes 0-1 · continue with byte_offset=1]");
+    assert!(err(&mut s, json!({ "path": "/data/README.md", "byte_offset": 0, "limit": 1 })).contains("not both"));
+    assert_eq!(
+        err(&mut s, json!({ "path": "/data/README.md", "byte_length": 60001 })),
+        "byte_length must be at most 60000"
+    );
 }
 
 #[test]
@@ -271,4 +312,40 @@ fn grep_cut_short_by_context_is_not_reported_as_no_matches() {
     let out = ok(&mut s, "grep", json!({ "pattern": "needle", "path": "/data", "context": 20 }));
     assert!(!out.starts_with("No matches"), "{}", &out[out.len() - 200..]);
     assert!(out.ends_with("output cut short, narrow the path or glob]"), "{}", &out[out.len() - 200..]);
+}
+
+/// A source that reports no sizes and refuses whole-file reads, like a large remote
+/// object that only supports range requests.
+#[derive(Debug)]
+struct RangeOnly(&'static [u8]);
+
+impl sandfs_core::Source for RangeOnly {
+    fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+        Ok("".into())
+    }
+    fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+        let file = sandfs_core::Kind::File { executable: false };
+        Ok([("big.log".to_owned(), sandfs_core::SourceEntry { kind: file, key: "big.log".into(), size: None })].into())
+    }
+    fn read_file(&self, _key: &str) -> sandfs_core::Result<bytes::Bytes> {
+        panic!("a byte read must not load the whole file");
+    }
+    fn read_range(&self, _key: &str, offset: u64, len: u64) -> sandfs_core::Result<bytes::Bytes> {
+        let start = (offset as usize).min(self.0.len());
+        Ok(bytes::Bytes::from_static(&self.0[start..(start + len as usize).min(self.0.len())]))
+    }
+}
+
+#[test]
+fn byte_reads_never_load_the_whole_file() {
+    let mut ws = Workspace::new();
+    ws.mount("/remote", Arc::new(RangeOnly(b"line one\nline two\n"))).unwrap();
+    let mut s = Server::new(ws);
+    let out = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 5, "byte_length": 3 }));
+    assert_eq!(out, "one\n[bytes 5-8 · continue with byte_offset=8]");
+    // A range that ends exactly at the end of the file says so.
+    let exact = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 14, "byte_length": 4 }));
+    assert_eq!(exact, "two\n\n[bytes 14-18 · end of file]");
+    let tail = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 9 }));
+    assert_eq!(tail, "line two\n\n[bytes 9-18 · end of file]");
 }
