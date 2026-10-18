@@ -349,3 +349,57 @@ fn byte_reads_never_load_the_whole_file() {
     let tail = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 9 }));
     assert_eq!(tail, "line two\n\n[bytes 9-18 · end of file]");
 }
+
+#[test]
+fn paths_with_control_characters_are_shown_quoted() {
+    // A newline in a name would otherwise split one path over two lines.
+    let source = MemorySource::from_files([
+        ("odd\nname.txt", b"needle\n".to_vec()),
+        ("plain.txt", b"needle\n".to_vec()),
+        ("sub\ndir/f.txt", b"x".to_vec()),
+        ("next\u{85}line.txt", b"x".to_vec()),
+        ("para\u{2029}sep", b"x".to_vec()),
+        ("\"odd\\nname.txt\"", b"x".to_vec()),
+    ])
+    .unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/d", Arc::new(source)).unwrap();
+    let mut s = Server::new(ws);
+    assert_eq!(
+        ok(&mut s, "list", json!({ "path": "/d" })),
+        concat!(
+            r#""\"odd\\nname.txt\"" (1 bytes)"#,
+            "\n",
+            r#""next\u0085line.txt" (1 bytes)"#,
+            "\n",
+            r#""odd\nname.txt" (7 bytes)"#,
+            "\n",
+            r#""para\u2029sep" (1 bytes)"#,
+            "\nplain.txt (7 bytes)\n",
+            r#""sub\ndir/""#,
+        )
+    );
+    assert_eq!(
+        ok(&mut s, "glob", json!({ "pattern": "*e*.txt", "path": "/d" })),
+        "\"/d/next\\u0085line.txt\"\n\"/d/odd\\nname.txt\""
+    );
+    assert!(
+        ok(&mut s, "grep", json!({ "pattern": "needle", "path": "/d" }))
+            .starts_with("\"/d/odd\\nname.txt\":1:needle\n")
+    );
+    ok(&mut s, "write", json!({ "path": "/d/odd\nname.txt", "content": "x" }));
+    assert!(ok(&mut s, "changes", json!({})).starts_with("M \"/d/odd\\nname.txt\" (1 bytes)\n"));
+
+    // Results that find nothing name the path the same way.
+    ok(&mut s, "delete", json!({ "path": "/d/sub\ndir/f.txt" }));
+    assert_eq!(ok(&mut s, "list", json!({ "path": "/d/sub\ndir" })), "\"/d/sub\\ndir\" is empty");
+    assert_eq!(
+        ok(&mut s, "glob", json!({ "pattern": "*", "path": "/d/sub\ndir" })),
+        "No files match * under \"/d/sub\\ndir\""
+    );
+    assert_eq!(
+        ok(&mut s, "grep", json!({ "pattern": "y", "path": "/d/sub\ndir" })),
+        "No matches for y under \"/d/sub\\ndir\""
+    );
+    assert_eq!(ok(&mut s, "changes", json!({ "path": "/d/sub\ndir/x" })), "No changes under \"/d/sub\\ndir/x\"");
+}

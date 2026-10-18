@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **sandfs-mcp**: `list`, `glob`, `grep` and `changes` show a path holding a control character or line separator, such as a newline, as a quoted JSON string, so one name can't read as two lines.
+
 ## 0.4.0 (2026-10-18)
 
 A rewrite. sandfs is now a general-purpose sandbox filesystem with a Rust core, and the Python package is a thin binding over it. Nothing from the 0.2 API carries over.

@@ -60,7 +60,10 @@ impl Tools {
     /// What the agent is told at `initialize`: the top-level layout and how to work.
     pub(crate) fn instructions(&self) -> String {
         let top: Vec<String> = match self.workspace.list("/") {
-            Ok(entries) => entries.iter().map(|entry| format!("/{}{}", entry.name, suffix(entry.kind))).collect(),
+            Ok(entries) => entries
+                .iter()
+                .map(|entry| shown(&format!("/{}{}", entry.name, suffix(entry.kind))).into_owned())
+                .collect(),
             Err(_) => Vec::new(),
         };
         let layout = if top.is_empty() {
@@ -71,7 +74,7 @@ impl Tools {
         format!(
             "These tools are your filesystem: a private copy-on-write workspace. {layout} Paths are absolute. \
              Mounted sources are never modified; every write stays in this workspace, and `changes` shows what you \
-             changed."
+             changed. A path holding a control character or line separator, such as a newline, is shown as a quoted JSON string."
         )
     }
 
@@ -204,14 +207,14 @@ impl Tools {
                 return false;
             }
             lines.push(match (entry.kind, entry.size) {
-                (Kind::Dir, _) => format!("{rel}/"),
-                (_, Some(size)) => format!("{rel} ({size} bytes)"),
-                (_, None) => format!("{rel} (size unknown)"),
+                (Kind::Dir, _) => shown(&format!("{rel}/")).into_owned(),
+                (_, Some(size)) => format!("{} ({size} bytes)", shown(rel)),
+                (_, None) => format!("{} (size unknown)", shown(rel)),
             });
             true
         })?;
         if lines.is_empty() {
-            return Ok(format!("{path} is empty"));
+            return Ok(format!("{} is empty", shown(&path)));
         }
         let mut out = lines.join("\n");
         if truncated {
@@ -236,11 +239,11 @@ impl Tools {
                 truncated = true;
                 return false;
             }
-            found.push(abs.to_owned());
+            found.push(shown(abs).into_owned());
             true
         })?;
         if found.is_empty() {
-            return Ok(format!("No files match {pattern} under {root}"));
+            return Ok(format!("No files match {pattern} under {}", shown(&root)));
         }
         let mut out = found.join("\n");
         if truncated {
@@ -300,7 +303,7 @@ impl Tools {
                 0 => String::new(),
                 n => format!(" ({n} files could not be read)"),
             };
-            return Ok(format!("No matches for {pattern} under {root}{unread}"));
+            return Ok(format!("No matches for {pattern} under {}{unread}", shown(&root)));
         }
         let mut out = search.out;
         let files = if search.files == 1 { "file" } else { "files" };
@@ -382,16 +385,16 @@ impl Tools {
         for change in self.workspace.changes().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
             let path = change.path.as_str();
             lines.push(match change.kind {
-                ChangeKind::Deleted => format!("D {path}"),
+                ChangeKind::Deleted => format!("D {}", shown(path)),
                 kind => {
                     let mark = if kind == ChangeKind::Added { 'A' } else { 'M' };
                     let size = self.workspace.stat(path).map_err(err)?.size;
-                    format!("{mark} {path} ({size} bytes)")
+                    format!("{mark} {} ({size} bytes)", shown(path))
                 }
             });
         }
         if lines.is_empty() {
-            return Ok(format!("No changes under {scope}"));
+            return Ok(format!("No changes under {}", shown(scope.as_str())));
         }
         lines.push("[A added, M modified, D deleted; read a file to see its contents]".to_owned());
         Ok(lines.join("\n"))
@@ -436,6 +439,7 @@ impl Search<'_> {
         }
         let hit_set: BTreeSet<usize> = hits.iter().copied().collect();
         self.files += 1;
+        let path = shown(path);
         for (start, end) in ranges {
             if self.context > 0 && !self.out.is_empty() {
                 self.out.push_str("--\n");
@@ -651,6 +655,33 @@ fn cap(mut text: String) -> String {
     text.truncate(cut);
     text.push_str("[output cut at 64 KiB; narrow the request, e.g. with a path, offset or limit]");
     text
+}
+
+/// A path as tool output shows it: as is, or as a quoted JSON string when it holds a
+/// control character or line separator, so a newline in a name cannot split it over
+/// two lines. The quoted form is what the agent passes back as a JSON argument. A path
+/// that itself starts with `"` is quoted too, so the two forms never look alike.
+fn shown(path: &str) -> std::borrow::Cow<'_, str> {
+    let breaks = |c: char| c.is_control() || c == '\u{2028}' || c == '\u{2029}';
+    if !path.starts_with('"') && !path.chars().any(breaks) {
+        return path.into();
+    }
+    // JSON serializers escape only ASCII controls, so U+0080..U+009F (such as NEXT
+    // LINE) and the Unicode line separators are escaped here too, each as `\uXXXX`.
+    let mut quoted = String::from('"');
+    for c in path.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            '\r' => quoted.push_str("\\r"),
+            c if breaks(c) => quoted.push_str(&format!("\\u{:04x}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted.into()
 }
 
 fn suffix(kind: Kind) -> &'static str {
