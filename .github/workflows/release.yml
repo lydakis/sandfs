@@ -1,20 +1,25 @@
-name: Publish
+name: Release
 
+# Every pull request builds the wheels and sdist and installs them, so packaging
+# breaks show up before a release. Only a pushed `v*` tag publishes to PyPI.
 on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   wheels:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64 }
+          - { os: ubuntu-latest, target: x86_64, smoke: true }
           - { os: ubuntu-latest, target: aarch64 }
           - { os: macos-latest, target: x86_64 }
-          - { os: macos-latest, target: aarch64 }
-          - { os: windows-latest, target: x64 }
+          - { os: macos-latest, target: aarch64, smoke: true }
+          - { os: windows-latest, target: x64, smoke: true }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -24,6 +29,18 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
+      # Install the wheel on the runners that can execute it and use it once.
+      - if: matrix.smoke
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - if: matrix.smoke
+        name: Smoke-test the wheel
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist sandfs
+          cd "$RUNNER_TEMP"
+          python -I -c "import sandfs; ws = sandfs.Workspace(); ws.mount('/m', sandfs.MemorySource({'a.txt': 'hi'})); f = ws.fork(); f.write('/m/b.bin', b'data'); assert ws.read_text('/m/a.txt') == 'hi'; assert [(c.kind, c.path) for c in f.changes()] == [('added', '/m/b.bin')]; print(sandfs.__version__)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
@@ -44,6 +61,7 @@ jobs:
 
   publish:
     needs: [wheels, sdist]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -53,6 +71,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # The version comes from Cargo.toml; refuse to publish under a different tag.
+      - name: Check the tag matches the package version
+        run: test -f "dist/sandfs-${GITHUB_REF_NAME#v}.tar.gz"
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
