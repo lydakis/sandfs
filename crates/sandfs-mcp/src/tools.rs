@@ -301,8 +301,10 @@ impl Tools {
                 ChangeKind::Deleted => format!("D {path}"),
                 kind => {
                     let mark = if kind == ChangeKind::Added { 'A' } else { 'M' };
-                    let size = self.workspace.stat(path).map_err(err)?.size;
-                    format!("{mark} {path} ({size} bytes)")
+                    match self.workspace.stat(path).map_err(err)?.size {
+                        Some(size) => format!("{mark} {path} ({size} bytes)"),
+                        None => format!("{mark} {path}"),
+                    }
                 }
             });
         }
