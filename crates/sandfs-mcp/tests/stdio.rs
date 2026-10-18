@@ -66,7 +66,7 @@ fn a_session_over_a_mounted_directory() {
     assert_eq!(names, ["read", "list", "glob", "grep", "write", "edit", "move", "delete", "diff"]);
 
     assert_eq!(replies[2]["result"]["isError"], false);
-    assert!(replies[2]["result"]["content"][0]["text"].as_str().unwrap().contains("+bye"));
+    assert_eq!(replies[2]["result"]["content"][0]["text"], "Edited /work/hello.txt, version 1");
     // The host file is untouched: the edit lives in the workspace.
     assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "hello\n");
 
@@ -79,9 +79,9 @@ fn a_session_over_a_mounted_directory() {
     assert_eq!(replies[6]["id"], 7);
     assert_eq!(replies[7]["error"]["code"], -32600, "a request without an id is still validated");
     assert_eq!(replies[7]["id"], Value::Null);
-    let image = &replies[8]["result"]["content"];
-    assert_eq!(image[0], json!({ "type": "image", "data": "R0lGODlhAQA=", "mimeType": "image/gif" }));
-    assert_eq!(image[1]["text"], "/work/dot.gif: image/gif image, 8 bytes, version 0");
+    let gif = &replies[8]["result"]["content"];
+    assert_eq!(gif.as_array().unwrap().len(), 1, "non-text files are described, never sent as bytes");
+    assert_eq!(gif[0]["text"], "/work/dot.gif: GIF image, 8 bytes, version 0; not text, so not shown");
     assert_eq!(replies[9]["error"]["code"], -32700);
 }
 
@@ -97,5 +97,5 @@ fn unparseable_lines_get_a_parse_error() {
 fn bad_arguments_exit_with_usage() {
     let output = Command::new(env!("CARGO_BIN_EXE_sandfs-mcp")).args(["--dir", "nonsense"]).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("expected MOUNT=SOURCE"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected MOUNT=PATH"));
 }

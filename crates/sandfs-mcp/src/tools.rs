@@ -2,17 +2,14 @@
 
 use std::collections::BTreeSet;
 
-use bytes::Bytes;
+use base64::prelude::{BASE64_STANDARD, Engine};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::RegexBuilder;
-use sandfs_core::{ChangeKind, DirEntry, Edit, Error, Kind, VPath, Workspace};
+use sandfs_core::{ChangeKind, DirEntry, Error, Kind, VPath, Workspace};
 use serde_json::{Map, Value, json};
-use similar::TextDiff;
 
 /// Results longer than this many bytes are cut, with a note saying how to see the rest.
 pub const MAX_OUTPUT: usize = 64 * 1024;
-/// Images up to this size are returned as image content; larger ones only by size.
-pub const MAX_IMAGE: usize = 5 * 1024 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_READ_LINE_CHARS: usize = 2000;
 const MAX_GREP_LINE_CHARS: usize = 500;
@@ -20,20 +17,8 @@ const MAX_ENTRIES: usize = 1000;
 const DEFAULT_GREP_MATCHES: usize = 200;
 const MAX_CONTEXT: u64 = 20;
 const MAX_LIST_DEPTH: u64 = 20;
-const MAX_SYMLINK_HOPS: usize = 40;
-/// Files larger than this (old plus new bytes) are listed in a diff but not diffed.
-const MAX_DIFF_INPUT: usize = 1024 * 1024;
 
 type ToolResult = Result<String, String>;
-
-/// Image bytes returned by `read`, with their MIME type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Image {
-    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
-    pub mime_type: &'static str,
-    /// The raw file bytes.
-    pub data: Bytes,
-}
 
 /// The workspace an MCP session works on.
 pub(crate) struct Tools {
@@ -86,31 +71,15 @@ impl Tools {
         )
     }
 
-    /// For `read` of a PNG, JPEG, GIF or WebP file within [`MAX_IMAGE`]: the image and a
-    /// caption. Anything else, errors included, is left to the text read.
-    pub(crate) fn read_image(&self, arguments: &Value) -> Option<(Image, String)> {
-        let Value::Object(map) = arguments else { return None };
-        let path = Args(map).path("path").ok()?;
-        let target = follow(&self.workspace, &path).ok()?;
-        let bytes = self.workspace.read(&target).ok()?;
-        let mime_type = image_type(&bytes)?;
-        if bytes.len() > MAX_IMAGE {
-            return None;
-        }
-        let version = self.workspace.stat(&target).ok()?.version;
-        let caption = format!("{path}: {mime_type} image, {} bytes, version {version}", bytes.len());
-        Some((Image { mime_type, data: bytes }, caption))
-    }
-
     fn read(&self, args: &Args) -> ToolResult {
         let path = args.path("path")?;
         let offset = args.opt_u64("offset")?.unwrap_or(1).max(1) as usize;
         let limit = args.opt_u64("limit")?.map_or(DEFAULT_READ_LINES, |n| n as usize).max(1);
-        let target = follow(&self.workspace, &path)?;
-        let version = self.workspace.stat(&target).map_err(err)?.version;
-        let bytes = self.workspace.read(&target).map_err(err)?;
+        let version = self.workspace.stat(&path).map_err(err)?.version;
+        let bytes = self.workspace.read(&path).map_err(err)?;
         let Some(text) = as_text(&bytes) else {
-            return Ok(format!("{path}: binary file, {} bytes, version {version}", bytes.len()));
+            let kind = detect_type(&bytes);
+            return Ok(format!("{path}: {kind}, {} bytes, version {version}; not text, so not shown", bytes.len()));
         };
         if text.is_empty() {
             return Ok(format!("{path}: empty file, version {version}"));
@@ -151,21 +120,15 @@ impl Tools {
         let depth = args.opt_u64("depth")?.unwrap_or(1).clamp(1, MAX_LIST_DEPTH) as usize;
         let mut lines = Vec::new();
         let mut truncated = false;
-        walk(&self.workspace, &path, depth, &mut |abs, rel, entry| {
+        walk(&self.workspace, &path, depth, &mut |_, rel, entry| {
             if lines.len() == MAX_ENTRIES {
                 truncated = true;
                 return false;
             }
-            lines.push(match entry.kind {
-                Kind::Dir => format!("{rel}/"),
-                Kind::Symlink => match self.workspace.read_link(abs) {
-                    Ok(target) => format!("{rel} -> {target}"),
-                    Err(_) => format!("{rel} -> ?"),
-                },
-                Kind::File { .. } => match entry.size {
-                    Some(size) => format!("{rel} ({size} bytes)"),
-                    None => rel.to_owned(),
-                },
+            lines.push(match (entry.kind, entry.size) {
+                (Kind::Dir, _) => format!("{rel}/"),
+                (_, Some(size)) => format!("{rel} ({size} bytes)"),
+                (_, None) => format!("{rel} (size unknown)"),
             });
             true
         })?;
@@ -232,8 +195,7 @@ impl Tools {
         };
         if self.workspace.stat(&root).map_err(err)?.kind.is_dir() {
             walk(&self.workspace, &root, usize::MAX, &mut |abs, rel, entry| {
-                // Symlinks are not followed, as in ripgrep, so no file is searched twice.
-                if !matches!(entry.kind, Kind::File { .. }) {
+                if entry.kind.is_dir() {
                     return true;
                 }
                 // Like ripgrep, a glob without a slash matches the file name at any depth.
@@ -274,28 +236,47 @@ impl Tools {
     fn write(&mut self, args: &Args) -> ToolResult {
         let path = args.path("path")?;
         let content = args.str("content")?;
+        let data = match args.opt_str("encoding")?.unwrap_or("text") {
+            "text" => content.as_bytes().to_vec(),
+            "base64" => {
+                BASE64_STANDARD.decode(content.trim()).map_err(|e| format!("content is not valid base64: {e}"))?
+            }
+            other => return Err(format!("unknown encoding {other:?}; use text or base64")),
+        };
+        let size = data.len();
         let version = match args.opt_u64("expected_version")? {
-            Some(expected) => self.workspace.write_versioned(&path, content.to_owned(), expected),
-            None => self.workspace.write(&path, content.to_owned()),
+            Some(expected) => self.workspace.write_versioned(&path, data, expected),
+            None => self.workspace.write(&path, data),
         }
         .map_err(err)?;
-        Ok(format!("Wrote {path} ({} bytes), version {version}", content.len()))
+        Ok(format!("Wrote {path} ({size} bytes), version {version}"))
     }
 
     fn edit(&mut self, args: &Args) -> ToolResult {
         let path = args.path("path")?;
         let edits = args.edits()?;
-        let target = follow(&self.workspace, &path)?;
+        let version = self.workspace.stat(&path).map_err(err)?.version;
         if let Some(expected) = args.opt_u64("expected_version")? {
-            let actual = self.workspace.stat(&target).map_err(err)?.version;
-            if actual != expected {
-                return Err(Error::VersionMismatch { path, expected, actual }.to_string());
+            if expected != version {
+                return Err(Error::VersionMismatch { path, expected, actual: version }.to_string());
             }
         }
-        let before = self.workspace.read_text(&target).map_err(err)?;
-        let version = self.workspace.edit(&target, &edits).map_err(err)?;
-        let after = self.workspace.read_text(&target).map_err(err)?;
-        Ok(format!("Edited {path}, version {version}\n{}", unified(&path, Some(&before), Some(&after))))
+        let bytes = self.workspace.read(&path).map_err(err)?;
+        let mut text =
+            as_text(&bytes).ok_or_else(|| format!("{path}: not a text file, so it cannot be edited"))?.to_owned();
+        for edit in &edits {
+            let count = text.matches(edit.old.as_str()).count();
+            match (count, edit.replace_all) {
+                (0, _) => return Err(format!("{path}: edit failed: text not found: {:?}", edit.old)),
+                (1, _) | (_, true) => text = text.replace(edit.old.as_str(), &edit.new),
+                (n, false) => {
+                    return Err(format!("{path}: edit failed: text matches {n} times; add context or set replace_all"));
+                }
+            }
+        }
+        // The versioned write fails if anything changed the file since it was read.
+        let version = self.workspace.write_versioned(&path, text, version).map_err(err)?;
+        Ok(format!("Edited {path}, version {version}"))
     }
 
     fn rename(&mut self, args: &Args) -> ToolResult {
@@ -313,28 +294,25 @@ impl Tools {
 
     fn diff(&self, args: &Args) -> ToolResult {
         let scope = VPath::parse(&args.opt_path("path")?).map_err(err)?;
-        let current = &self.workspace;
-        let base = current.base();
-        let mut summary = String::new();
-        let mut body = String::new();
-        for change in current.diff().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
+        let mut lines = Vec::new();
+        for change in self.workspace.diff().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
             let path = change.path.as_str();
-            let mark = match change.kind {
-                ChangeKind::Added => 'A',
-                ChangeKind::Modified => 'M',
-                ChangeKind::Deleted => 'D',
-            };
-            summary.push_str(&format!("{mark} {path}\n"));
-            // Every change is listed, but patches stop once the output is past its cap.
-            if body.len() < MAX_OUTPUT {
-                let (before, after) = (file_state(&base, path)?, file_state(current, path)?);
-                body.push_str(&render_change(path, before.as_ref(), after.as_ref()));
-            }
+            lines.push(match change.kind {
+                ChangeKind::Deleted => format!("D {path}"),
+                kind => {
+                    let mark = if kind == ChangeKind::Added { 'A' } else { 'M' };
+                    match self.workspace.stat(path).map_err(err)?.size {
+                        Some(size) => format!("{mark} {path} ({size} bytes)"),
+                        None => format!("{mark} {path}"),
+                    }
+                }
+            });
         }
-        if summary.is_empty() {
+        if lines.is_empty() {
             return Ok(format!("No changes under {scope}"));
         }
-        Ok(format!("{summary}\n{body}"))
+        lines.push("[A added, M modified, D deleted; read a file to see its contents]".to_owned());
+        Ok(lines.join("\n"))
     }
 }
 
@@ -396,6 +374,13 @@ impl Search<'_> {
     }
 }
 
+/// One exact-text replacement for `edit`.
+struct TextEdit {
+    old: String,
+    new: String,
+    replace_all: bool,
+}
+
 /// Arguments of one tool call.
 struct Args<'a>(&'a Map<String, Value>);
 
@@ -444,7 +429,7 @@ impl Args<'_> {
         if self.opt_str(key)?.is_none() { Ok("/".to_owned()) } else { self.path(key) }
     }
 
-    fn edits(&self) -> Result<Vec<Edit>, String> {
+    fn edits(&self) -> Result<Vec<TextEdit>, String> {
         let Some(Value::Array(items)) = self.0.get("edits") else {
             return Err("`edits` must be a list of {old, new, replace_all?} objects".to_owned());
         };
@@ -456,8 +441,12 @@ impl Args<'_> {
             .map(|item| {
                 let Value::Object(map) = item else { return Err("each edit must be an object".to_owned()) };
                 let edit = Args(map);
-                Ok(Edit {
-                    old: edit.str("old")?.to_owned(),
+                let old = edit.str("old")?;
+                if old.is_empty() {
+                    return Err("an edit's `old` text is empty".to_owned());
+                }
+                Ok(TextEdit {
+                    old: old.to_owned(),
                     new: edit.str("new")?.to_owned(),
                     replace_all: edit.opt_bool("replace_all")?,
                 })
@@ -466,68 +455,7 @@ impl Args<'_> {
     }
 }
 
-/// A file as diff compares it: its kind and its bytes (a symlink's are its target).
-struct FileState {
-    kind: Kind,
-    bytes: Vec<u8>,
-}
-
-fn file_state(workspace: &Workspace, path: &str) -> Result<Option<FileState>, String> {
-    let meta = match workspace.stat(path) {
-        Ok(meta) => meta,
-        Err(Error::NotFound(_) | Error::NotADirectory(_)) => return Ok(None),
-        Err(e) => return Err(e.to_string()),
-    };
-    let bytes = match meta.kind {
-        Kind::Dir => return Ok(None),
-        Kind::Symlink => workspace.read_link(path).map_err(err)?.into_bytes(),
-        Kind::File { .. } => workspace.read(path).map_err(err)?.to_vec(),
-    };
-    Ok(Some(FileState { kind: meta.kind, bytes }))
-}
-
-fn render_change(path: &str, before: Option<&FileState>, after: Option<&FileState>) -> String {
-    fn text(state: Option<&FileState>) -> Option<&str> {
-        state.map_or(Some(""), |state| as_text(&state.bytes))
-    }
-    let size = |state: Option<&FileState>| state.map_or(0, |state| state.bytes.len());
-    let mut out = match (before, after) {
-        (Some(old), Some(new)) if old.kind != new.kind => {
-            format!("{path}: changed from {} to {}\n", kind_name(old.kind), kind_name(new.kind))
-        }
-        _ => String::new(),
-    };
-    match (text(before), text(after)) {
-        (Some(old), Some(new)) if old == new => {}
-        // Diffing is quadratic in the worst case, and the result would be cut anyway.
-        _ if size(before) + size(after) > MAX_DIFF_INPUT => {
-            out.push_str(&format!("{path}: too large to diff here; read it in pages\n"));
-        }
-        (Some(old), Some(new)) => out.push_str(&unified(path, before.map(|_| old), after.map(|_| new))),
-        _ => out.push_str(&format!("Binary file {path} differs\n")),
-    }
-    out
-}
-
-/// A unified diff with git-style `a/` and `b/` headers; `None` is a missing file.
-fn unified(path: &str, before: Option<&str>, after: Option<&str>) -> String {
-    let old_header = if before.is_some() { format!("a{path}") } else { "/dev/null".to_owned() };
-    let new_header = if after.is_some() { format!("b{path}") } else { "/dev/null".to_owned() };
-    let (old, new) = (before.unwrap_or(""), after.unwrap_or(""));
-    TextDiff::from_lines(old, new).unified_diff().context_radius(3).header(&old_header, &new_header).to_string()
-}
-
-fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Dir => "a directory",
-        Kind::File { executable: true } => "an executable file",
-        Kind::File { executable: false } => "a file",
-        Kind::Symlink => "a symlink",
-    }
-}
-
 /// Visit everything below `root` depth-first in name order, up to `max_depth` levels.
-/// Symlinks are reported but not followed.
 /// The visitor gets the absolute path, the path relative to `root` and the entry, and
 /// returns false to stop the walk.
 fn walk(
@@ -560,27 +488,6 @@ fn walk(
     walk_dir(workspace, root.as_str(), "", max_depth, visit).map(|_| ())
 }
 
-/// Resolve symlinks in the final component, so versions are reported for the file a
-/// read or write actually reaches.
-fn follow(workspace: &Workspace, path: &str) -> Result<String, String> {
-    let mut current = VPath::parse(path).map_err(err)?;
-    for _ in 0..MAX_SYMLINK_HOPS {
-        match workspace.stat(current.as_str()) {
-            Ok(meta) if meta.kind == Kind::Symlink => {
-                let target = workspace.read_link(current.as_str()).map_err(err)?;
-                let joined = if target.starts_with('/') {
-                    target
-                } else {
-                    format!("{}/{target}", current.parent().unwrap_or_else(VPath::root))
-                };
-                current = VPath::parse(&joined).map_err(err)?;
-            }
-            _ => return Ok(current.to_string()),
-        }
-    }
-    Err(format!("{path}: too many levels of symbolic links"))
-}
-
 fn glob_matcher(pattern: &str) -> Result<GlobMatcher, String> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
@@ -589,19 +496,22 @@ fn glob_matcher(pattern: &str) -> Result<GlobMatcher, String> {
         .map_err(|e| format!("invalid glob {pattern:?}: {e}"))
 }
 
-/// The MIME type of an image MCP clients can show, sniffed from its first bytes.
-fn image_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
+/// A short description of a non-text file, sniffed from its first bytes.
+fn detect_type(bytes: &[u8]) -> &'static str {
+    const SIGNATURES: &[(&[u8], &str)] = &[
+        (b"\x89PNG\r\n\x1a\n", "PNG image"),
+        (b"\xFF\xD8\xFF", "JPEG image"),
+        (b"GIF8", "GIF image"),
+        (b"%PDF-", "PDF document"),
+        (b"PK\x03\x04", "ZIP archive (also docx, xlsx, pptx)"),
+        (b"\x1F\x8B", "gzip archive"),
+        (b"SQLite format 3\0", "SQLite database"),
+        (b"PAR1", "Parquet file"),
+    ];
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return "WebP image";
     }
+    SIGNATURES.iter().find(|(magic, _)| bytes.starts_with(magic)).map_or("binary file", |(_, name)| name)
 }
 
 /// Text if the bytes are UTF-8 without NUL bytes; anything else is treated as binary.
@@ -648,9 +558,9 @@ pub(crate) fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "read",
-            "description": "Read a file, with its version for `write`/`edit`. Text comes back with line \
-                numbers (like `cat -n`), up to 2000 lines; use offset and limit for more. PNG, JPEG, GIF \
-                and WebP images come back as images. Other binary files report their size only.",
+            "description": "Read a file, with its version for `write`/`edit`. Text files come back with line numbers \
+                (like `cat -n`), up to 2000 lines; use offset and limit for more. Other files report their \
+                detected type and size, not their bytes.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute path of the file."),
                 "offset": { "type": "integer", "minimum": 1, "description": "First line to show (1-based)." },
@@ -660,8 +570,7 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "list",
-            "description": "List a directory. Directories end in `/`, files show their size when known, \
-                symlinks show their target.",
+            "description": "List a directory. Directories end in `/`; files show their size when known.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute directory path. Defaults to /."),
                 "depth": { "type": "integer", "minimum": 1, "description": "Levels to descend (default 1)." },
@@ -681,9 +590,8 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "grep",
-            "description": "Search file contents with a regular expression (ripgrep syntax). Prints \
-                `path:line:text` for matches and `path-line-text` for context lines. Symlinks and \
-                binary files are skipped.",
+            "description": "Search text files with a regular expression (ripgrep syntax). Prints `path:line:text` \
+                for matches and `path-line-text` for context lines. Files that are not text are skipped.",
             "inputSchema": { "type": "object", "properties": {
                 "pattern": { "type": "string", "description": "Regular expression." },
                 "path": path("File or directory to search. Defaults to /."),
@@ -696,20 +604,21 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "write",
-            "description": "Create or overwrite a file, creating parent directories. Pass the version from \
-                `read` as expected_version to fail instead of overwriting a change you have not seen \
-                (a new file, or a mounted file not yet changed, has version 0).",
+            "description": "Create or overwrite a file, creating parent directories. Content is text, or base64 for \
+                binary files. Pass the version from `read` as expected_version to fail instead of \
+                overwriting a change you have not seen (a new file, or a mounted file not yet changed, \
+                has version 0).",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute path of the file."),
                 "content": { "type": "string", "description": "The full new contents." },
+                "encoding": { "type": "string", "enum": ["text", "base64"], "description": "How content is encoded (default text)." },
                 "expected_version": { "type": "integer", "minimum": 0, "description": "Version the file must have." },
             }, "required": ["path", "content"] },
         }),
         json!({
             "name": "edit",
-            "description": "Replace exact text in a file. Each `old` must match exactly once unless \
-                replace_all is set; edits apply in order and either all apply or none do. Returns the \
-                new version and a diff of the change.",
+            "description": "Replace exact text in a text file. Each `old` must match exactly once unless replace_all \
+                is set; edits apply in order and either all apply or none do. Returns the new version.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute path of the file."),
                 "edits": { "type": "array", "minItems": 1, "items": { "type": "object", "properties": {
@@ -730,7 +639,7 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "delete",
-            "description": "Delete a file, symlink or empty directory; set recursive to delete a directory tree.",
+            "description": "Delete a file or an empty directory; set recursive to delete a directory tree.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute path."),
                 "recursive": { "type": "boolean", "description": "Delete a directory and everything in it." },
@@ -738,8 +647,8 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "diff",
-            "description": "Show what changed as a list of added (A), modified (M) and deleted (D) files \
-                followed by a unified diff. Compares against the mounted sources.",
+            "description": "List the files changed against the mounted sources: added (A), modified (M) or deleted \
+                (D), with their size. Read a file to see its new contents.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Only show changes at or below this path."),
             } },

@@ -147,20 +147,6 @@ fn a_kept_fork_is_a_snapshot() {
 }
 
 #[test]
-fn base_drops_the_overlay_and_keeps_the_cache() {
-    let (mut ws, source) = workspace();
-    ws.read("/repo/README.md").unwrap();
-    ws.write("/repo/README.md", "changed").unwrap();
-    ws.remove("/repo/docs", true).unwrap();
-
-    let base = ws.base();
-    assert_eq!(base.read_text("/repo/README.md").unwrap(), "hello\n");
-    assert!(base.exists("/repo/docs/guide.md"));
-    assert!(base.diff().unwrap().is_empty());
-    assert_eq!(source.reads().1, 1, "the base reuses the blob the workspace fetched");
-}
-
-#[test]
 fn writes_create_parents_and_bump_versions() {
     let (mut ws, _) = workspace();
     assert_eq!(ws.write("/scratch/notes/a.txt", "a").unwrap(), 1);

@@ -24,7 +24,7 @@ Access policies come back in a smaller form only if a real use needs them.
 1. **Core** (`sandfs-core`). Workspace over read-only sources, overlay, fork, diff, exact-string edits. Done.
 2. **Git source** (`sandfs-git`). Commit trees read through `git cat-file --batch`; a `blob:none` partial clone fetches only the blobs that are read. Done.
 3. **Python bindings** (PyO3), with `sandfs.Workspace` replacing `VirtualFileSystem`.
-4. **MCP server** (`sandfs-mcp`): read, list, glob, grep, write, edit, move, delete and diff over one workspace. Forks, checkpoints and commits stay with the harness.
+4. **MCP server**: read, list, glob, grep, write, edit, move, delete, diff, snapshot/restore and commit.
 5. **CLI and FUSE**: `sandfs mount`, `sandfs worktree add`, `sandfs diff`, `sandfs serve --mcp`.
 6. **Commit back**: turn a workspace diff into a git commit or a pull request.
 7. **TypeScript bindings** (napi-rs, later WASM).

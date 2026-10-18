@@ -196,12 +196,6 @@ impl Workspace {
         self.clone()
     }
 
-    /// The mounts alone, with an empty overlay: the state [`Workspace::diff`] compares
-    /// against. It shares the source cache and costs O(1), like a fork.
-    pub fn base(&self) -> Workspace {
-        Workspace { mounts: self.mounts.clone(), overlay: OrdMap::new(), cache: self.cache.clone(), clock: self.clock }
-    }
-
     /// True if the path exists.
     pub fn exists(&self, path: &str) -> bool {
         VPath::parse(path).is_ok_and(|path| self.resolve(&path).is_ok())

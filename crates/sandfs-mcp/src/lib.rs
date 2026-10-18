@@ -13,7 +13,7 @@
 //! ```json
 //! { "mcpServers": { "sandfs": {
 //!     "command": "sandfs-mcp",
-//!     "args": ["--dir", "/data=./datasets", "--git", "/docs=/path/to/clone@main"]
+//!     "args": ["--dir", "/data=./datasets", "--dir", "/notes=./notes"]
 //! } } }
 //! ```
 //!
@@ -26,14 +26,13 @@
 
 use std::io::{self, BufRead, Write};
 
-use base64::prelude::{BASE64_STANDARD, Engine};
 use sandfs_core::Workspace;
 use serde_json::{Value, json};
 
 mod tools;
 
+pub use tools::MAX_OUTPUT;
 use tools::Tools;
-pub use tools::{Image, MAX_IMAGE, MAX_OUTPUT};
 
 /// MCP protocol revisions this server speaks, newest first.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -43,13 +42,11 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
-/// What a tool call returned, and whether it is an error the agent should see.
+/// The text a tool call returned, and whether it is an error the agent should see.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutput {
     /// Plain text for the model, capped at [`MAX_OUTPUT`] bytes.
     pub text: String,
-    /// An image, when `read` opened one; `text` is then its caption.
-    pub image: Option<Image>,
     /// True when the call failed; the text then says why.
     pub is_error: bool,
 }
@@ -78,15 +75,10 @@ impl Server {
     /// Run one tool directly, without JSON-RPC framing. Returns `None` for an unknown
     /// tool name. `arguments` is the JSON object an MCP client would send.
     pub fn call_tool(&mut self, name: &str, arguments: &Value) -> Option<ToolOutput> {
-        if name == "read" {
-            if let Some((image, text)) = self.tools.read_image(arguments) {
-                return Some(ToolOutput { text, image: Some(image), is_error: false });
-            }
-        }
         let result = self.tools.call(name, arguments)?;
         Some(match result {
-            Ok(text) => ToolOutput { text, image: None, is_error: false },
-            Err(text) => ToolOutput { text, image: None, is_error: true },
+            Ok(text) => ToolOutput { text, is_error: false },
+            Err(text) => ToolOutput { text, is_error: true },
         })
     }
 
@@ -157,13 +149,10 @@ impl Server {
                 let arguments = params.get("arguments").unwrap_or(&Value::Null);
                 let output =
                     self.call_tool(name, arguments).ok_or((INVALID_PARAMS, format!("unknown tool {name:?}")))?;
-                let mut content = Vec::new();
-                if let Some(image) = &output.image {
-                    let data = BASE64_STANDARD.encode(&image.data);
-                    content.push(json!({ "type": "image", "data": data, "mimeType": image.mime_type }));
-                }
-                content.push(json!({ "type": "text", "text": output.text }));
-                Ok(json!({ "content": content, "isError": output.is_error }))
+                Ok(json!({
+                    "content": [{ "type": "text", "text": output.text }],
+                    "isError": output.is_error,
+                }))
             }
             other => Err((METHOD_NOT_FOUND, format!("method not found: {other}"))),
         }
