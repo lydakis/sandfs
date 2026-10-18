@@ -225,7 +225,41 @@ fn large_results_are_cut_with_a_note() {
     assert!(grep.ends_with("output cut short, narrow the path or glob]"));
 
     ok(&mut s, "write", json!({ "path": "/long.txt", "content": "y".repeat(5000) }));
-    assert!(ok(&mut s, "read", json!({ "path": "/long.txt" })).contains("… [line cut at 2000 characters]"));
+    let cut = ok(&mut s, "read", json!({ "path": "/long.txt" }));
+    assert!(cut.contains("… [line cut at 2000 characters; rest from byte_offset=2000]"), "{cut}");
+}
+
+#[test]
+fn byte_reads_reach_the_rest_of_long_lines() {
+    let mut s = server();
+    // A wide record: 3000 two-byte characters, then a marker past the line cut.
+    let record = format!("{}END,42\nnext\n", "é".repeat(3000));
+    ok(&mut s, "write", json!({ "path": "/data/wide.csv", "content": record }));
+    let page = ok(&mut s, "read", json!({ "path": "/data/wide.csv" }));
+    assert!(page.contains("rest from byte_offset=4000]"), "{page}");
+
+    let rest = ok(&mut s, "read", json!({ "path": "/data/wide.csv", "byte_offset": 4000 }));
+    assert!(rest.starts_with(&"é".repeat(1000)), "{rest}");
+    assert!(rest.ends_with("END,42\nnext\n\n[version 1 · bytes 4000-6012 of 6012]"), "{rest}");
+    // Text found by bytes is exact, so it can be edited.
+    ok(&mut s, "edit", json!({ "path": "/data/wide.csv", "edits": [{ "old": "éEND,42", "new": "éEND,43" }] }));
+
+    // A range that starts or ends inside a character moves onto its boundaries.
+    let mid = ok(&mut s, "read", json!({ "path": "/data/wide.csv", "byte_offset": 1, "byte_length": 6 }));
+    assert_eq!(mid, "éé\n[version 2 · bytes 2-6 of 6012 · continue with byte_offset=6]");
+
+    // Mounted files are read by range too.
+    let head = ok(&mut s, "read", json!({ "path": "/data/sales/2026.csv", "byte_length": "12" }));
+    assert_eq!(head, "region,total\n[version 0 · bytes 0-12 of 41 · continue with byte_offset=12]");
+
+    let err = |s: &mut Server, args| fails(s, "read", args);
+    assert!(err(&mut s, json!({ "path": "/data/README.md", "byte_offset": 22 })).contains("past the end"));
+    assert!(err(&mut s, json!({ "path": "/data/chart.png", "byte_offset": 0 })).contains("are not text"));
+    assert!(err(&mut s, json!({ "path": "/data/README.md", "byte_offset": 0, "limit": 1 })).contains("not both"));
+    assert_eq!(
+        err(&mut s, json!({ "path": "/data/README.md", "byte_length": 60001 })),
+        "byte_length must be at most 60000"
+    );
 }
 
 #[test]
