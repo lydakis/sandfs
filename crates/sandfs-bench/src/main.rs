@@ -193,12 +193,17 @@ fn nanos(times: &[Duration]) -> Vec<u64> {
 fn median(times: &[Duration]) -> Duration {
     let mut sorted = times.to_vec();
     sorted.sort();
-    sorted[sorted.len() / 2]
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 { (sorted[mid - 1] + sorted[mid]) / 2 } else { sorted[mid] }
 }
 
 fn fmt_duration(d: Duration) -> String {
     let us = d.as_secs_f64() * 1e6;
-    if us < 1000.0 {
+    if us < 1.0 {
+        format!("{} ns", d.as_nanos())
+    } else if us < 10.0 {
+        format!("{us:.1} µs")
+    } else if us < 1000.0 {
         format!("{us:.0} µs")
     } else if us < 1e6 {
         format!("{:.1} ms", us / 1e3)

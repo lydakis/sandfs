@@ -146,8 +146,8 @@ def positive(value: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--files", type=int, default=10_000)
-    parser.add_argument("--writes", type=int, default=1000)
+    parser.add_argument("--files", type=positive, default=10_000)
+    parser.add_argument("--writes", type=positive, default=1000)
     parser.add_argument("--iters", type=positive, default=5)
     parser.add_argument("--scratch", help="where to generate the files (default: system temp)")
     args = parser.parse_args()
@@ -223,6 +223,10 @@ def main() -> None:
 
 
 def fmt(seconds: float) -> str:
+    if seconds < 1e-6:
+        return f"{seconds * 1e9:.0f} ns"
+    if seconds < 1e-5:
+        return f"{seconds * 1e6:.1f} µs"
     if seconds < 1e-3:
         return f"{seconds * 1e6:.0f} µs"
     if seconds < 1:
