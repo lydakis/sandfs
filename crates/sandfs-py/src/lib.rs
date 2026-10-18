@@ -2,8 +2,8 @@
 //!
 //! The bindings stay thin. Each method converts its arguments, calls the core and maps
 //! core errors onto the closest built-in Python exception, so `except FileNotFoundError`
-//! works the way Python users expect. Calls that may read a source (git can fetch from
-//! a remote) release the GIL while they run.
+//! works the way Python users expect. Every call into the core releases the GIL, since
+//! almost any path lookup can read a source and git may fetch from a remote.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -169,8 +169,9 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn mount_source(&mut self, path: &str, source: Arc<dyn Source>) -> PyResult<()> {
-        self.inner.mount(path, source).or_raise()
+    fn mount_source(&mut self, py: Python<'_>, path: &str, source: Arc<dyn Source>) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.mount(path, source)).or_raise()
     }
 }
 
@@ -193,20 +194,20 @@ impl Workspace {
     #[pyo3(signature = (path, repo, rev = "HEAD"))]
     fn mount_git(&mut self, py: Python<'_>, path: &str, repo: PathBuf, rev: &str) -> PyResult<()> {
         let source = py.detach(|| GitSource::open(repo, rev)).or_raise()?;
-        self.mount_source(path, Arc::new(source))
+        self.mount_source(py, path, Arc::new(source))
     }
 
     /// Mount the host directory `root`, read-only. Writes go to the overlay, never to disk.
-    fn mount_dir(&mut self, path: &str, root: PathBuf) -> PyResult<()> {
+    fn mount_dir(&mut self, py: Python<'_>, path: &str, root: PathBuf) -> PyResult<()> {
         let source = DirSource::new(root).or_raise()?;
-        self.mount_source(path, Arc::new(source))
+        self.mount_source(py, path, Arc::new(source))
     }
 
     /// Mount in-memory files, given as `{relative path: str or bytes}`, read-only.
-    fn mount_files(&mut self, path: &str, files: HashMap<String, Data>) -> PyResult<()> {
+    fn mount_files(&mut self, py: Python<'_>, path: &str, files: HashMap<String, Data>) -> PyResult<()> {
         let source =
             MemorySource::from_files(files.into_iter().map(|(name, data)| (name, Bytes::from(data)))).or_raise()?;
-        self.mount_source(path, Arc::new(source))
+        self.mount_source(py, path, Arc::new(source))
     }
 
     /// A new workspace with the same mounts and changes. O(1); later changes to
@@ -266,11 +267,13 @@ impl Workspace {
     /// the file's new version. With `expected_version`, raise `VersionMismatch` unless
     /// the file is still at that version (0 for a file that does not exist yet).
     #[pyo3(signature = (path, data, *, expected_version = None))]
-    fn write(&mut self, path: &str, data: Data, expected_version: Option<u64>) -> PyResult<u64> {
-        match expected_version {
-            Some(expected) => self.inner.write_versioned(path, Bytes::from(data), expected),
-            None => self.inner.write(path, Bytes::from(data)),
-        }
+    fn write(&mut self, py: Python<'_>, path: &str, data: Data, expected_version: Option<u64>) -> PyResult<u64> {
+        let data = Bytes::from(data);
+        let inner = &mut self.inner;
+        py.detach(|| match expected_version {
+            Some(expected) => inner.write_versioned(path, data, expected),
+            None => inner.write(path, data),
+        })
         .or_raise()
     }
 
@@ -290,7 +293,6 @@ impl Workspace {
         expected_version: Option<u64>,
     ) -> PyResult<u64> {
         let edits = [Edit { old, new, replace_all }];
-        // Editing an unread git file may fetch it from a remote, so release the GIL.
         let inner = &mut self.inner;
         py.detach(|| match expected_version {
             Some(expected) => inner.edit_versioned(path, &edits, expected),
@@ -301,32 +303,37 @@ impl Workspace {
 
     /// Create a directory; with `parents`, create missing parents and accept an existing directory.
     #[pyo3(signature = (path, *, parents = false))]
-    fn mkdir(&mut self, path: &str, parents: bool) -> PyResult<()> {
-        self.inner.mkdir(path, parents).or_raise()
+    fn mkdir(&mut self, py: Python<'_>, path: &str, parents: bool) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.mkdir(path, parents)).or_raise()
     }
 
     /// Create a symlink at `path` pointing to `target`.
-    fn symlink(&mut self, path: &str, target: &str) -> PyResult<()> {
-        self.inner.symlink(path, target).or_raise()
+    fn symlink(&mut self, py: Python<'_>, path: &str, target: &str) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.symlink(path, target)).or_raise()
     }
 
     /// Remove a file, symlink or empty directory; with `recursive`, remove a whole tree.
     #[pyo3(signature = (path, *, recursive = false))]
-    fn remove(&mut self, path: &str, recursive: bool) -> PyResult<()> {
-        self.inner.remove(path, recursive).or_raise()
+    fn remove(&mut self, py: Python<'_>, path: &str, recursive: bool) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.remove(path, recursive)).or_raise()
     }
 
     /// Copy `src` to `dst`; directories need `recursive`. Base files are copied by
     /// reference, so nothing is read.
     #[pyo3(signature = (src, dst, *, recursive = false))]
-    fn copy(&mut self, src: &str, dst: &str, recursive: bool) -> PyResult<()> {
-        self.inner.copy(src, dst, recursive).or_raise()
+    fn copy(&mut self, py: Python<'_>, src: &str, dst: &str, recursive: bool) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.copy(src, dst, recursive)).or_raise()
     }
 
     /// Move or rename `src` to `dst`, which must not exist yet.
     #[pyo3(name = "move")]
-    fn rename(&mut self, src: &str, dst: &str) -> PyResult<()> {
-        self.inner.rename(src, dst).or_raise()
+    fn rename(&mut self, py: Python<'_>, src: &str, dst: &str) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.rename(src, dst)).or_raise()
     }
 
     /// The files that differ from the mounts, sorted by path.

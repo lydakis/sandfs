@@ -56,7 +56,7 @@ In a partial clone (`git clone --filter=blob:none`), git fetches a file's conten
 | `mkdir`, `symlink`, `remove`, `copy`, `move` | File operations; base files are copied by reference |
 | `diff()` | `Change(path, kind)` for every added, modified or deleted file |
 
-Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`, and `sandfs.EditFailed`. Calls that may read a source release the GIL. A workspace is not meant to be shared between threads; fork one per thread instead.
+Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`, and `sandfs.EditFailed`. Calls into the core release the GIL, so a slow git fetch never blocks other threads. A workspace is not meant to be shared between threads; fork one per thread instead.
 
 ## What sandfs is not
 
