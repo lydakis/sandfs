@@ -1,180 +1,91 @@
 # sandfs
 
-`sandfs` is an experimental Python package that implements an entirely virtual filesystem (VFS) that can be embedded inside AI agent tooling. Each sandbox keeps its own private directory tree, supports dynamic nodes that are hydrated on demand, and exposes a small UNIX-like command surface (`cd`, `ls`, `cat`, `grep`, `rg`, etc.) so agents can reuse familiar workflows.
+`sandfs` is a sandbox filesystem for agents. Mount any data without copying it (a folder, in-memory files, an API, a bucket, a git commit), let the agent read and write through a copy-on-write workspace, fork that workspace in O(1) for every attempt, and collect the files it changed. Files are bytes of any kind: documents, spreadsheets, images, data sets and code alike.
 
-> **Status**: design prototype. APIs are subject to change.
+> **Status**: early. The core is Rust (`crates/`), and the Python package is a thin binding over it. APIs may still change.
 
-> **Direction**: the core is being rewritten in Rust under `crates/` as a lean primitive: lazy mounts (a git commit, a host directory), a copy-on-write workspace that forks in O(1), and a diff of what changed. Python 0.3 is the last release of the design below; the shell, host bridge, Python executor and storage adapters are not carried forward. See [the roadmap](docs/roadmap.md).
+## Primitives
 
-## Why?
+- **Source**: a read-only tree, read only when a path below it is touched. sandfs ships a host directory, in-memory files and an optional git source; anything else is two methods you write, `list` and `read`.
+- **Workspace**: sources mounted at paths, plus a copy-on-write overlay that holds every write, directory and deletion. Sources are never modified.
+- **Change**: one file that differs from the mounts, returned by `changes()`.
 
-Agent builders frequently need a scratch filesystem for planning, iterating on generated code, and testing hypotheses. Shipping a simple `exec` tool that proxies every bash command to the host disk is unsafe. `sandfs` keeps those operations inside a controlled, in-memory sandbox while still feeling like a mini Linux environment.
-
-## Features
-
-- In-memory directories and files that never touch the host disk unless exported.
-- Dynamic nodes backed by callables (e.g., query a DB, fetch from an API, or generate text on the fly).
-- Pure-Python shell/executor with a bash-like subset (pipelines, redirection, env vars) and a curated command set.
-- Optional Python execution helper that evaluates snippets against the sandbox state only.
-- Bridge to real GNU utilities via `host -p <path> <command>` which materializes the subtree and runs the host binary against it.
-- Optional full-text search view mounted at `/@search` for queryable result trees.
-- Node policies (read-only, append-only, visibility labels) plus shell views so different agents see only the nodes they are allowed to.
-- Write hooks and optimistic versions so hosts can flush files to external stores with conflict detection.
-- Storage adapters and snapshots so you can mount external state and roll forward/back within a turn.
-
-See [`docs/roadmap.md`](docs/roadmap.md) for the up-to-date view of supported commands and the upcoming backlog.
+Everything else is a composition. A snapshot is a fork nobody writes to, a working copy on disk is a fork mounted over FUSE, and saving is the harness walking `changes()` and writing each changed file wherever its data lives.
 
 ## Installation
 
 ```bash
-pip install git+https://github.com/lydakis/sandfs.git
-# Once a PyPI release is available: pip install sandfs
+pip install git+https://github.com/lydakis/sandfs.git   # builds the Rust extension; needs a Rust toolchain
 ```
 
 ## Quickstart
 
 ```python
-from sandfs import VirtualFileSystem, SandboxShell
+import sandfs
 
-vfs = VirtualFileSystem()
-vfs.write_file("/notes/todo.txt", "- build VFS\n- add rg support\n")
+class Tickets:
+    """Any data can be a source: list a directory, read a file."""
 
-shell = SandboxShell(vfs)
-print(shell.exec("ls /notes").stdout)
-print(shell.exec("rg 'VFS' /notes").stdout)
+    def list(self, path):
+        return [sandfs.DirEntry("T-1.json"), sandfs.DirEntry("T-2.json")]
+
+    def read(self, path):
+        return fetch_ticket_json(path.removeprefix("/").removesuffix(".json"))
+
+base = sandfs.Workspace()
+base.mount("/reports", sandfs.DirSource("./reports"))   # a host folder, never written to
+base.mount("/tickets", Tickets())                        # read only when the agent looks
+base.mount("/brief", sandfs.MemorySource({"task.md": "Summarise open tickets\n"}))
+
+attempt = base.fork()                                    # one fork per agent or attempt
+version = attempt.write("/reports/summary.md", "# Open tickets\n")
+attempt.write("/reports/summary.md", "# Open tickets (2)\n", expected_version=version)
+attempt.write("/reports/chart.png", png_bytes)
+
+for change in attempt.changes():
+    print(change.kind, change.path)                      # added /reports/chart.png, added /reports/summary.md
 ```
 
-### Agent shell usage
+`base` is unchanged: forks share the mounts and everything already read, but never see each other's changes.
 
-```python
-from sandfs import ProvidedNode, SandboxShell, VirtualFileSystem
+A source must return the same answer every time, because what it returns is cached and shared between forks. Sizes in `DirEntry` are optional; `stat` reads a file once to find a size the source left out.
 
-vfs = VirtualFileSystem()
-vfs.write_file("/workspace/app.py", "print('hello')\n")
+`sandfs.GitSource(repo, rev="HEAD")` mounts a commit of a local repository without a checkout. In a partial clone (`git clone --filter=blob:none`), git fetches a file's contents only when it is first read.
 
-def logs_provider(ctx):
-    return {"latest.log": ProvidedNode.file(content="generated on demand")}
+## API
 
-vfs.mount_directory("/workspace/logs", logs_provider)
+| Call | Does |
+| --- | --- |
+| `mount(path, source)` | Mount a `DirSource(root)`, `MemorySource({name: str or bytes})`, `GitSource(repo, rev)`, or any object with `list(path)` and `read(path)` |
+| `fork()` | A new workspace with the same mounts and changes, in O(1) |
+| `read(path)`, `read_text(path)` | File contents as bytes, or as UTF-8 text |
+| `list(path="/")`, `stat(path)`, `exists(path)` | Entries (name, kind, size), and kind, size and version |
+| `write(path, data, *, expected_version=None)` | Write str or bytes, creating parents, and return the new version |
+| `mkdir`, `remove`, `copy`, `move` | File operations; base files are copied by reference |
+| `changes()` | `Change(path, kind)` for every added, modified or deleted file |
 
-shell = SandboxShell(vfs)
-shell.exec("cd /workspace")
-print(shell.exec("ls").stdout)
-print(shell.exec("tree").stdout)
-```
+Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`. An exception raised inside a Python source surfaces as `OSError`. Calls into the core release the GIL, so a slow source never blocks other threads. A workspace is not meant to be shared between threads; fork one per thread instead.
 
-### Running host GNU tools
+## What sandfs is not
 
-With `host_commands=True`, `SandboxShell` exposes `host` to materialize a subtree onto the host disk and invoke any installed command:
-
-```
-host -p /workspace grep -n TODO app.py
-```
-
-The example above exports `/workspace` into a temporary directory, runs the system `grep` inside it, then discards the files.
-
-> `host`, `bash` and `sh` are off by default. Enable them with `SandboxShell(..., host_commands=True)`, or set `host_fallback=True` to also send unknown commands to the host. See [Security model](#security-model).
-
-## Security model
-
-`sandfs` enforces policies on the virtual tree. It does **not** isolate code execution:
-
-- `host`, `bash` and `sh` run real host processes with the host user's permissions and environment. They exist only when you pass `host_commands=True` or `host_fallback=True`.
-- `python`/`python3` run `exec()` with a reduced set of builtins. That is a convenience, not a sandbox: sandboxed code can reach the host through the objects it is given.
-- Host commands only see nodes the shell's `view` may read; hidden and unreadable nodes are never exported, and sync-back never touches them.
-- `allowed_commands` is checked before host fallback, so an allowlist cannot be bypassed by an unknown command.
-
-For untrusted code, run the command in a real sandbox (a container or microVM) and treat `sandfs` as the filesystem it reads.
-
-### Search views
-
-Enable the search view to surface results as a virtual directory tree:
-
-```python
-from sandfs import VirtualFileSystem
-
-vfs = VirtualFileSystem()
-vfs.write_file("/workspace/README.md", "hello world\n")
-vfs.enable_search_view()
-```
-
-You can then query it via the shell:
-
-```
-ls /@search?q=hello
-cat /@search?q=hello/workspace/README.md
-```
-
-### CLI / REPL
-
-`sandfs` ships a minimal local CLI for interactive use:
-
-```
-sandfs exec "ls /"
-sandfs shell --mount /Users/me/project:/workspace
-```
-
-### Policies & views
-
-```python
-vfs.set_policy(
-    "/agent/identity/persona.md",
-    NodePolicy(writable=False, classification="private", principals={"alice", "bob"}),
-)
-shell = SandboxShell(vfs, view=VisibilityView(classifications={"public"}, principals={"alice"}))
-```
-
-### Agent shell mode
-
-```python
-shell = SandboxShell(
-    vfs,
-    allowed_commands={"ls", "cat", "rg"},
-    max_output_bytes=8_192,
-)
-```
-
-Commands outside `allowed_commands` now return an error immediately, and outputs larger than `max_output_bytes` are rejected so partner-facing agents cannot dump oversized payloads.
-
-### Storage adapters
-
-```python
-from sandfs import MemoryStorageAdapter, VirtualFileSystem
-
-adapter = MemoryStorageAdapter(initial={"a.txt": "seed"})
-vfs = VirtualFileSystem()
-vfs.mount_storage("/data", adapter)
-
-print(vfs.read_file("/data/a.txt"))
-vfs.write_file("/data/a.txt", "update")
-vfs.sync_storage("/data")  # refresh from adapter if it changed externally
-```
-
-`mount_storage` keeps the virtual tree synchronized with the adapter, while `sync_storage` refreshes the VFS from the latest adapter contents.
-
-### Snapshots
-
-```python
-snap = vfs.snapshot()
-# run risky operations ...
-vfs.restore(snap)
-```
-
-Snapshots capture the entire tree (including storage-backed nodes) so you can checkpoint before an agent action and roll back on failure.
+sandfs does not run commands. Commands an agent wants to run belong in a real sandbox (a container or microVM) pointed at the files, and a FUSE mount of a workspace is on the roadmap for that. It also has no symlinks and no text-editing or patch tools in the core; those are code concerns that live in the MCP tools, if anywhere. The 0.3 releases had a bash-like shell, a host-command bridge, a Python executor, access policies and storage adapters. They were dropped to keep the primitive small; 0.3 remains in git history.
 
 ## Repository layout
 
 ```
 .
 ├── crates/
-│   ├── sandfs-core/    # Rust core: workspaces, sources, overlay, diff
-│   └── sandfs-git/     # lazy git commit mounts
-├── docs/               # roadmap and notes
-├── sandfs/             # Python library (0.3 design)
+│   ├── sandfs-core/    # workspaces, overlay, changes, directory and in-memory sources
+│   ├── sandfs-git/     # optional lazy git source
+│   └── sandfs-py/      # Python bindings (the sandfs._core extension)
+├── docs/               # roadmap and publishing notes
+├── sandfs/             # Python package: re-exports and type stubs
 └── tests/              # Python tests
 ```
 
 ## Local development
+
+Building the package compiles the Rust extension, so you need a Rust toolchain ([rustup](https://rustup.rs)). Re-run the install after changing Rust code.
 
 ```
 python -m venv .venv
@@ -184,36 +95,8 @@ pre-commit install
 uv run pytest
 uv run ruff check .
 uv run mypy sandfs
+cargo test --workspace
 ```
-
-### Persistence hooks
-
-Register a write hook to flush files into your own store and use optimistic versions to avoid clobbering concurrent updates:
-
-```python
-from sandfs import VirtualFileSystem
-from sandfs.hooks import WriteEvent
-
-vfs = VirtualFileSystem()
-
-def flush(event: WriteEvent) -> None:
-    save_to_db(event.path, event.content, event.version)
-
-vfs.register_write_hook("/agent/work", flush)
-vfs.write_file("/agent/work/note.md", "draft")
-vfs.write_file("/agent/work/note.md", "final", expected_version=1)
-```
-
-### Integration hooks
-
-```python
-from sandfs.integrations import InboxRecorder
-
-recorder = InboxRecorder()
-recorder.attach(vfs, "/agent/inbox")
-```
-
-`PathEvent` (used under the hood) carries the path, event type (`create`, `update`, `delete`), and latest content so you can fan writes into staging queues or audit logs.
 
 ## License
 

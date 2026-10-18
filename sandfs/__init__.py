@@ -1,35 +1,36 @@
-"""sandfs package: virtual filesystem sandbox with a mini shell."""
+"""sandfs: a lazy, copy-on-write sandbox filesystem for agents.
 
-from .adapters import FileSystemAdapter, MemoryStorageAdapter, StorageAdapter
-from .hooks import WriteEvent, WriteHook
-from .integrations import PathEvent, PathHook
-from .policies import NodePolicy, VisibilityView
-from .providers import ContentProvider, DirectoryProvider, NodeContext, ProvidedNode
-from .pyexec import PythonExecutionResult, PythonExecutor
-from .search import FullTextIndex, SearchQuery, SearchResult
-from .shell import CommandResult, SandboxShell
-from .vfs import VirtualFileSystem
+A ``Workspace`` mounts read-only sources (a host directory, in-memory files, a git
+commit, or any object with ``list`` and ``read`` methods), keeps every change in a
+copy-on-write overlay, forks in O(1) and reports which files changed with ``changes()``.
+Files are bytes of any kind. The implementation is the Rust core in ``sandfs._core``.
+"""
+
+from importlib.metadata import version
+
+from ._core import (
+    Change,
+    DirEntry,
+    DirSource,
+    GitSource,
+    MemorySource,
+    Stat,
+    VersionMismatch,
+    Workspace,
+)
+from .source import Source
+
+__version__ = version("sandfs")
 
 __all__ = [
-    "VirtualFileSystem",
-    "SandboxShell",
-    "CommandResult",
-    "PythonExecutor",
-    "PythonExecutionResult",
-    "ContentProvider",
-    "DirectoryProvider",
-    "NodeContext",
-    "ProvidedNode",
-    "NodePolicy",
-    "VisibilityView",
-    "WriteEvent",
-    "WriteHook",
-    "PathEvent",
-    "PathHook",
-    "StorageAdapter",
-    "MemoryStorageAdapter",
-    "FileSystemAdapter",
-    "SearchQuery",
-    "SearchResult",
-    "FullTextIndex",
+    "Workspace",
+    "DirSource",
+    "MemorySource",
+    "GitSource",
+    "Source",
+    "DirEntry",
+    "Stat",
+    "Change",
+    "VersionMismatch",
+    "__version__",
 ]

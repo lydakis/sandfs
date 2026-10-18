@@ -1,41 +1,26 @@
 # Publishing sandfs
 
-1. Ensure `pyproject.toml` has the correct `version` and changelog/README are up to date.
-2. Build the package:
+The `sandfs` package on PyPI is a Rust extension built with [maturin](https://www.maturin.rs). Each release ships one abi3 wheel per platform, which covers every Python from 3.11 up, plus an sdist that builds from source when a Rust toolchain is installed.
 
-```bash
-uv build
-```
+## Release steps
 
-This produces distributions under `dist/`.
+1. Set `version` in `pyproject.toml` to the release number.
+2. Check the build locally:
 
-3. Publish to PyPI:
+   ```bash
+   uv build          # sdist and a wheel for this machine, via maturin
+   ```
 
-```bash
-uv publish --username <pypi-user>
-```
+3. Tag and push:
 
-`uv publish` will prompt for credentials or can read `PYPI_TOKEN`. Remove `--dry-run`; uv currently publishes directly.
-
-If you prefer Twine:
-
-```bash
-python -m build
-python -m twine upload dist/*
-```
-
-4. Tag the release:
-
-```bash
-git tag -a v0.1.0 -m "sandfs v0.1.0"
-git push origin v0.1.0
-```
+   ```bash
+   git tag -a v0.4.0 -m "sandfs v0.4.0"
+   git push origin v0.4.0
+   ```
 
 ## GitHub Actions release
 
-Once PyPI is configured with a trusted publisher for `lydakis/sandfs` (workflow `release.yml`), pushing a `v*` tag triggers `.github/workflows/release.yml`. The workflow:
+Pushing a `v*` tag runs `.github/workflows/release.yml`:
 
-1. Builds artifacts via `uv build`.
-2. Uses `pypa/gh-action-pypi-publish@release/v1` with OIDC credentials to upload the contents of `dist/`.
-
-No API tokens are needed once the trusted publisher is authorized.
+1. `PyO3/maturin-action` builds wheels for Linux (x86_64, aarch64, manylinux), macOS (x86_64, arm64) and Windows (x64), plus the sdist.
+2. `pypa/gh-action-pypi-publish` uploads them with PyPI trusted publishing (OIDC), so no API token is needed once the trusted publisher for `lydakis/sandfs` and `release.yml` is configured on PyPI.

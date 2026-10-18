@@ -5,3 +5,7 @@ __pycache__/
 
 # Rust
 target/
+
+# Built extension module (maturin develop / editable installs)
+sandfs/*.so
+sandfs/*.pyd

@@ -1,7 +1,7 @@
 //! Read-only sources that back a workspace's base layer.
 //!
-//! A source exposes an immutable tree through opaque keys: a git source uses object
-//! ids, a directory source uses relative paths. The workspace asks for a directory
+//! A source exposes an immutable tree through opaque keys: a directory source uses
+//! relative paths, while an API or object store can use whatever ids it already has. The workspace asks for a directory
 //! listing the first time something under it is touched and for file bytes the first
 //! time a file is read, and caches both, so a source only pays for what is used.
 
@@ -22,13 +22,11 @@ pub type SourceKey = Arc<str>;
 pub enum Kind {
     /// A directory.
     Dir,
-    /// A regular file.
+    /// A file: any bytes.
     File {
-        /// Whether the executable bit is set.
+        /// Whether the executable bit is set, reported as the mode on a FUSE mount.
         executable: bool,
     },
-    /// A symbolic link; its content is the link target.
-    Symlink,
 }
 
 impl Kind {
@@ -45,7 +43,8 @@ pub struct SourceEntry {
     pub kind: Kind,
     /// Key to pass back to [`Source::read_dir`] or [`Source::read_file`].
     pub key: SourceKey,
-    /// Size in bytes when the source knows it without reading the file.
+    /// Size in bytes when the source knows it without reading the file. When it is
+    /// `None`, [`crate::Workspace::stat`] reads the file once to find it.
     pub size: Option<u64>,
 }
 
@@ -61,7 +60,7 @@ pub trait Source: Send + Sync + fmt::Debug {
     fn root(&self) -> Result<SourceKey>;
     /// List the directory with this key.
     fn read_dir(&self, key: &str) -> Result<Listing>;
-    /// Read the file (or symlink target) with this key.
+    /// Read the file with this key.
     fn read_file(&self, key: &str) -> Result<Bytes>;
 }
 
@@ -83,16 +82,14 @@ impl MemorySource {
         let mut source = MemorySource::default();
         source.dirs.insert(String::new(), Listing::new());
         for (path, data) in files {
-            source.insert(path.as_ref(), data.into(), Kind::File { executable: false })?;
+            source.insert(path.as_ref(), data.into(), false)?;
         }
         Ok(source)
     }
 
-    /// Add a file, executable file or symlink at a relative path.
-    pub fn insert(&mut self, path: &str, data: Bytes, kind: Kind) -> Result<()> {
-        if kind.is_dir() {
-            return Err(Error::Unsupported(path.to_owned(), "insert files, not directories"));
-        }
+    /// Add a file at a relative path; parent directories are implied.
+    pub fn insert(&mut self, path: &str, data: Bytes, executable: bool) -> Result<()> {
+        let kind = Kind::File { executable };
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         let Some((name, dirs)) = parts.split_last() else {
             return Err(Error::InvalidPath(path.to_owned()));
@@ -143,7 +140,7 @@ impl Source for MemorySource {
 
 /// A read-only view of a host directory, read lazily and treated as a snapshot.
 ///
-/// Symlinks are reported as symlinks and never followed on the host, so a link cannot
+/// Symlinks and special files (sockets, devices, fifos) are skipped, so a link cannot
 /// lead the workspace outside `root`. Each read also checks that the resolved host
 /// path is still inside `root`, in case a directory was swapped for a symlink after it
 /// was listed. That check is not atomic with the read, so treat the directory as
@@ -193,14 +190,12 @@ impl Source for DirSource {
                 continue; // non-UTF-8 names cannot be addressed by a workspace path
             };
             let meta = entry.path().symlink_metadata().map_err(io_error)?;
-            let kind = if meta.file_type().is_symlink() {
-                Kind::Symlink
-            } else if meta.is_dir() {
+            let kind = if meta.is_dir() {
                 Kind::Dir
             } else if meta.is_file() {
                 Kind::File { executable: is_executable(&meta) }
             } else {
-                continue; // sockets, devices and fifos are not part of a workspace
+                continue; // symlinks and special files are not part of a workspace
             };
             let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
             let size = matches!(kind, Kind::File { .. }).then(|| meta.len());
@@ -211,12 +206,11 @@ impl Source for DirSource {
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
         let path = self.host_path(key);
-        // The final component is never followed, so only its parent needs checking.
+        // A symlink in the final component is refused below, so only the parent needs
+        // checking.
         self.check_inside(path.parent().unwrap_or(&self.root))?;
-        let meta = path.symlink_metadata().map_err(io_error)?;
-        if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&path).map_err(io_error)?;
-            return Ok(Bytes::from(target.to_string_lossy().into_owned()));
+        if !path.symlink_metadata().map_err(io_error)?.is_file() {
+            return Err(Error::Source(format!("{} is not a regular file", path.display())));
         }
         std::fs::read(path).map(Bytes::from).map_err(io_error)
     }

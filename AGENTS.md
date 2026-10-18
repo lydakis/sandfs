@@ -1,37 +1,36 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `sandfs/` is the library core (VFS, node policies, shell, adapters, integrations). Start here when adding new capabilities or extending host fallback logic.
-- `tests/` contains all pytest suites; mirror the runtime structure (e.g., `test_shell.py`, `test_vfs.py`) when adding scenarios.
-- `crates/` holds the Rust core that replaces the Python VFS: `sandfs-core` (workspaces, sources, overlays, diff) and `sandfs-git` (lazy git mounts). New capabilities land here.
-- `docs/` tracks the roadmap. Keep repository-wide guidance in README and this file.
-- `pyproject.toml` holds metadata, dependencies, and version numbers that drive the release workflow; update it before tagging.
+- `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `changes()` reports) plus the directory and in-memory sources, `sandfs-git` is an optional lazy git source, and `sandfs-py` is the PyO3 extension, including sources written in Python. New capabilities land here.
+- `sandfs/` is the Python package: re-exports from the `sandfs._core` extension, its type stubs (`_core.pyi`) and the `Source` protocol (`source.py`). Keep it thin; logic belongs in Rust.
+- `tests/` contains the pytest suites for the Python surface; Rust tests live next to each crate (`crates/*/tests`).
+- `docs/` tracks the roadmap and release notes. Keep repository-wide guidance in README and this file.
+- `pyproject.toml` holds the package metadata and the version that drives the release workflow; update it before tagging.
 
 ## Build, Test, and Development Commands
-- `uv pip install -e .[dev]` – install sandfs in editable mode with dev extras inside the provided `.venv`.
-- `uv run pytest` – run the full suite (currently ~110 tests) and is required before every commit.
-- `uv run pytest tests/test_shell.py -k host` – focus on a single module/pattern when doing TDD.
+- `uv pip install -e .[dev]` – build the extension with maturin and install sandfs in editable mode inside `.venv`. Re-run it after changing Rust code.
+- `uv run pytest` – run the Python suite; required before every commit.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` – the Rust checks CI runs.
-- `uv run sandfs exec "ls /"` or `uv run sandfs shell --mount ./project:/workspace` – try commands from the CLI; inline examples (`python - <<'PY' …`) still work for API experiments.
-- `uv run ruff check .` and `uv run ruff format sandfs tests` – lint (PEP 8, imports, bugbear, pyupgrade) and format.
-- `uv run mypy sandfs` – run static type checks; keep hints up to date before committing.
+- `uv run ruff check .` and `uv run ruff format sandfs tests` – lint and format Python.
+- `uv run mypy sandfs` – type-check the package and its stubs; update `_core.pyi` whenever the extension's API changes.
 - `pre-commit install` – enables automatic Ruff and MyPy hooks before every commit.
 
 ## Coding Style & Naming Conventions
-- Python 3.11+, 4-space indentation, PEP 8 naming (snake_case for functions, PascalCase for classes). Type hints and dataclasses are expected; prefer `PurePosixPath` for paths.
-- Keep comments meaningful (brief rationale before non-trivial logic, e.g., explaining policy enforcement). Avoid repository-specific jargon unless defined.
-- When touching the shell, favor small helper methods to keep command handlers readable; add docstrings if the behavior is non-obvious.
+- Rust: edition 2024, `rustfmt.toml` settings, no `unsafe`, doc comments on public items. Prefer small, composable functions over new concepts; a feature that can be built from mount, fork and changes should be.
+- Python 3.11+, 4-space indentation, PEP 8 naming, type hints everywhere.
+- Keep comments meaningful: a brief rationale before non-trivial logic. Avoid repository-specific jargon unless defined.
 
 ## Testing Guidelines
-- Framework: pytest only, with Hypothesis configured via dev extras. Test files are named `test_*.py`, and test functions start with `test_`.
-- Follow TDD: reproduce the agent scenario in tests before fixing code. Examples include path translation regressions (`test_host_command_preserves_trailing_slash_paths`).
-- Keep assertions specific (stdout text, versions, policies). Use fixtures/helpers (`setup_shell`) instead of duplicating VFS bootstrapping.
+- Rust: integration tests in `crates/<crate>/tests`, unit tests beside the code. Python: pytest, files named `test_*.py`.
+- Follow TDD: reproduce the agent scenario in a test before fixing code.
+- Keep assertions specific (contents, versions, change kinds, exception types).
 
 ## Commit & Pull Request Guidelines
-- Write commits in imperative present tense (“Fix host path rewrite…”). Each commit should include or reference updated tests.
-- Pull requests (or internal reviews) should describe the behavior change, note any new commands/policies, and mention how to reproduce the new tests.
-- Tag releases after meaningful fixes (`v0.x.y`) and let GitHub Actions publish via the trusted PyPI workflow; keep `pyproject.toml` version in sync with the tag.
+- Write commits in imperative present tense ("Fix version reuse after delete"). Each commit should include or reference updated tests.
+- Pull requests should describe the behavior change, note any API changes, and mention how to run the new tests.
+- Tag releases (`v0.x.y`) and let GitHub Actions build the wheels and publish via the trusted PyPI workflow; keep `pyproject.toml` in sync with the tag.
 
-## Agent & Host Integration Tips
-- Host commands are not sandboxed: they run as the host user, and exist only with `SandboxShell(..., host_commands=True)` (or `host_fallback=True`). Host fallback materializes only what the shell's view may read under a temporary directory. Commands like `host -p /workspace …` or `bash -lc '…'` are the preferred way to use GNU utilities without re-implementing them.
-- Always ensure writes stay inside the sandbox hierarchy. If you need host IO beyond that scope, add explicit adapters/policies rather than bypassing the VFS.
+## Scope
+- sandfs is a general-purpose sandbox filesystem: files are bytes of any kind, and code is one use case among many. Don't add features that only make sense for source code to the core; text tools belong in the MCP crate.
+- It never runs commands. Execution belongs to a container or microVM pointed at the files.
+- Sources are read-only; every change goes to the workspace overlay. Never add a path that writes back to a source implicitly.
