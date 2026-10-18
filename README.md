@@ -17,6 +17,7 @@ Everything else is a composition. A snapshot is a fork nobody writes to, a worki
 ```bash
 pip install "sandfs>=0.4"   # prebuilt wheels for Linux, macOS and Windows, Python 3.11+
 cargo add sandfs-core       # the Rust core; sandfs-git adds the git source
+cargo install sandfs-mcp    # an MCP server with file tools over a workspace
 ```
 
 Until 0.4.0 is published, install from git instead with `pip install git+https://github.com/lydakis/sandfs.git`, which builds the extension and needs a Rust toolchain.
@@ -82,6 +83,7 @@ sandfs does not run commands. Commands an agent wants to run belong in a real sa
 ├── crates/
 │   ├── sandfs-core/    # workspaces, overlay, changes, directory and in-memory sources
 │   ├── sandfs-git/     # optional lazy git source
+│   ├── sandfs-mcp/     # MCP server: file tools over one workspace
 │   └── sandfs-py/      # Python bindings (the sandfs._core extension)
 ├── docs/               # roadmap, changelog and publishing notes
 ├── sandfs/             # Python package: re-exports and type stubs

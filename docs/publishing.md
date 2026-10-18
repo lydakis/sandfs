@@ -1,12 +1,12 @@
 # Publishing sandfs
 
-A release ships the `sandfs` Python package to PyPI and the `sandfs-core` and `sandfs-git` crates to crates.io, all at one version number. `sandfs-py` is the extension crate inside the Python package and is not published on its own.
+A release ships the `sandfs` Python package to PyPI and the `sandfs-core`, `sandfs-git` and `sandfs-mcp` crates to crates.io, all at one version number. `sandfs-py` is the extension crate inside the Python package and is not published on its own.
 
 The Python package is built with [maturin](https://www.maturin.rs): one abi3 wheel per platform covers every Python from 3.11 up, plus an sdist that builds from source when a Rust toolchain is installed.
 
 ## Version
 
-The version lives in one place, `version` under `[workspace.package]` in the root `Cargo.toml`. The crates inherit it and maturin copies it into the Python package. Bump it together with the `version` of the `sandfs-core` and `sandfs-git` entries under `[workspace.dependencies]`, and move the changelog entry from "unreleased" to the release date.
+The version lives in one place, `version` under `[workspace.package]` in the root `Cargo.toml`. The crates inherit it and maturin copies it into the Python package. Bump it together with the `version` of the `sandfs-*` entries under `[workspace.dependencies]`, and move the changelog entry from "unreleased" to the release date.
 
 ## Checks before tagging
 
@@ -14,7 +14,7 @@ Every pull request already runs these in CI (`ci.yml` and `release.yml`). To run
 
 ```bash
 uv build                                       # sdist, then a wheel built from it
-cargo package --workspace --exclude sandfs-py  # builds both crates as crates.io would
+cargo package --workspace --exclude sandfs-py  # builds the crates as crates.io would
 ```
 
 ## Release
@@ -26,11 +26,12 @@ cargo package --workspace --exclude sandfs-py  # builds both crates as crates.io
    git push origin v0.4.0
    ```
 
-2. Publish the crates, core first because the git crate depends on it:
+2. Publish the crates, core first because the others depend on it:
 
    ```bash
    cargo publish -p sandfs-core
    cargo publish -p sandfs-git
+   cargo publish -p sandfs-mcp
    ```
 
 3. Create a GitHub release for the tag with the changelog entry as its notes.

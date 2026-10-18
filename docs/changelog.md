@@ -10,7 +10,8 @@ A rewrite. sandfs is now a general-purpose sandbox filesystem with a Rust core, 
 - **Bytes first**: files are bytes of any kind. `stat` always reports an exact size and a version, and `write(..., expected_version=...)` rejects a write to a file that changed since it was read.
 - **Large files**: `read(path, offset=..., length=...)` reads one range without caching the whole file. A source can define `read_range` to serve ranges itself.
 - **Concurrency**: calls release the GIL, and forks reading the same uncached file fetch it from the source once.
-- **Packaging**: one abi3 wheel per platform covers Python 3.11 and later. The Rust crates `sandfs-core` and `sandfs-git` are published alongside.
+- **sandfs-mcp**: an MCP server exposing a copy-on-write workspace as nine file tools (read, list, glob, grep, write, edit, move, delete, changes); `sandfs-mcp --dir MOUNT=PATH`.
+- **Packaging**: one abi3 wheel per platform covers Python 3.11 and later. The Rust crates `sandfs-core`, `sandfs-git` and `sandfs-mcp` are published alongside.
 - **Removed**: the bash-like shell, host-command bridge, Python executor, access policies, storage adapters, write hooks, symlinks, text edit and unified diffs.
 
 ## 0.2.2 and earlier
