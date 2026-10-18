@@ -44,6 +44,9 @@ Issues = "https://github.com/lydakis/sandfs/issues"
 [project.scripts]
 sandfs = "sandfs.cli:main"
 
+[tool.hatch.build.targets.sdist]
+exclude = ["crates", "target", "Cargo.toml", "Cargo.lock", "rustfmt.toml"]
+
 [tool.hatch.metadata]
 allow-direct-references = true
 

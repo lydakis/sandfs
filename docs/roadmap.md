@@ -1,56 +1,36 @@
 # sandfs Roadmap
 
-This document captures the practical roadmap for `sandfs` so we can measure progress toward a "VFS-first" agent environment where the virtual tree feels like the whole world.
+sandfs is the filesystem you give an agent instead of a bash tool. The goal is a small, solid primitive: lazy mounts of real sources (a git commit, a host directory), a copy-on-write workspace on top that forks in O(1), and a diff of what the agent changed.
 
-## Where we are today
+The full design lives in the interface spec linked from the project. This file tracks where the code is.
 
-- **Core VFS** – in-memory directories, provider-backed nodes, optimistic versions, snapshots, host export/import helpers.
-- **Policy layer** – read/write/append policies plus visibility views and path hooks so hosts can mirror activity elsewhere.
-- **Command surface** – built-in shell commands: `pwd`, `cd`, `ls`, `tree`, `cat`, `touch`, `mkdir`, `rm`, `cp`, `mv`, `write`, `append`, `echo`, `printf`, `wc`, `grep`, `rg`, `search`, `stat`, `head`, `tail`, `find`, `python`, `python3`, `host`, `bash`, `sh`, and `help`, with pipes, `<`/`>`/`>>` redirection and env vars.
-- **Host bridge** – `host` (plus `bash`/`sh`) materializes the visible tree to a temp dir and runs native binaries; both these commands (`host_commands=True`) and host fallback for unknown commands are opt-in. Host commands are not isolated from the host.
-- **Search** – optional full-text index and a `/@search?q=` view.
-- **CLI** – `sandfs exec` and `sandfs shell` with host directory mounts.
+## Direction
 
-## Principles for upcoming work
+The core is being rewritten in Rust (`crates/`). Python and TypeScript become thin bindings over it, and agents reach it through MCP file tools. Execution stays out of scope: sandfs is where an agent reads and writes, not the sandbox that runs its commands.
 
-1. **Pure VFS illusion by default** – agents should accomplish >80% of tasks without touching host fallback.
-2. **Small, opinionated command set** – implement the utilities agents actually need (read/search/light edits) instead of replicating full POSIX semantics.
-3. **Explicit escape hatches** – keep host fallback as an opt-in convenience and clearly document its risks.
-4. **Pluggable execution backends** – over time, allow swapping in WASI/containers/namespaces without changing the shell API.
+Python 0.3 is the last release of the original design. The Rust-backed release keeps only the primitive and drops the rest:
 
-## Near-term backlog (v0.x)
+| Kept | Dropped |
+| --- | --- |
+| Workspaces, mounts, fork, diff, edit | Bash-like shell and its command set |
+| Lazy git and directory sources | Host bridge (`host`, `bash`, `sh`, host fallback) |
+| MCP file tools for agents | Python executor |
+| | Storage adapters, write hooks, full-text index |
 
-Focus: expand the pure-Python toolchain so normal agent workflows never require host commands.
+Access policies come back in a smaller form only if a real use needs them.
 
-- **Navigation & metadata**
-  - Support `ls -a`/`ls -R` flags plus a `du`-lite summary command.
-- **Viewing & paging**
-  - Add a pager-style `view` for long files.
-  - Extend `cat` with line numbers and highlighting options useful to LLMs.
-- **Search & filtering**
-  - Extend `find` with more predicates (`-path`, `-maxdepth`, extensions).
-  - Enhance `rg` with include/exclude globs, max-results, and JSON output for agents.
-- **Editing & diffs**
-  - Introduce `apply_patch` and `diff` so agents can restructure files safely.
-  - Provide `sed`-lite replacements and multi-file write helpers.
-- **File creation ergonomics**
-  - Extend `write`/`append` with heredoc (`<<EOF`) support, timestamp helpers, and batch command execution so agents can create structured notes without `/bin/sh`.
-- **Snapshots & history**
-  - Surface shell commands for `snapshot`, `restore`, and `diff-snap <id>` (wrapping the existing VFS APIs).
-- **Ergonomics**
-  - Structured command responses (rich metadata that the CLI/UI can pretty-print) and better error messaging.
-  - Diagnostics helpers like `status`/`info` to expose visible roots, policies, and current mounts without falling back to host shells.
+## Build order
 
-## Mid-term explorations
+1. **Core** (`sandfs-core`). Workspace over read-only sources, overlay, fork, diff, exact-string edits. Done.
+2. **Git source** (`sandfs-git`). Commit trees read through `git cat-file --batch`; a `blob:none` partial clone fetches only the blobs that are read. Done.
+3. **Python bindings** (PyO3), with `sandfs.Workspace` replacing `VirtualFileSystem`.
+4. **MCP server**: read, list, glob, grep, write, edit, move, delete, diff, snapshot/restore and commit.
+5. **CLI and FUSE**: `sandfs mount`, `sandfs worktree add`, `sandfs diff`, `sandfs serve --mcp`.
+6. **Commit back**: turn a workspace diff into a git commit or a pull request.
+7. **TypeScript bindings** (napi-rs, later WASM).
 
-- **Structured data helpers** – `select`/`jq`-style view of JSON/YAML/TOML, CSV previewers, formatting utilities.
-- **Archive / packaging** – zip/tar helpers entirely within the VFS so agents can bundle outputs without host tooling.
-- **Execution backends** – research a WASI-based backend (reuse BusyBox/coreutils) and, for Linux deployments, a namespace/container-backed host runner for "hard" isolation.
+## Known gaps in the core
 
-## Long-term ideas
-
-- **Policy-aware agents** – surface node policies directly in command responses so planners can avoid forbidden paths proactively.
-- **Observability** – pluggable telemetry for command usage, timing, and write hooks that integrate with host logs.
-- **Multi-tenant sandboxes** – carve multiple views over the same VFS (per agent/principal) with isolated shells.
-
-This roadmap will evolve as we learn what commands agents rely on most. Contributions or feedback can be filed as issues referencing the relevant section above.
+- Symlinks are followed only as the final path component; a path through a directory symlink is not found.
+- Directory renames copy entries by reference, so they cost one overlay entry per file in the subtree.
+- Git listings don't carry file sizes, so `stat` on an unread git file has no size.
