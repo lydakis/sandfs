@@ -425,3 +425,68 @@ fn executable_bits_change_through_the_overlay() {
     assert!(changes(&ws).is_empty(), "back to the base mode");
     assert!(matches!(ws.set_executable("/repo/src", true), Err(Error::IsADirectory(_))));
 }
+
+/// A source that can only be read in ranges, counting each ranged read.
+#[derive(Debug)]
+struct Ranged {
+    inner: MemorySource,
+    ranges: AtomicUsize,
+}
+
+impl Source for Ranged {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        self.inner.root()
+    }
+
+    fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+        self.inner.read_dir(key)
+    }
+
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        self.inner.read_file(key)
+    }
+
+    fn read_range(&self, key: &str, offset: u64, len: u64) -> sandfs_core::Result<Bytes> {
+        self.ranges.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_range(key, offset, len)
+    }
+}
+
+#[test]
+fn ranged_reads_clamp_to_the_end_of_the_file() {
+    let (mut ws, _) = workspace();
+    ws.write("/notes.txt", "0123456789").unwrap();
+    assert_eq!(ws.read_range("/notes.txt", 3, 4).unwrap(), "3456");
+    assert_eq!(ws.read_range("/notes.txt", 8, 10).unwrap(), "89");
+    assert_eq!(ws.read_range("/notes.txt", 20, 1).unwrap(), "");
+    assert_eq!(ws.read_range("/repo/README.md", 0, 4).unwrap(), "hell");
+    assert!(matches!(ws.read_range("/repo/src", 0, 1), Err(Error::IsADirectory(_))));
+}
+
+#[test]
+fn ranged_reads_go_to_the_source_until_the_file_is_read_whole() {
+    let source = Arc::new(Ranged { inner: repo(), ranges: AtomicUsize::new(0) });
+    let mut ws = Workspace::new();
+    ws.mount("/data", source.clone()).unwrap();
+
+    assert_eq!(ws.read_range("/data/README.md", 1, 3).unwrap(), "ell");
+    assert_eq!(ws.read_range("/data/README.md", 1, 3).unwrap(), "ell");
+    assert_eq!(source.ranges.load(Ordering::SeqCst), 2, "partial reads are not cached");
+
+    ws.read("/data/README.md").unwrap();
+    assert_eq!(ws.read_range("/data/README.md", 0, 2).unwrap(), "he");
+    assert_eq!(source.ranges.load(Ordering::SeqCst), 2, "a whole read fills the cache");
+}
+
+#[test]
+fn dir_source_reads_ranges_from_disk() {
+    let dir = std::env::temp_dir().join(format!("sandfs-range-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("big.bin"), (0..=255u8).collect::<Vec<_>>()).unwrap();
+
+    let mut ws = Workspace::new();
+    ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
+    assert_eq!(ws.read_range("/host/big.bin", 250, 100).unwrap(), Bytes::from_static(&[250, 251, 252, 253, 254, 255]));
+    assert_eq!(ws.read_range("/host/big.bin", 1000, 10).unwrap(), Bytes::new());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

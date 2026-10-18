@@ -19,13 +19,13 @@ Python 0.3 was the last release of the original design. Its shell, host bridge, 
 2. **Python bindings** (`sandfs-py`, PyO3 and maturin): `sandfs.Workspace`, built-in directory, in-memory and git sources, and sources written in Python. Done.
 3. **MCP server**: read, list, glob, grep, write, edit, move, delete and changes over one workspace. Text edit, glob and search live here, built from read and a versioned write.
 4. **CLI and FUSE** (`sandfs-cli`, Linux): `sandfs mount`, `sandfs fork`, `sandfs changes`. `sandfs serve --mcp` lands with the MCP server.
-5. **Ranged reads**: read a large file in pieces instead of whole.
+5. **Ranged reads**: `read_range` on sources and workspaces, so a large file is read in pieces instead of whole. Done.
 6. **TypeScript bindings**, when a caller needs them.
 
 ## Known gaps in the core
 
 - Directory renames copy entries by reference, so they cost one overlay entry per file in the subtree.
-- Files are read whole and cached whole, so a multi-gigabyte file costs its size in memory once read.
+- A whole read of a base file is cached for the workspace's lifetime, so reading a multi-gigabyte file whole (not in ranges) keeps it in memory. Writes always replace a whole file.
 - A source that leaves out sizes (git does) makes `stat` read the file to answer.
 
 ## Known gaps in the CLI

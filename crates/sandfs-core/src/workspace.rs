@@ -17,7 +17,7 @@ use imbl::OrdMap;
 use crate::change::{Change, ChangeKind};
 use crate::error::{Error, Result};
 use crate::path::VPath;
-use crate::source::{Kind, Listing, Source, SourceEntry, SourceKey};
+use crate::source::{Kind, Listing, Source, SourceEntry, SourceKey, slice};
 
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -202,6 +202,26 @@ impl Workspace {
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { content, .. } => self.content_bytes(&content),
+        }
+    }
+
+    /// Read up to `len` bytes of a file starting at `offset`; fewer near the end of
+    /// the file, none past it.
+    ///
+    /// A base file that has not been read whole is read from its source in that range
+    /// and not cached, so a large file is never held in memory whole.
+    pub fn read_range(&self, path: &str, offset: u64, len: u64) -> Result<Bytes> {
+        let path = VPath::parse(path)?;
+        match self.resolve(&path)? {
+            Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
+            Resolved::File { content: Content::Bytes(bytes), .. } => Ok(slice(&bytes, offset, len)),
+            Resolved::File { content: Content::Base { mount, key, .. }, .. } => {
+                let cached = self.cache.blobs.lock().expect("cache lock").get(&(mount.id, key.clone())).cloned();
+                match cached {
+                    Some(bytes) => Ok(slice(&bytes, offset, len)),
+                    None => mount.source.read_range(&key, offset, len),
+                }
+            }
         }
     }
 
