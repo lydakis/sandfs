@@ -758,7 +758,7 @@ fn resolve_link(link: &VPath, target: &[u8]) -> Result<VPath> {
     // Decoding strictly: a lossy decode could turn an invalid target into a real name.
     let target = std::str::from_utf8(target).map_err(|_| Error::NotText(link.to_string()))?;
     if target.starts_with('/') {
-        return VPath::parse(&target);
+        return VPath::parse(target);
     }
     let parent = link.parent().unwrap_or_else(VPath::root);
     VPath::parse(&format!("{}/{}", parent.as_str().trim_end_matches('/'), target))
