@@ -18,6 +18,8 @@ const DEFAULT_GREP_MATCHES: usize = 200;
 const MAX_CONTEXT: u64 = 20;
 const MAX_LIST_DEPTH: u64 = 20;
 const MAX_SYMLINK_HOPS: usize = 40;
+/// Files larger than this (old plus new bytes) are listed in a diff but not diffed.
+const MAX_DIFF_INPUT: usize = 1024 * 1024;
 
 type ToolResult = Result<String, String>;
 
@@ -104,6 +106,13 @@ impl Tools {
         out.push_str(&format!("[version {version} · lines {offset}-{last} of {total}"));
         if last < total {
             out.push_str(&format!(" · continue with offset={}", last + 1));
+        }
+        // Line endings are not shown, but exact-text edits must match them.
+        if text.contains("\r\n") {
+            out.push_str(" · CRLF line endings: use \\r\\n in edit text");
+        }
+        if !text.ends_with('\n') && last == total {
+            out.push_str(" · no newline at end of file");
         }
         out.push(']');
         Ok(out)
@@ -213,7 +222,11 @@ impl Tools {
         }
 
         if search.matches == 0 {
-            return Ok(format!("No matches for {pattern} under {root}"));
+            let unread = match search.unreadable {
+                0 => String::new(),
+                n => format!(" ({n} files could not be read)"),
+            };
+            return Ok(format!("No matches for {pattern} under {root}{unread}"));
         }
         let mut out = search.out;
         let files = if search.files == 1 { "file" } else { "files" };
@@ -278,14 +291,17 @@ impl Tools {
         let mut body = String::new();
         for change in current.diff().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
             let path = change.path.as_str();
-            let (before, after) = (file_state(&base, path)?, file_state(current, path)?);
             let mark = match change.kind {
                 ChangeKind::Added => 'A',
                 ChangeKind::Modified => 'M',
                 ChangeKind::Deleted => 'D',
             };
             summary.push_str(&format!("{mark} {path}\n"));
-            body.push_str(&render_change(path, before.as_ref(), after.as_ref()));
+            // Every change is listed, but patches stop once the output is past its cap.
+            if body.len() < MAX_OUTPUT {
+                let (before, after) = (file_state(&base, path)?, file_state(current, path)?);
+                body.push_str(&render_change(path, before.as_ref(), after.as_ref()));
+            }
         }
         if summary.is_empty() {
             return Ok(format!("No changes under {scope}"));
@@ -446,14 +462,23 @@ fn render_change(path: &str, before: Option<&FileState>, after: Option<&FileStat
     fn text(state: Option<&FileState>) -> Option<&str> {
         state.map_or(Some(""), |state| as_text(&state.bytes))
     }
-    match (text(before), text(after)) {
-        (Some(old), Some(new)) if old == new => {
-            let kinds = (before.map(|s| kind_name(s.kind)), after.map(|s| kind_name(s.kind)));
-            format!("{path}: changed from {} to {}\n", kinds.0.unwrap_or("nothing"), kinds.1.unwrap_or("nothing"))
+    let size = |state: Option<&FileState>| state.map_or(0, |state| state.bytes.len());
+    let mut out = match (before, after) {
+        (Some(old), Some(new)) if old.kind != new.kind => {
+            format!("{path}: changed from {} to {}\n", kind_name(old.kind), kind_name(new.kind))
         }
-        (Some(old), Some(new)) => unified(path, before.map(|_| old), after.map(|_| new)),
-        _ => format!("Binary file {path} differs\n"),
+        _ => String::new(),
+    };
+    match (text(before), text(after)) {
+        (Some(old), Some(new)) if old == new => {}
+        // Diffing is quadratic in the worst case, and the result would be cut anyway.
+        _ if size(before) + size(after) > MAX_DIFF_INPUT => {
+            out.push_str(&format!("{path}: too large to diff here; read it in pages\n"));
+        }
+        (Some(old), Some(new)) => out.push_str(&unified(path, before.map(|_| old), after.map(|_| new))),
+        _ => out.push_str(&format!("Binary file {path} differs\n")),
     }
+    out
 }
 
 /// A unified diff with git-style `a/` and `b/` headers; `None` is a missing file.
@@ -630,7 +655,7 @@ pub(crate) fn definitions() -> Vec<Value> {
             "name": "write",
             "description": "Create or overwrite a file, creating parent directories. Pass the version from \
                 `read` as expected_version to fail instead of overwriting a change you have not seen \
-                (0 means the file must not exist).",
+                (a new file, or a mounted file not yet changed, has version 0).",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute path of the file."),
                 "content": { "type": "string", "description": "The full new contents." },

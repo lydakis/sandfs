@@ -91,16 +91,17 @@ impl Server {
         if !request.is_object() {
             return Some(error_response(Value::Null, INVALID_REQUEST, "expected a JSON-RPC request object"));
         }
-        // Without an id the message is a notification (`notifications/initialized`,
-        // cancellations), which never gets an answer.
-        let id = request.get("id")?.clone();
+        let id = request.get("id").cloned();
         let Some(method) = request.get("method").and_then(Value::as_str) else {
             // This server sends no requests, so a response addressed to it is ignored.
             if request.get("result").is_some() || request.get("error").is_some() {
                 return None;
             }
-            return Some(error_response(id, INVALID_REQUEST, "missing method"));
+            return Some(error_response(id.unwrap_or(Value::Null), INVALID_REQUEST, "missing method"));
         };
+        // A valid request without an id is a notification (`notifications/initialized`,
+        // cancellations), which never gets an answer.
+        let id = id?;
         let params = request.get("params").unwrap_or(&Value::Null);
         let reply = match self.dispatch(method, params) {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),

@@ -206,3 +206,40 @@ fn unknown_tools_and_bad_arguments() {
     assert!(fails(&mut s, "read", json!({ "path": "/repo/README.md", "limit": -1 })).contains("non-negative integer"));
     assert!(fails(&mut s, "delete", json!({ "path": "/x", "recursive": "yes" })).contains("true or false"));
 }
+
+#[test]
+fn read_notes_line_endings_that_edits_must_match() {
+    let mut s = server();
+    ok(&mut s, "write", json!({ "path": "/crlf.txt", "content": "a\r\nb" }));
+    let read = ok(&mut s, "read", json!({ "path": "/crlf.txt" }));
+    assert!(read.ends_with("CRLF line endings: use \\r\\n in edit text · no newline at end of file]"), "{read}");
+    ok(&mut s, "edit", json!({ "path": "/crlf.txt", "edits": [{ "old": "a\r\nb", "new": "c\r\nd" }] }));
+}
+
+#[test]
+fn diff_reports_kind_changes_and_skips_huge_patches() {
+    let mut s = server();
+    ok(&mut s, "delete", json!({ "path": "/repo/latest" }));
+    ok(&mut s, "write", json!({ "path": "/repo/latest", "content": "now a file\n" }));
+    ok(&mut s, "write", json!({ "path": "/huge.txt", "content": "z\n".repeat(600_000) }));
+    let diff = ok(&mut s, "diff", json!({}));
+    assert!(diff.starts_with("A /huge.txt\nM /repo/latest\n\n"), "{diff}");
+    assert!(diff.contains("/huge.txt: too large to diff here; read it in pages\n"));
+    assert!(diff.contains("/repo/latest: changed from a symlink to a file\n--- a/repo/latest\n"), "{diff}");
+    assert!(diff.contains("-README.md\n") && diff.contains("+now a file\n"), "{diff}");
+}
+
+#[test]
+fn grep_reports_unreadable_files_when_nothing_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("gone.txt"), "x").unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/d", Arc::new(sandfs_core::DirSource::new(dir.path()).unwrap())).unwrap();
+    ws.list("/d").unwrap();
+    std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+    let mut s = Server::new(ws);
+    assert_eq!(
+        ok(&mut s, "grep", json!({ "pattern": "x", "path": "/d" })),
+        "No matches for x under /d (1 files could not be read)"
+    );
+}
