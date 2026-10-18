@@ -401,3 +401,19 @@ fn dir_source_refuses_reads_through_a_swapped_in_symlink() {
     assert!(ws.read("/host/sub/file").is_err());
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn versioned_edits_check_the_symlink_target() {
+    let (mut ws, _) = workspace();
+    ws.symlink("/alias", "/repo/README.md").unwrap();
+    let target = ws.write("/repo/README.md", "hello world").unwrap();
+    let link = ws.stat("/alias").unwrap().version;
+    assert_ne!(link, target);
+
+    let stale = ws.edit_versioned("/alias", &[Edit::new("hello", "hi")], link);
+    assert!(
+        matches!(stale, Err(Error::VersionMismatch { expected, actual, .. }) if expected == link && actual == target)
+    );
+    ws.edit_versioned("/alias", &[Edit::new("hello", "hi")], target).unwrap();
+    assert_eq!(ws.read_text("/repo/README.md").unwrap(), "hi world");
+}

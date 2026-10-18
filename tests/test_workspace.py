@@ -135,6 +135,18 @@ def test_expected_version_guards_writes_and_edits() -> None:
     assert ws.read_text("/notes.md") == "final"
 
 
+def test_versioned_edits_through_a_symlink_check_the_target() -> None:
+    ws = Workspace()
+    target = ws.write("/notes.md", "draft")
+    ws.symlink("/latest", "/notes.md")
+
+    with pytest.raises(VersionMismatch):
+        ws.edit("/latest", "draft", "final", expected_version=ws.stat("/latest").version)
+    ws.edit("/latest", "draft", "final", expected_version=target)
+
+    assert ws.read_text("/notes.md") == "final"
+
+
 def test_edit_requires_a_unique_match_unless_replace_all() -> None:
     ws = Workspace()
     ws.write("/a.txt", "one one two")
@@ -164,6 +176,8 @@ def test_copy_move_symlink_and_mkdir() -> None:
     assert ws.exists("/deep/er")
     with pytest.raises(IsADirectoryError):
         ws.copy("/base/src", "/other")
+    with pytest.raises(FileExistsError):
+        ws.move("/work/b.txt", "/work/renamed.txt")
 
 
 def test_reads_release_the_gil(repo: Path) -> None:

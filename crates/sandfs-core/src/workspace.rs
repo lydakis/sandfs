@@ -319,8 +319,23 @@ impl Workspace {
     /// Each edit's `old` text must match exactly once (or `replace_all` must be set);
     /// if any edit fails, nothing is written.
     pub fn edit(&mut self, path: &str, edits: &[Edit]) -> Result<u64> {
+        self.edit_checked(path, edits, None)
+    }
+
+    /// Like [`Workspace::edit`], but only if the file is at version `expected`. The
+    /// version checked is the edited file's, after following a final symlink.
+    pub fn edit_versioned(&mut self, path: &str, edits: &[Edit], expected: u64) -> Result<u64> {
+        self.edit_checked(path, edits, Some(expected))
+    }
+
+    fn edit_checked(&mut self, path: &str, edits: &[Edit], expected: Option<u64>) -> Result<u64> {
         let target = self.follow(VPath::parse(path)?)?;
         let version = self.stat(target.as_str())?.version;
+        if let Some(expected) = expected {
+            if expected != version {
+                return Err(Error::VersionMismatch { path: target.to_string(), expected, actual: version });
+            }
+        }
         let mut text = self.read_text(target.as_str())?;
         for edit in edits {
             let fail = |reason: String| Error::EditFailed { path: path.to_owned(), reason };

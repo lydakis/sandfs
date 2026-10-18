@@ -277,7 +277,8 @@ impl Workspace {
     /// Replace `old` with `new` in the text file at `path` and return the new version.
     ///
     /// `old` must match exactly once unless `replace_all` is set; otherwise `EditFailed`
-    /// is raised and the file is unchanged.
+    /// is raised and the file is unchanged. A final symlink is followed, and
+    /// `expected_version` is checked against the file it points to.
     #[pyo3(signature = (path, old, new, *, replace_all = false, expected_version = None))]
     fn edit(
         &mut self,
@@ -288,13 +289,14 @@ impl Workspace {
         replace_all: bool,
         expected_version: Option<u64>,
     ) -> PyResult<u64> {
-        if let Some(expected) = expected_version {
-            let actual = py.detach(|| self.inner.stat(path)).or_raise()?.version;
-            if actual != expected {
-                return Err(to_py(Error::VersionMismatch { path: path.to_owned(), expected, actual }));
-            }
-        }
-        self.inner.edit(path, &[Edit { old, new, replace_all }]).or_raise()
+        let edits = [Edit { old, new, replace_all }];
+        // Editing an unread git file may fetch it from a remote, so release the GIL.
+        let inner = &mut self.inner;
+        py.detach(|| match expected_version {
+            Some(expected) => inner.edit_versioned(path, &edits, expected),
+            None => inner.edit(path, &edits),
+        })
+        .or_raise()
     }
 
     /// Create a directory; with `parents`, create missing parents and accept an existing directory.
@@ -321,7 +323,7 @@ impl Workspace {
         self.inner.copy(src, dst, recursive).or_raise()
     }
 
-    /// Move `src` to `dst`, replacing a file at `dst`.
+    /// Move or rename `src` to `dst`, which must not exist yet.
     #[pyo3(name = "move")]
     fn rename(&mut self, src: &str, dst: &str) -> PyResult<()> {
         self.inner.rename(src, dst).or_raise()
