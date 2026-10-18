@@ -84,21 +84,28 @@ impl Tools {
         if text.is_empty() {
             return Ok(format!("{path}: empty file, version {version}"));
         }
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
-        if offset > total {
-            return Err(format!("{path}: offset {offset} is past the end of the file ({total} lines)"));
-        }
+        // One pass that renders only the requested page and counts the rest, so a large
+        // file costs no per-line index.
         let mut out = String::new();
         let mut last = offset - 1;
-        for (idx, line) in lines.iter().enumerate().skip(offset - 1).take(limit) {
+        let mut full = false;
+        let mut total = 0;
+        for (idx, line) in text.lines().enumerate() {
+            total = idx + 1;
+            if full || idx < offset - 1 || idx >= offset - 1 + limit {
+                continue;
+            }
             let entry = format!("{:>6}\t{}\n", idx + 1, clip(line, MAX_READ_LINE_CHARS));
             // Leave room for the footer, but always show at least one line.
             if !out.is_empty() && out.len() + entry.len() > MAX_OUTPUT - 200 {
-                break;
+                full = true;
+                continue;
             }
             out.push_str(&entry);
             last = idx + 1;
+        }
+        if offset > total {
+            return Err(format!("{path}: offset {offset} is past the end of the file ({total} lines)"));
         }
         out.push_str(&format!("[version {version} · lines {offset}-{last} of {total}"));
         if last < total {
@@ -117,7 +124,11 @@ impl Tools {
 
     fn list(&self, args: &Args) -> ToolResult {
         let path = args.opt_path("path")?;
-        let depth = args.opt_u64("depth")?.unwrap_or(1).clamp(1, MAX_LIST_DEPTH) as usize;
+        let depth = args.opt_u64("depth")?.unwrap_or(1).max(1);
+        if depth > MAX_LIST_DEPTH {
+            return Err(format!("depth must be at most {MAX_LIST_DEPTH}"));
+        }
+        let depth = depth as usize;
         let mut lines = Vec::new();
         let mut truncated = false;
         walk(&self.workspace, &path, depth, &mut |_, rel, entry| {
@@ -573,7 +584,7 @@ pub(crate) fn definitions() -> Vec<Value> {
             "description": "List a directory. Directories end in `/`; files show their size when known.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Absolute directory path. Defaults to /."),
-                "depth": { "type": "integer", "minimum": 1, "description": "Levels to descend (default 1)." },
+                "depth": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Levels to descend (default 1, at most 20)." },
             } },
             "annotations": read_only,
         }),

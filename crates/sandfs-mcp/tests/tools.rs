@@ -80,6 +80,7 @@ fn list_shows_kinds_sizes_and_depth() {
     );
     let deep = ok(&mut s, "list", json!({ "path": "/data/sales", "depth": 3 }));
     assert_eq!(deep, "2026.csv (41 bytes)\nnotes/\nnotes/todo.txt (17 bytes)");
+    assert_eq!(fails(&mut s, "list", json!({ "depth": 21 })), "depth must be at most 20");
 }
 
 #[test]
