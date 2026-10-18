@@ -1,7 +1,8 @@
 name: Release
 
 # Every pull request builds the wheels and sdist and installs them, so packaging
-# breaks show up before a release. Only a pushed `v*` tag publishes to PyPI.
+# breaks show up before a release. Only a pushed `v*` tag publishes, to PyPI and
+# crates.io. Running the workflow by hand on a tag publishes any crates still missing.
 on:
   push:
     tags:
@@ -78,3 +79,42 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist
+
+  crates:
+    # crates.io versions are permanent, so publish only once every artifact built.
+    needs: [wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      # Publishes every crate without `publish = false` that crates.io lacks at this
+      # version, dependencies first, so a re-run finishes a partial release.
+      - name: Publish to crates.io
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          if [ "$(jq -r '.packages[] | select(.name == "sandfs-core") | .version' <<<"$metadata")" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version"
+            exit 1
+          fi
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set, so no crates were published"
+            exit 0
+          fi
+          packages=()
+          for crate in $(jq -r '.packages[] | select(.publish != []) | .name' <<<"$metadata"); do
+            if ! curl -sf -A "sandfs-release (https://github.com/lydakis/sandfs)" "https://crates.io/api/v1/crates/$crate/$version" > /dev/null; then
+              packages+=(-p "$crate")
+            fi
+          done
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "Every crate is already on crates.io at $version"
+            exit 0
+          fi
+          cargo publish "${packages[@]}"
