@@ -149,7 +149,7 @@ pub struct Workspace {
 impl fmt::Debug for Workspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Workspace")
-            .field("mounts", &self.mounts.keys().collect::<Vec<_>>())
+            .field("mounts", &self.mounts.keys().map(VPath::as_str).collect::<Vec<_>>())
             .field("overlay_entries", &self.overlay.len())
             .finish()
     }

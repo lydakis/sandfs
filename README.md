@@ -6,6 +6,29 @@
 
 > **Direction**: the core is being rewritten in Rust under `crates/` as a lean primitive: lazy mounts (a git commit, a host directory), a copy-on-write workspace that forks in O(1), and a diff of what changed. Python 0.3 is the last release of the design below; the shell, host bridge, Python executor and storage adapters are not carried forward. See [the roadmap](docs/roadmap.md).
 
+## Workspaces (Rust core)
+
+`sandfs.Workspace` is the new Rust-backed API. Mounts are read-only and lazy, every change lands in a copy-on-write overlay, `fork()` is O(1), and `diff()` lists what changed.
+
+```python
+import sandfs
+
+base = sandfs.Workspace()
+base.mount_git("/repo", "path/to/clone", rev="main")   # no checkout; blobs read on demand
+base.mount_dir("/data", "./fixtures")                   # host directory, never written to
+base.mount_files("/notes", {"todo.md": "- ship it\n"})
+
+attempt = base.fork()                                   # one fork per agent or attempt
+attempt.edit("/repo/README.md", "sandfs", "SandFS")
+version = attempt.write("/notes/plan.md", "1. fork\n2. diff\n")
+attempt.write("/notes/plan.md", "revised", expected_version=version)
+
+for change in attempt.diff():
+    print(change.kind, change.path)                     # added /notes/plan.md, ...
+```
+
+In a partial clone (`git clone --filter=blob:none`), a file's contents are fetched from the remote only when it is first read. Errors are built-in exceptions (`FileNotFoundError`, `IsADirectoryError`, ...) plus `sandfs.VersionMismatch` and `sandfs.EditFailed`.
+
 ## Why?
 
 Agent builders frequently need a scratch filesystem for planning, iterating on generated code, and testing hypotheses. Shipping a simple `exec` tool that proxies every bash command to the host disk is unsafe. `sandfs` keeps those operations inside a controlled, in-memory sandbox while still feeling like a mini Linux environment.
@@ -168,13 +191,16 @@ Snapshots capture the entire tree (including storage-backed nodes) so you can ch
 .
 ├── crates/
 │   ├── sandfs-core/    # Rust core: workspaces, sources, overlay, diff
-│   └── sandfs-git/     # lazy git commit mounts
+│   ├── sandfs-git/     # lazy git commit mounts
+│   └── sandfs-py/      # Python bindings (the sandfs._core extension)
 ├── docs/               # roadmap and notes
-├── sandfs/             # Python library (0.3 design)
+├── sandfs/             # Python package: Workspace plus the 0.3 design
 └── tests/              # Python tests
 ```
 
 ## Local development
+
+Building the package compiles the Rust extension, so you need a Rust toolchain ([rustup](https://rustup.rs)). Re-run the install after changing Rust code.
 
 ```
 python -m venv .venv
@@ -184,6 +210,7 @@ pre-commit install
 uv run pytest
 uv run ruff check .
 uv run mypy sandfs
+cargo test --workspace
 ```
 
 ### Persistence hooks

@@ -21,7 +21,9 @@ jobs:
         run: pip install uv
       - name: Create virtual environment
         run: uv venv
-      - name: Install dependencies
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Install dependencies (builds the Rust extension)
         run: |
           uv pip install -e .[dev]
       - name: Run Ruff
