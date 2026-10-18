@@ -18,7 +18,7 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 1. **Core** (`sandfs-core`): sources, overlay, fork, changes. Done.
 2. **Python bindings** (`sandfs-py`, PyO3 and maturin): `sandfs.Workspace`, built-in directory, in-memory and git sources, and sources written in Python. Done.
 3. **MCP server**: read, list, glob, grep, write, edit, move, delete and changes over one workspace. Text edit, glob and search live here, built from read and a versioned write. Done (`sandfs-mcp`).
-4. **CLI and FUSE** (`sandfs-cli`, Linux): `sandfs mount`, `sandfs fork`, `sandfs changes`. Done; `sandfs serve --mcp` is next.
+4. **CLI and FUSE** (`sandfs-cli`, Linux): `sandfs mount`, `sandfs fork`, `sandfs changes`, `sandfs serve --mcp`. Done.
 5. **Ranged reads**: `read_range` on sources and workspaces, so a large file is read in pieces instead of whole. Done.
 6. **TypeScript bindings**, when a caller needs them.
 

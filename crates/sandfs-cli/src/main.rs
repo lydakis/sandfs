@@ -4,9 +4,11 @@
 //! The commands are the core's primitives. `mount` creates a workspace over a source
 //! and serves it with FUSE, `fork` mounts an O(1) copy of one, and `changes` lists the
 //! files a workspace changed. A working copy on disk is just a fork mounted at a path.
+//! `serve --mcp` hands a workspace to an agent as MCP file tools instead of a mount.
 
 mod fs;
 mod git;
+mod mcp;
 mod persist;
 mod store;
 
@@ -76,6 +78,18 @@ enum Cmd {
     },
     /// Delete an unmounted workspace and its changes.
     Rm { name: String },
+    /// Serve an unmounted workspace to an agent as MCP file tools over stdin and stdout.
+    ///
+    /// The agent gets read, list, glob, grep, write, edit, move, delete and changes,
+    /// with the source's files under /mnt. Every change is saved before its reply, so
+    /// `changes`, `fork` and `mount` see it afterwards.
+    Serve {
+        /// Speak MCP (the only protocol so far).
+        #[arg(long)]
+        mcp: bool,
+        /// A workspace name.
+        workspace: String,
+    },
     /// Serve a workspace's FUSE mount in this process (used by `mount` and `fork`).
     #[command(hide = true)]
     Daemon { name: String, dir: PathBuf },
@@ -148,6 +162,12 @@ fn run(cli: Cli) -> Result<()> {
             }
             home.record(&name)?;
             home.remove(&name)
+        }
+        Cmd::Serve { mcp, workspace } => {
+            if !mcp {
+                bail!("say what to serve: sandfs serve --mcp {workspace}");
+            }
+            mcp::serve(&home, &home.find(&workspace)?)
         }
         Cmd::Daemon { name, dir } => serve(&home, &name, &dir),
     }

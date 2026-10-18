@@ -627,6 +627,7 @@ dependencies = [
  "libc",
  "sandfs-core",
  "sandfs-git",
+ "sandfs-mcp",
  "serde",
  "serde_json",
  "tempfile",
