@@ -5,14 +5,14 @@ build-backend = "maturin"
 [project]
 name = "sandfs"
 version = "0.4.0.dev0"
-description = "A lazy, copy-on-write filesystem for agents: mount a git commit, fork in O(1), diff what changed"
+description = "A lazy, copy-on-write sandbox filesystem for agents: mount any data, fork in O(1), see what changed"
 requires-python = ">=3.11"
 authors = [
   { name = "sandfs contributors" }
 ]
 readme = "README.md"
 license = { text = "MIT" }
-keywords = ["virtual filesystem", "agents", "copy-on-write", "git", "workspace"]
+keywords = ["virtual filesystem", "sandbox", "agents", "copy-on-write", "workspace"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",

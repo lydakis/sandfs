@@ -1,4 +1,7 @@
-//! Mount a git commit into a sandfs workspace without checking it out.
+//! A sandfs source for a git commit, read without checking it out.
+//!
+//! It is an optional source built on the same `Source` trait any harness can
+//! implement, and a reference for writing one.
 //!
 //! [`GitSource`] reads trees and blobs on demand through one long-running
 //! `git cat-file --batch` process. Nothing is written to a working tree, and in a
@@ -97,8 +100,8 @@ fn parse_tree(data: &[u8], hash_len: usize) -> Result<Listing> {
             b"40000" => Kind::Dir,
             b"100644" | b"100664" => Kind::File { executable: false },
             b"100755" => Kind::File { executable: true },
-            b"120000" => Kind::Symlink,
-            // Submodules (160000) point at commits in other repositories.
+            // Symlinks (120000) are not part of a workspace, and submodules (160000)
+            // point at commits in other repositories.
             _ => continue,
         };
         let Ok(name) = name else { continue }; // non-UTF-8 names cannot be workspace paths

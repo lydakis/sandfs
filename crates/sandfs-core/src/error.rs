@@ -42,18 +42,10 @@ pub enum Error {
         /// Version the file actually has.
         actual: u64,
     },
-    /// An exact-string edit could not be applied.
-    #[error("{path}: edit failed: {reason}")]
-    EditFailed {
-        /// Path of the file.
-        path: String,
-        /// Why the edit failed.
-        reason: String,
-    },
     /// A file that must be text is not valid UTF-8.
     #[error("{0}: not valid UTF-8 text")]
     NotText(String),
-    /// A backing source (git, disk, a callback) failed.
+    /// A backing source (a directory, an API, a callback) failed.
     #[error("source error: {0}")]
     Source(String),
 }

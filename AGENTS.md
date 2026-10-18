@@ -1,8 +1,8 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `diff()` reports), `sandfs-git` mounts git commits lazily, and `sandfs-py` is the PyO3 extension. New capabilities land here.
-- `sandfs/` is the Python package: re-exports from the `sandfs._core` extension and its type stubs (`_core.pyi`). Keep it thin; logic belongs in Rust.
+- `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `diff()` reports) plus the directory and in-memory sources, `sandfs-git` is an optional lazy git source, and `sandfs-py` is the PyO3 extension, including sources written in Python. New capabilities land here.
+- `sandfs/` is the Python package: re-exports from the `sandfs._core` extension, its type stubs (`_core.pyi`) and the `Source` protocol (`source.py`). Keep it thin; logic belongs in Rust.
 - `tests/` contains the pytest suites for the Python surface; Rust tests live next to each crate (`crates/*/tests`).
 - `docs/` tracks the roadmap and release notes. Keep repository-wide guidance in README and this file.
 - `pyproject.toml` holds the package metadata and the version that drives the release workflow; update it before tagging.
@@ -31,5 +31,6 @@
 - Tag releases (`v0.x.y`) and let GitHub Actions build the wheels and publish via the trusted PyPI workflow; keep `pyproject.toml` in sync with the tag.
 
 ## Scope
-- sandfs is a filesystem, not a sandbox: it never runs commands. Execution belongs to a container or microVM pointed at the files.
+- sandfs is a general-purpose sandbox filesystem: files are bytes of any kind, and code is one use case among many. Don't add features that only make sense for source code to the core; text tools belong in the MCP crate.
+- It never runs commands. Execution belongs to a container or microVM pointed at the files.
 - Sources are read-only; every change goes to the workspace overlay. Never add a path that writes back to a source implicitly.

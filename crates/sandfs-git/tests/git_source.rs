@@ -57,9 +57,7 @@ fn mounts_a_commit_without_a_checkout() {
     #[cfg(unix)]
     {
         assert_eq!(ws.stat("/head/run.sh").unwrap().kind, Kind::File { executable: true });
-        assert_eq!(ws.stat("/head/link").unwrap().kind, Kind::Symlink);
-        assert_eq!(ws.read_link("/head/link").unwrap(), "README.md");
-        assert_eq!(ws.read_text("/head/link").unwrap(), "second\n");
+        assert!(!ws.exists("/head/link"), "symlinks are skipped");
     }
 
     ws.write("/head/src/lib.rs", "changed\n").unwrap();

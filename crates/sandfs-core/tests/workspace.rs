@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use sandfs_core::{
-    Change, ChangeKind, DirSource, Edit, Error, Kind, Listing, MemorySource, Source, SourceKey, VPath, Workspace,
+    Change, ChangeKind, DirSource, Error, Kind, Listing, MemorySource, Source, SourceKey, VPath, Workspace,
 };
 
 /// A source whose listing of one directory key always fails.
@@ -29,6 +29,28 @@ impl Source for Failing {
 
     fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
         self.inner.read_file(key)
+    }
+}
+
+/// A source that never reports sizes in its listings, like an API without metadata.
+#[derive(Debug)]
+struct Unsized(MemorySource);
+
+impl Source for Unsized {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        self.0.root()
+    }
+
+    fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+        let mut listing = self.0.read_dir(key)?;
+        for entry in listing.values_mut() {
+            entry.size = None;
+        }
+        Ok(listing)
+    }
+
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        self.0.read_file(key)
     }
 }
 
@@ -166,21 +188,6 @@ fn versioned_writes_detect_conflicts() {
 }
 
 #[test]
-fn edits_require_unique_matches_and_apply_atomically() {
-    let (mut ws, _) = workspace();
-    ws.write("/f.txt", "a b a\n").unwrap();
-
-    assert!(matches!(ws.edit("/f.txt", &[Edit::new("a", "x")]), Err(Error::EditFailed { .. })));
-    assert!(matches!(ws.edit("/f.txt", &[Edit::new("zzz", "x")]), Err(Error::EditFailed { .. })));
-    // The second edit fails, so the first is not applied either.
-    assert!(ws.edit("/f.txt", &[Edit::new("b", "B"), Edit::new("nope", "x")]).is_err());
-    assert_eq!(ws.read_text("/f.txt").unwrap(), "a b a\n");
-
-    ws.edit("/f.txt", &[Edit::new("b", "B"), Edit { old: "a".into(), new: "x".into(), replace_all: true }]).unwrap();
-    assert_eq!(ws.read_text("/f.txt").unwrap(), "x B x\n");
-}
-
-#[test]
 fn removing_hides_base_entries_and_recreating_starts_empty() {
     let (mut ws, _) = workspace();
     assert!(matches!(ws.remove("/repo/src", false), Err(Error::DirectoryNotEmpty(_))));
@@ -224,24 +231,6 @@ fn copies_and_renames_of_base_files_stay_lazy() {
     assert!(!ws.exists("/repo/docs"));
     assert!(matches!(ws.copy("/repo/src", "/repo/src/inner", true), Err(Error::Unsupported(..))));
     assert!(matches!(ws.rename("/repo/README.md", "/repo/manual"), Err(Error::AlreadyExists(_))));
-}
-
-#[test]
-fn symlinks_are_followed_for_reads_and_writes() {
-    let (mut ws, _) = workspace();
-    ws.symlink("/repo/link.md", "README.md").unwrap();
-    ws.symlink("/abs", "/repo/src/lib.rs").unwrap();
-    assert_eq!(ws.read_text("/repo/link.md").unwrap(), "hello\n");
-    assert_eq!(ws.read_link("/repo/link.md").unwrap(), "README.md");
-    assert_eq!(ws.stat("/repo/link.md").unwrap().kind, Kind::Symlink);
-
-    ws.write("/repo/link.md", "through").unwrap();
-    assert_eq!(ws.read_text("/repo/README.md").unwrap(), "through");
-    assert_eq!(ws.stat("/repo/link.md").unwrap().kind, Kind::Symlink);
-
-    ws.symlink("/loop", "/loop").unwrap();
-    assert!(matches!(ws.read("/loop"), Err(Error::Unsupported(..))));
-    assert_eq!(ws.read_text("/abs").unwrap(), "pub fn one() -> u32 { 1 }\n");
 }
 
 #[test]
@@ -327,16 +316,6 @@ fn versions_are_never_reused_after_a_delete() {
 }
 
 #[test]
-fn invalid_symlink_targets_are_rejected_not_rewritten() {
-    let mut source = MemorySource::from_files([("\u{fffd}", "wrong file")]).unwrap();
-    source.insert("link", Bytes::from_static(b"\xff"), Kind::Symlink).unwrap();
-    let mut ws = Workspace::new();
-    ws.mount("/m", Arc::new(source)).unwrap();
-    assert!(matches!(ws.read("/m/link"), Err(Error::NotText(_))));
-    assert!(matches!(ws.read_link("/m/link"), Err(Error::NotText(_))));
-}
-
-#[test]
 fn failed_copies_and_renames_change_nothing() {
     let source = Failing { inner: repo(), broken_dir: "src/util" };
     let mut ws = Workspace::new();
@@ -348,20 +327,6 @@ fn failed_copies_and_renames_change_nothing() {
     assert!(!ws.exists("/repo/moved"));
     assert!(ws.exists("/repo/src/lib.rs"));
     assert!(changes(&ws).is_empty());
-}
-
-#[test]
-fn symlink_creation_reports_source_errors() {
-    let mut ws = Workspace::new();
-    ws.mount("/repo", Arc::new(Failing { inner: repo(), broken_dir: "" })).unwrap();
-    assert!(matches!(ws.symlink("/repo/link", "README.md"), Err(Error::Source(_))));
-}
-
-#[test]
-fn list_follows_a_final_directory_symlink() {
-    let (mut ws, _) = workspace();
-    ws.symlink("/alias", "/repo/src").unwrap();
-    assert_eq!(names(&ws, "/alias"), ["lib.rs", "util"]);
 }
 
 #[test]
@@ -403,17 +368,45 @@ fn dir_source_refuses_reads_through_a_swapped_in_symlink() {
 }
 
 #[test]
-fn versioned_edits_check_the_symlink_target() {
-    let (mut ws, _) = workspace();
-    ws.symlink("/alias", "/repo/README.md").unwrap();
-    let target = ws.write("/repo/README.md", "hello world").unwrap();
-    let link = ws.stat("/alias").unwrap().version;
-    assert_ne!(link, target);
+fn stat_finds_sizes_a_source_did_not_report() {
+    let mut ws = Workspace::new();
+    ws.mount("/api", Arc::new(Unsized(repo()))).unwrap();
+    assert_eq!(ws.list("/api").unwrap()[0].size, None);
+    assert_eq!(ws.stat("/api/README.md").unwrap().size, 6);
+    assert_eq!(ws.stat("/api/src").unwrap().size, 0);
+}
 
-    let stale = ws.edit_versioned("/alias", &[Edit::new("hello", "hi")], link);
-    assert!(
-        matches!(stale, Err(Error::VersionMismatch { expected, actual, .. }) if expected == link && actual == target)
-    );
-    ws.edit_versioned("/alias", &[Edit::new("hello", "hi")], target).unwrap();
-    assert_eq!(ws.read_text("/repo/README.md").unwrap(), "hi world");
+#[test]
+fn binary_files_round_trip_untouched() {
+    let (mut ws, _) = workspace();
+    let png = Bytes::from_static(b"\x89PNG\r\n\x1a\n\x00\xff");
+    ws.write("/out/chart.png", png.clone()).unwrap();
+    assert_eq!(ws.read("/out/chart.png").unwrap(), png);
+    assert!(matches!(ws.read_text("/out/chart.png"), Err(Error::NotText(_))));
+    assert_eq!(changes(&ws), [("/out/chart.png".into(), ChangeKind::Added)]);
+}
+
+#[test]
+fn executable_bits_survive_copies() {
+    let mut source = MemorySource::default();
+    source.insert("bin/run", Bytes::from_static(b"#!/bin/sh\n"), true).unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/m", Arc::new(source)).unwrap();
+    ws.copy("/m/bin/run", "/m/bin/run2", false).unwrap();
+    assert_eq!(ws.stat("/m/bin/run2").unwrap().kind, Kind::File { executable: true });
+}
+
+#[cfg(unix)]
+#[test]
+fn dir_source_skips_symlinks() {
+    let dir = std::env::temp_dir().join(format!("sandfs-links-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("data.csv"), "a,b\n").unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", dir.join("link")).unwrap();
+
+    let mut ws = Workspace::new();
+    ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
+    assert_eq!(names(&ws, "/host"), ["data.csv"]);
+    assert!(matches!(ws.read("/host/link"), Err(Error::NotFound(_))));
+    std::fs::remove_dir_all(&dir).unwrap();
 }
