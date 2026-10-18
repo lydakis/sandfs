@@ -8,10 +8,10 @@
 
 ## Build, Test, and Development Commands
 - `uv pip install -e .[dev]` – install sandfs in editable mode with dev extras inside the provided `.venv`.
-- `uv run pytest` – run the full suite (currently ~40 tests) and is required before every commit.
+- `uv run pytest` – run the full suite (currently ~110 tests) and is required before every commit.
 - `uv run pytest tests/test_shell.py -k host` – focus on a single module/pattern when doing TDD for regressions seen in Blue logs.
-- `uv run python -m sandfs.shell` currently does nothing; use inline examples (`python - <<'PY' …`) to experiment with the API.
-- `uv run ruff check .` – lint for PEP 8 compliance, import hygiene, and general best practices.
+- `uv run sandfs exec "ls /"` or `uv run sandfs shell --mount ./project:/workspace` – try commands from the CLI; inline examples (`python - <<'PY' …`) still work for API experiments.
+- `uv run ruff check .` and `uv run ruff format sandfs tests` – lint (PEP 8, imports, bugbear, pyupgrade) and format.
 - `uv run mypy sandfs` – run static type checks; keep hints up to date before committing.
 - `pre-commit install` – enables automatic Ruff and MyPy hooks before every commit.
 
@@ -31,5 +31,5 @@
 - Tag releases after meaningful fixes (`v0.x.y`) and let GitHub Actions publish via the trusted PyPI workflow; keep `pyproject.toml` version in sync with the tag.
 
 ## Agent & Host Integration Tips
-- Host fallback materializes under a temporary directory. Commands like `host -p /workspace …` or `bash -lc '…'` are the preferred way to use GNU utilities without re-implementing them.
+- Host commands are not sandboxed: they run as the host user, and exist only with `SandboxShell(..., host_commands=True)` (or `host_fallback=True`). Host fallback materializes only what the shell's view may read under a temporary directory. Commands like `host -p /workspace …` or `bash -lc '…'` are the preferred way to use GNU utilities without re-implementing them.
 - Always ensure writes stay inside the sandbox hierarchy (`/blue`, `/workspace`). If you need host IO beyond that scope, add explicit adapters/policies rather than bypassing the VFS.

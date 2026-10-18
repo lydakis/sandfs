@@ -61,7 +61,14 @@ class SandboxShell:
         allowed_commands: Iterable[str] | None = None,
         max_output_bytes: int | None = None,
         host_fallback: bool = False,
+        host_commands: bool = False,
     ) -> None:
+        """Create a shell over ``vfs``.
+
+        ``host_commands`` registers ``host``, ``bash`` and ``sh``, which run real host
+        processes. ``host_fallback`` sends unknown commands to the host and implies
+        ``host_commands``. Both are off by default so a plain shell never leaves the VFS.
+        """
         self.vfs = vfs
         self.env: dict[str, str] = dict(env or {})
         self.commands: dict[str, CommandHandler] = {}
@@ -71,9 +78,35 @@ class SandboxShell:
         self.view = view or VisibilityView()
         self.allowed_commands: set[str] | None = set(allowed_commands) if allowed_commands else None
         self.max_output_bytes = max_output_bytes
-        self.host_fallback = host_fallback
+        self.host_commands = False
+        self._host_fallback = False
         self._handler_accepts_ctx: dict[str, bool] = {}
         self._register_builtin_commands()
+        if host_commands:
+            self._enable_host_commands()
+        self.host_fallback = host_fallback
+
+    @property
+    def host_fallback(self) -> bool:
+        """Whether unknown commands run on the host; enabling it also enables host commands."""
+        return self._host_fallback
+
+    @host_fallback.setter
+    def host_fallback(self, value: bool) -> None:
+        self._host_fallback = value
+        if value:
+            self._enable_host_commands()
+
+    def _enable_host_commands(self) -> None:
+        if self.host_commands:
+            return
+        self.host_commands = True
+        for name, handler, description in (
+            ("host", self._cmd_host, "Run host command in materialized tree"),
+            ("bash", self._cmd_shell_host, "Run bash via host"),
+            ("sh", self._cmd_shell_host, "Run sh via host"),
+        ):
+            self.register_command(name, handler, description=description)
 
     # ------------------------------------------------------------------
     # Command registration
@@ -103,13 +136,8 @@ class SandboxShell:
     def _ensure_visible_path(self, path: str) -> None:
         if self.view is None:
             return
-        if self.view.path_prefixes is not None:
-            normalized = self.vfs._normalize(path)
-            if not any(
-                normalized.is_relative_to(prefix) or prefix.is_relative_to(normalized)
-                for prefix in self.view.path_prefixes
-            ):
-                raise InvalidOperation(f"Path {path} is hidden for this view")
+        if not self.view.allows_path(self.vfs._normalize(path)):
+            raise InvalidOperation(f"Path {path} is hidden for this view")
         try:
             node = self.vfs.get_node(path)
         except NodeNotFound:
@@ -149,8 +177,12 @@ class SandboxShell:
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
+        skipped: list[PurePosixPath] = []
         try:
-            with self.vfs.materialize("/") as fs_root:
+            # Only what this shell's view may read is exported, and sync-back only touches
+            # those exported paths, so hidden or unreadable nodes never reach the host.
+            with self.vfs.materialize("/", view=self.view) as fs_root:
+                exported = self._host_tree_paths(fs_root)
                 host_cwd = self._sandbox_to_host_path(fs_root, sandbox_cwd)
                 mapped = self._map_command_tokens(command_tokens, fs_root)
                 completed = subprocess.run(
@@ -162,18 +194,27 @@ class SandboxShell:
                     check=False,
                     env=merged_env,
                 )
-                self._sync_from_host(fs_root)
+                skipped = self._sync_from_host(fs_root, exported)
         except SandboxError as exc:
             return CommandResult(stderr=str(exc), exit_code=1)
         except FileNotFoundError as exc:
             return CommandResult(stderr=str(exc), exit_code=127)
         except OSError as exc:
             return CommandResult(stderr=str(exc), exit_code=getattr(exc, "errno", 1))
+        stderr = completed.stderr
+        for skipped_path in skipped:
+            stderr += f"sandfs: did not sync {skipped_path}: path is hidden or unreadable\n"
         return CommandResult(
             stdout=completed.stdout,
-            stderr=completed.stderr,
+            stderr=stderr,
             exit_code=completed.returncode,
         )
+
+    def _host_tree_paths(self, fs_root: Path) -> set[PurePosixPath]:
+        paths = {PurePosixPath("/")}
+        for path in fs_root.rglob("*"):
+            paths.add(PurePosixPath("/").joinpath(*path.relative_to(fs_root).parts))
+        return paths
 
     def _sandbox_to_host_path(self, fs_root: Path, sandbox_path: PurePosixPath) -> Path:
         if not sandbox_path.is_absolute():
@@ -200,7 +241,9 @@ class SandboxShell:
                 rendered = f"{rendered}/"
             return rendered
 
-        return re.sub(r"/[A-Za-z0-9._/\-]+", replacer, token)
+        # Only rewrite paths that start a token or follow a separator such as "=" or ":";
+        # a slash inside a relative path ("./src/app.py", "../a/b") must stay as written.
+        return re.sub(r"(?<![A-Za-z0-9._~/\-])/[A-Za-z0-9._/\-]+", replacer, token)
 
     def _eligible_sandbox_path(self, path_str: str) -> PurePosixPath | None:
         try:
@@ -216,11 +259,24 @@ class SandboxShell:
             return normalized
         return None
 
-    def _sync_from_host(self, fs_root: Path) -> None:
+    def _sync_from_host(
+        self,
+        fs_root: Path,
+        exported: set[PurePosixPath],
+    ) -> list[PurePosixPath]:
+        """Apply host-side changes to the VFS; return paths skipped because they are hidden."""
         host_dirs: set[PurePosixPath] = set()
         host_files: set[PurePosixPath] = set()
+        skipped: list[PurePosixPath] = []
         for path in sorted(fs_root.rglob("*")):
             sandbox_path = PurePosixPath("/").joinpath(*path.relative_to(fs_root).parts)
+            if any(parent in skipped for parent in sandbox_path.parents):
+                continue
+            if sandbox_path not in exported and self.vfs.exists(sandbox_path):
+                # The host created a path that shadows a node it was never shown;
+                # everything beneath it is skipped too.
+                skipped.append(sandbox_path)
+                continue
             if path.is_dir():
                 host_dirs.add(sandbox_path)
                 if sandbox_path != PurePosixPath("/"):
@@ -243,17 +299,23 @@ class SandboxShell:
                         should_write = False
             if should_write:
                 self.vfs.write_file(sandbox_path, text)
-        self._remove_missing(host_dirs, host_files)
+        self._remove_missing(host_dirs, host_files, exported)
+        return skipped
 
     def _remove_missing(
         self,
         host_dirs: set[PurePosixPath],
         host_files: set[PurePosixPath],
+        exported: set[PurePosixPath],
     ) -> None:
         existing_dirs: list[PurePosixPath] = []
         existing_files: list[PurePosixPath] = []
+        unexported: list[PurePosixPath] = []
         for path, node in self.vfs.walk("/"):
             sandbox_path = PurePosixPath(path)
+            if sandbox_path not in exported:
+                unexported.append(sandbox_path)
+                continue
             if isinstance(node, VirtualDirectory):
                 existing_dirs.append(sandbox_path)
             elif isinstance(node, VirtualFile):
@@ -264,8 +326,12 @@ class SandboxShell:
         for dir_path in sorted(existing_dirs, key=lambda p: len(p.parts), reverse=True):
             if dir_path == PurePosixPath("/"):
                 continue
-            if dir_path not in host_dirs and str(dir_path) != "/":
-                self.vfs.remove(str(dir_path), recursive=True)
+            if dir_path in host_dirs:
+                continue
+            # Keep a directory that still holds nodes the host was never shown.
+            if any(dir_path in hidden.parents for hidden in unexported):
+                continue
+            self.vfs.remove(str(dir_path), recursive=True)
 
     # ------------------------------------------------------------------
     # Dispatcher
@@ -344,13 +410,14 @@ class SandboxShell:
 
     def _run_command(self, name: str, args: list[str], ctx: CommandContext) -> CommandResult:
         self.last_command_name = name
+        # The allowlist is checked first so host fallback cannot run commands it excludes.
+        if self.allowed_commands is not None and name not in self.allowed_commands:
+            return CommandResult(stderr=f"Command '{name}' is disabled in this shell", exit_code=1)
         handler = self.commands.get(name)
         if handler is None:
             if self.host_fallback:
                 return self._run_host_process([name, *args], None, stdin=ctx.stdin, env=ctx.env)
             return CommandResult(stderr=f"Unknown command: {name}", exit_code=127)
-        if self.allowed_commands is not None and name not in self.allowed_commands:
-            return CommandResult(stderr=f"Command '{name}' is disabled in this shell", exit_code=1)
         try:
             if self._handler_accepts_ctx.get(name):
                 result = handler(args, ctx)
@@ -425,12 +492,12 @@ class SandboxShell:
         else:
             self.vfs.write_file(path, content)
 
-    def _resolve_search_nav(self, parsed: "ParsedSearchPath") -> str:
+    def _resolve_search_nav(self, parsed: ParsedSearchPath) -> str:
         if parsed.nav is None:
             return str(parsed.base)
         return str(parsed.base.joinpath(parsed.nav))
 
-    def _parse_search_path(self, path: str) -> "ParsedSearchPath | None":
+    def _parse_search_path(self, path: str) -> ParsedSearchPath | None:
         prefix = self.vfs._search_view_prefix
         if prefix is None or "?" not in path:
             return None
@@ -514,9 +581,6 @@ class SandboxShell:
             ("search", self._cmd_search, "Search files (rg-like)"),
             ("python", self._cmd_python, "Execute Python snippet"),
             ("python3", self._cmd_python, "Execute Python snippet"),
-            ("host", self._cmd_host, "Run host command in materialized tree"),
-            ("bash", self._cmd_shell_host, "Run bash via host"),
-            ("sh", self._cmd_shell_host, "Run sh via host"),
             ("help", self._cmd_help, "Show available commands"),
             ("stat", self._cmd_stat, "Display file status"),
             ("head", self._cmd_head, "Output the first part of files"),
@@ -785,9 +849,7 @@ class SandboxShell:
         outputs: list[str] = []
         if not paths:
             content = ctx.stdin if ctx else ""
-            outputs.append(
-                format_counts(len(content.splitlines()), len(content.encode("utf-8")))
-            )
+            outputs.append(format_counts(len(content.splitlines()), len(content.encode("utf-8"))))
             return CommandResult(stdout="\n".join(outputs))
 
         for path in paths:
@@ -932,7 +994,7 @@ class SandboxShell:
                     results.append(f"{match.path}:{match.line_no}:{match.line_text}")
                 else:
                     results.append(f"{match.path}:{match.line_text}")
-        return CommandResult(stdout="\\n".join(results))
+        return CommandResult(stdout="\n".join(results))
 
     def _search(
         self,
@@ -1059,7 +1121,8 @@ class SandboxShell:
                 lines.append(f"  {name} - {desc}")
             else:
                 lines.append(f"  {name}")
-        lines.append("Use host <cmd> for full GNU tools.")
+        if self.host_commands:
+            lines.append("Use host <cmd> for full GNU tools.")
         return CommandResult(stdout="\n".join(lines))
 
     def _cmd_stat(self, args: list[str], ctx: CommandContext | None = None) -> CommandResult:

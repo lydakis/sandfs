@@ -5,7 +5,7 @@ def setup_shell() -> SandboxShell:
     vfs = VirtualFileSystem()
     vfs.write_file("/workspace/app.py", "print('hi')\n")
     vfs.write_file("/workspace/README.md", "hello world\n")
-    return SandboxShell(vfs)
+    return SandboxShell(vfs, host_commands=True)
 
 
 def test_ls_and_cd():
@@ -323,3 +323,73 @@ def test_cp_copies_directory_with_recursive_flag():
     assert result.exit_code == 0
     assert shell.vfs.read_file("/workspace/archive/inbox/note.txt") == "hi"
     assert shell.vfs.exists("/blue/inbox/note.txt")
+
+
+def test_allowed_commands_apply_to_host_fallback():
+    vfs = VirtualFileSystem()
+    shell = SandboxShell(vfs, allowed_commands={"ls"}, host_fallback=True)
+
+    result = shell.exec("uname -s")
+
+    assert result.exit_code == 1
+    assert "disabled" in result.stderr
+    assert result.stdout == ""
+
+
+def test_host_relative_path_tokens_are_not_rewritten():
+    shell = setup_shell()
+
+    result = shell.exec("host -p / cat ./workspace/README.md")
+
+    assert result.exit_code == 0
+    assert result.stdout == "hello world\n"
+
+
+def test_host_option_paths_are_rewritten():
+    shell = setup_shell()
+
+    result = shell.exec("host -p / grep --file=/workspace/README.md /workspace/README.md")
+
+    assert result.exit_code == 0
+    assert "hello world" in result.stdout
+
+
+def test_search_command_separates_results_with_newlines():
+    shell = setup_shell()
+    shell.exec("write /workspace/notes.txt hello again")
+
+    result = shell.exec("search hello /workspace")
+
+    assert result.stdout.splitlines() == [
+        "/workspace/README.md:1:hello world",
+        "/workspace/notes.txt:1:hello again",
+    ]
+
+
+def test_host_commands_are_off_by_default():
+    shell = SandboxShell(VirtualFileSystem())
+
+    for command in ("bash -c 'echo hi'", "sh -c 'echo hi'", "host echo hi"):
+        result = shell.exec(command)
+        assert result.exit_code == 127
+        assert result.stdout == ""
+    assert "host" not in shell.exec("help").stdout
+
+
+def test_host_fallback_implies_host_commands():
+    shell = SandboxShell(VirtualFileSystem(), host_fallback=True)
+
+    result = shell.exec("bash -c 'printf hi'")
+
+    assert result.exit_code == 0
+    assert result.stdout == "hi"
+
+
+def test_enabling_host_fallback_later_registers_host_commands():
+    shell = SandboxShell(VirtualFileSystem())
+    assert "host" not in shell.available_commands()
+
+    shell.host_fallback = True
+
+    assert {"host", "bash", "sh"} <= set(shell.available_commands())
+    assert shell.exec("host echo hi").stdout.strip() == "hi"

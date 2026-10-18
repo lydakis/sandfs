@@ -107,7 +107,13 @@ class VirtualFileSystem:
             current = current.get_child(part, self)
         return current
 
-    def _resolve_dir(self, path: str | PurePosixPath, *, create: bool = False) -> VirtualDirectory:
+    def _resolve_dir(
+        self,
+        path: str | PurePosixPath,
+        *,
+        create: bool = False,
+        enforce_policy: bool = False,
+    ) -> VirtualDirectory:
         target = self._normalize(path)
         if target == PurePosixPath("/"):
             return self.root
@@ -120,6 +126,8 @@ class VirtualFileSystem:
             except NodeNotFound:
                 if not create:
                     raise
+                if enforce_policy:
+                    self._ensure_write_allowed(current)
                 next_node = VirtualDirectory(name=part, parent=current)
                 current.add_child(next_node)
             if not isinstance(next_node, VirtualDirectory):
@@ -127,12 +135,28 @@ class VirtualFileSystem:
             current = next_node
         return current
 
-    def _ensure_file(self, path: str | PurePosixPath, *, create: bool = False) -> VirtualFile:
+    def _ensure_file(
+        self,
+        path: str | PurePosixPath,
+        *,
+        create: bool = False,
+        enforce_policy: bool = False,
+    ) -> VirtualFile:
+        """Resolve a file, optionally creating it and any missing parent directories.
+
+        Internal callers that rebuild trees (restore, storage loads) leave
+        ``enforce_policy`` off; user-facing writes turn it on so a read-only directory
+        cannot gain new children.
+        """
         target = self._normalize(path)
         parent_path = target.parent
         if parent_path == target:
             raise InvalidOperation("Cannot create file at root path")
-        parent = self._resolve_dir(parent_path or PurePosixPath("/"), create=create)
+        parent = self._resolve_dir(
+            parent_path or PurePosixPath("/"),
+            create=create,
+            enforce_policy=enforce_policy,
+        )
         name = target.name
         if not name:
             raise InvalidOperation("Missing file name")
@@ -141,6 +165,8 @@ class VirtualFileSystem:
         except NodeNotFound:
             if not create:
                 raise
+            if enforce_policy:
+                self._ensure_write_allowed(parent)
             node = VirtualFile(name=name, parent=parent)
             parent.add_child(node)
             return node
@@ -163,22 +189,21 @@ class VirtualFileSystem:
             return
         if node.version != expected_version:
             raise InvalidOperation(
-                (
-                    f"Version mismatch for {node.path()}: "
-                    f"expected {expected_version}, current {node.version}"
-                )
+                f"Version mismatch for {node.path()}: "
+                f"expected {expected_version}, current {node.version}"
             )
 
     def _emit_write_event(self, node: VirtualFile, *, append: bool, event_type: str) -> None:
+        if not self._write_hooks and not self._path_hooks:
+            return
+        path = node.path()
+        content = node.read(self)
         if self._write_hooks:
-            path = node.path()
-            content = node.read(self)
             event = WriteEvent(path=str(path), content=content, version=node.version, append=append)
             for prefix, hook in self._write_hooks:
                 if self._path_matches_prefix(path, prefix):
                     hook(event)
-
-        self._emit_path_event(node.path(), event_type, node.read(self))
+        self._emit_path_event(path, event_type, content)
 
     def _emit_path_event(self, path: PurePosixPath, event_type: str, content: str | None) -> None:
         if not self._path_hooks:
@@ -233,13 +258,62 @@ class VirtualFileSystem:
             node.version = previous_version
             raise InvalidOperation(f"Storage conflict for {node.path()}") from exc
 
-    def _delete_storage_entry(self, node: VirtualFile) -> None:
+    def _delete_storage_entry(self, path: PurePosixPath) -> None:
+        mount = self._find_storage_mount(path)
+        if not mount:
+            return
+        prefix, adapter = mount
+        relative = self._relative_storage_path(path, prefix)
+        adapter.delete(relative)
+
+    def _persist_placed_file(self, node: VirtualFile) -> None:
+        """Persist a file that a copy or move placed at a new path.
+
+        Copies and moves overwrite on purpose, so the adapter's current version is used
+        instead of the node's, and the node adopts the version the adapter returns.
+        """
         mount = self._find_storage_mount(node.path())
         if not mount:
             return
         prefix, adapter = mount
         relative = self._relative_storage_path(node.path(), prefix)
-        adapter.delete(relative)
+        try:
+            current = adapter.read(relative).version
+        except FileNotFoundError:
+            current = 0
+        try:
+            entry = adapter.write(relative, node.read(self), version=current)
+        except ValueError as exc:
+            raise InvalidOperation(f"Storage conflict for {node.path()}") from exc
+        node.version = entry.version
+
+    def _ensure_storable(self, node: VirtualNode, dest: PurePosixPath) -> None:
+        """Refuse to place nodes with policies under a storage mount.
+
+        Adapters store content only, so a private file or directory would come back
+        public after a reload; failing is better than silently dropping the policy.
+        """
+        if self._find_storage_mount(dest) is None:
+            return
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            if current.policy != NodePolicy():
+                raise InvalidOperation(
+                    f"Cannot store {current.path()} under {dest}: storage does not keep policies"
+                )
+            if isinstance(current, VirtualDirectory):
+                pending.extend(current.children.values())
+
+    def _loaded_files(self, node: VirtualNode) -> list[VirtualFile]:
+        """Files already materialized under ``node``, without hydrating lazy directories."""
+        if isinstance(node, VirtualFile):
+            return [node]
+        files: list[VirtualFile] = []
+        if isinstance(node, VirtualDirectory):
+            for child in node.children.values():
+                files.extend(self._loaded_files(child))
+        return files
 
     def _load_storage_mount(self, prefix: PurePosixPath, adapter: StorageAdapter) -> None:
         directory = self._resolve_dir(prefix)
@@ -337,9 +411,7 @@ class VirtualFileSystem:
                     children = {}
                     node.children = children
                 cursor = children
-            content_lines = [
-                f"{path}:{match.line_no}:{match.line_text}" for match in matches
-            ]
+            content_lines = [f"{path}:{match.line_no}:{match.line_text}" for match in matches]
             cursor[parts[-1]] = ProvidedNode.file(content="\n".join(content_lines))
         return root
 
@@ -442,9 +514,7 @@ class VirtualFileSystem:
                     if query.query in line:
                         matched = True
                 if matched:
-                    file_results.append(
-                        SearchResult(path=path, line_no=idx, line_text=line)
-                    )
+                    file_results.append(SearchResult(path=path, line_no=idx, line_text=line))
         return file_results
 
     def glob(
@@ -460,9 +530,7 @@ class VirtualFileSystem:
         if "/" not in pattern and not pattern.startswith("/"):
             entries = self.ls(cwd_path, view=view)
             return [
-                str(entry.path)
-                for entry in entries
-                if fnmatch.fnmatchcase(entry.name, pattern)
+                str(entry.path) for entry in entries if fnmatch.fnmatchcase(entry.name, pattern)
             ]
 
         if pattern.startswith("/"):
@@ -485,17 +553,32 @@ class VirtualFileSystem:
         parents: bool = False,
         exist_ok: bool = False,
     ) -> VirtualDirectory:
+        return self._mkdir(path, parents=parents, exist_ok=exist_ok, enforce_policy=True)
+
+    def _mkdir(
+        self,
+        path: str | PurePosixPath,
+        *,
+        parents: bool,
+        exist_ok: bool,
+        enforce_policy: bool,
+    ) -> VirtualDirectory:
         normalized = self._normalize(path)
         if normalized == PurePosixPath("/"):
             return self.root
-        parent = self._resolve_dir(normalized.parent or PurePosixPath("/"), create=parents)
-        self._ensure_write_allowed(parent)
+        parent = self._resolve_dir(
+            normalized.parent or PurePosixPath("/"),
+            create=parents,
+            enforce_policy=enforce_policy,
+        )
         name = normalized.name
         if not name:
             raise InvalidOperation("Directory name missing")
         try:
             existing = parent.get_child(name, self)
         except NodeNotFound:
+            if enforce_policy:
+                self._ensure_write_allowed(parent)
             node = VirtualDirectory(name=name, parent=parent)
             parent.add_child(node)
             return node
@@ -513,18 +596,37 @@ class VirtualFileSystem:
         append: bool = False,
         expected_version: int | None = None,
     ) -> VirtualFile:
-        node = self._ensure_file(path, create=True)
-        self._ensure_write_allowed(node, append=append)
-        self._check_version(node, expected_version)
+        existed = self.exists(path)
+        node = self._ensure_file(path, create=True, enforce_policy=True)
+        try:
+            self._ensure_write_allowed(node, append=append)
+            self._check_version(node, expected_version)
+        except InvalidOperation:
+            if not existed:
+                self._discard_new_file(node)
+            raise
         previous_version = node.version
+        previous_state = node.content_state()
         node.write(data, append=append)
         node.version += 1
+        try:
+            self._persist_storage(node, previous_version)
+        except InvalidOperation:
+            # Keep the VFS consistent with storage: the rejected write never happened.
+            node.restore_content_state(previous_state)
+            node.version = previous_version
+            if not existed:
+                self._discard_new_file(node)
+            raise
         node.modified_at = time.time()
-        self._persist_storage(node, previous_version)
         self._index_file(node)
         event_type = "create" if previous_version == 0 else "update"
         self._emit_write_event(node, append=append, event_type=event_type)
         return node
+
+    def _discard_new_file(self, node: VirtualFile) -> None:
+        if node.parent is not None and node.name in node.parent.children:
+            node.parent.remove_child(node.name)
 
     def append_file(
         self,
@@ -541,7 +643,7 @@ class VirtualFileSystem:
         return node.read(self)
 
     def touch(self, path: str | PurePosixPath) -> VirtualFile:
-        node = self._ensure_file(path, create=True)
+        node = self._ensure_file(path, create=True, enforce_policy=True)
         self._ensure_write_allowed(node, append=True)
         node.modified_at = time.time()
         return node
@@ -569,7 +671,7 @@ class VirtualFileSystem:
                 self.remove(child_node.path(), recursive=True)
         parent.remove_child(node.name)
         if isinstance(node, VirtualFile):
-            self._delete_storage_entry(node)
+            self._delete_storage_entry(node.path())
             self._remove_index_entry(node.path())
             self._emit_path_event(node.path(), "delete", None)
 
@@ -622,9 +724,27 @@ class VirtualFileSystem:
         if dest_parent is node:
             raise InvalidOperation("Cannot move a node into itself")
 
+        # Storage mounts are registered by path; moving one would orphan its adapter.
+        if any(mount == node_path or node_path in mount.parents for mount in self._storage_mounts):
+            raise InvalidOperation(f"Cannot move {node_path}: it is or contains a storage mount")
+
+        if self._find_storage_mount(dest_parent.path().joinpath(dest_name)) is not None:
+            # Storage only receives loaded files, so hydrate lazy directories first.
+            for _ in self.walk(node_path):
+                pass
+        moved_files = [(file_node.path(), file_node) for file_node in self._loaded_files(node)]
+        self._ensure_storable(node, dest_parent.path().joinpath(dest_name))
         parent.remove_child(node.name)
         node.name = dest_name
         dest_parent.add_child(node)
+        # A move is a delete at the old paths plus a create at the new ones, for storage
+        # adapters and hooks alike.
+        for old_path, _ in moved_files:
+            self._delete_storage_entry(old_path)
+            self._emit_path_event(old_path, "delete", None)
+        for _, file_node in moved_files:
+            self._persist_placed_file(file_node)
+            self._emit_write_event(file_node, append=False, event_type="create")
         if isinstance(node, VirtualFile):
             self._remove_index_entry(original_path)
             self._index_file(node)
@@ -648,6 +768,7 @@ class VirtualFileSystem:
         dest_parent: VirtualDirectory
         dest_name: str
 
+        replaced: VirtualNode | None = None
         try:
             dest_node = self._resolve_node(dest_path)
         except (NodeNotFound, InvalidOperation):
@@ -662,12 +783,12 @@ class VirtualFileSystem:
                 dest_parent = dest_node
                 dest_name = node.name
             else:
+                replaced = dest_node
                 parent_node = dest_node.parent
                 if parent_node is None:
                     raise InvalidOperation("Cannot overwrite root directory")
                 self._ensure_write_allowed(parent_node)
                 self._ensure_write_allowed(dest_node)
-                parent_node.remove_child(dest_node.name)
                 dest_name = dest_node.name
                 dest_parent = parent_node
 
@@ -682,7 +803,21 @@ class VirtualFileSystem:
 
         clone = self._clone_node(node, recursive=recursive)
         clone.name = dest_name
+        target_path = dest_parent.path().joinpath(dest_name)
+        self._ensure_storable(clone, target_path)
+        # Nothing has changed yet; detach the replaced file only once the copy is valid.
+        file_replaced = replaced is not None and isinstance(clone, VirtualFile)
+        if replaced is not None:
+            dest_parent.remove_child(replaced.name)
+            if not file_replaced:
+                # A directory takes the file's place, so the file is deleted.
+                self._delete_storage_entry(target_path)
+                self._emit_path_event(target_path, "delete", None)
         dest_parent.add_child(clone)
+        for file_node in self._loaded_files(clone):
+            self._persist_placed_file(file_node)
+            event_type = "update" if file_replaced else "create"
+            self._emit_write_event(file_node, append=False, event_type=event_type)
         if isinstance(clone, VirtualFile):
             self._index_file(clone)
         else:
@@ -796,7 +931,7 @@ class VirtualFileSystem:
                 target.modified_at = node_state.modified_at
                 continue
             if node_state.is_dir:
-                directory = self.mkdir(path, parents=True, exist_ok=True)
+                directory = self._mkdir(path, parents=True, exist_ok=True, enforce_policy=False)
                 directory.metadata = dict(node_state.metadata)
                 directory.policy = self._clone_policy(node_state.policy)
                 directory.version = node_state.version
@@ -818,30 +953,57 @@ class VirtualFileSystem:
         target: Path,
         *,
         source: str | PurePosixPath | None = None,
+        view: VisibilityView | None = None,
     ) -> Path:
+        """Write a subtree to ``target`` on the host disk.
+
+        Unreadable nodes are always skipped. When ``view`` is given, nodes it hides are
+        skipped too, so exporting never reveals more than the caller could ``cat``.
+        """
         node = self._resolve_dir(source or self.cwd.path())
         target = Path(target)
         target.mkdir(parents=True, exist_ok=True)
-        self._export_directory(node, target)
+        if self._export_allows(node, view):
+            self._export_directory(node, target, view)
         return target
 
     @contextlib.contextmanager
     def materialize(
         self,
         path: str | PurePosixPath | None = None,
+        *,
+        view: VisibilityView | None = None,
     ) -> Iterator[Path]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.export_to_path(root, source=path)
+            self.export_to_path(root, source=path, view=view)
             yield root
 
-    def _export_directory(self, node: VirtualDirectory, dest: Path) -> None:
+    def _export_allows(self, node: VirtualNode, view: VisibilityView | None) -> bool:
+        if not node.policy.readable:
+            return False
+        if view is None:
+            return True
+        if isinstance(node, VirtualDirectory):
+            # Directories are containers: metadata filters apply to the files inside them,
+            # matching how the shell resolves visible paths.
+            return view.allows(node.policy) and view.allows_path(node.path())
+        return view.allows_node(node)
+
+    def _export_directory(
+        self,
+        node: VirtualDirectory,
+        dest: Path,
+        view: VisibilityView | None = None,
+    ) -> None:
         node.ensure_loaded(self)
         dest.mkdir(parents=True, exist_ok=True)
         for child in node.iter_children(self):
+            if not self._export_allows(child, view):
+                continue
             target = dest / child.name
             if isinstance(child, VirtualDirectory):
-                self._export_directory(child, target)
+                self._export_directory(child, target, view)
             elif isinstance(child, VirtualFile):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(child.read(self))
@@ -893,7 +1055,7 @@ class VirtualFileSystem:
         *,
         metadata: dict[str, object] | None = None,
     ) -> VirtualDirectory:
-        node = self.mkdir(path, parents=True, exist_ok=True)
+        node = self._mkdir(path, parents=True, exist_ok=True, enforce_policy=False)
         node.loader = provider
         node._loaded = False  # allow reload
         if metadata:
@@ -908,7 +1070,7 @@ class VirtualFileSystem:
         policy: NodePolicy | None = None,
     ) -> VirtualDirectory:
         normalized = self._normalize(path)
-        directory = self.mkdir(normalized, parents=True, exist_ok=True)
+        directory = self._mkdir(normalized, parents=True, exist_ok=True, enforce_policy=False)
         if policy is not None:
             directory.policy = policy
         self._storage_mounts[normalized] = adapter

@@ -122,3 +122,185 @@ def test_filesystem_adapter_delete_removes_file(tmp_path):
     assert not (root / "a.txt").exists()
     with pytest.raises(FileNotFoundError):
         adapter.read("a.txt")
+
+
+def test_storage_conflict_rolls_back_content_and_version():
+    adapter = MemoryStorageAdapter(initial={"f.txt": "orig"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    adapter.write("f.txt", "external", version=0)
+
+    with pytest.raises(InvalidOperation):
+        vfs.write_file("/d/f.txt", "mine")
+
+    assert vfs.read_file("/d/f.txt") == "orig"
+    assert vfs.get_version("/d/f.txt") == 0
+
+
+def test_storage_conflict_on_new_file_removes_it():
+    class RejectingAdapter(MemoryStorageAdapter):
+        def write(self, path, content, *, version):
+            raise ValueError("version mismatch")
+
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", RejectingAdapter())
+
+    with pytest.raises(InvalidOperation):
+        vfs.write_file("/d/new.txt", "x")
+
+    assert not vfs.exists("/d/new.txt")
+
+
+def test_move_within_storage_mount_persists():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A", "dir/b.txt": "B"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+
+    vfs.move("/d/a.txt", "/d/renamed.txt")
+    vfs.move("/d/dir", "/d/moved")
+
+    assert sorted(adapter.list()) == ["moved/b.txt", "renamed.txt"]
+    assert adapter.read("renamed.txt").content == "A"
+
+
+def test_move_out_of_storage_mount_deletes_entry():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+
+    vfs.move("/d/a.txt", "/scratch.txt")
+
+    assert adapter.list() == {}
+    assert vfs.read_file("/scratch.txt") == "A"
+
+
+def test_copy_into_storage_mount_persists():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/outside/c.txt", "C")
+
+    vfs.copy("/d/a.txt", "/d/b.txt")
+    vfs.copy("/outside", "/d/imported", recursive=True)
+    vfs.copy("/outside/c.txt", "/d/a.txt")
+
+    entries = adapter.list()
+    assert sorted(entries) == ["a.txt", "b.txt", "imported/c.txt"]
+    assert entries["a.txt"].content == "C"
+    assert entries["b.txt"].content == "A"
+
+
+def test_copy_and_move_emit_path_events():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/src/a.txt", "A")
+    events = []
+    vfs.register_path_hook("/", events.append)
+
+    vfs.copy("/src/a.txt", "/src/b.txt")
+    vfs.move("/src/b.txt", "/src/c.txt")
+
+    assert [(e.path, e.event) for e in events] == [
+        ("/src/b.txt", "create"),
+        ("/src/b.txt", "delete"),
+        ("/src/c.txt", "create"),
+    ]
+
+
+def test_move_of_storage_mount_root_is_rejected():
+    adapter = MemoryStorageAdapter(initial={"a.txt": "A"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.mkdir("/outer")
+    vfs.mount_storage("/outer/inner", MemoryStorageAdapter(initial={"b.txt": "B"}))
+
+    with pytest.raises(InvalidOperation):
+        vfs.move("/d", "/renamed")
+    with pytest.raises(InvalidOperation):
+        vfs.move("/outer", "/elsewhere")
+
+    assert sorted(adapter.list()) == ["a.txt"]
+    assert vfs.read_file("/d/a.txt") == "A"
+
+
+def test_move_of_unloaded_provider_directory_into_storage_persists():
+    from sandfs.providers import ProvidedNode
+
+    adapter = MemoryStorageAdapter()
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.mount_directory("/lazy/pkg", lambda ctx: {"a.txt": ProvidedNode.file(content="A")})
+
+    vfs.move("/lazy/pkg", "/d/pkg")
+
+    assert adapter.read("pkg/a.txt").content == "A"
+
+
+def test_copy_of_directory_over_stored_file_replaces_entry():
+    adapter = MemoryStorageAdapter(initial={"target": "old"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/src/a.txt", "A")
+
+    vfs.copy("/src", "/d/target", recursive=True)
+
+    assert sorted(adapter.list()) == ["target/a.txt"]
+    vfs.sync_storage("/d")
+    assert vfs.read_file("/d/target/a.txt") == "A"
+
+
+def test_copy_into_storage_rejects_files_with_policies():
+    adapter = MemoryStorageAdapter()
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/src/public.txt", "ok")
+    vfs.write_file("/src/private.txt", "SECRET")
+    vfs.set_policy("/src/private.txt", NodePolicy(classification="private"))
+
+    with pytest.raises(InvalidOperation):
+        vfs.copy("/src", "/d/src", recursive=True)
+    with pytest.raises(InvalidOperation):
+        vfs.move("/src", "/d/src")
+
+    assert adapter.list() == {}
+    assert not vfs.exists("/d/src")
+    assert vfs.read_file("/src/private.txt") == "SECRET"
+
+
+def test_rejected_copy_keeps_the_destination_file():
+    adapter = MemoryStorageAdapter(initial={"target": "old"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/src/private.txt", "SECRET")
+    vfs.set_policy("/src/private.txt", NodePolicy(classification="private"))
+
+    with pytest.raises(InvalidOperation):
+        vfs.copy("/src", "/d/target", recursive=True)
+
+    assert vfs.read_file("/d/target") == "old"
+
+
+def test_storage_rejects_directories_with_policies():
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", MemoryStorageAdapter())
+    vfs.write_file("/src/hidden/a.txt", "A")
+    vfs.set_policy("/src/hidden", NodePolicy(classification="private"))
+
+    with pytest.raises(InvalidOperation):
+        vfs.copy("/src", "/d/src", recursive=True)
+    with pytest.raises(InvalidOperation):
+        vfs.move("/src", "/d/src")
+
+
+def test_directory_copied_over_file_emits_delete_then_create():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/src/a.txt", "A")
+    vfs.write_file("/target", "old")
+    events = []
+    vfs.register_path_hook("/", events.append)
+
+    vfs.copy("/src", "/target", recursive=True)
+
+    assert [(e.path, e.event) for e in events] == [
+        ("/target", "delete"),
+        ("/target/a.txt", "create"),
+    ]

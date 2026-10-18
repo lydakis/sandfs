@@ -72,16 +72,20 @@ class VisibilityView:
             return True
         return policy.classification in self.classifications
 
-    def allows_node(self, node: "VirtualNode") -> bool:
+    def allows_path(self, path: PurePosixPath) -> bool:
+        """Return True when ``path`` is inside, or an ancestor of, an allowed prefix."""
+        if self.path_prefixes is None:
+            return True
+        return any(
+            path.is_relative_to(prefix) or prefix.is_relative_to(path)
+            for prefix in self.path_prefixes
+        )
+
+    def allows_node(self, node: VirtualNode) -> bool:
         if not self.allows(node.policy):
             return False
-        if self.path_prefixes is not None:
-            node_path = node.path()
-            if not any(
-                node_path.is_relative_to(prefix) or prefix.is_relative_to(node_path)
-                for prefix in self.path_prefixes
-            ):
-                return False
+        if not self.allows_path(node.path()):
+            return False
         if self.metadata_filters is not None:
             for key, value in self.metadata_filters.items():
                 if node.metadata.get(key) != value:

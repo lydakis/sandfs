@@ -21,7 +21,7 @@ class VirtualNode:
     """Base node stored inside the sandbox."""
 
     name: str
-    parent: "VirtualDirectory" | None = None
+    parent: VirtualDirectory | None = None
     metadata: dict[str, object] = field(default_factory=dict)
     policy: NodePolicy = field(default_factory=NodePolicy)
     version: int = 0
@@ -38,7 +38,7 @@ class VirtualNode:
             node = node.parent
         return PurePosixPath("/" + "/".join(reversed(segments))) if segments else PurePosixPath("/")
 
-    def build_context(self, vfs: "VirtualFileSystem" | None = None) -> NodeContext:
+    def build_context(self, vfs: VirtualFileSystem | None = None) -> NodeContext:
         return NodeContext(path=self.path(), metadata=self.metadata, vfs=vfs)
 
 
@@ -49,7 +49,7 @@ class VirtualFile(VirtualNode):
         self,
         name: str,
         *,
-        parent: "VirtualDirectory" | None = None,
+        parent: VirtualDirectory | None = None,
         content: str | None = None,
         provider: ContentProvider | None = None,
         metadata: dict[str, object] | None = None,
@@ -58,7 +58,7 @@ class VirtualFile(VirtualNode):
         self._content = content or ""
         self._provider = provider
 
-    def read(self, vfs: "VirtualFileSystem" | None = None) -> str:
+    def read(self, vfs: VirtualFileSystem | None = None) -> str:
         if self._provider is None:
             return self._content
         ctx = self.build_context(vfs)
@@ -77,6 +77,13 @@ class VirtualFile(VirtualNode):
     def set_provider(self, provider: ContentProvider) -> None:
         self._provider = provider
 
+    def content_state(self) -> tuple[str, ContentProvider | None]:
+        """Opaque copy of the file's content source, for rolling back a failed write."""
+        return (self._content, self._provider)
+
+    def restore_content_state(self, state: tuple[str, ContentProvider | None]) -> None:
+        self._content, self._provider = state
+
 
 class VirtualDirectory(VirtualNode):
     """Directories store children lazily when a loader is present."""
@@ -85,7 +92,7 @@ class VirtualDirectory(VirtualNode):
         self,
         name: str,
         *,
-        parent: "VirtualDirectory" | None = None,
+        parent: VirtualDirectory | None = None,
         loader: DirectoryProvider | None = None,
         metadata: dict[str, object] | None = None,
     ) -> None:
@@ -94,7 +101,7 @@ class VirtualDirectory(VirtualNode):
         self._loaded = loader is None
         self.children: dict[str, VirtualNode] = {}
 
-    def ensure_loaded(self, vfs: "VirtualFileSystem" | None = None) -> None:
+    def ensure_loaded(self, vfs: VirtualFileSystem | None = None) -> None:
         if self._loaded:
             return
         if self.loader is None:
@@ -119,14 +126,14 @@ class VirtualDirectory(VirtualNode):
             raise NodeNotFound(f"Child {name} not found in {self.path()}")
         del self.children[name]
 
-    def get_child(self, name: str, vfs: "VirtualFileSystem" | None = None) -> VirtualNode:
+    def get_child(self, name: str, vfs: VirtualFileSystem | None = None) -> VirtualNode:
         self.ensure_loaded(vfs)
         try:
             return self.children[name]
         except KeyError as exc:
             raise NodeNotFound(f"Child {name} not found in {self.path()}") from exc
 
-    def iter_children(self, vfs: "VirtualFileSystem" | None = None) -> Iterator[VirtualNode]:
+    def iter_children(self, vfs: VirtualFileSystem | None = None) -> Iterator[VirtualNode]:
         self.ensure_loaded(vfs)
         return iter(self.children.values())
 
