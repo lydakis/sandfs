@@ -183,3 +183,36 @@ fn a_directory_source_is_never_written() {
     assert_eq!(std::fs::read_to_string(ws.join("out/summary.txt")).unwrap(), "2 rows\n", "saved before the crash");
     sandfs.unmount(&ws);
 }
+
+#[test]
+fn rereading_a_changed_file_never_returns_cached_bytes() {
+    if !fuse_available() {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("data.csv"), "one\n").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+
+    let file = ws.join("data.csv");
+    // Read twice so the second open may keep the kernel's cached pages, then change the
+    // file in ways that keep its size, which a stale cache would not notice.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+    std::fs::write(&file, "two\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "two\n");
+    std::fs::write(ws.join("other.csv"), "six\n").unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("other.csv")).unwrap(), "six\n");
+    std::fs::rename(ws.join("other.csv"), &file).unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "six\n");
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut handle = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        handle.seek(SeekFrom::Start(1)).unwrap();
+        handle.write_all(b"ea").unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "sea\n");
+    sandfs.unmount(&ws);
+}

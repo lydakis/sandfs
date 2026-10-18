@@ -26,8 +26,9 @@ use sandfs_core::{Error, Kind, VPath, Workspace};
 use crate::persist::{Saved, Snapshot};
 
 /// How long the kernel may cache attributes and names. Every change goes through this
-/// filesystem, so the kernel already sees its own updates; the TTL only bounds staleness.
-const TTL: Duration = Duration::from_secs(1);
+/// filesystem, so the kernel already sees its own updates and nothing goes stale;
+/// a short TTL would only make it ask again (a round trip per path, per second).
+const TTL: Duration = Duration::from_secs(60);
 const ROOT_INO: u64 = 1;
 /// Files live in memory, so refuse sizes that could only be a mistake.
 const MAX_FILE_SIZE: usize = 4 << 30;
@@ -91,6 +92,9 @@ pub struct Inner {
     open: HashMap<u64, u32>,
     /// File contents written but not yet flushed to the workspace.
     buffers: HashMap<u64, Vec<u8>>,
+    /// The file version each inode had when it was last opened. A file opened again
+    /// at the same version keeps the kernel's page cache instead of reading it again.
+    opened_versions: HashMap<u64, u64>,
     /// Modification times of touched paths; others report `base_time`.
     times: BTreeMap<String, SystemTime>,
     /// Directories created or removed here, which a save must record.
@@ -124,6 +128,7 @@ impl Inner {
             next_fh: 1,
             open: HashMap::new(),
             buffers: HashMap::new(),
+            opened_versions: HashMap::new(),
             times,
             dirs,
             base_time,
@@ -253,6 +258,7 @@ impl Inner {
                 }
             }
             self.buffers.remove(&ino);
+            self.opened_versions.remove(&ino);
         }
     }
 
@@ -494,21 +500,27 @@ impl Inner {
             Err(err) => return Err(errno(&err)),
         }
         let attr = self.entry(&path)?;
-        let fh = self.open(attr.ino.0, false)?;
+        let (fh, _) = self.open(attr.ino.0, false)?;
         Ok((attr, fh))
     }
 
-    pub fn open(&mut self, ino: u64, truncate: bool) -> FsResult<u64> {
+    /// Open a file. The flag says whether the kernel may keep the pages it cached
+    /// for this inode: only when the file's version is the one it had at the last
+    /// open, since every change in between gets a new version.
+    pub fn open(&mut self, ino: u64, truncate: bool) -> FsResult<(u64, bool)> {
         let path = self.path(ino)?;
         if truncate {
             self.buffers.insert(ino, Vec::new());
             self.touch(&path);
         }
+        let version = self.ws.stat(path.as_str()).fs()?.version;
+        let unchanged = self.opened_versions.insert(ino, version) == Some(version);
+        let keep_cache = unchanged && !self.buffers.contains_key(&ino);
         let fh = self.next_fh;
         self.next_fh += 1;
         self.handles.insert(fh, Handle::File { ino });
         *self.open.entry(ino).or_default() += 1;
-        Ok(fh)
+        Ok((fh, keep_cache))
     }
 
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> FsResult<Bytes> {
@@ -706,8 +718,13 @@ impl Shared {
         self.wake.notify_all();
     }
 
+    /// Wake the saver if the last request left something unsaved. Most requests
+    /// (a close after a read) change nothing, and waking a thread costs more than the
+    /// request itself.
     fn changed(&self) {
-        self.wake.notify_one();
+        if self.lock().unsaved {
+            self.wake.notify_one();
+        }
     }
 }
 
@@ -810,7 +827,14 @@ impl Filesystem for SandFs {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
         match self.0.lock().open(ino.0, writable && flags.0 & libc::O_TRUNC != 0) {
-            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Ok((fh, keep_cache)) => {
+                let mut reply_flags = FopenFlags::empty();
+                reply_flags.set(FopenFlags::FOPEN_KEEP_CACHE, keep_cache);
+                // A read-only handle has nothing to commit when it is closed, so the
+                // kernel can skip the flush round trip.
+                reply_flags.set(FopenFlags::FOPEN_NOFLUSH, !writable);
+                reply.opened(FileHandle(fh), reply_flags)
+            }
             Err(err) => reply.error(err),
         }
     }
@@ -987,7 +1011,7 @@ mod tests {
     fn writes_are_buffered_until_flush() {
         let mut fs = fs();
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
-        let fh = fs.open(ino, false).unwrap();
+        let (fh, _) = fs.open(ino, false).unwrap();
         fs.write(ino, 6, b"world\n").unwrap();
         assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\n", "not flushed yet");
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\nworld\n", "reads see the buffer");
@@ -998,10 +1022,31 @@ mod tests {
     }
 
     #[test]
+    fn the_kernel_keeps_its_cache_only_for_unchanged_files() {
+        let mut fs = fs();
+        let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let reopen = |fs: &mut Inner| {
+            let (fh, keep) = fs.open(ino, false).unwrap();
+            fs.release(fh).unwrap();
+            keep
+        };
+        assert!(!reopen(&mut fs), "nothing is cached on the first open");
+        assert!(reopen(&mut fs), "same version");
+        let (fh, _) = fs.open(ino, false).unwrap();
+        fs.write(ino, 0, b"HELLO\n").unwrap();
+        fs.release(fh).unwrap();
+        assert!(!reopen(&mut fs), "written since the last open");
+        assert!(reopen(&mut fs));
+        let (fh, keep) = fs.open(ino, true).unwrap();
+        assert!(!keep, "truncated");
+        fs.release(fh).unwrap();
+    }
+
+    #[test]
     fn syncing_the_directory_commits_open_files() {
         let mut fs = fs();
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
-        let fh = fs.open(ino, false).unwrap();
+        let (fh, _) = fs.open(ino, false).unwrap();
         fs.write(ino, 6, b"world\n").unwrap();
         fs.commit_all().unwrap();
         assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\nworld\n");
@@ -1058,7 +1103,7 @@ mod tests {
     fn removed_files_stay_readable_while_open() {
         let mut fs = fs();
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
-        let fh = fs.open(ino, false).unwrap();
+        let (fh, _) = fs.open(ino, false).unwrap();
         fs.unlink(ROOT_INO, name("README.md")).unwrap();
         assert_eq!(fs.lookup(ROOT_INO, name("README.md")).unwrap_err(), Errno::ENOENT);
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\n");
