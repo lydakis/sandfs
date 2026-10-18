@@ -1,0 +1,25 @@
+[package]
+name = "sandfs-py"
+description = "Python bindings for sandfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+# The extension is tested from Python; a Rust test binary would need libpython to link.
+test = false
+doctest = false
+
+[dependencies]
+bytes.workspace = true
+pyo3 = { version = "0.30", features = ["abi3-py311"] }
+sandfs-core.workspace = true
+sandfs-git.workspace = true
+
+[lints]
+workspace = true

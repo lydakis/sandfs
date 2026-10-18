@@ -306,16 +306,14 @@ impl Tools {
     fn changes(&self, args: &Args) -> ToolResult {
         let scope = VPath::parse(&args.opt_path("path")?).map_err(err)?;
         let mut lines = Vec::new();
-        for change in self.workspace.diff().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
+        for change in self.workspace.changes().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
             let path = change.path.as_str();
             lines.push(match change.kind {
                 ChangeKind::Deleted => format!("D {path}"),
                 kind => {
                     let mark = if kind == ChangeKind::Added { 'A' } else { 'M' };
-                    match self.workspace.stat(path).map_err(err)?.size {
-                        Some(size) => format!("{mark} {path} ({size} bytes)"),
-                        None => format!("{mark} {path}"),
-                    }
+                    let size = self.workspace.stat(path).map_err(err)?.size;
+                    format!("{mark} {path} ({size} bytes)")
                 }
             });
         }

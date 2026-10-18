@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sandfs-core", "crates/sandfs-git", "crates/sandfs-mcp"]
+members = ["crates/sandfs-core", "crates/sandfs-git", "crates/sandfs-mcp", "crates/sandfs-py"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ bytes = "1.12"
 imbl = "7.0"
 thiserror = "2.0"
 sandfs-core = { path = "crates/sandfs-core" }
+sandfs-git = { path = "crates/sandfs-git" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -14,13 +14,10 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use imbl::OrdMap;
 
-use crate::diff::{Change, ChangeKind};
+use crate::change::{Change, ChangeKind};
 use crate::error::{Error, Result};
 use crate::path::VPath;
 use crate::source::{Kind, Listing, Source, SourceEntry, SourceKey};
-
-/// Symlink hops followed before reads give up, as on Linux.
-const MAX_SYMLINK_HOPS: usize = 40;
 
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -111,29 +108,11 @@ pub struct DirEntry {
 pub struct Metadata {
     /// What the path is.
     pub kind: Kind,
-    /// Size in bytes, when known without reading the file.
-    pub size: Option<u64>,
+    /// Size in bytes; 0 for directories.
+    pub size: u64,
     /// Optimistic version: 0 for untouched base files. Every change gets a new
     /// version from a per-workspace clock, so versions are never reused.
     pub version: u64,
-}
-
-/// One exact-string replacement for [`Workspace::edit`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Edit {
-    /// Text to find. Must match exactly once unless `replace_all` is set.
-    pub old: String,
-    /// Replacement text.
-    pub new: String,
-    /// Replace every occurrence instead of requiring a unique match.
-    pub replace_all: bool,
-}
-
-impl Edit {
-    /// A replacement that must match exactly once.
-    pub fn new(old: impl Into<String>, new: impl Into<String>) -> Self {
-        Edit { old: old.into(), new: new.into(), replace_all: false }
-    }
 }
 
 /// A copy-on-write filesystem view: read-only mounts plus an overlay of changes.
@@ -149,7 +128,7 @@ pub struct Workspace {
 impl fmt::Debug for Workspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Workspace")
-            .field("mounts", &self.mounts.keys().collect::<Vec<_>>())
+            .field("mounts", &self.mounts.keys().map(VPath::as_str).collect::<Vec<_>>())
             .field("overlay_entries", &self.overlay.len())
             .finish()
     }
@@ -201,18 +180,25 @@ impl Workspace {
         VPath::parse(path).is_ok_and(|path| self.resolve(&path).is_ok())
     }
 
-    /// Metadata for a path, without following a final symlink.
+    /// Metadata for a path. When a source did not report a file's size, the file is
+    /// read once to find it, so the size is always exact.
     pub fn stat(&self, path: &str) -> Result<Metadata> {
         let path = VPath::parse(path)?;
         Ok(match self.resolve(&path)? {
-            Resolved::Dir { .. } => Metadata { kind: Kind::Dir, size: None, version: 0 },
-            Resolved::File { content, kind, version } => Metadata { kind, size: content_size(&content), version },
+            Resolved::Dir { .. } => Metadata { kind: Kind::Dir, size: 0, version: 0 },
+            Resolved::File { content, kind, version } => {
+                let size = match content_size(&content) {
+                    Some(size) => size,
+                    None => self.content_bytes(&content)?.len() as u64,
+                };
+                Metadata { kind, size, version }
+            }
         })
     }
 
-    /// Read a file's bytes, following symlinks inside the workspace.
+    /// Read a file's bytes.
     pub fn read(&self, path: &str) -> Result<Bytes> {
-        let path = self.follow(VPath::parse(path)?)?;
+        let path = VPath::parse(path)?;
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { content, .. } => self.content_bytes(&content),
@@ -225,21 +211,9 @@ impl Workspace {
         String::from_utf8(bytes.to_vec()).map_err(|_| Error::NotText(path.to_owned()))
     }
 
-    /// The target of a symlink.
-    pub fn read_link(&self, path: &str) -> Result<String> {
-        let path = VPath::parse(path)?;
-        match self.resolve(&path)? {
-            Resolved::File { content, kind: Kind::Symlink, .. } => {
-                let target = self.content_bytes(&content)?;
-                String::from_utf8(target.to_vec()).map_err(|_| Error::NotText(path.to_string()))
-            }
-            _ => Err(Error::Unsupported(path.to_string(), "not a symbolic link")),
-        }
-    }
-
-    /// The entries of a directory, sorted by name, following a final symlink.
+    /// The entries of a directory, sorted by name.
     pub fn list(&self, path: &str) -> Result<Vec<DirEntry>> {
-        let path = self.follow(VPath::parse(path)?)?;
+        let path = VPath::parse(path)?;
         let base = match self.resolve(&path)? {
             Resolved::Dir { base } => base,
             Resolved::File { .. } => return Err(Error::NotADirectory(path.to_string())),
@@ -293,8 +267,7 @@ impl Workspace {
     }
 
     fn write_checked(&mut self, path: &str, data: impl Into<Bytes>, expected: Option<u64>) -> Result<u64> {
-        // Writes go through symlinks to their target, as with open(2).
-        let path = self.follow(VPath::parse(path)?)?;
+        let path = VPath::parse(path)?;
         let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
         let (kind, version) = match self.resolve(&path) {
             Ok(Resolved::Dir { .. }) => return Err(Error::IsADirectory(path.to_string())),
@@ -312,47 +285,6 @@ impl Workspace {
         let version = self.tick();
         self.overlay.insert(path, Overlay::File { content, kind, version });
         Ok(version)
-    }
-
-    /// Apply exact-string edits to a text file atomically. Returns the new version.
-    ///
-    /// Each edit's `old` text must match exactly once (or `replace_all` must be set);
-    /// if any edit fails, nothing is written.
-    pub fn edit(&mut self, path: &str, edits: &[Edit]) -> Result<u64> {
-        let target = self.follow(VPath::parse(path)?)?;
-        let version = self.stat(target.as_str())?.version;
-        let mut text = self.read_text(target.as_str())?;
-        for edit in edits {
-            let fail = |reason: String| Error::EditFailed { path: path.to_owned(), reason };
-            if edit.old.is_empty() {
-                return Err(fail("old text is empty".to_owned()));
-            }
-            let count = text.matches(edit.old.as_str()).count();
-            match (count, edit.replace_all) {
-                (0, _) => return Err(fail(format!("text not found: {:?}", edit.old))),
-                (1, _) | (_, true) => text = text.replace(edit.old.as_str(), &edit.new),
-                (n, false) => {
-                    return Err(fail(format!("text matches {n} times; add context or set replace_all")));
-                }
-            }
-        }
-        self.write_versioned(target.as_str(), text, version)
-    }
-
-    /// Create a symlink at `path` pointing to `target`.
-    pub fn symlink(&mut self, path: &str, target: &str) -> Result<()> {
-        let path = VPath::parse(path)?;
-        match self.resolve(&path) {
-            Err(Error::NotFound(_)) => {}
-            Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
-            Err(err) => return Err(err),
-        }
-        let parent = path.parent().ok_or_else(|| Error::AlreadyExists(path.to_string()))?;
-        self.ensure_dir(&parent)?;
-        let content = Content::Bytes(Bytes::from(target.to_owned()));
-        let version = self.tick();
-        self.overlay.insert(path, Overlay::File { content, kind: Kind::Symlink, version });
-        Ok(())
     }
 
     /// Create a directory. With `parents`, missing ancestors are created and an
@@ -375,7 +307,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Remove a file, symlink or (with `recursive`) a directory tree.
+    /// Remove a file or (with `recursive`) a directory tree.
     pub fn remove(&mut self, path: &str, recursive: bool) -> Result<()> {
         let path = VPath::parse(path)?;
         self.check_removable(&path)?;
@@ -417,9 +349,9 @@ impl Workspace {
 
     /// Files added, modified or deleted relative to the mounts, sorted by path.
     ///
-    /// Directories are not reported (git does not track them). The cost is
+    /// Only files are reported; an empty directory is not a change. The cost is
     /// proportional to the overlay, plus listing any base directories that were deleted.
-    pub fn diff(&self) -> Result<Vec<Change>> {
+    pub fn changes(&self) -> Result<Vec<Change>> {
         let mut changes: BTreeMap<VPath, ChangeKind> = BTreeMap::new();
         // First every base file the overlay hides: below whiteouts, recreated
         // directories, and files written where a base directory used to be.
@@ -456,21 +388,6 @@ impl Workspace {
     // ------------------------------------------------------------------
     // Resolution
     // ------------------------------------------------------------------
-
-    /// Follow symlinks in the final component. Intermediate components are not
-    /// followed, so a path through a directory symlink is not found.
-    fn follow(&self, mut path: VPath) -> Result<VPath> {
-        for _ in 0..MAX_SYMLINK_HOPS {
-            match self.resolve(&path) {
-                Ok(Resolved::File { content, kind: Kind::Symlink, .. }) => {
-                    let target = self.content_bytes(&content)?;
-                    path = resolve_link(&path, &target)?;
-                }
-                _ => return Ok(path),
-            }
-        }
-        Err(Error::Unsupported(path.to_string(), "too many levels of symbolic links"))
-    }
 
     fn resolve(&self, path: &VPath) -> Result<Resolved> {
         let mut base_hidden = false;
@@ -752,14 +669,4 @@ fn content_size(content: &Content) -> Option<u64> {
         Content::Bytes(bytes) => Some(bytes.len() as u64),
         Content::Base { size, .. } => *size,
     }
-}
-
-fn resolve_link(link: &VPath, target: &[u8]) -> Result<VPath> {
-    // Decoding strictly: a lossy decode could turn an invalid target into a real name.
-    let target = std::str::from_utf8(target).map_err(|_| Error::NotText(link.to_string()))?;
-    if target.starts_with('/') {
-        return VPath::parse(target);
-    }
-    let parent = link.parent().unwrap_or_else(VPath::root);
-    VPath::parse(&format!("{}/{}", parent.as_str().trim_end_matches('/'), target))
 }

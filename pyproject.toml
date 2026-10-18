@@ -1,22 +1,23 @@
 [build-system]
-requires = ["hatchling>=1.20"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "sandfs"
-version = "0.3.0"
-description = "Composable virtual filesystem sandbox with a UNIX-like command surface for agents"
+version = "0.4.0.dev0"
+description = "A lazy, copy-on-write sandbox filesystem for agents: mount any data, fork in O(1), see what changed"
 requires-python = ">=3.11"
 authors = [
   { name = "sandfs contributors" }
 ]
 readme = "README.md"
 license = { text = "MIT" }
-keywords = ["virtual filesystem", "agents", "sandbox", "in-memory"]
+keywords = ["virtual filesystem", "sandbox", "agents", "copy-on-write", "workspace"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -41,14 +42,9 @@ Homepage = "https://github.com/lydakis/sandfs"
 Repository = "https://github.com/lydakis/sandfs"
 Issues = "https://github.com/lydakis/sandfs/issues"
 
-[project.scripts]
-sandfs = "sandfs.cli:main"
-
-[tool.hatch.build.targets.sdist]
-exclude = ["crates", "target", "Cargo.toml", "Cargo.lock", "rustfmt.toml"]
-
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.maturin]
+manifest-path = "crates/sandfs-py/Cargo.toml"
+module-name = "sandfs._core"
 
 [tool.ruff]
 target-version = "py311"
