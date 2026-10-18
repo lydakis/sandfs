@@ -33,11 +33,45 @@ impl fmt::Debug for Mount {
     }
 }
 
+/// A cache entry. Its own lock is held while the source loads it, so forks on other
+/// threads that want the same entry wait for that load instead of repeating it.
+type Slot<T> = Mutex<Option<T>>;
+
+/// A `(mount id, source key)` pair.
+type CacheKey = (u64, SourceKey);
+
 /// Listings and blobs fetched from sources; keys are immutable, so forks share it.
 #[derive(Default)]
 struct Cache {
-    dirs: Mutex<HashMap<(u64, SourceKey), Arc<Listing>>>,
-    blobs: Mutex<HashMap<(u64, SourceKey), Bytes>>,
+    dirs: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
+    blobs: Mutex<HashMap<CacheKey, Arc<Slot<Bytes>>>>,
+}
+
+impl Cache {
+    /// The cached value for `key`, loading it with `fetch` on a miss. Concurrent
+    /// misses on one key fetch once. A failed fetch caches nothing, so it is retried.
+    fn get_or_load<T: Clone>(
+        map: &Mutex<HashMap<CacheKey, Arc<Slot<T>>>>,
+        key: CacheKey,
+        fetch: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        // The map lock is held only to find the slot, so loads of different keys
+        // never wait for each other.
+        let slot = map.lock().expect("cache lock").entry(key).or_default().clone();
+        let mut value = slot.lock().expect("cache slot lock");
+        if let Some(value) = value.as_ref() {
+            return Ok(value.clone());
+        }
+        let fetched = fetch()?;
+        *value = Some(fetched.clone());
+        Ok(fetched)
+    }
+
+    /// The cached blob for `key`, if it is loaded and not being loaded right now.
+    fn peek_blob(&self, key: &CacheKey) -> Option<Bytes> {
+        let slot = self.blobs.lock().expect("cache lock").get(key)?.clone();
+        slot.try_lock().ok()?.clone()
+    }
 }
 
 /// File content: bytes written into the overlay, or a reference to a base file that
@@ -216,8 +250,7 @@ impl Workspace {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { content: Content::Bytes(bytes), .. } => Ok(slice(&bytes, offset, len)),
             Resolved::File { content: Content::Base { mount, key, .. }, .. } => {
-                let cached = self.cache.blobs.lock().expect("cache lock").get(&(mount.id, key.clone())).cloned();
-                match cached {
+                match self.cache.peek_blob(&(mount.id, key.clone())) {
                     Some(bytes) => Ok(slice(&bytes, offset, len)),
                     None => mount.source.read_range(&key, offset, len),
                 }
@@ -511,26 +544,14 @@ impl Workspace {
     }
 
     fn cached_listing(&self, mount: &Arc<Mount>, key: &SourceKey) -> Result<Arc<Listing>> {
-        let cache_key = (mount.id, key.clone());
-        if let Some(listing) = self.cache.dirs.lock().expect("cache lock").get(&cache_key) {
-            return Ok(listing.clone());
-        }
-        let listing = Arc::new(mount.source.read_dir(key)?);
-        self.cache.dirs.lock().expect("cache lock").insert(cache_key, listing.clone());
-        Ok(listing)
+        Cache::get_or_load(&self.cache.dirs, (mount.id, key.clone()), || Ok(Arc::new(mount.source.read_dir(key)?)))
     }
 
     fn content_bytes(&self, content: &Content) -> Result<Bytes> {
         match content {
             Content::Bytes(bytes) => Ok(bytes.clone()),
             Content::Base { mount, key, .. } => {
-                let cache_key = (mount.id, key.clone());
-                if let Some(bytes) = self.cache.blobs.lock().expect("cache lock").get(&cache_key) {
-                    return Ok(bytes.clone());
-                }
-                let bytes = mount.source.read_file(key)?;
-                self.cache.blobs.lock().expect("cache lock").insert(cache_key, bytes.clone());
-                Ok(bytes)
+                Cache::get_or_load(&self.cache.blobs, (mount.id, key.clone()), || mount.source.read_file(key))
             }
         }
     }
