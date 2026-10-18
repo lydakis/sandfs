@@ -200,13 +200,13 @@ impl Saved {
         for dir in &snap.dirs {
             let path = VPath::parse(dir)?;
             let rel = relative(root, &path)?;
-            if entries.contains_key(&rel) {
-                continue;
-            }
             let entry = match snap.ws.stat(dir) {
+                // A directory that replaced a deleted base file overrides its deletion.
                 Ok(meta) if meta.kind.is_dir() => Entry::Dir { mtime: snap.times.get(dir).map(|t| to_time(*t)) },
+                _ if entries.contains_key(&rel) => continue,
                 Ok(_) => self.entry(snap, &path, &rel, &mut kept)?,
-                Err(Error::NotFound(_)) => Entry::Absent,
+                // Gone, or below a file that replaced one of its parents.
+                Err(Error::NotFound(_) | Error::NotADirectory(_)) => Entry::Absent,
                 Err(err) => return Err(err.into()),
             };
             entries.insert(rel, entry);
@@ -429,6 +429,25 @@ mod tests {
         Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
         assert_eq!(loaded.read_text("/mnt/dir").unwrap(), "now a file");
         assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
+    }
+
+    #[test]
+    fn replacements_between_files_and_directories_are_saved() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        // dir/sub is tracked as removed, then dir itself becomes a file.
+        ws.remove("/mnt/dir", true).unwrap();
+        ws.write("/mnt/dir", "a file").unwrap();
+        // a.txt becomes an empty directory.
+        ws.remove("/mnt/a.txt", false).unwrap();
+        ws.mkdir("/mnt/a.txt", false).unwrap();
+        let dirs = ["/mnt/dir", "/mnt/dir/sub", "/mnt/a.txt"].map(str::to_owned).into();
+        Saved::new(state.path()).save(&Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs }, &root()).unwrap();
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/dir").unwrap(), "a file");
+        assert!(loaded.stat("/mnt/a.txt").unwrap().kind.is_dir(), "the directory that replaced a file is kept");
     }
 
     #[test]

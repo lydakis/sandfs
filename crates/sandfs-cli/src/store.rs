@@ -137,10 +137,15 @@ impl Home {
 
     /// Where `name` is mounted, if a live process is serving it.
     pub fn mount_info(&self, name: &str) -> Option<MountInfo> {
+        self.attached_mount(name).filter(|info| Path::new(&format!("/proc/{}", info.pid)).exists())
+    }
+
+    /// Where `name` was mounted, if that mount is still attached, even when the process
+    /// serving it has died and left it disconnected.
+    pub fn attached_mount(&self, name: &str) -> Option<MountInfo> {
         let data = std::fs::read(self.workspace_dir(name).join("mount.json")).ok()?;
         let info: MountInfo = serde_json::from_slice(&data).ok()?;
-        let alive = Path::new(&format!("/proc/{}", info.pid)).exists();
-        (alive && is_mounted(&info.mountpoint)).then_some(info)
+        is_mounted(&info.mountpoint).then_some(info)
     }
 
     pub fn set_mount_info(&self, name: &str, info: Option<&MountInfo>) -> Result<()> {

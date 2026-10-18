@@ -139,11 +139,11 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Unmount { workspace } => {
             let name = home.find(&workspace)?;
-            let info = home.mount_info(&name).with_context(|| format!("{name} is not mounted"))?;
+            let info = home.attached_mount(&name).with_context(|| format!("{name} is not mounted"))?;
             unmount(&info, &home.workspace_dir(&name).join("mount.json"))
         }
         Cmd::Rm { name } => {
-            if home.mount_info(&name).is_some() {
+            if home.attached_mount(&name).is_some() {
                 bail!("{name} is mounted; unmount it first");
             }
             home.record(&name)?;
@@ -222,7 +222,8 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
     // Opening the workspace can fetch from a remote, so allow it some time.
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
-        if is_mounted(&dir) {
+        // The kernel shows the mount slightly before the daemon records it.
+        if home.mount_info(name).is_some_and(|info| info.pid == child.id()) {
             println!("{name} mounted at {}", dir.display());
             return Ok(());
         }
@@ -301,6 +302,11 @@ fn unmount(info: &MountInfo, mount_file: &Path) -> Result<()> {
             bail!("unmounted, but process {} is still saving the workspace's changes", info.pid);
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if mount_file.exists() {
+        // The serving process died without cleaning up; its last save is what remains.
+        eprintln!("sandfs: the mount's process had exited; changes since its last save are lost");
+        let _ = std::fs::remove_file(mount_file);
     }
     Ok(())
 }
