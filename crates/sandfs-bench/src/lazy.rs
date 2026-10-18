@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
 use sandfs_core::{Listing, MemorySource, Source, SourceKey, Workspace};
 
@@ -70,6 +70,13 @@ impl Setup {
         Ok(Arc::new(Slow { inner, latency: self.latency, calls: AtomicUsize::new(0) }))
     }
 
+    /// The bytes in the files at `paths`, to check every approach read them all.
+    fn bytes(&self, paths: &[String]) -> usize {
+        let sizes: HashMap<String, usize> =
+            self.files.iter().map(|(path, data)| (format!("/src/{path}"), data.len())).collect();
+        paths.iter().map(|path| sizes[path]).sum()
+    }
+
     fn paths(&self, n: usize) -> Vec<String> {
         let step = (self.files.len() / n.max(1)).max(1);
         self.files.iter().step_by(step).take(n).map(|(path, _)| format!("/src/{path}")).collect()
@@ -98,20 +105,26 @@ fn lazy_read(setup: &Setup, paths: &[String]) -> Result<(Duration, usize)> {
     let start = Instant::now();
     let mut ws = Workspace::new();
     ws.mount("/src", source.clone())?;
+    let mut total = 0;
     for path in paths {
-        ws.read(path)?;
+        total += ws.read(path)?.len();
     }
-    Ok((start.elapsed(), source.calls()))
+    let elapsed = start.elapsed();
+    ensure!(total == setup.bytes(paths), "read {total} bytes, expected {}", setup.bytes(paths));
+    Ok((elapsed, source.calls()))
 }
 
 fn eager_read(setup: &Setup, paths: &[String]) -> Result<(Duration, usize)> {
     let source = setup.source()?;
     let start = Instant::now();
     let files = fetch_all(&source)?;
+    let mut total = 0;
     for path in paths {
-        ensure!(files.contains_key(path), "{path} missing from the copy");
+        total += files.get(path).map(Bytes::len).ok_or_else(|| anyhow!("{path} missing from the copy"))?;
     }
-    Ok((start.elapsed(), source.calls()))
+    let elapsed = start.elapsed();
+    ensure!(total == setup.bytes(paths), "copied {total} bytes, expected {}", setup.bytes(paths));
+    Ok((elapsed, source.calls()))
 }
 
 const THREADS: usize = 8;
@@ -121,29 +134,40 @@ fn lazy_concurrent(setup: &Setup, paths: &[String]) -> Result<(Duration, usize)>
     let start = Instant::now();
     let mut ws = Workspace::new();
     ws.mount("/src", source.clone())?;
-    std::thread::scope(|scope| {
+    let total = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let fork = ws.fork();
-                scope.spawn(move || paths.iter().try_for_each(|path| fork.read(path).map(drop)))
+                scope.spawn(move || {
+                    paths.iter().map(|path| fork.read(path).map(|data| data.len())).sum::<sandfs_core::Result<usize>>()
+                })
             })
             .collect();
-        handles.into_iter().try_for_each(|handle| handle.join().expect("reader thread"))
+        handles.into_iter().map(|handle| handle.join().expect("reader thread")).sum::<sandfs_core::Result<usize>>()
     })?;
-    Ok((start.elapsed(), source.calls()))
+    let elapsed = start.elapsed();
+    let expected = THREADS * setup.bytes(paths);
+    ensure!(total == expected, "read {total} bytes, expected {expected}");
+    Ok((elapsed, source.calls()))
 }
 
 fn eager_concurrent(setup: &Setup, paths: &[String]) -> Result<(Duration, usize)> {
     let source = setup.source()?;
     let start = Instant::now();
     let files = Arc::new(fetch_all(&source)?);
-    std::thread::scope(|scope| {
-        for _ in 0..THREADS {
-            let files = files.clone();
-            scope.spawn(move || paths.iter().all(|path| files.contains_key(path)));
-        }
+    let total = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let files = files.clone();
+                scope.spawn(move || paths.iter().map(|path| files.get(path).map(Bytes::len)).sum::<Option<usize>>())
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().expect("reader thread")).sum::<Option<usize>>()
     });
-    Ok((start.elapsed(), source.calls()))
+    let elapsed = start.elapsed();
+    let expected = THREADS * setup.bytes(paths);
+    ensure!(total == Some(expected), "copied {total:?} bytes, expected {expected}");
+    Ok((elapsed, source.calls()))
 }
 
 /// The lazy-source workloads, by name.
