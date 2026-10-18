@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-if False:  # pragma: no cover - for type checkers only
-    from .vfs import VirtualFileSystem
 from .policies import NodePolicy
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .vfs import VirtualFileSystem
 
 
 @dataclass(frozen=True)
@@ -18,7 +19,7 @@ class NodeContext:
 
     path: PurePosixPath
     metadata: Mapping[str, Any]
-    vfs: "VirtualFileSystem" | None = None
+    vfs: VirtualFileSystem | None = None
 
 
 ContentProvider = Callable[[NodeContext], str]
@@ -34,7 +35,7 @@ class ProvidedNode:
     content: str | None = None
     content_provider: ContentProvider | None = None
     directory_provider: DirectoryProvider | None = None
-    children: MutableMapping[str, "ProvidedNode"] | None = None
+    children: MutableMapping[str, ProvidedNode] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     policy: NodePolicy | None = None
 
@@ -45,7 +46,7 @@ class ProvidedNode:
         content_provider: ContentProvider | None = None,
         metadata: Mapping[str, Any] | None = None,
         policy: NodePolicy | None = None,
-    ) -> "ProvidedNode":
+    ) -> ProvidedNode:
         return ProvidedNode(
             kind="file",
             content=content,
@@ -57,11 +58,11 @@ class ProvidedNode:
     @staticmethod
     def directory(
         *,
-        children: Mapping[str, "ProvidedNode"] | None = None,
+        children: Mapping[str, ProvidedNode] | None = None,
         directory_provider: DirectoryProvider | None = None,
         metadata: Mapping[str, Any] | None = None,
         policy: NodePolicy | None = None,
-    ) -> "ProvidedNode":
+    ) -> ProvidedNode:
         frozen_children = None
         if children is not None:
             frozen_children = {name: child for name, child in children.items()}

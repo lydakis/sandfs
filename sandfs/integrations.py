@@ -24,7 +24,7 @@ PathHook = Callable[[PathEvent], None]
 class InboxRecorder:
     events: list[dict[str, str | None]] = field(default_factory=list)
 
-    def attach(self, vfs: "VirtualFileSystem", prefix: str) -> None:
+    def attach(self, vfs: VirtualFileSystem, prefix: str) -> None:
         vfs.register_path_hook(prefix, self._handle)
 
     def _handle(self, event: PathEvent) -> None:

@@ -1,4 +1,9 @@
-"""Helper to execute Python snippets inside the sandbox."""
+"""Helper to execute Python snippets against the sandbox state.
+
+This is not a security boundary: code runs in-process with a reduced set of builtins,
+and objects such as ``vfs`` expose the host interpreter. Run untrusted code in a real
+sandbox (a container, microVM or WASM runtime) instead.
+"""
 
 from __future__ import annotations
 

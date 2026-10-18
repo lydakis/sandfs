@@ -6,8 +6,10 @@ This document captures the practical roadmap for `sandfs` so we can measure prog
 
 - **Core VFS** – in-memory directories, provider-backed nodes, optimistic versions, snapshots, host export/import helpers.
 - **Policy layer** – read/write/append policies plus visibility views and path hooks so hosts can mirror activity elsewhere.
-- **Command surface** – built-in shell commands: `pwd`, `cd`, `ls`, `tree`, `cat`, `touch`, `mkdir`, `rm`, `cp`, `mv`, `write`, `append`, `echo`, `printf`, `wc`, `grep`, `rg`, `search`, `stat`, `head`, `tail`, `find`, `python`, `python3`, `host`, `bash`, `sh`, and `help`.
-- **Host bridge** – `host` materializes the tree to a temp dir and runs native binaries; host fallback is opt-in for untrusted users.
+- **Command surface** – built-in shell commands: `pwd`, `cd`, `ls`, `tree`, `cat`, `touch`, `mkdir`, `rm`, `cp`, `mv`, `write`, `append`, `echo`, `printf`, `wc`, `grep`, `rg`, `search`, `stat`, `head`, `tail`, `find`, `python`, `python3`, `host`, `bash`, `sh`, and `help`, with pipes, `<`/`>`/`>>` redirection and env vars.
+- **Host bridge** – `host` materializes the visible tree to a temp dir and runs native binaries; host fallback for unknown commands is opt-in. Host commands are not isolated from the host.
+- **Search** – optional full-text index and a `/@search?q=` view.
+- **CLI** – `sandfs exec` and `sandfs shell` with host directory mounts.
 
 ## Principles for upcoming work
 
@@ -21,16 +23,15 @@ This document captures the practical roadmap for `sandfs` so we can measure prog
 Focus: expand the pure-Python toolchain so normal agent workflows never require host commands.
 
 - **Navigation & metadata**
-  - Add `stat`/`info` for per-path metadata (size, policy, version, timestamps).
   - Support `ls -a`/`ls -R` flags plus a `du`-lite summary command.
 - **Viewing & paging**
-  - Implement `head`, `tail`, and a pager-style `view` for long files.
+  - Add a pager-style `view` for long files.
   - Extend `cat` with line numbers and highlighting options useful to LLMs.
 - **Search & filtering**
-  - Ship a `find`/`fd`-style command for filtered traversals (name/glob/extension filters).
+  - Extend `find` with more predicates (`-path`, `-maxdepth`, extensions).
   - Enhance `rg` with include/exclude globs, max-results, and JSON output for agents.
 - **Editing & diffs**
-  - Introduce `cp`, `mv`, `apply_patch`, and `diff` so agents can restructure files safely.
+  - Introduce `apply_patch` and `diff` so agents can restructure files safely.
   - Provide `sed`-lite replacements and multi-file write helpers.
 - **File creation ergonomics**
   - Extend `write`/`append` with heredoc (`<<EOF`) support, timestamp helpers, and batch command execution so agents can create structured notes without `/bin/sh`.

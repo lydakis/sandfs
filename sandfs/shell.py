@@ -450,12 +450,12 @@ class SandboxShell:
         else:
             self.vfs.write_file(path, content)
 
-    def _resolve_search_nav(self, parsed: "ParsedSearchPath") -> str:
+    def _resolve_search_nav(self, parsed: ParsedSearchPath) -> str:
         if parsed.nav is None:
             return str(parsed.base)
         return str(parsed.base.joinpath(parsed.nav))
 
-    def _parse_search_path(self, path: str) -> "ParsedSearchPath | None":
+    def _parse_search_path(self, path: str) -> ParsedSearchPath | None:
         prefix = self.vfs._search_view_prefix
         if prefix is None or "?" not in path:
             return None

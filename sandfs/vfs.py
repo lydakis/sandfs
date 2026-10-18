@@ -189,10 +189,8 @@ class VirtualFileSystem:
             return
         if node.version != expected_version:
             raise InvalidOperation(
-                (
-                    f"Version mismatch for {node.path()}: "
-                    f"expected {expected_version}, current {node.version}"
-                )
+                f"Version mismatch for {node.path()}: "
+                f"expected {expected_version}, current {node.version}"
             )
 
     def _emit_write_event(self, node: VirtualFile, *, append: bool, event_type: str) -> None:

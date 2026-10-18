@@ -19,7 +19,6 @@ Agent builders frequently need a scratch filesystem for planning, iterating on g
 - Node policies (read-only, append-only, visibility labels) plus shell views so different agents see only the nodes they are allowed to.
 - Write hooks and optimistic versions so hosts can flush files to external stores with conflict detection.
 - Storage adapters and snapshots so you can mount external state and roll forward/back within a turn.
-- Serialization helpers to snapshot or hydrate sandboxes (planned).
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the up-to-date view of supported commands and the upcoming backlog.
 
@@ -72,7 +71,18 @@ host -p /workspace grep -n TODO app.py
 
 The example above exports `/workspace` into a temporary directory, runs the system `grep` inside it, then discards the files.
 
-> Tip: host fallback is disabled by default. To allow unknown commands to run on the host, set `SandboxShell(..., host_fallback=True)`.
+> Tip: host fallback for *unknown* commands is disabled by default. To allow unknown commands to run on the host, set `SandboxShell(..., host_fallback=True)`. The `host`, `bash` and `sh` commands are always registered; see [Security model](#security-model).
+
+## Security model
+
+`sandfs` enforces policies on the virtual tree. It does **not** isolate code execution:
+
+- `host`, `bash` and `sh` run real host processes with the host user's permissions and environment. They are registered by default; remove them with `allowed_commands` for untrusted agents.
+- `python`/`python3` run `exec()` with a reduced set of builtins. That is a convenience, not a sandbox: sandboxed code can reach the host through the objects it is given.
+- Host commands only see nodes the shell's `view` may read; hidden and unreadable nodes are never exported, and sync-back never touches them.
+- `allowed_commands` is checked before host fallback, so an allowlist cannot be bypassed by an unknown command.
+
+For untrusted code, run the command in a real sandbox (a container or microVM) and treat `sandfs` as the filesystem it reads.
 
 ### Search views
 
