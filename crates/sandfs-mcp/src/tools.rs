@@ -62,7 +62,7 @@ impl Tools {
         let top: Vec<String> = match self.workspace.list("/") {
             Ok(entries) => entries
                 .iter()
-                .map(|entry| format!("{}{}", shown(&format!("/{}", entry.name)), suffix(entry.kind)))
+                .map(|entry| shown(&format!("/{}{}", entry.name, suffix(entry.kind))).into_owned())
                 .collect(),
             Err(_) => Vec::new(),
         };
@@ -206,16 +206,15 @@ impl Tools {
                 truncated = true;
                 return false;
             }
-            let rel = shown(rel);
             lines.push(match (entry.kind, entry.size) {
-                (Kind::Dir, _) => format!("{rel}/"),
-                (_, Some(size)) => format!("{rel} ({size} bytes)"),
-                (_, None) => format!("{rel} (size unknown)"),
+                (Kind::Dir, _) => shown(&format!("{rel}/")).into_owned(),
+                (_, Some(size)) => format!("{} ({size} bytes)", shown(rel)),
+                (_, None) => format!("{} (size unknown)", shown(rel)),
             });
             true
         })?;
         if lines.is_empty() {
-            return Ok(format!("{path} is empty"));
+            return Ok(format!("{} is empty", shown(&path)));
         }
         let mut out = lines.join("\n");
         if truncated {
@@ -244,7 +243,7 @@ impl Tools {
             true
         })?;
         if found.is_empty() {
-            return Ok(format!("No files match {pattern} under {root}"));
+            return Ok(format!("No files match {pattern} under {}", shown(&root)));
         }
         let mut out = found.join("\n");
         if truncated {
@@ -304,7 +303,7 @@ impl Tools {
                 0 => String::new(),
                 n => format!(" ({n} files could not be read)"),
             };
-            return Ok(format!("No matches for {pattern} under {root}{unread}"));
+            return Ok(format!("No matches for {pattern} under {}{unread}", shown(&root)));
         }
         let mut out = search.out;
         let files = if search.files == 1 { "file" } else { "files" };
@@ -395,7 +394,7 @@ impl Tools {
             });
         }
         if lines.is_empty() {
-            return Ok(format!("No changes under {scope}"));
+            return Ok(format!("No changes under {}", shown(scope.as_str())));
         }
         lines.push("[A added, M modified, D deleted; read a file to see its contents]".to_owned());
         Ok(lines.join("\n"))
@@ -662,7 +661,25 @@ fn cap(mut text: String) -> String {
 /// control character, so a newline in a name cannot split it over two lines. The quoted
 /// form is what the agent passes back as a JSON argument.
 fn shown(path: &str) -> std::borrow::Cow<'_, str> {
-    if path.chars().any(char::is_control) { Value::from(path).to_string().into() } else { path.into() }
+    if !path.chars().any(char::is_control) {
+        return path.into();
+    }
+    // JSON serializers escape only ASCII controls, so U+0080..U+009F (such as NEXT
+    // LINE) are escaped here too. Every control character fits in one `\uXXXX`.
+    let mut quoted = String::from('"');
+    for c in path.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            '\r' => quoted.push_str("\\r"),
+            c if c.is_control() => quoted.push_str(&format!("\\u{:04x}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted.into()
 }
 
 fn suffix(kind: Kind) -> &'static str {
