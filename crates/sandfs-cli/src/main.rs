@@ -261,7 +261,9 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let group = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(dir)?);
     let base_time = UNIX_EPOCH + Duration::from_secs(opened.record.created);
     let root = VPath::parse(ROOT)?;
-    let inner = Inner::new(opened.ws, &root, opened.restored.times, opened.restored.dirs, base_time, (owner, group));
+    let mut inner =
+        Inner::new(opened.ws, &root, opened.restored.times, opened.restored.dirs, base_time, (owner, group));
+    inner.ranged_reads = matches!(opened.record.base, Base::Dir { .. });
     let shared = Shared::new(inner, opened.saved, root);
     let saver = shared.spawn_saver();
 

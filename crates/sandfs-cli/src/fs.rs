@@ -31,6 +31,8 @@ const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
 /// Files live in memory, so refuse sizes that could only be a mistake.
 const MAX_FILE_SIZE: usize = 4 << 30;
+/// Base files larger than this are read in ranges rather than whole.
+const RANGED_READ_SIZE: u64 = 64 << 20;
 
 pub type FsResult<T> = Result<T, Errno>;
 
@@ -98,6 +100,9 @@ pub struct Inner {
     gid: u32,
     /// Set by every change, cleared when a save takes a snapshot.
     unsaved: bool,
+    /// Read large base files in ranges. Only worth it for sources that can seek (a
+    /// host folder): git reads a whole blob for every range.
+    pub ranged_reads: bool,
 }
 
 impl Inner {
@@ -125,6 +130,7 @@ impl Inner {
             uid,
             gid,
             unsaved: false,
+            ranged_reads: false,
         };
         inner.inos.insert(root.to_string(), ROOT_INO);
         inner.nodes.insert(ROOT_INO, Node { path: root.clone(), lookups: 0, linked: true });
@@ -509,7 +515,12 @@ impl Inner {
         match self.buffers.get(&ino) {
             Some(buffer) => Ok(Bytes::copy_from_slice(&buffer[range(buffer.len())])),
             None => {
-                let data = self.ws.read(self.path(ino)?.as_str()).fs()?;
+                let path = self.path(ino)?;
+                if self.ranged_reads && self.ws.stat(path.as_str()).fs()?.size > RANGED_READ_SIZE {
+                    return self.ws.read_range(path.as_str(), offset, size.into()).fs();
+                }
+                // Other files are read whole once and served from the workspace's cache.
+                let data = self.ws.read(path.as_str()).fs()?;
                 Ok(data.slice(range(data.len())))
             }
         }
