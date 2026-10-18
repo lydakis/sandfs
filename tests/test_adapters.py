@@ -264,3 +264,43 @@ def test_copy_into_storage_rejects_files_with_policies():
     assert adapter.list() == {}
     assert not vfs.exists("/d/src")
     assert vfs.read_file("/src/private.txt") == "SECRET"
+
+
+def test_rejected_copy_keeps_the_destination_file():
+    adapter = MemoryStorageAdapter(initial={"target": "old"})
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", adapter)
+    vfs.write_file("/src/private.txt", "SECRET")
+    vfs.set_policy("/src/private.txt", NodePolicy(classification="private"))
+
+    with pytest.raises(InvalidOperation):
+        vfs.copy("/src", "/d/target", recursive=True)
+
+    assert vfs.read_file("/d/target") == "old"
+
+
+def test_storage_rejects_directories_with_policies():
+    vfs = VirtualFileSystem()
+    vfs.mount_storage("/d", MemoryStorageAdapter())
+    vfs.write_file("/src/hidden/a.txt", "A")
+    vfs.set_policy("/src/hidden", NodePolicy(classification="private"))
+
+    with pytest.raises(InvalidOperation):
+        vfs.copy("/src", "/d/src", recursive=True)
+    with pytest.raises(InvalidOperation):
+        vfs.move("/src", "/d/src")
+
+
+def test_directory_copied_over_file_emits_delete_then_create():
+    vfs = VirtualFileSystem()
+    vfs.write_file("/src/a.txt", "A")
+    vfs.write_file("/target", "old")
+    events = []
+    vfs.register_path_hook("/", events.append)
+
+    vfs.copy("/src", "/target", recursive=True)
+
+    assert [(e.path, e.event) for e in events] == [
+        ("/target", "delete"),
+        ("/target/a.txt", "create"),
+    ]

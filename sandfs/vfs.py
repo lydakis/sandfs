@@ -287,19 +287,23 @@ class VirtualFileSystem:
             raise InvalidOperation(f"Storage conflict for {node.path()}") from exc
         node.version = entry.version
 
-    def _ensure_storable(self, files: list[VirtualFile], dest: PurePosixPath) -> None:
-        """Refuse to place files with policies under a storage mount.
+    def _ensure_storable(self, node: VirtualNode, dest: PurePosixPath) -> None:
+        """Refuse to place nodes with policies under a storage mount.
 
-        Adapters store content only, so a private file would come back public after a
-        reload; failing is better than silently dropping the policy.
+        Adapters store content only, so a private file or directory would come back
+        public after a reload; failing is better than silently dropping the policy.
         """
         if self._find_storage_mount(dest) is None:
             return
-        for file_node in files:
-            if file_node.policy != NodePolicy():
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            if current.policy != NodePolicy():
                 raise InvalidOperation(
-                    f"Cannot store {file_node.path()} under {dest}: storage does not keep policies"
+                    f"Cannot store {current.path()} under {dest}: storage does not keep policies"
                 )
+            if isinstance(current, VirtualDirectory):
+                pending.extend(current.children.values())
 
     def _loaded_files(self, node: VirtualNode) -> list[VirtualFile]:
         """Files already materialized under ``node``, without hydrating lazy directories."""
@@ -729,9 +733,7 @@ class VirtualFileSystem:
             for _ in self.walk(node_path):
                 pass
         moved_files = [(file_node.path(), file_node) for file_node in self._loaded_files(node)]
-        self._ensure_storable(
-            [file_node for _, file_node in moved_files], dest_parent.path().joinpath(dest_name)
-        )
+        self._ensure_storable(node, dest_parent.path().joinpath(dest_name))
         parent.remove_child(node.name)
         node.name = dest_name
         dest_parent.add_child(node)
@@ -766,7 +768,7 @@ class VirtualFileSystem:
         dest_parent: VirtualDirectory
         dest_name: str
 
-        replaced = False
+        replaced: VirtualNode | None = None
         try:
             dest_node = self._resolve_node(dest_path)
         except (NodeNotFound, InvalidOperation):
@@ -781,13 +783,12 @@ class VirtualFileSystem:
                 dest_parent = dest_node
                 dest_name = node.name
             else:
-                replaced = True
+                replaced = dest_node
                 parent_node = dest_node.parent
                 if parent_node is None:
                     raise InvalidOperation("Cannot overwrite root directory")
                 self._ensure_write_allowed(parent_node)
                 self._ensure_write_allowed(dest_node)
-                parent_node.remove_child(dest_node.name)
                 dest_name = dest_node.name
                 dest_parent = parent_node
 
@@ -802,14 +803,20 @@ class VirtualFileSystem:
 
         clone = self._clone_node(node, recursive=recursive)
         clone.name = dest_name
-        self._ensure_storable(self._loaded_files(clone), dest_parent.path().joinpath(dest_name))
-        if replaced and isinstance(clone, VirtualDirectory):
-            # The stored file becomes a directory, so its adapter entry has to go.
-            self._delete_storage_entry(dest_parent.path().joinpath(dest_name))
+        target_path = dest_parent.path().joinpath(dest_name)
+        self._ensure_storable(clone, target_path)
+        # Nothing has changed yet; detach the replaced file only once the copy is valid.
+        file_replaced = replaced is not None and isinstance(clone, VirtualFile)
+        if replaced is not None:
+            dest_parent.remove_child(replaced.name)
+            if not file_replaced:
+                # A directory takes the file's place, so the file is deleted.
+                self._delete_storage_entry(target_path)
+                self._emit_path_event(target_path, "delete", None)
         dest_parent.add_child(clone)
         for file_node in self._loaded_files(clone):
             self._persist_placed_file(file_node)
-            event_type = "update" if replaced else "create"
+            event_type = "update" if file_replaced else "create"
             self._emit_write_event(file_node, append=False, event_type=event_type)
         if isinstance(clone, VirtualFile):
             self._index_file(clone)
