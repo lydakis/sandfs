@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `changes()` reports) plus the directory and in-memory sources, `sandfs-git` is an optional lazy git source, `sandfs-mcp` is the MCP server with the text tools (glob, grep, edit), `sandfs-cli` is the `sandfs` command (mount, fork and changes over FUSE), and `sandfs-py` is the PyO3 extension, including sources written in Python. New capabilities land here.
+- `crates/` holds the implementation. `sandfs-core` has the three primitives (sources, workspaces with a copy-on-write overlay, and the changes `changes()` reports) plus the directory and in-memory sources, `sandfs-git` is an optional lazy git source, `sandfs-mcp` is the MCP server with the text tools (glob, grep, edit), `sandfs-cli` is the `sandfs` command (mount, fork and changes over FUSE), `sandfs-py` is the PyO3 extension, including sources written in Python, and `sandfs-bench` (unpublished) benchmarks sandfs against the host filesystem and overlayfs. New capabilities land here.
 - `sandfs/` is the Python package: re-exports from the `sandfs._core` extension, its type stubs (`_core.pyi`) and the `Source` protocol (`source.py`). Keep it thin; logic belongs in Rust.
 - `tests/` contains the pytest suites for the Python surface; Rust tests live next to each crate (`crates/*/tests`).
 - `docs/` tracks the roadmap, changelog and release steps (`docs/publishing.md`). Keep repository-wide guidance in README and this file.
@@ -13,6 +13,7 @@
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` – the Rust checks CI runs. The FUSE tests in `crates/sandfs-cli/tests/mount.rs` skip themselves without `/dev/fuse` and `fusermount3`; CI sets `SANDFS_REQUIRE_FUSE=1` so they cannot skip there.
 - `uv run ruff check .` and `uv run ruff format sandfs tests` – lint and format Python.
 - `uv run mypy sandfs` – type-check the package and its stubs; update `_core.pyi` whenever the extension's API changes.
+- `cargo run --release -p sandfs-bench -- --scratch /dev/shm` – the benchmarks (build `sandfs-cli` in release too for the FUSE column); performance PRs quote its before and after numbers.
 - `pre-commit install` – enables automatic Ruff and MyPy hooks before every commit.
 
 ## Coding Style & Naming Conventions
