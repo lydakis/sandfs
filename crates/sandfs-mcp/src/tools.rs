@@ -160,11 +160,13 @@ impl Tools {
         if head.contains(&0) || detect_type(&head) != UNKNOWN_BINARY {
             return Err(format!("{path}: {}; not text, so not shown", detect_type(&head)));
         }
-        let bytes = self.workspace.read_range(path, offset, length).map_err(err)?;
+        // One byte past the range says whether the file goes on.
+        let mut bytes = self.workspace.read_range(path, offset, length + 1).map_err(err)?;
         if bytes.is_empty() {
             return Err(format!("{path}: byte_offset {offset} is at or past the end of the file"));
         }
-        let at_end = (bytes.len() as u64) < length;
+        let at_end = bytes.len() as u64 <= length;
+        bytes.truncate(length as usize);
         // Move the range onto character boundaries: skip a split character at the start
         // and drop one at the end. A file cannot end inside a character and be text.
         let skip = bytes.iter().take(3).take_while(|&&b| b & 0xC0 == 0x80).count();

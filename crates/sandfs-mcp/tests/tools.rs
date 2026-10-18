@@ -343,6 +343,9 @@ fn byte_reads_never_load_the_whole_file() {
     let mut s = Server::new(ws);
     let out = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 5, "byte_length": 3 }));
     assert_eq!(out, "one\n[bytes 5-8 · continue with byte_offset=8]");
+    // A range that ends exactly at the end of the file says so.
+    let exact = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 14, "byte_length": 4 }));
+    assert_eq!(exact, "two\n\n[bytes 14-18 · end of file]");
     let tail = ok(&mut s, "read", json!({ "path": "/remote/big.log", "byte_offset": 9 }));
     assert_eq!(tail, "line two\n\n[bytes 9-18 · end of file]");
 }
