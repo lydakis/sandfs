@@ -122,6 +122,9 @@ fn run(args: Args) -> Result<()> {
 
     let selected = |name: &str| args.only.as_ref().is_none_or(|only| name.contains(only.as_str()));
     let workloads: Vec<_> = workloads::all(&data).into_iter().filter(|w| selected(w.name)).collect();
+    if workloads.is_empty() && !lazy::NAMES.iter().any(|name| selected(name)) {
+        bail!("--only {:?} matches no workload", args.only.as_deref().unwrap_or_default());
+    }
     let mut table: Vec<Vec<Option<Vec<Duration>>>> = Vec::new();
     for workload in &workloads {
         eprintln!("{}", workload.name);
@@ -173,8 +176,10 @@ fn measure(target: &dyn Target, workload: &workloads::Workload, data: &Data) -> 
         let start = Instant::now();
         let leftover = (workload.run)(data, view.as_mut());
         let elapsed = start.elapsed();
-        drop(leftover?);
-        (workload.check)(data, view.as_mut())?;
+        // A fork is checked itself, so a target that forks without the changes fails.
+        let mut leftover = leftover?;
+        (workload.check)(data, leftover.as_deref_mut().unwrap_or(view.as_mut()))?;
+        drop(leftover);
         drop(view);
         times.push(elapsed);
     }

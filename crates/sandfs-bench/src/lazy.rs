@@ -146,9 +146,12 @@ fn eager_concurrent(setup: &Setup, paths: &[String]) -> Result<(Duration, usize)
     Ok((start.elapsed(), source.calls()))
 }
 
+/// The lazy-source workloads, by name.
+pub const NAMES: [&str; 3] = ["lazy/read-1%", "lazy/read-all", "lazy/forks"];
+
 /// Run the lazy-source workloads over the first `scale.lazy_files` small files.
 pub fn run(data: &Data, latency: Duration, iters: usize, selected: &dyn Fn(&str) -> bool) -> Result<Vec<LazyResult>> {
-    if !["lazy/read-1%", "lazy/read-all", "lazy/forks"].iter().any(|name| selected(name)) {
+    if !NAMES.iter().any(|name| selected(name)) {
         return Ok(Vec::new());
     }
     let n = data.scale.lazy_files.min(data.small.len());

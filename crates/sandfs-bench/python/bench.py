@@ -137,11 +137,18 @@ def generate(root: Path, files: int) -> list[str]:
     return paths
 
 
+def positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
+    return number
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--files", type=int, default=10_000)
     parser.add_argument("--writes", type=int, default=1000)
-    parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--iters", type=positive, default=5)
     parser.add_argument("--scratch", help="where to generate the files (default: system temp)")
     args = parser.parse_args()
 

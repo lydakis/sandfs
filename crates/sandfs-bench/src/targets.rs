@@ -244,7 +244,12 @@ impl Fuse {
             bail!("{} not found; build it with `cargo build --release -p sandfs-cli`", bin.display());
         }
         let home = tempfile::Builder::new().prefix("sandfs-home-").tempdir_in(&scratch)?;
-        Ok(Fuse { data, scratch, bin, home: Arc::new(home), next: Arc::new(AtomicUsize::new(0)) })
+        let fuse = Fuse { data, scratch, bin, home: Arc::new(home), next: Arc::new(AtomicUsize::new(0)) };
+        // Mount once and throw it away: the device and helper can exist while this
+        // process is still not allowed to mount.
+        let probe = tempfile::Builder::new().prefix("fuse-probe-").tempdir_in(&fuse.scratch)?;
+        drop(fuse.open_dir(probe.path()).context("cannot mount FUSE here")?);
+        Ok(fuse)
     }
 
     fn command(&self) -> Command {
@@ -259,8 +264,15 @@ impl Fuse {
         (name, dir)
     }
 
-    fn view(&self, mountpoint: PathBuf) -> Box<dyn View> {
-        Box::new(DirView { root: mountpoint.clone(), backend: Backend::Fuse { fuse: self.clone(), mountpoint } })
+    fn view(&self, name: String, mountpoint: PathBuf) -> Box<dyn View> {
+        Box::new(DirView { root: mountpoint.clone(), backend: Backend::Fuse { fuse: self.clone(), name, mountpoint } })
+    }
+
+    /// Mount a new workspace over the data set at a fresh mountpoint.
+    fn open_dir(&self, source: &Path) -> Result<Box<dyn View>> {
+        let (name, dir) = self.fresh_mountpoint();
+        run(self.command().arg("mount").arg(source).arg(&dir).args(["--name", &name]))?;
+        Ok(self.view(name, dir))
     }
 }
 
@@ -270,9 +282,7 @@ impl Target for Fuse {
     }
 
     fn open(&self, _writable: bool) -> Result<Box<dyn View>> {
-        let (name, dir) = self.fresh_mountpoint();
-        run(self.command().arg("mount").arg(&self.data).arg(&dir).args(["--name", &name]))?;
-        Ok(self.view(dir))
+        self.open_dir(&self.data)
     }
 }
 
@@ -280,7 +290,7 @@ enum Backend {
     HostOriginal,
     HostCopy { original: PathBuf, scratch: PathBuf, _copy: TempDir },
     Overlay { upper: PathBuf, data: PathBuf, scratch: PathBuf, _dir: TempDir },
-    Fuse { fuse: Fuse, mountpoint: PathBuf },
+    Fuse { fuse: Fuse, name: String, mountpoint: PathBuf },
 }
 
 /// A view that is a directory on the host, used through `std::fs`.
@@ -336,7 +346,7 @@ impl View for DirView {
             Backend::Fuse { fuse, mountpoint, .. } => {
                 let (name, dir) = fuse.fresh_mountpoint();
                 run(fuse.command().arg("fork").arg(mountpoint).arg(&dir).args(["--name", &name]))?;
-                Ok(fuse.view(dir))
+                Ok(fuse.view(name, dir))
             }
         }
     }
@@ -363,8 +373,11 @@ impl Drop for DirView {
             Backend::Overlay { .. } => {
                 let _ = umount(&self.root);
             }
-            Backend::Fuse { fuse, mountpoint, .. } => {
-                let _ = run(fuse.command().arg("unmount").arg(mountpoint));
+            Backend::Fuse { fuse, name, mountpoint } => {
+                // Unmounting keeps the workspace; remove it so later runs do not pile up.
+                if run(fuse.command().arg("unmount").arg(mountpoint)).is_ok() {
+                    let _ = run(fuse.command().arg("rm").arg(name));
+                }
                 let _ = fs::remove_dir(mountpoint);
             }
             _ => {}

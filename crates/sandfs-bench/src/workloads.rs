@@ -12,7 +12,8 @@ pub type Leftover = Option<Box<dyn View>>;
 type Step = Box<dyn Fn(&Data, &mut dyn View) -> Result<Leftover>>;
 
 /// One benchmark: `prepare` runs untimed on a fresh view, then `run` is timed, then
-/// `check` confirms untimed that the run did all its work.
+/// `check` confirms untimed that the run did all its work, on the fork when `run`
+/// returns one.
 pub struct Workload {
     /// Short name, `group/name`.
     pub name: &'static str,
@@ -27,6 +28,15 @@ pub struct Workload {
 
 fn step(f: impl Fn(&Data, &mut dyn View) -> Result<()> + 'static) -> Step {
     Box::new(move |data, view| f(data, view).map(|()| None))
+}
+
+/// A check that the view reports exactly `expected` changed files.
+fn changed(expected: usize) -> Step {
+    step(move |_, view| {
+        let found = view.changes()?;
+        ensure!(found == expected, "found {found} changes, expected {expected}");
+        Ok(())
+    })
 }
 
 fn nothing() -> Step {
@@ -244,7 +254,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
             writable: true,
             prepare: nothing(),
             run: Box::new(|_, view| view.fork().map(Some)),
-            check: nothing(),
+            check: changed(0),
         },
         Workload {
             name: "fork/changed",
@@ -255,7 +265,7 @@ pub fn all(data: &Data) -> Vec<Workload> {
                 overwrite(data, view)
             }),
             run: Box::new(|_, view| view.fork().map(Some)),
-            check: nothing(),
+            check: changed(ops * 2),
         },
         Workload {
             name: "changes",
