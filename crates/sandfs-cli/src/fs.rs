@@ -17,9 +17,9 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenAccMode,
-    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig,
+    LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use sandfs_core::{Error, Kind, VPath, Workspace};
 
@@ -639,6 +639,33 @@ impl Inner {
         }
     }
 
+    /// Like [`Inner::readdir`], with each entry's attributes, handed to `add` until it
+    /// reports the reply full. The kernel counts every entry it accepts as a lookup,
+    /// except `.` and `..`, so those entries count here too.
+    pub fn readdirplus(
+        &mut self,
+        fh: u64,
+        offset: u64,
+        mut add: impl FnMut(u64, u64, &str, &FileAttr) -> bool,
+    ) -> FsResult<()> {
+        let mut position = usize::try_from(offset).unwrap_or(usize::MAX);
+        loop {
+            let Some(Handle::Dir { entries }) = self.handles.get(&fh) else { return Err(Errno::EBADF) };
+            let Some((ino, _, name)) = entries.get(position).cloned() else { return Ok(()) };
+            position += 1;
+            // An entry removed since the directory was opened is left out.
+            let Ok(attr) = self.attr(ino) else { continue };
+            if add(ino, position as u64, &name, &attr) {
+                return Ok(());
+            }
+            if name != "." && name != ".." {
+                if let Some(node) = self.nodes.get_mut(&ino) {
+                    node.lookups += 1;
+                }
+            }
+        }
+    }
+
     pub fn releasedir(&mut self, fh: u64) {
         self.handles.remove(&fh);
     }
@@ -750,6 +777,15 @@ impl SandFs {
 }
 
 impl Filesystem for SandFs {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Listings carry attributes, so a walk that stats every entry (`ls -l`, `find`)
+        // costs a round trip per page of entries instead of one per entry. Kernels
+        // without it fall back to plain listings.
+        let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS);
+        let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.0.lock().lookup(parent.0, name) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -917,6 +953,16 @@ impl Filesystem for SandFs {
                 }
                 reply.ok();
             }
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn readdirplus(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
+        let result = self.0.lock().readdirplus(fh.0, offset, |ino, next, name, attr| {
+            reply.add(INodeNo(ino), next, name, &TTL, attr, Generation(0))
+        });
+        match result {
+            Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
     }
@@ -1126,6 +1172,35 @@ mod tests {
         assert_eq!(fs.unlink(ROOT_INO, name("src")).unwrap_err(), Errno::EISDIR);
         assert_eq!(fs.rmdir(ROOT_INO, name("README.md")).unwrap_err(), Errno::ENOTDIR);
         assert!(fs.dirs.contains("/mnt/new"));
+    }
+
+    #[test]
+    fn listings_with_attributes_count_lookups_and_resume() {
+        let mut fs = fs();
+        let fh = fs.opendir(ROOT_INO).unwrap();
+        // Accept one entry past `.` and `..`, then report the reply full.
+        let mut seen = Vec::new();
+        fs.readdirplus(fh, 0, |_, next, name, _| {
+            seen.push((next, name.to_owned()));
+            seen.len() > 3
+        })
+        .unwrap();
+        assert_eq!(seen.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), [".", "..", "README.md", "src"]);
+        let resume = seen[2].0;
+        let mut rest = Vec::new();
+        fs.readdirplus(fh, resume, |_, _, name, attr| {
+            rest.push((name.to_owned(), attr.kind));
+            false
+        })
+        .unwrap();
+        assert_eq!(rest, [("src".to_owned(), FileType::Directory)], "the refused entry comes again");
+        fs.releasedir(fh);
+
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        assert_eq!(fs.nodes[&readme].lookups, 2, "one from the listing, one from lookup");
+        assert_eq!(fs.nodes[&src].lookups, 2, "counted once, when accepted");
+        assert_eq!(fs.nodes[&ROOT_INO].lookups, 0, ". and .. are not counted");
     }
 
     #[test]
