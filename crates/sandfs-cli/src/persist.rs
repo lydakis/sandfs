@@ -73,12 +73,14 @@ pub struct Saved {
     /// Objects the previous save replaced. They are deleted one save later, so a
     /// reader that loaded the index just before that save still finds them.
     doomed: Vec<String>,
+    /// Objects written since the last durable save, not yet flushed to disk.
+    unsynced: HashSet<String>,
 }
 
 impl Saved {
     /// The saved changes in the state directory `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Saved { dir: dir.into(), objects: HashMap::new(), next_object: 1, doomed: Vec::new() }
+        Saved { dir: dir.into(), objects: HashMap::new(), next_object: 1, doomed: Vec::new(), unsynced: HashSet::new() }
     }
 
     fn index_path(&self) -> PathBuf {
@@ -185,8 +187,9 @@ impl Saved {
         Ok(())
     }
 
-    /// Save `snap`, whose source is mounted at `root`.
-    pub fn save(&mut self, snap: &Snapshot, root: &VPath) -> Result<()> {
+    /// Save `snap`, whose source is mounted at `root`. A `durable` save, which answers
+    /// `fsync`, also flushes the index and every object it names to disk before returning.
+    pub fn save(&mut self, snap: &Snapshot, root: &VPath, durable: bool) -> Result<()> {
         let mut entries = BTreeMap::new();
         let mut kept = HashMap::new();
         for change in snap.ws.changes()? {
@@ -214,8 +217,25 @@ impl Saved {
 
         let index = serde_json::to_vec(&Changes { entries })?;
         let tmp = self.dir.join("changes.json.tmp");
+        if durable {
+            // Objects reach the disk before the index that names them.
+            let live: HashSet<&String> = kept.values().map(|(_, object)| object).collect();
+            for object in self.unsynced.iter().filter(|o| live.contains(o)) {
+                sync_path(&self.objects_dir().join(object))?;
+            }
+            if !self.unsynced.is_empty() {
+                sync_path(&self.objects_dir())?;
+            }
+            self.unsynced.clear();
+        }
         std::fs::write(&tmp, index).context("writing changes.json")?;
+        if durable {
+            sync_path(&tmp)?;
+        }
         std::fs::rename(&tmp, self.index_path()).context("writing changes.json")?;
+        if durable {
+            sync_path(&self.dir)?;
+        }
 
         // Objects replaced by the save before this one are now two indexes old.
         for object in std::mem::take(&mut self.doomed) {
@@ -258,6 +278,7 @@ impl Saved {
         let object = self.next_object.to_string();
         self.next_object += 1;
         std::fs::write(dir.join(&object), data).context("writing a saved file")?;
+        self.unsynced.insert(object.clone());
         Ok(object)
     }
 
@@ -285,6 +306,8 @@ impl Saved {
                     continue;
                 }
                 if std::fs::hard_link(&from, &target).is_err() && std::fs::copy(&from, &target).is_err() {
+                    // A failed copy may leave part of the file, which a retry must not reuse.
+                    let _ = std::fs::remove_file(&target);
                     complete = false;
                     break;
                 }
@@ -332,6 +355,11 @@ fn from_time((secs, nanos): Time) -> SystemTime {
     UNIX_EPOCH + Duration::new(secs, nanos)
 }
 
+/// Flush a file or directory to disk (`fsync`).
+fn sync_path(path: &Path) -> Result<()> {
+    std::fs::File::open(path).and_then(|file| file.sync_all()).with_context(|| format!("syncing {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -369,7 +397,8 @@ mod tests {
         let times = [("/mnt/a.txt".to_owned(), mtime)].into();
 
         let mut saved = Saved::new(state.path());
-        saved.save(&Snapshot { ws: ws.fork(), times, dirs }, &root()).unwrap();
+        saved.save(&Snapshot { ws: ws.fork(), times, dirs }, &root(), true).unwrap();
+        assert!(saved.unsynced.is_empty(), "a durable save flushes every object it wrote");
 
         let mut loaded = base();
         let restored = Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
@@ -390,7 +419,7 @@ mod tests {
         ws.write("/mnt/two.txt", "2").unwrap();
         let mut saved = Saved::new(state.path());
         let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
-        saved.save(&snap(&ws), &root()).unwrap();
+        saved.save(&snap(&ws), &root(), false).unwrap();
         let objects = |dir: &Path| {
             let mut names: Vec<String> = std::fs::read_dir(dir.join("objects"))
                 .unwrap()
@@ -402,11 +431,11 @@ mod tests {
         assert_eq!(objects(state.path()), ["1", "2"]);
 
         ws.write("/mnt/two.txt", "2 again").unwrap();
-        saved.save(&snap(&ws), &root()).unwrap();
+        saved.save(&snap(&ws), &root(), false).unwrap();
         assert_eq!(objects(state.path()), ["1", "2", "3"], "one.txt kept its object; two.txt's old one waits a save");
 
         ws.remove("/mnt/one.txt", false).unwrap();
-        saved.save(&snap(&ws), &root()).unwrap();
+        saved.save(&snap(&ws), &root(), false).unwrap();
         assert_eq!(objects(state.path()), ["1", "3"], "2 is gone now; 1 goes after the next save");
 
         let mut reopened = Saved::new(state.path());
@@ -423,7 +452,7 @@ mod tests {
         ws.remove("/mnt/dir", true).unwrap();
         ws.write("/mnt/dir", "now a file").unwrap();
         let snap = Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: ["/mnt/dir".to_owned()].into() };
-        Saved::new(state.path()).save(&snap, &root()).unwrap();
+        Saved::new(state.path()).save(&snap, &root(), false).unwrap();
 
         let mut loaded = base();
         Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
@@ -442,7 +471,9 @@ mod tests {
         ws.remove("/mnt/a.txt", false).unwrap();
         ws.mkdir("/mnt/a.txt", false).unwrap();
         let dirs = ["/mnt/dir", "/mnt/dir/sub", "/mnt/a.txt"].map(str::to_owned).into();
-        Saved::new(state.path()).save(&Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs }, &root()).unwrap();
+        Saved::new(state.path())
+            .save(&Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs }, &root(), false)
+            .unwrap();
 
         let mut loaded = base();
         Saved::new(state.path()).load(&mut loaded, &root()).unwrap();

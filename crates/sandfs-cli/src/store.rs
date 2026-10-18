@@ -164,9 +164,12 @@ impl Home {
         if self.exists(what) {
             return Ok(what.to_owned());
         }
-        if let Ok(dir) = Path::new(what).canonicalize() {
+        // A mount whose process died cannot be canonicalized (ENOTCONN), but it is
+        // still found by its absolute path, so `unmount DIR` can detach it.
+        let dir = Path::new(what).canonicalize().or_else(|_| std::path::absolute(what));
+        if let Ok(dir) = dir {
             for name in self.names()? {
-                if self.mount_info(&name).is_some_and(|info| info.mountpoint == dir) {
+                if self.attached_mount(&name).is_some_and(|info| info.mountpoint == dir) {
                     return Ok(name);
                 }
             }

@@ -293,6 +293,10 @@ impl Inner {
         if let Some(size) = size {
             let size = usize::try_from(size).ok().filter(|size| *size <= MAX_FILE_SIZE).ok_or(Errno::EFBIG)?;
             self.buffer(ino)?.resize(size, 0);
+            // ftruncate on a removed file that is still open changes only its buffer.
+            if !self.nodes.get(&ino).is_some_and(|node| node.linked) {
+                return self.attr(ino);
+            }
             let path = self.path(ino)?;
             self.touch(&path);
             // truncate(2) on a file nobody has open: there will be no flush to wait for.
@@ -656,11 +660,11 @@ impl Shared {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Save the workspace's changes now.
-    pub fn save(&self) -> anyhow::Result<()> {
+    /// Save the workspace's changes now; `durable` also flushes them to disk, as `fsync` promises.
+    pub fn save(&self, durable: bool) -> anyhow::Result<()> {
         let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
         let snapshot = self.lock().snapshot();
-        let result = saved.save(&snapshot, &self.root);
+        let result = saved.save(&snapshot, &self.root, durable);
         if result.is_err() {
             self.lock().unsaved = true;
         }
@@ -683,7 +687,7 @@ impl Shared {
                 }
                 // Let a burst of writes settle so it costs one save, not one per write.
                 std::thread::sleep(Duration::from_millis(250));
-                if let Err(err) = shared.save() {
+                if let Err(err) = shared.save(false) {
                     eprintln!("sandfs: saving changes failed: {err:#}");
                     std::thread::sleep(Duration::from_secs(1));
                 }
@@ -862,7 +866,7 @@ impl Filesystem for SandFs {
 
     fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         let result = self.0.lock().commit(ino.0);
-        let result = result.and_then(|()| self.0.save().map_err(|err| log_io(&err)));
+        let result = result.and_then(|()| self.0.save(true).map_err(|err| log_io(&err)));
         self.reply_empty(reply, result);
     }
 
@@ -897,7 +901,7 @@ impl Filesystem for SandFs {
     /// a fork or `changes` sees everything written so far.
     fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         let committed = self.0.lock().commit_all();
-        let result = committed.and_then(|()| self.0.save().map_err(|err| log_io(&err)));
+        let result = committed.and_then(|()| self.0.save(true).map_err(|err| log_io(&err)));
         self.reply_empty(reply, result);
     }
 
@@ -1054,6 +1058,8 @@ mod tests {
         assert_eq!(fs.lookup(ROOT_INO, name("README.md")).unwrap_err(), Errno::ENOENT);
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\n");
         fs.write(ino, 0, b"HELLO\n").unwrap();
+        assert_eq!(fs.setattr(ino, None, Some(2), None).unwrap().size, 2, "ftruncate on the open handle");
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"HE");
         fs.release(fh).unwrap();
         assert!(!fs.ws.exists("/mnt/README.md"), "a removed file's writes go nowhere");
     }

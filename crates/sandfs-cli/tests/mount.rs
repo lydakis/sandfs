@@ -161,5 +161,24 @@ fn a_directory_source_is_never_written() {
     assert_eq!(sandfs.stdout(&["changes", "data"]), "A out/summary.txt\nD raw/rows.csv\n");
     assert_eq!(std::fs::read_to_string(data.path().join("raw/rows.csv")).unwrap(), "id,value\n1,10\n");
     assert!(!data.path().join("out").exists());
+
+    // A fork whose mount fails is removed, so the same command can be retried.
+    let blocked = dirs.path().join("file");
+    std::fs::write(&blocked, "").unwrap();
+    let failed = sandfs.try_run(&["fork", "data", blocked.join("copy").to_str().unwrap()]);
+    assert!(!failed.status.success());
+    assert!(!sandfs.stdout(&["list"]).contains("copy"), "the failed fork is gone");
+
+    // A crashed mount process leaves a disconnected mount that `unmount DIR` detaches.
+    let mount_json = sandfs.home.path().join("workspaces/data/mount.json");
+    let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&mount_json).unwrap()).unwrap();
+    let pid = info["pid"].as_u64().unwrap().to_string();
+    assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    sandfs.unmount(&ws);
+    sandfs.mount(&["mount", "data", ws.to_str().unwrap()], &ws);
+    assert_eq!(std::fs::read_to_string(ws.join("out/summary.txt")).unwrap(), "2 rows\n", "saved before the crash");
     sandfs.unmount(&ws);
 }

@@ -176,9 +176,12 @@ fn sync(home: &Home, name: &str) -> Result<()> {
 /// Mount a workspace that was just created, removing it again if the mount fails so
 /// the same command can simply be retried.
 fn mount_new(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
+    // A fork starts with a copy of its parent's changes.json. Every mount saves when it
+    // ends, so an index that is still the initial one means the mount never ran.
+    let index = home.workspace_dir(name).join("changes.json");
+    let initial = std::fs::read(&index).ok();
     let result = mount(home, name, dir, foreground);
-    // Every mount saves at least once when it ends, so no changes.json means it never ran.
-    if result.is_err() && !home.workspace_dir(name).join("changes.json").exists() {
+    if result.is_err() && std::fs::read(&index).ok() == initial {
         let _ = home.remove(name);
     }
     result
@@ -193,6 +196,8 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
     // The source is read through its host path, so a mount on top of it or inside it
     // would read itself (and create the mount point inside a read-only source).
     if let Base::Dir { path } = home.record(name)?.base {
+        // Opening the source canonicalizes its path again, so compare with that.
+        let path = path.canonicalize().unwrap_or(path);
         let target = resolve_new(dir)?;
         if target.starts_with(&path) || path.starts_with(&target) {
             bail!("{} overlaps the source folder {}; mount it somewhere else", target.display(), path.display());
@@ -278,7 +283,7 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
 
     shared.stop();
     let _ = saver.join();
-    let saved = shared.save();
+    let saved = shared.save(true);
     home.set_mount_info(name, None)?;
     result.context("serving the mount")?;
     saved.context("saving changes at unmount")
