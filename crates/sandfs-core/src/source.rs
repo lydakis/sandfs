@@ -102,16 +102,22 @@ impl MemorySource {
         for part in dirs {
             let child_key = if dir_key.is_empty() { (*part).to_owned() } else { format!("{dir_key}/{part}") };
             let listing = self.dirs.entry(dir_key.clone()).or_default();
-            listing.entry((*part).to_owned()).or_insert_with(|| SourceEntry {
+            let entry = listing.entry((*part).to_owned()).or_insert_with(|| SourceEntry {
                 kind: Kind::Dir,
                 key: child_key.as_str().into(),
                 size: None,
             });
+            if !entry.kind.is_dir() {
+                return Err(Error::NotADirectory(child_key));
+            }
             self.dirs.entry(child_key.clone()).or_default();
             dir_key = child_key;
         }
         let file_key = if dir_key.is_empty() { (*name).to_owned() } else { format!("{dir_key}/{name}") };
         let size = Some(data.len() as u64);
+        if self.dirs.contains_key(&file_key) {
+            return Err(Error::IsADirectory(file_key));
+        }
         self.dirs
             .entry(dir_key)
             .or_default()
@@ -138,7 +144,10 @@ impl Source for MemorySource {
 /// A read-only view of a host directory, read lazily and treated as a snapshot.
 ///
 /// Symlinks are reported as symlinks and never followed on the host, so a link cannot
-/// lead the workspace outside `root`.
+/// lead the workspace outside `root`. Each read also checks that the resolved host
+/// path is still inside `root`, in case a directory was swapped for a symlink after it
+/// was listed. That check is not atomic with the read, so treat the directory as
+/// trusted while it is mounted.
 #[derive(Debug)]
 pub struct DirSource {
     root: PathBuf,
@@ -147,11 +156,20 @@ pub struct DirSource {
 impl DirSource {
     /// Expose the directory at `root`.
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
+        let root = root.as_ref();
         if !root.is_dir() {
             return Err(Error::Source(format!("{} is not a directory", root.display())));
         }
-        Ok(DirSource { root })
+        Ok(DirSource { root: root.canonicalize().map_err(io_error)? })
+    }
+
+    /// Fail unless `dir`, with every symlink resolved, is still `root` or inside it.
+    fn check_inside(&self, dir: &Path) -> Result<()> {
+        if dir.canonicalize().map_err(io_error)?.starts_with(&self.root) {
+            Ok(())
+        } else {
+            Err(Error::Source(format!("{} is outside the mounted directory", dir.display())))
+        }
     }
 
     fn host_path(&self, key: &str) -> PathBuf {
@@ -165,7 +183,9 @@ impl Source for DirSource {
     }
 
     fn read_dir(&self, key: &str) -> Result<Listing> {
-        let entries = std::fs::read_dir(self.host_path(key)).map_err(io_error)?;
+        let dir = self.host_path(key);
+        self.check_inside(&dir)?;
+        let entries = std::fs::read_dir(dir).map_err(io_error)?;
         let mut listing = Listing::new();
         for entry in entries {
             let entry = entry.map_err(io_error)?;
@@ -191,6 +211,8 @@ impl Source for DirSource {
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
         let path = self.host_path(key);
+        // The final component is never followed, so only its parent needs checking.
+        self.check_inside(path.parent().unwrap_or(&self.root))?;
         let meta = path.symlink_metadata().map_err(io_error)?;
         if meta.file_type().is_symlink() {
             let target = std::fs::read_link(&path).map_err(io_error)?;

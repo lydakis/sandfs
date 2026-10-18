@@ -8,6 +8,30 @@ use sandfs_core::{
     Change, ChangeKind, DirSource, Edit, Error, Kind, Listing, MemorySource, Source, SourceKey, VPath, Workspace,
 };
 
+/// A source whose listing of one directory key always fails.
+#[derive(Debug)]
+struct Failing {
+    inner: MemorySource,
+    broken_dir: &'static str,
+}
+
+impl Source for Failing {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        self.inner.root()
+    }
+
+    fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+        if key == self.broken_dir {
+            return Err(Error::Source("listing failed".into()));
+        }
+        self.inner.read_dir(key)
+    }
+
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        self.inner.read_file(key)
+    }
+}
+
 /// Wraps a source and counts how often it is asked for listings and file bytes.
 #[derive(Debug)]
 struct Counting {
@@ -128,8 +152,8 @@ fn writes_create_parents_and_bump_versions() {
     assert_eq!(ws.write("/scratch/notes/a.txt", "a").unwrap(), 1);
     assert_eq!(names(&ws, "/"), ["repo", "scratch"]);
     assert_eq!(ws.stat("/repo/README.md").unwrap().version, 0);
-    assert_eq!(ws.write("/repo/README.md", "v1").unwrap(), 1);
-    assert_eq!(ws.write("/repo/README.md", "v2").unwrap(), 2);
+    assert_eq!(ws.write("/repo/README.md", "v1").unwrap(), 2);
+    assert_eq!(ws.write("/repo/README.md", "v2").unwrap(), 3);
 }
 
 #[test]
@@ -287,4 +311,93 @@ fn paths_cannot_escape_the_root() {
     let (ws, _) = workspace();
     assert!(matches!(ws.read("/../etc/passwd"), Err(Error::InvalidPath(_))));
     assert_eq!(VPath::parse("/repo/../repo/./README.md").unwrap().as_str(), "/repo/README.md");
+}
+
+#[test]
+fn versions_are_never_reused_after_a_delete() {
+    let (mut ws, _) = workspace();
+    let stale = ws.stat("/repo/README.md").unwrap().version;
+    ws.remove("/repo/README.md", false).unwrap();
+    assert!(matches!(ws.write_versioned("/repo/README.md", "stale", stale), Err(Error::VersionMismatch { .. })));
+
+    let first = ws.write("/new.txt", "1").unwrap();
+    ws.remove("/new.txt", false).unwrap();
+    ws.write("/new.txt", "2").unwrap();
+    assert!(matches!(ws.write_versioned("/new.txt", "stale", first), Err(Error::VersionMismatch { .. })));
+}
+
+#[test]
+fn invalid_symlink_targets_are_rejected_not_rewritten() {
+    let mut source = MemorySource::from_files([("\u{fffd}", "wrong file")]).unwrap();
+    source.insert("link", Bytes::from_static(b"\xff"), Kind::Symlink).unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/m", Arc::new(source)).unwrap();
+    assert!(matches!(ws.read("/m/link"), Err(Error::NotText(_))));
+    assert!(matches!(ws.read_link("/m/link"), Err(Error::NotText(_))));
+}
+
+#[test]
+fn failed_copies_and_renames_change_nothing() {
+    let source = Failing { inner: repo(), broken_dir: "src/util" };
+    let mut ws = Workspace::new();
+    ws.mount("/repo", Arc::new(source)).unwrap();
+
+    assert!(ws.copy("/repo/src", "/repo/src2", true).is_err());
+    assert!(!ws.exists("/repo/src2"));
+    assert!(ws.rename("/repo/src", "/repo/moved").is_err());
+    assert!(!ws.exists("/repo/moved"));
+    assert!(ws.exists("/repo/src/lib.rs"));
+    assert!(changes(&ws).is_empty());
+}
+
+#[test]
+fn symlink_creation_reports_source_errors() {
+    let mut ws = Workspace::new();
+    ws.mount("/repo", Arc::new(Failing { inner: repo(), broken_dir: "" })).unwrap();
+    assert!(matches!(ws.symlink("/repo/link", "README.md"), Err(Error::Source(_))));
+}
+
+#[test]
+fn list_follows_a_final_directory_symlink() {
+    let (mut ws, _) = workspace();
+    ws.symlink("/alias", "/repo/src").unwrap();
+    assert_eq!(names(&ws, "/alias"), ["lib.rs", "util"]);
+}
+
+#[test]
+fn mounting_over_a_deleted_path_makes_the_mount_visible() {
+    let (mut ws, _) = workspace();
+    ws.remove("/repo/docs", true).unwrap();
+    ws.mount("/repo/docs", Arc::new(MemorySource::from_files([("new.md", "new")]).unwrap())).unwrap();
+    assert_eq!(ws.read_text("/repo/docs/new.md").unwrap(), "new");
+
+    ws.remove("/repo/src", true).unwrap();
+    ws.mount("/repo/src/vendor", Arc::new(MemorySource::from_files([("v.txt", "v")]).unwrap())).unwrap();
+    assert_eq!(names(&ws, "/repo/src"), ["vendor"], "the deleted base entries stay hidden");
+}
+
+#[test]
+fn memory_source_rejects_a_file_that_is_also_a_directory() {
+    assert!(MemorySource::from_files([("a", "file"), ("a/b", "child")]).is_err());
+    assert!(MemorySource::from_files([("a/b", "child"), ("a", "file")]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn dir_source_refuses_reads_through_a_swapped_in_symlink() {
+    let base = std::env::temp_dir().join(format!("sandfs-escape-{}", std::process::id()));
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("sub/file"), "inside").unwrap();
+    std::fs::write(outside.join("file"), "SECRET").unwrap();
+
+    let mut ws = Workspace::new();
+    ws.mount("/host", Arc::new(DirSource::new(&root).unwrap())).unwrap();
+    ws.list("/host/sub").unwrap();
+    std::fs::remove_dir_all(root.join("sub")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
+
+    assert!(ws.read("/host/sub/file").is_err());
+    std::fs::remove_dir_all(&base).unwrap();
 }

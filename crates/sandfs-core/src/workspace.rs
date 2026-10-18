@@ -63,7 +63,11 @@ enum Overlay {
     Dir {
         opaque: bool,
     },
-    Deleted,
+    /// A whiteout. It keeps the version the deletion was given, so a stale version
+    /// token for the old file cannot match the missing path.
+    Deleted {
+        version: u64,
+    },
 }
 
 /// Where a path's base (pre-overlay) node comes from.
@@ -109,7 +113,8 @@ pub struct Metadata {
     pub kind: Kind,
     /// Size in bytes, when known without reading the file.
     pub size: Option<u64>,
-    /// Optimistic version: 0 for untouched base files, incremented on every write.
+    /// Optimistic version: 0 for untouched base files. Every change gets a new
+    /// version from a per-workspace clock, so versions are never reused.
     pub version: u64,
 }
 
@@ -137,6 +142,8 @@ pub struct Workspace {
     mounts: OrdMap<VPath, Arc<Mount>>,
     overlay: OrdMap<VPath, Overlay>,
     cache: Arc<Cache>,
+    /// The last version handed out.
+    clock: u64,
 }
 
 impl fmt::Debug for Workspace {
@@ -168,6 +175,14 @@ impl Workspace {
             Err(err) => return Err(err),
         }
         let root = source.root()?;
+        // A mount can go where something was deleted: deleted ancestors become empty
+        // directories (still hiding their old base entries) and the whiteout goes.
+        for ancestor in path.ancestors() {
+            if let Some(Overlay::Deleted { .. }) = self.overlay.get(&ancestor) {
+                self.overlay.insert(ancestor, Overlay::Dir { opaque: true });
+            }
+        }
+        self.overlay.remove(&path);
         let mount = Mount { id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed), source, root };
         self.mounts.insert(path, Arc::new(mount));
         Ok(())
@@ -216,15 +231,15 @@ impl Workspace {
         match self.resolve(&path)? {
             Resolved::File { content, kind: Kind::Symlink, .. } => {
                 let target = self.content_bytes(&content)?;
-                Ok(String::from_utf8_lossy(&target).into_owned())
+                String::from_utf8(target.to_vec()).map_err(|_| Error::NotText(path.to_string()))
             }
             _ => Err(Error::Unsupported(path.to_string(), "not a symbolic link")),
         }
     }
 
-    /// The entries of a directory, sorted by name.
+    /// The entries of a directory, sorted by name, following a final symlink.
     pub fn list(&self, path: &str) -> Result<Vec<DirEntry>> {
-        let path = VPath::parse(path)?;
+        let path = self.follow(VPath::parse(path)?)?;
         let base = match self.resolve(&path)? {
             Resolved::Dir { base } => base,
             Resolved::File { .. } => return Err(Error::NotADirectory(path.to_string())),
@@ -252,7 +267,7 @@ impl Workspace {
             }
             let name = child.name().unwrap_or_default().to_owned();
             match entry {
-                Overlay::Deleted => {
+                Overlay::Deleted { .. } => {
                     entries.remove(&name);
                 }
                 Overlay::Dir { .. } => {
@@ -284,7 +299,7 @@ impl Workspace {
         let (kind, version) = match self.resolve(&path) {
             Ok(Resolved::Dir { .. }) => return Err(Error::IsADirectory(path.to_string())),
             Ok(Resolved::File { kind, version, .. }) => (kind, version),
-            Err(Error::NotFound(_)) => (Kind::File { executable: false }, 0),
+            Err(Error::NotFound(_)) => (Kind::File { executable: false }, self.missing_version(&path)),
             Err(err) => return Err(err),
         };
         if let Some(expected) = expected {
@@ -294,8 +309,9 @@ impl Workspace {
         }
         self.ensure_dir(&parent)?;
         let content = Content::Bytes(data.into());
-        self.overlay.insert(path, Overlay::File { content, kind, version: version + 1 });
-        Ok(version + 1)
+        let version = self.tick();
+        self.overlay.insert(path, Overlay::File { content, kind, version });
+        Ok(version)
     }
 
     /// Apply exact-string edits to a text file atomically. Returns the new version.
@@ -326,13 +342,16 @@ impl Workspace {
     /// Create a symlink at `path` pointing to `target`.
     pub fn symlink(&mut self, path: &str, target: &str) -> Result<()> {
         let path = VPath::parse(path)?;
-        if self.resolve(&path).is_ok() {
-            return Err(Error::AlreadyExists(path.to_string()));
+        match self.resolve(&path) {
+            Err(Error::NotFound(_)) => {}
+            Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
+            Err(err) => return Err(err),
         }
         let parent = path.parent().ok_or_else(|| Error::AlreadyExists(path.to_string()))?;
         self.ensure_dir(&parent)?;
         let content = Content::Bytes(Bytes::from(target.to_owned()));
-        self.overlay.insert(path, Overlay::File { content, kind: Kind::Symlink, version: 1 });
+        let version = self.tick();
+        self.overlay.insert(path, Overlay::File { content, kind: Kind::Symlink, version });
         Ok(())
     }
 
@@ -379,7 +398,7 @@ impl Workspace {
             return Err(Error::IsADirectory(from.to_string()));
         }
         self.check_destination(&from, &to)?;
-        self.copy_tree(&from, &to)
+        self.atomically(|ws| ws.copy_tree(&from, &to))
     }
 
     /// Move or rename a file or directory tree. The destination must not exist.
@@ -389,9 +408,11 @@ impl Workspace {
         self.check_removable(&from_path)?;
         self.resolve(&from_path)?;
         self.check_destination(&from_path, &to_path)?;
-        self.copy_tree(&from_path, &to_path)?;
-        self.remove_unchecked(&from_path);
-        Ok(())
+        self.atomically(|ws| {
+            ws.copy_tree(&from_path, &to_path)?;
+            ws.remove_unchecked(&from_path);
+            Ok(())
+        })
     }
 
     /// Files added, modified or deleted relative to the mounts, sorted by path.
@@ -404,7 +425,7 @@ impl Workspace {
         // directories, and files written where a base directory used to be.
         for (path, entry) in self.overlay.iter() {
             let hides_base = match entry {
-                Overlay::Deleted | Overlay::Dir { opaque: true } => true,
+                Overlay::Deleted { .. } | Overlay::Dir { opaque: true } => true,
                 Overlay::File { .. } => self.base_node(path)?.is_some_and(|node| node.kind().is_dir()),
                 Overlay::Dir { opaque: false } => false,
             };
@@ -455,7 +476,7 @@ impl Workspace {
         let mut base_hidden = false;
         for ancestor in path.ancestors() {
             match self.overlay.get(&ancestor) {
-                Some(Overlay::Deleted) => return Err(Error::NotFound(path.to_string())),
+                Some(Overlay::Deleted { .. }) => return Err(Error::NotFound(path.to_string())),
                 Some(Overlay::File { .. }) => return Err(Error::NotADirectory(ancestor.to_string())),
                 Some(Overlay::Dir { opaque: true }) => base_hidden = true,
                 Some(Overlay::Dir { opaque: false }) | None => {}
@@ -465,7 +486,7 @@ impl Workspace {
             if base_hidden { Ok(self.structural_node(path)) } else { self.base_node(path) }
         };
         match self.overlay.get(path) {
-            Some(Overlay::Deleted) => Err(Error::NotFound(path.to_string())),
+            Some(Overlay::Deleted { .. }) => Err(Error::NotFound(path.to_string())),
             Some(Overlay::File { content, kind, version }) => {
                 Ok(Resolved::File { content: content.clone(), kind: *kind, version: *version })
             }
@@ -614,6 +635,30 @@ impl Workspace {
     // Mutation helpers
     // ------------------------------------------------------------------
 
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// The version a missing path reports: its whiteout's, or 0 if it never existed.
+    fn missing_version(&self, path: &VPath) -> u64 {
+        match self.overlay.get(path) {
+            Some(Overlay::Deleted { version }) => *version,
+            _ => 0,
+        }
+    }
+
+    /// Run a multi-step change, restoring the overlay if any step fails. Saving the
+    /// overlay is O(1) because it is a persistent map.
+    fn atomically(&mut self, change: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let saved = self.overlay.clone();
+        let result = change(self);
+        if result.is_err() {
+            self.overlay = saved;
+        }
+        result
+    }
+
     fn ensure_dir(&mut self, path: &VPath) -> Result<()> {
         let mut chain = path.ancestors();
         chain.push(path.clone());
@@ -630,7 +675,7 @@ impl Workspace {
 
     fn insert_dir(&mut self, path: VPath) {
         // Recreating a deleted directory must not bring its old base children back.
-        let opaque = matches!(self.overlay.get(&path), Some(Overlay::Deleted));
+        let opaque = matches!(self.overlay.get(&path), Some(Overlay::Deleted { .. }));
         self.overlay.insert(path, Overlay::Dir { opaque });
     }
 
@@ -663,7 +708,8 @@ impl Workspace {
     fn copy_tree(&mut self, from: &VPath, to: &VPath) -> Result<()> {
         match self.resolve(from)? {
             Resolved::File { content, kind, .. } => {
-                self.overlay.insert(to.clone(), Overlay::File { content, kind, version: 1 });
+                let version = self.tick();
+                self.overlay.insert(to.clone(), Overlay::File { content, kind, version });
             }
             Resolved::Dir { .. } => {
                 self.insert_dir(to.clone());
@@ -683,7 +729,8 @@ impl Workspace {
         // A whiteout is only needed when the base still has something to hide.
         let in_base = !self.base_hidden(path) && matches!(self.base_node(path), Ok(Some(_)));
         if in_base {
-            self.overlay.insert(path.clone(), Overlay::Deleted);
+            let version = self.tick();
+            self.overlay.insert(path.clone(), Overlay::Deleted { version });
         } else {
             self.overlay.remove(path);
         }
@@ -708,7 +755,8 @@ fn content_size(content: &Content) -> Option<u64> {
 }
 
 fn resolve_link(link: &VPath, target: &[u8]) -> Result<VPath> {
-    let target = String::from_utf8_lossy(target);
+    // Decoding strictly: a lossy decode could turn an invalid target into a real name.
+    let target = std::str::from_utf8(target).map_err(|_| Error::NotText(link.to_string()))?;
     if target.starts_with('/') {
         return VPath::parse(&target);
     }
