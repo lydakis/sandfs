@@ -2,7 +2,7 @@
 
 sandfs is the filesystem you give an agent instead of a bash tool. The goal is a small, solid primitive: lazy mounts of real sources (a git commit, a host directory), a copy-on-write workspace on top that forks in O(1), and a diff of what the agent changed.
 
-The full design lives in the interface spec linked from the project. This file tracks where the code is.
+The core has three primitives: a **source** (a read-only tree read lazily), a **workspace** (sources mounted at paths plus a copy-on-write overlay) and a **change** (one file that differs, from `diff()`). Snapshots, worktrees and checkpoints are forks, not new concepts. The full design lives in the interface spec linked from the project; this file tracks where the code is.
 
 ## Direction
 
@@ -24,8 +24,8 @@ Access policies come back in a smaller form only if a real use needs them.
 1. **Core** (`sandfs-core`). Workspace over read-only sources, overlay, fork, diff, exact-string edits. Done.
 2. **Git source** (`sandfs-git`). Commit trees read through `git cat-file --batch`; a `blob:none` partial clone fetches only the blobs that are read. Done.
 3. **Python bindings** (`sandfs-py`, PyO3 and maturin): `sandfs.Workspace` with git, directory and in-memory mounts. Done.
-4. **MCP server**: read, list, glob, grep, write, edit, move, delete, diff, snapshot/restore and commit.
-5. **CLI and FUSE**: `sandfs mount`, `sandfs worktree add`, `sandfs diff`, `sandfs serve --mcp`.
+4. **MCP server**: read, list, glob, grep, write, edit, move, delete and diff over one workspace. Forking, checkpoints and commits stay with the harness.
+5. **CLI and FUSE**: `sandfs mount`, `sandfs fork`, `sandfs diff`, `sandfs serve --mcp`. A worktree is just a fork mounted at a path.
 6. **Commit back**: turn a workspace diff into a git commit or a pull request.
 7. **TypeScript bindings** (napi-rs, later WASM).
 
