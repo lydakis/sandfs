@@ -362,8 +362,12 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let shared = Shared::new(inner, opened.saved, root);
     let saver = shared.spawn_saver();
 
+    // A mount that never came up has nothing to save, and saving would make a new
+    // workspace look used to the `mount_new` that removes it again.
+    let was_mounted = std::cell::Cell::new(false);
     let mounted = |save_port: Option<u16>| -> Result<()> {
         home.set_mount_info(name, Some(&MountInfo { pid, mountpoint: dir.to_path_buf(), save_port }))?;
+        was_mounted.set(true);
         eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
         Ok(())
     };
@@ -380,6 +384,9 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
 
     shared.stop();
     let _ = saver.join();
+    if !was_mounted.get() {
+        return result.context("mounting");
+    }
     let saved = shared.save(true);
     match &saved {
         Ok(()) => home.set_mount_info(name, None)?,

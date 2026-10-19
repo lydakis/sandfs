@@ -447,3 +447,25 @@ fn a_failed_final_save_fails_unmount() {
     assert!(!ws.join("lost.txt").exists());
     sandfs.unmount(&ws);
 }
+
+/// A mount that fails leaves no workspace behind, so the same command can be retried.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_mount_leaves_no_workspace_behind() {
+    use std::os::unix::fs::MetadataExt;
+    // A folder someone else owns, which macOS won't let this user mount on.
+    let theirs = Path::new("/var/empty");
+    let mine = nix::unistd::getuid().as_raw();
+    if !fuse_available() || std::fs::metadata(theirs).map_or(true, |meta| meta.uid() == mine) || mine == 0 {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    let mut sandfs = Sandfs::new();
+    let failed = sandfs.try_run(&["mount", "--name", "ws", folder.path().to_str().unwrap(), theirs.to_str().unwrap()]);
+    assert!(!failed.status.success());
+    assert!(!sandfs.stdout(&["list"]).contains("ws\t"), "the workspace is removed again");
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", "--name", "ws", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+    sandfs.unmount(&ws);
+}
