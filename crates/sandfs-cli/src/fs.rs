@@ -164,7 +164,7 @@ pub struct Inner {
     /// source that can seek and that the OS already caches (a host folder). Git reads
     /// a whole blob for every range, so its files are read whole into `recent`.
     pub ranged_reads: bool,
-    /// Whole files read lately, by inode and version, newest last, so the kernel's
+    /// Whole files read lately, by inode and version, latest read last, so the kernel's
     /// chunks of one file read it once. At most [`RECENT_FILES`] and [`RECENT_BYTES`],
     /// except that the newest file stays however large it is. Nothing else is kept: the kernel caches
     /// what it read, and a copy here for every file would hold each one twice.
@@ -680,13 +680,7 @@ impl Inner {
             return ws.read_range(path.as_str(), offset, size.into()).fs();
         }
         let meta = ws.stat(path.as_str()).fs()?;
-        let kept = self
-            .recent
-            .borrow()
-            .iter()
-            .find(|(i, v, _)| (*i, *v) == (ino, meta.version))
-            .map(|(.., data)| data.clone());
-        let data = match kept {
+        let data = match self.kept(ino, meta.version) {
             Some(data) => data,
             None => {
                 // A range covering the whole file is read from the source without the
@@ -697,6 +691,17 @@ impl Inner {
             }
         };
         Ok(data.slice(range(data.len())))
+    }
+
+    /// The kept copy of `ino` at `version`, moved to the back as the latest read, so
+    /// a file read in chunks between other files stays kept.
+    fn kept(&self, ino: u64, version: u64) -> Option<Bytes> {
+        let mut recent = self.recent.borrow_mut();
+        let at = recent.iter().position(|(i, v, _)| (*i, *v) == (ino, version))?;
+        let entry = recent.remove(at)?;
+        let data = entry.2.clone();
+        recent.push_back(entry);
+        Some(data)
     }
 
     /// Keep a whole file in `recent`, dropping the oldest ones beyond the bounds.
@@ -1393,10 +1398,15 @@ mod tests {
             fs.read(ino, 0, 100).unwrap();
         }
         assert_eq!(reads(), 20);
-        fs.read(inos[19], 0, 100).unwrap();
+        fs.read(inos[4], 0, 100).unwrap();
         assert_eq!(reads(), 20, "kept while it is among the last read");
         fs.read(inos[0], 0, 100).unwrap();
         assert_eq!(reads(), 21, "dropped once later files took its place");
+        // Reading f04 again made it the latest read, so f05 went to make room instead.
+        fs.read(inos[4], 0, 100).unwrap();
+        assert_eq!(reads(), 21);
+        fs.read(inos[5], 0, 100).unwrap();
+        assert_eq!(reads(), 22);
 
         // A file written since it was kept is read as written.
         fs.write(inos[19], 0, b"new").unwrap();
