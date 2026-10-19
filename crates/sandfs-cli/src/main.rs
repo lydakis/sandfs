@@ -225,6 +225,12 @@ fn default_name(name: Option<String>, dir: &Path) -> Result<String> {
 /// mount's process saves when asked on its save port, since `fsync` never reaches it.
 fn sync(home: &Home, name: &str) -> Result<()> {
     let Some(info) = home.mount_info(name) else { return Ok(()) };
+    // A dead server's pid may belong to another process by now. Only the process holding
+    // the workspace serves it; without one, the last save is all there is to read.
+    #[cfg(mount)]
+    if !home.locked_by(name, info.pid) {
+        return Ok(());
+    }
     let saved = match (info.save_port, info.save_secret) {
         #[cfg(nfs)]
         (Some(port), Some(secret)) => nfs::request_save(port, &secret),

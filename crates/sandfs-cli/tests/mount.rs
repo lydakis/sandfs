@@ -297,6 +297,12 @@ fn open_files_work_without_open_or_close_reaching_sandfs() {
     while Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    // Another process may get the dead server's pid. Reading the workspace then uses its
+    // last save rather than asking that process to save.
+    let mut reused = info.clone();
+    reused["pid"] = std::process::id().into();
+    std::fs::write(&mount_json, serde_json::to_vec(&reused).unwrap()).unwrap();
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M log.txt\nD old.txt\nA report.txt\n");
     sandfs.unmount(&ws);
     sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
     assert_eq!(std::fs::read_to_string(ws.join("report.txt")).unwrap(), "done\n", "saved before the crash");
