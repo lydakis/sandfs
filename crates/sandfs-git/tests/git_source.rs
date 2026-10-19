@@ -117,9 +117,11 @@ fn sizes_fetch_a_directory_of_a_partial_clone_in_one_request() {
     let src = ws.list("/repo/src").unwrap();
     assert_eq!(src.iter().find(|e| e.name == "lib.rs").unwrap().size, Some(13));
     assert_eq!(ws.stat("/repo/src/lib.rs").unwrap().size, 13);
-    // Reaching /repo/src lists /repo too: its three blobs and lib.rs were fetched, while
-    // src/deep, never listed, still has its blob missing.
-    assert_eq!(missing(clone.path()), before - 4);
+    // Reaching /repo/src lists /repo too: its blobs (README.md, run.sh and, where the
+    // repository has it, the symlink) and lib.rs were fetched, while src/deep, never
+    // listed, still has its blob missing.
+    let root_blobs = if cfg!(unix) { 3 } else { 2 };
+    assert_eq!(missing(clone.path()), before - root_blobs - 1);
 
     let root = ws.list("/repo").unwrap();
     assert_eq!(root.iter().find(|e| e.name == "README.md").unwrap().size, Some(7));
