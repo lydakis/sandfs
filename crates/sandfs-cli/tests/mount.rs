@@ -2,6 +2,7 @@
 //!
 //! Skipped where FUSE is unavailable (no `/dev/fuse` or no `fusermount3`), unless
 //! `SANDFS_REQUIRE_FUSE` is set, as CI does, in which case that is a failure.
+#![cfg(fuse)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -294,8 +295,8 @@ fn one_process_serves_a_workspace_at_a_time() {
 
     // An MCP session holds the workspace until its client goes away.
     let mut agent = spawn(&sandfs, &["serve", "--mcp", "ws"]);
-    let lock = sandfs.home.path().join("workspaces/ws/lock");
-    while !std::fs::read_to_string(&lock).unwrap_or_default().contains("MCP") {
+    let holder = sandfs.home.path().join("workspaces/ws/holder");
+    while !std::fs::read_to_string(&holder).unwrap_or_default().contains("MCP") {
         assert!(agent.try_wait().unwrap().is_none(), "the session exited early");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

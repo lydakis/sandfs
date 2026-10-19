@@ -182,14 +182,22 @@ fn split_rev(spec: &str) -> (&str, Option<String>) {
     };
     let (location, rev) = (&spec[..at], &spec[at + 1..]);
     // Ref names cannot contain ':', which rules out the host of `user@host:repo`, and
-    // an https user is followed by a host with no path before it.
-    let user_of_url = location.split_once("://").is_some_and(|(_, rest)| !rest.contains('/'));
+    // an https user is followed by a host with no path before it (`file://C:\repo` on
+    // Windows has one).
+    let user_of_url = location.split_once("://").is_some_and(|(_, rest)| !rest.contains(['/', '\\']));
     if at == 0 || rev.contains(':') || user_of_url { (spec, None) } else { (location, Some(rev.to_owned())) }
 }
 
 /// A URL, or scp-style `[user@]host:path`, as git reads it: a ':' before any '/'.
 fn is_url(location: &str) -> bool {
-    location.contains("://") || location.find(':').is_some_and(|colon| !location[..colon].contains('/'))
+    location.contains("://")
+        || location.find(':').is_some_and(|colon| !location[..colon].contains(['/', '\\']) && !drive_letter(location))
+}
+
+/// `C:\repo` or `C:/repo`: a local path on Windows, as git reads it there.
+fn drive_letter(location: &str) -> bool {
+    let bytes = location.as_bytes();
+    cfg!(windows) && bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// `https://github.com/owner/repo.git` becomes `github.com/owner/repo.git`.
@@ -246,6 +254,7 @@ mod tests {
         assert_eq!(split("/srv/repo@feature/foo"), ("/srv/repo".into(), Some("feature/foo".into())));
         assert_eq!(split("https://u@host/r@release/1.0"), ("https://u@host/r".into(), Some("release/1.0".into())));
         assert_eq!(split("/srv/repo@HEAD@{1}"), ("/srv/repo".into(), Some("HEAD@{1}".into())));
+        assert_eq!(split(r"file://C:\src\repo@v1"), (r"file://C:\src\repo".into(), Some("v1".into())));
         assert_eq!(split("/srv/repo@main@{2.days.ago}"), ("/srv/repo".into(), Some("main@{2.days.ago}".into())));
         assert!(resolve(Path::new("/nonexistent"), "repo@").is_err());
     }
@@ -291,13 +300,16 @@ mod tests {
         run(&repo, &["remote", "set-url", "origin", "file:///nowhere"]);
         assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, third);
         assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
-        let unreachable = remote.to_str().unwrap().trim_start_matches('/').replacen('/', ":", 1);
-        assert_eq!(repos.join(cache_path(&unreachable).unwrap()), repo);
-        assert!(fetch_commit(&repos, &unreachable, "main").is_err());
-        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
-        // The same holds for a commit mounted before, which needs no fetch.
-        assert!(fetch_commit(&repos, &unreachable, &third).is_ok());
-        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+        // (A Windows path has no '/' to turn into an ssh host.)
+        if cfg!(unix) {
+            let unreachable = remote.to_str().unwrap().trim_start_matches('/').replacen('/', ":", 1);
+            assert_eq!(repos.join(cache_path(&unreachable).unwrap()), repo);
+            assert!(fetch_commit(&repos, &unreachable, "main").is_err());
+            assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+            // The same holds for a commit mounted before, which needs no fetch.
+            assert!(fetch_commit(&repos, &unreachable, &third).is_ok());
+            assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+        }
         run(&repo, &["remote", "set-url", "origin", "file:///nowhere"]);
         assert_eq!(resolve(&repos, &format!("{url}@{third}")).unwrap().1, third);
         assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
@@ -372,5 +384,8 @@ mod tests {
         assert!(cache_path("https://host/../x").is_err());
         assert!(is_url("https://github.com/o/r") && is_url("git@github.com:o/r") && is_url("github.com:o/r"));
         assert!(!is_url("/home/me/repo") && !is_url("~/src/repo") && !is_url("./a:b"));
+        assert!(!is_url(r".\a:b"));
+        assert_eq!(is_url(r"C:\src\repo"), cfg!(unix));
+        assert_eq!(is_url("C:/src/repo"), cfg!(unix));
     }
 }

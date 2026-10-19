@@ -6,12 +6,18 @@
 //! files a workspace changed. A working copy on disk is just a fork mounted at a path.
 //! `serve --mcp` hands a workspace to an agent as MCP file tools instead of a mount.
 
+// Without FUSE, mounting is stubbed out below, which leaves its helpers unused.
+#![cfg_attr(not(fuse), allow(dead_code, unused_imports))]
+
+#[cfg(fuse)]
 mod fs;
 mod git;
+mod host;
 mod mcp;
 mod persist;
 mod store;
 
+#[cfg(fuse)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,6 +27,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use sandfs_core::{ChangeKind, VPath};
 
+#[cfg(fuse)]
 use crate::fs::{Inner, SandFs, Shared};
 use crate::persist::Saved;
 use crate::store::{Base, Home, MountInfo, ROOT, check_name, is_mounted};
@@ -78,7 +85,8 @@ enum Cmd {
     },
     /// Delete an unmounted workspace and its changes.
     Rm { name: String },
-    /// Serve an unmounted workspace to an agent as MCP file tools over stdin and stdout.
+    /// Serve an unmounted workspace to an agent as MCP file tools over stdin and stdout,
+    /// or create one over a source and serve that.
     ///
     /// The agent gets read, list, glob, grep, write, edit, move, delete and changes,
     /// with the source's files under /mnt. Every change is saved before its reply, so
@@ -87,8 +95,11 @@ enum Cmd {
         /// Speak MCP (the only protocol so far).
         #[arg(long)]
         mcp: bool,
-        /// A workspace name.
+        /// A workspace name, or a source as for `mount`.
         workspace: String,
+        /// Name for a new workspace (default: the source's last component).
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Serve a workspace's FUSE mount in this process (used by `mount` and `fork`).
     #[command(hide = true)]
@@ -164,13 +175,35 @@ fn run(cli: Cli) -> Result<()> {
             let _writer = home.lock(&name, "sandfs rm")?;
             home.remove(&name)
         }
-        Cmd::Serve { mcp, workspace } => {
+        Cmd::Serve { mcp, workspace, name } => {
             if !mcp {
                 bail!("say what to serve: sandfs serve --mcp {workspace}");
             }
-            mcp::serve(&home, &home.find(&workspace)?)
+            // As with `mount`, a bare word naming a workspace serves it; anything else
+            // is a source. This is how workspaces are made where nothing mounts.
+            if home.exists(&workspace) && name.is_none() {
+                return mcp::serve(&home, &workspace);
+            }
+            // Named after the resolved folder or repository, so `.` and `repo@v1` work.
+            let record = home.resolve(&workspace)?;
+            let name = default_name(name, &source_dir(&record.base))?;
+            home.create(&name, &record)?;
+            mcp::serve(&home, &name)
         }
         Cmd::Daemon { name, dir } => serve(&home, &name, &dir),
+    }
+}
+
+/// The folder a source's name comes from: `data` for `/srv/data`, `/srv/data/.git` or a
+/// cached `github.com/team/data.git`.
+fn source_dir(base: &Base) -> PathBuf {
+    match base {
+        Base::Dir { path } => path.clone(),
+        Base::Git { repo, .. } if repo.file_name().is_some_and(|name| name == ".git") => {
+            repo.parent().map_or_else(|| repo.clone(), Path::to_path_buf)
+        }
+        Base::Git { repo, .. } if repo.extension().is_some_and(|ext| ext == "git") => repo.with_extension(""),
+        Base::Git { repo, .. } => repo.clone(),
     }
 }
 
@@ -218,6 +251,7 @@ fn remove_unused(home: &Home, name: &str) {
 
 /// Mount `name` at `dir`: serve it here with `foreground`, otherwise start a
 /// background process and wait until the mount is up.
+#[cfg(fuse)]
 fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
     if let Some(info) = home.mount_info(name) {
         bail!("{name} is already mounted at {}", info.mountpoint.display());
@@ -292,6 +326,7 @@ fn resolve_new(dir: &Path) -> Result<PathBuf> {
 }
 
 /// Serve `name` at `dir` until it is unmounted, then save its changes.
+#[cfg(fuse)]
 fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let pid = std::process::id();
     let _writer = home.lock(name, &format!("the mount at {} (process {pid})", dir.display()))?;
@@ -318,8 +353,7 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let saver = shared.spawn_saver();
 
     let mut config = fuser::Config::default();
-    config.mount_options =
-        vec![fuser::MountOption::FSName(format!("sandfs:{name}")), fuser::MountOption::Subtype("sandfs".to_owned())];
+    config.mount_options = host::mount_options(name);
     let session = fuser::Session::new(SandFs(shared.clone()), dir, &config).context("mounting with FUSE")?;
     home.set_mount_info(name, Some(&MountInfo { pid, mountpoint: dir.to_path_buf() }))?;
     eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
@@ -343,25 +377,19 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
 }
 
 /// Where a mount's process leaves the error of a final save that failed.
+#[cfg(fuse)]
 const SAVE_ERROR: &str = "save-error";
 
 /// Unmount `name` and wait for the serving process to save, which it signals by
 /// removing mount.json, and to let go of the workspace.
+#[cfg(fuse)]
 fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     let state = home.workspace_dir(name);
     let mount_file = state.join("mount.json");
-    let ran = ["fusermount3", "fusermount"]
-        .iter()
-        .find_map(|tool| Command::new(tool).arg("-u").arg(&info.mountpoint).status().ok());
-    match ran {
-        Some(status) if status.success() => {}
-        Some(status) => bail!("unmounting {} failed ({status})", info.mountpoint.display()),
-        None => bail!("fusermount3 is not installed; install fuse3"),
-    }
-    let proc = PathBuf::from(format!("/proc/{}", info.pid));
+    host::unmount(&info.mountpoint)?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut wait = Duration::from_millis(1);
-    while mount_file.exists() && proc.exists() {
+    while mount_file.exists() && host::alive(info.pid) {
         if Instant::now() >= deadline {
             bail!("unmounted, but process {} is still saving the workspace's changes", info.pid);
         }
@@ -375,7 +403,7 @@ fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     }
     // The process lets go of the workspace as it exits, just after removing mount.json.
     // Wait for that too, so a command right after this one finds the workspace free.
-    while proc.exists() && home.lock(name, "sandfs unmount").is_err() {
+    while host::alive(info.pid) && home.lock(name, "sandfs unmount").is_err() {
         if Instant::now() >= deadline {
             bail!("unmounted, but process {} has not exited", info.pid);
         }
@@ -392,4 +420,25 @@ fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
         bail!("unmounted, but saving the last changes failed, so changes since the last save are lost: {reason}");
     }
     Ok(())
+}
+
+// Without FUSE (macOS, Windows, or a build without the `mount` feature) everything
+// works but mounting; `serve --mcp SOURCE` creates workspaces instead.
+#[cfg(not(fuse))]
+const NO_FUSE: &str =
+    "mounting needs FUSE, which this build of sandfs only has on Linux; `sandfs serve --mcp SOURCE` works here";
+
+#[cfg(not(fuse))]
+fn mount(_home: &Home, _name: &str, _dir: &Path, _foreground: bool) -> Result<()> {
+    bail!(NO_FUSE)
+}
+
+#[cfg(not(fuse))]
+fn serve(_home: &Home, _name: &str, _dir: &Path) -> Result<()> {
+    bail!(NO_FUSE)
+}
+
+#[cfg(not(fuse))]
+fn unmount(_home: &Home, _name: &str, _info: &MountInfo) -> Result<()> {
+    bail!(NO_FUSE)
 }

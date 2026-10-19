@@ -10,6 +10,7 @@
 //! workspaces/<name>/objects/        bodies of saved files
 //! workspaces/<name>/mount.json      present while it is mounted
 //! workspaces/<name>/lock            held by the one process that may save it
+//! workspaces/<name>/holder          who holds the lock, for whoever it refuses
 //! ```
 //!
 //! A workspace's base is pinned when it is created: a host folder, or a git commit
@@ -20,16 +21,17 @@
 //! It holds the workspace's [`Writer`] lock for as long as it serves. Readers (`changes`,
 //! `fork`) need no lock.
 
+use std::collections::BTreeMap;
 use std::fs::{File, TryLockError};
-use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use sandfs_core::{DirSource, Source, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
+use crate::host::mount_source;
 use crate::persist::{ObjectGone, Restored, Saved};
 
 /// Where a workspace's source is mounted inside the core workspace. The FUSE mount
@@ -82,6 +84,10 @@ pub struct Home {
     root: PathBuf,
 }
 
+/// How often, and how long apart, [`Home::lock`] retries a lock that looks held.
+const LOCK_RETRIES: u32 = 20;
+const LOCK_RETRY_WAIT: Duration = Duration::from_millis(10);
+
 impl Home {
     /// The home directory from the environment.
     pub fn locate() -> Result<Home> {
@@ -89,10 +95,10 @@ impl Home {
             PathBuf::from(dir)
         } else if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
             PathBuf::from(dir).join("sandfs")
-        } else if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".local/share/sandfs")
+        } else if let Some(home) = std::env::home_dir() {
+            home.join(".local/share/sandfs")
         } else {
-            bail!("set SANDFS_HOME or HOME so sandfs knows where to keep workspaces");
+            bail!("set SANDFS_HOME so sandfs knows where to keep workspaces");
         };
         Ok(Home { root })
     }
@@ -155,7 +161,7 @@ impl Home {
 
     /// Where `name` is mounted, if a live process is serving it.
     pub fn mount_info(&self, name: &str) -> Option<MountInfo> {
-        self.attached_mount(name).filter(|info| Path::new(&format!("/proc/{}", info.pid)).exists())
+        self.attached_mount(name).filter(|info| crate::host::alive(info.pid))
     }
 
     /// Where `name` was mounted, if that mount is still attached, even when the process
@@ -201,27 +207,38 @@ impl Home {
     pub fn lock(&self, name: &str, holder: &str) -> Result<Writer> {
         check_name(name)?;
         let path = self.workspace_dir(name).join("lock");
-        // Not truncated on open: until the lock is ours, the text names the current holder.
-        let mut file = File::options()
-            .read(true)
+        let file = File::options()
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        match file.try_lock() {
+        // Who holds the lock lives in a file of its own: on Windows a locked file can't
+        // be read, even by the process that is refused.
+        let holder_path = self.workspace_dir(name).join("holder");
+        // A child process this one is starting holds a copy of the lock until it runs
+        // its program, so a lock let go a moment ago can still look held. Retry briefly
+        // before calling it in use.
+        let mut attempt = 0;
+        let locked = loop {
+            match file.try_lock() {
+                Err(TryLockError::WouldBlock) if attempt < LOCK_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(LOCK_RETRY_WAIT);
+                }
+                result => break result,
+            }
+        };
+        match locked {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let mut held_by = String::new();
-                let _ = file.read_to_string(&mut held_by);
+                let held_by = std::fs::read_to_string(&holder_path).unwrap_or_default();
                 let held_by = if held_by.trim().is_empty() { "another sandfs process" } else { held_by.trim() };
                 bail!("{name} is in use by {held_by}");
             }
             Err(TryLockError::Error(err)) => return Err(err).with_context(|| format!("locking {}", path.display())),
         }
-        file.set_len(0)?;
-        file.rewind()?;
-        file.write_all(holder.as_bytes())?;
+        std::fs::write(&holder_path, holder).with_context(|| format!("writing {}", holder_path.display()))?;
         Ok(Writer { _file: file })
     }
 
@@ -279,10 +296,11 @@ impl Home {
     }
 }
 
-/// Expand a leading `~/`.
+/// Expand a leading `~/` (or `~\` on Windows) to the user's home.
 pub fn expand(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+    let rest = path.strip_prefix("~/").or_else(|| if cfg!(windows) { path.strip_prefix("~\\") } else { None });
+    match (rest, std::env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
 }
@@ -296,42 +314,18 @@ pub fn check_name(name: &str) -> Result<()> {
     if ok { Ok(()) } else { bail!("invalid workspace name {name:?}: use letters, digits, '.', '_' and '-'") }
 }
 
-/// Whether a FUSE filesystem is mounted at `dir`, from `/proc/self/mountinfo`.
+/// The keys of `map` equal to `prefix` or below it.
+pub(crate) fn subtree_keys<T>(map: &BTreeMap<String, T>, prefix: &VPath) -> Vec<String> {
+    let p = prefix.as_str();
+    let mut keys: Vec<String> = map.contains_key(p).then(|| p.to_owned()).into_iter().collect();
+    // '0' is the byte after '/', so this range is exactly the paths below `prefix`.
+    keys.extend(map.range(format!("{p}/")..format!("{p}0")).map(|(key, _)| key.clone()));
+    keys
+}
+
+/// Whether a FUSE filesystem is mounted at `dir`.
 pub fn is_mounted(dir: &Path) -> bool {
     mount_source(dir).is_some()
-}
-
-/// The source of the topmost FUSE mount at `dir` (`sandfs:<name>` for a workspace).
-fn mount_source(dir: &Path) -> Option<String> {
-    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    table.lines().rev().find_map(|line| {
-        let fields: Vec<&str> = line.split(' ').collect();
-        // Field 5 is the mount point; the type and source follow the " - " separator.
-        let sep = fields.iter().position(|f| *f == "-")?;
-        let (fstype, source) = (fields.get(sep + 1)?, fields.get(sep + 2)?);
-        (fields.get(4).is_some_and(|point| Path::new(&unescape(point)) == dir) && fstype.starts_with("fuse"))
-            .then(|| unescape(source))
-    })
-}
-
-/// Undo mountinfo's octal escapes (`\040` for a space).
-fn unescape(field: &str) -> String {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() && bytes[i + 1..i + 4].iter().all(u8::is_ascii_digit) {
-            let code = std::str::from_utf8(&bytes[i + 1..i + 4]).ok().and_then(|s| u8::from_str_radix(s, 8).ok());
-            if let Some(code) = code {
-                out.push(code);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -344,12 +338,6 @@ mod tests {
         for bad in ["", ".hidden", "a/b", "..", "a b"] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn mountinfo_escapes_decode() {
-        assert_eq!(unescape(r"/home/me/my\040ws"), "/home/me/my ws");
-        assert_eq!(unescape(r"/plain"), "/plain");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 The `sandfs` command: mount a [sandfs](https://crates.io/crates/sandfs-core) workspace as a real directory with FUSE, so any program can read and write it. The source underneath, such as a host folder, is never modified; every write lands in a copy-on-write overlay. Forking never copies the source, and `changes` lists the files a workspace added, modified or deleted.
 
-It needs Linux with FUSE 3 (`fusermount3`, package `fuse3`). Install it with `cargo install sandfs-cli`.
+It mounts on Linux with FUSE 3 (`fusermount3`, package `fuse3`). Install it with `cargo install sandfs-cli`. On macOS and Windows you get everything but mounting: `serve --mcp`, `changes`, `list` and `rm`, with `sandfs serve --mcp SOURCE` creating a workspace over a source.
 
 ```bash
 sandfs mount ~/datasets/survey ~/ws/survey       # a host folder, never written to

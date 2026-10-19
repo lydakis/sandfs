@@ -396,7 +396,17 @@ fn from_time((secs, nanos): Time) -> SystemTime {
 
 /// Flush a file or directory to disk (`fsync`).
 fn sync_path(path: &Path) -> Result<()> {
-    std::fs::File::open(path).and_then(|file| file.sync_all()).with_context(|| format!("syncing {}", path.display()))
+    // Windows flushes only files opened for writing, and has no directory flush: NTFS
+    // journals the renames and new names a directory's flush would cover.
+    if cfg!(windows) && path.is_dir() {
+        return Ok(());
+    }
+    std::fs::File::options()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("syncing {}", path.display()))
 }
 
 #[cfg(test)]

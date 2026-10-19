@@ -14,9 +14,8 @@ use sandfs_core::{VPath, Workspace};
 use sandfs_mcp::Server;
 use serde_json::{Value, json};
 
-use crate::fs::subtree_keys;
 use crate::persist::{NotDurable, Restored, Snapshot};
-use crate::store::{Home, ROOT};
+use crate::store::{Home, ROOT, subtree_keys};
 
 /// Serve `name` over stdin and stdout until the client closes stdin.
 pub fn serve(home: &Home, name: &str) -> Result<()> {

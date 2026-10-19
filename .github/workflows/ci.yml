@@ -58,8 +58,8 @@ jobs:
       - name: Check the crates package
         run: cargo package --workspace --exclude sandfs-py
 
-  # The library crates and the Python package are meant to work on macOS and Windows
-  # too. The CLI and the benchmarks are Linux-only (FUSE, overlayfs), so they stay out.
+  # Everything but the benchmarks (overlayfs, Linux-only) works on macOS and Windows
+  # too, and the CLI does everything there but mount.
   other-os:
     strategy:
       fail-fast: false
@@ -76,9 +76,9 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
       - name: Run Clippy
-        run: cargo clippy -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-py --all-targets -- -D warnings
+        run: cargo clippy -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-py -p sandfs-cli --all-targets -- -D warnings
       - name: Run Rust tests
-        run: cargo test -p sandfs-core -p sandfs-git -p sandfs-mcp
+        run: cargo test -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-cli
       - name: Install uv
         run: pip install uv
       - name: Install the package (builds the Rust extension)

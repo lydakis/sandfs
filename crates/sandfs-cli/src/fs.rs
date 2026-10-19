@@ -24,6 +24,7 @@ use fuser::{
 use sandfs_core::{Error, Kind, VPath, Workspace};
 
 use crate::persist::{Saved, Snapshot};
+use crate::store::subtree_keys;
 
 /// How long the kernel may cache attributes and names. Every change goes through this
 /// filesystem, so the kernel already sees its own updates and nothing goes stale;
@@ -698,15 +699,6 @@ impl Inner {
         }
         self.maybe_drop(ino);
     }
-}
-
-/// The keys of `map` equal to `prefix` or below it.
-pub(crate) fn subtree_keys<T>(map: &BTreeMap<String, T>, prefix: &VPath) -> Vec<String> {
-    let p = prefix.as_str();
-    let mut keys: Vec<String> = map.contains_key(p).then(|| p.to_owned()).into_iter().collect();
-    // '0' is the byte after '/', so this range is exactly the paths below `prefix`.
-    keys.extend(map.range(format!("{p}/")..format!("{p}0")).map(|(key, _)| key.clone()));
-    keys
 }
 
 /// The filesystem state plus what saving needs, shared with the saver thread.
