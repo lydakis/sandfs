@@ -17,6 +17,15 @@ class Source(Protocol):
     A source that can read part of a file (an object store with range requests) may
     also define ``read_range(path, offset, length)``. Without it, a ranged read of a
     file not yet read whole calls ``read`` and slices the result.
+
+    A source where each call is a slow trip may also define
+    ``prefetch(path, recursive)``: a hint that the files in the directory at ``path``
+    (with ``recursive``, everything below it) are about to be read, so it can fetch
+    them in one trip. The workspace calls it when a walk reads files, and when a
+    second file in a directory needs a size its listing left out; it then lists the
+    directory again. A prefetch must not change any answer, except that a listing may
+    now include sizes. It may run on any thread, and an exception it raises is
+    reported, not raised.
     """
 
     def list(self, path: str) -> Iterable[DirEntry]:

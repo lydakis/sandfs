@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 import threading
 from collections.abc import Iterable
 from pathlib import Path
@@ -276,3 +277,61 @@ def test_ranged_reads_slice_whole_reads_for_simple_sources() -> None:
     assert ws.read("/tickets/README.txt", offset=1, length=3) == b"ell"
     assert ws.read("/notes.txt", offset=8, length=10) == b"89"
     assert ws.read("/notes.txt", offset=20) == b""
+
+
+def test_a_walk_that_reads_asks_a_python_source_to_prefetch() -> None:
+    class Bucket:
+        """A remote store where every call is a trip, counting the hints it gets."""
+
+        def __init__(self) -> None:
+            self.prefetches: list[tuple[str, bool]] = []
+
+        def list(self, path: str) -> Iterable[DirEntry]:
+            if path == "/":
+                return [DirEntry("photos", kind="dir")]
+            if path == "/photos":
+                return [DirEntry("2024", kind="dir"), DirEntry("cover.jpg")]
+            return [DirEntry("a.jpg"), DirEntry("b.jpg")]
+
+        def read(self, path: str) -> bytes:
+            return path.encode()
+
+        def prefetch(self, path: str, recursive: bool) -> None:
+            self.prefetches.append((path, recursive))
+
+    bucket = Bucket()
+    ws = Workspace()
+    ws.mount("/bucket", bucket)
+    ws.read("/bucket/photos/2024/a.jpg")
+    assert bucket.prefetches == [], "a single read is no walk"
+
+    # Listing names only, like `find`, asks for nothing either.
+    ws.list("/bucket/photos")
+    ws.list("/bucket/photos/2024")
+    assert bucket.prefetches == []
+    # Reading what the walk listed does, once per folder.
+    ws.read("/bucket/photos/2024/b.jpg")
+    ws.read("/bucket/photos/cover.jpg")
+    assert bucket.prefetches == [("/photos", True), ("/photos/2024", True)]
+
+
+def test_a_failing_prefetch_does_not_fail_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Flaky:
+        def list(self, path: str) -> Iterable[DirEntry]:
+            return [DirEntry("d", kind="dir")] if path == "/" else [DirEntry("f.txt")]
+
+        def read(self, path: str) -> bytes:
+            return b"ok"
+
+        def prefetch(self, path: str, recursive: bool) -> None:
+            raise RuntimeError("store unavailable")
+
+    reported: list[BaseException | None] = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda info: reported.append(info.exc_value))
+    ws = Workspace()
+    ws.mount("/s", Flaky())
+    ws.list("/s")
+    ws.list("/s/d")
+    assert ws.read("/s/d/f.txt") == b"ok"
+    # Both hints, for where the walk started and for the folder it read in, failed.
+    assert [str(err) for err in reported] == ["store unavailable"] * 2

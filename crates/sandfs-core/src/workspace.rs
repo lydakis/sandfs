@@ -6,7 +6,7 @@
 //! exactly the change set. Base content is read through a cache shared by every fork,
 //! so a file fetched once is never fetched again.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,17 @@ struct Cache {
     /// path costs one lookup instead of one listing lookup per component. Only
     /// entries that exist are kept, so probing for missing names costs no memory.
     entries: Mutex<HashMap<u64, HashMap<Box<str>, SourceEntry>>>,
+    /// Directories listed through [`Workspace::list`].
+    listed: Mutex<HashSet<CacheKey>>,
+    /// Directories a walk listed (listed inside a listed directory), each with the key
+    /// of the directory the walk started from.
+    walks: Mutex<HashMap<CacheKey, SourceKey>>,
+    /// Directories already prefetched with `recursive`, so each is asked for once.
+    prefetched: Mutex<HashSet<CacheKey>>,
+    /// Directories where a file's size was missing once already.
+    size_misses: Mutex<HashSet<CacheKey>>,
+    /// Directories listed again for their files' sizes, at most once each.
+    sized: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
 }
 
 impl Cache {
@@ -77,6 +88,11 @@ impl Cache {
 
     fn remember_entry(&self, mount: u64, rel: &str, entry: SourceEntry) {
         self.entries.lock().expect("cache lock").entry(mount).or_default().insert(rel.into(), entry);
+    }
+
+    /// Replace a cached listing with a newer answer from the same source.
+    fn replace_listing(&self, key: CacheKey, listing: Arc<Listing>) {
+        self.dirs.lock().expect("cache lock").insert(key, Arc::new(Mutex::new(Some(listing))));
     }
 
     /// The cached blob for `key`, if it is loaded and not being loaded right now.
@@ -235,7 +251,13 @@ impl Workspace {
             Resolved::File { content, kind, version } => {
                 let size = match content_size(&content) {
                     Some(size) => size,
-                    None => self.content_bytes(&content)?.len() as u64,
+                    None => match self.cached_size(&content) {
+                        Some(size) => size,
+                        None => match self.listed_size(&path, &content)? {
+                            Some(size) => size,
+                            None => self.content_bytes(&content)?.len() as u64,
+                        },
+                    },
                 };
                 Metadata { kind, size, version }
             }
@@ -247,7 +269,12 @@ impl Workspace {
         let path = VPath::parse(path)?;
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
-            Resolved::File { content, .. } => self.content_bytes(&content),
+            Resolved::File { content, .. } => {
+                if let Content::Base { mount, key, .. } = &content {
+                    self.reading(&path, mount, key)?;
+                }
+                self.content_bytes(&content)
+            }
         }
     }
 
@@ -264,7 +291,10 @@ impl Workspace {
             Resolved::File { content: Content::Base { mount, key, .. }, .. } => {
                 match self.cache.peek_blob(&(mount.id, key.clone())) {
                     Some(bytes) => Ok(slice(&bytes, offset, len)),
-                    None => mount.source.read_range(&key, offset, len),
+                    None => {
+                        self.reading(&path, &mount, &key)?;
+                        mount.source.read_range(&key, offset, len)
+                    }
                 }
             }
         }
@@ -285,6 +315,7 @@ impl Workspace {
         };
         let mut entries: BTreeMap<String, DirEntry> = BTreeMap::new();
         if let Some(base) = &base {
+            self.note_listed(&path, base)?;
             for (name, entry) in self.base_listing(base)?.iter() {
                 let kind = entry.kind;
                 entries.insert(name.clone(), DirEntry { name: name.clone(), kind, size: entry.size });
@@ -569,6 +600,105 @@ impl Workspace {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Prefetching: readahead for directories
+    // ------------------------------------------------------------------
+
+    /// Record that `path`, whose base node is `node`, is being listed. Listing a
+    /// directory inside one already listed is a walk (`find`, `grep -r`, a copy).
+    /// Nothing is prefetched yet: a walk that only lists (`find`, `ls -R`) needs no
+    /// file, so the source is asked only once the walk reads one.
+    fn note_listed(&self, path: &VPath, node: &BaseNode) -> Result<()> {
+        let Some((mount, key)) = dir_key(node) else { return Ok(()) };
+        let parent = match path.parent() {
+            Some(parent) => self.base_dir(&parent, &mount)?,
+            None => None,
+        };
+        let mut listed = self.cache.listed.lock().expect("cache lock");
+        listed.insert((mount.id, key.clone()));
+        let Some(parent) = parent.filter(|parent| listed.contains(&(mount.id, parent.clone()))) else { return Ok(()) };
+        drop(listed);
+        let mut walks = self.cache.walks.lock().expect("cache lock");
+        let start = walks.get(&(mount.id, parent.clone())).cloned().unwrap_or(parent);
+        walks.insert((mount.id, key), start);
+        Ok(())
+    }
+
+    /// Before a base file's bytes are fetched: if a walk listed its directory, the walk
+    /// is reading the files it lists (`grep -r`, a copy), so the source prefetches. A
+    /// read outside a walk prefetches nothing.
+    fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<()> {
+        // With no walk at all, a read costs nothing more.
+        if self.cache.walks.lock().expect("cache lock").is_empty()
+            || self.cache.peek_blob(&(mount.id, key.clone())).is_some()
+        {
+            return Ok(());
+        }
+        if let Some(dir) = path.parent().map(|parent| self.base_dir(&parent, mount)).transpose()?.flatten() {
+            self.walk_prefetch(mount, &dir);
+        }
+        Ok(())
+    }
+
+    /// If a walk listed the directory `dir`, ask the source to prefetch everything
+    /// below where the walk started and below `dir`, each once, and return true.
+    fn walk_prefetch(&self, mount: &Arc<Mount>, dir: &SourceKey) -> bool {
+        let Some(start) = self.cache.walks.lock().expect("cache lock").get(&(mount.id, dir.clone())).cloned() else {
+            return false;
+        };
+        for key in [start, dir.clone()] {
+            let first = self.cache.prefetched.lock().expect("cache lock").insert((mount.id, key.clone()));
+            if first {
+                mount.source.prefetch(&key, true);
+            }
+        }
+        true
+    }
+
+    /// The size of a base file already read.
+    fn cached_size(&self, content: &Content) -> Option<u64> {
+        let Content::Base { mount, key, .. } = content else { return None };
+        Some(self.cache.peek_blob(&(mount.id, key.clone()))?.len() as u64)
+    }
+
+    /// The size of the base file at `path` when its directory's listing left it out.
+    /// The first such file in a directory is read to find it, since one file says
+    /// nothing about the rest. From the second on (`ls -l`), or inside a walk, the
+    /// source is asked to prefetch the directory and it is listed again, once, for
+    /// every size at once. `None` when the size must come from reading the file.
+    fn listed_size(&self, path: &VPath, content: &Content) -> Result<Option<u64>> {
+        let Content::Base { mount, key, .. } = content else { return Ok(None) };
+        let (Some(parent), Some(name)) = (path.parent(), path.name()) else { return Ok(None) };
+        let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(None) };
+        let walked = self.walk_prefetch(mount, &dir);
+        let cache_key = (mount.id, dir.clone());
+        if !walked && self.cache.size_misses.lock().expect("cache lock").insert(cache_key.clone()) {
+            return Ok(None);
+        }
+        // Single-flight, like every other cache entry: forks asking at once prefetch once.
+        let listing = Cache::get_or_load(&self.cache.sized, cache_key.clone(), || {
+            if !walked {
+                mount.source.prefetch(&dir, false);
+            }
+            let listing = Arc::new(mount.source.read_dir(&dir)?);
+            self.cache.replace_listing(cache_key.clone(), listing.clone());
+            Ok(listing)
+        })?;
+        // A file copied or moved from another directory isn't in this listing.
+        Ok(listing.get(name).filter(|entry| entry.key == *key).and_then(|entry| entry.size))
+    }
+
+    /// The source key of the base directory at `path`, if `mount` provides it.
+    fn base_dir(&self, path: &VPath, mount: &Arc<Mount>) -> Result<Option<SourceKey>> {
+        Ok(match self.resolve(path) {
+            Ok(Resolved::Dir { base: Some(node) }) => {
+                dir_key(&node).filter(|(owner, _)| owner.id == mount.id).map(|(_, key)| key)
+            }
+            Ok(_) | Err(Error::NotFound(_)) => None,
+            Err(err) => return Err(err),
+        })
+    }
+
     fn cached_listing(&self, mount: &Arc<Mount>, key: &SourceKey) -> Result<Arc<Listing>> {
         Cache::get_or_load(&self.cache.dirs, (mount.id, key.clone()), || Ok(Arc::new(mount.source.read_dir(key)?)))
     }
@@ -746,6 +876,15 @@ impl Workspace {
 
 fn source_is_dir(resolved: &Resolved) -> bool {
     matches!(resolved, Resolved::Dir { .. })
+}
+
+/// The mount and source key of a base directory, if it has one.
+fn dir_key(node: &BaseNode) -> Option<(Arc<Mount>, SourceKey)> {
+    match node {
+        BaseNode::MountRoot(mount) => Some((mount.clone(), mount.root.clone())),
+        BaseNode::Entry(mount, entry) if entry.kind.is_dir() => Some((mount.clone(), entry.key.clone())),
+        _ => None,
+    }
 }
 
 fn content_size(content: &Content) -> Option<u64> {

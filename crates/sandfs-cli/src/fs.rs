@@ -117,6 +117,9 @@ struct Node {
 struct DirHandle {
     ino: u64,
     entries: Vec<(u64, FileType, String)>,
+    /// Files the listing gave no size for, with their executable bits. Their sizes
+    /// aren't looked up for `readdirplus`, since that can mean reading the file.
+    sizeless: HashMap<String, bool>,
 }
 
 /// A file's contents with writes the workspace hasn't seen yet.
@@ -315,6 +318,19 @@ impl Inner {
         };
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
         Ok(self.make_attr(ino, kind, perm, size, mtime))
+    }
+
+    /// Attributes for a file whose size isn't known without reading it: size 0, for
+    /// the kernel to ask about again.
+    #[cfg(any(fuse, test))]
+    fn sizeless_attr(&self, ino: u64, executable: bool) -> FsResult<FileAttr> {
+        let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
+        let path = node.path.as_str();
+        if !node.linked || !self.ws.exists(path) {
+            return Err(Errno::ENOENT);
+        }
+        let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
+        Ok(self.make_attr(ino, FileType::RegularFile, if executable { 0o755 } else { 0o644 }, 0, mtime))
     }
 
     fn make_attr(&self, ino: u64, kind: FileType, perm: u16, size: u64, mtime: SystemTime) -> FileAttr {
@@ -713,7 +729,11 @@ impl Inner {
         };
         let mut entries =
             vec![(ino, FileType::Directory, ".".to_owned()), (parent, FileType::Directory, "..".to_owned())];
+        let mut sizeless = HashMap::new();
         for entry in listing {
+            if let (Kind::File { executable }, None) = (entry.kind, entry.size) {
+                sizeless.insert(entry.name.clone(), executable);
+            }
             let child = path.join(&entry.name).map_err(|_| Errno::EIO)?;
             let kind = match entry.kind {
                 Kind::Dir => FileType::Directory,
@@ -723,7 +743,7 @@ impl Inner {
         }
         let fh = self.next_fh;
         self.next_fh += 1;
-        self.handles.insert(fh, DirHandle { ino, entries });
+        self.handles.insert(fh, DirHandle { ino, entries, sizeless });
         // The listing keeps its folder's inode until releasedir, since readdirplus
         // resolves names through it.
         *self.open.entry(ino).or_default() += 1;
@@ -737,21 +757,29 @@ impl Inner {
         Ok(handle.entries.get(usize::try_from(offset).unwrap_or(usize::MAX)..).unwrap_or_default())
     }
 
-    /// Like [`Inner::readdir`], with each entry's attributes, handed to `add` until it
-    /// reports the reply full. The kernel counts every entry it accepts as a lookup,
-    /// except `.` and `..`, so those entries count here too.
+    /// Like [`Inner::readdir`], with each entry's attributes and how long the kernel
+    /// may keep them, handed to `add` until it reports the reply full. The kernel counts
+    /// every entry it accepts as a lookup, except `.` and `..`, so those entries count
+    /// here too.
+    ///
+    /// A file the listing has no size for gets size 0 and no time to keep it, so the
+    /// kernel asks for its attributes when something needs them (`ls -l`, a read) and
+    /// a walk that needs only names (`find`) reads no file to find sizes.
     #[cfg(any(fuse, test))]
     pub fn readdirplus(
         &mut self,
         fh: u64,
         offset: u64,
-        mut add: impl FnMut(u64, u64, &str, &FileAttr) -> bool,
+        mut add: impl FnMut(u64, u64, &str, &FileAttr, Duration) -> bool,
     ) -> FsResult<()> {
         let mut position = usize::try_from(offset).unwrap_or(usize::MAX);
         loop {
-            let Some(DirHandle { ino: dir, entries }) = self.handles.get(&fh) else { return Err(Errno::EBADF) };
+            let Some(DirHandle { ino: dir, entries, sizeless }) = self.handles.get(&fh) else {
+                return Err(Errno::EBADF);
+            };
             let dir = *dir;
             let Some((saved, _, name)) = entries.get(position).cloned() else { return Ok(()) };
+            let executable = sizeless.get(&name).copied();
             position += 1;
             let dots = name == "." || name == "..";
             // Every other name is resolved again: the kernel keeps what this returns for
@@ -765,11 +793,15 @@ impl Inner {
                 };
                 self.ino_for(&path)
             };
-            let Ok(attr) = self.attr(ino) else {
+            let attr = match executable.filter(|_| !self.buffers.contains_key(&ino)) {
+                Some(executable) => self.sizeless_attr(ino, executable).map(|attr| (attr, Duration::ZERO)),
+                None => self.attr(ino).map(|attr| (attr, TTL)),
+            };
+            let Ok((attr, ttl)) = attr else {
                 self.maybe_drop(ino);
                 continue;
             };
-            if add(ino, position as u64, &name, &attr) {
+            if add(ino, position as u64, &name, &attr, ttl) {
                 if !dots {
                     self.maybe_drop(ino);
                 }
@@ -1106,8 +1138,8 @@ impl Filesystem for SandFs {
     }
 
     fn readdirplus(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
-        let result = self.0.lock().readdirplus(fh.0, offset, |ino, next, name, attr| {
-            reply.add(INodeNo(ino), next, name, &TTL, attr, Generation(0))
+        let result = self.0.lock().readdirplus(fh.0, offset, |ino, next, name, attr, ttl| {
+            reply.add(INodeNo(ino), next, name, &ttl, attr, Generation(0))
         });
         match result {
             Ok(()) => reply.ok(),
@@ -1373,7 +1405,7 @@ mod tests {
         let fh = fs.opendir(ROOT_INO).unwrap();
         // Accept one entry past `.` and `..`, then report the reply full.
         let mut seen = Vec::new();
-        fs.readdirplus(fh, 0, |_, next, name, _| {
+        fs.readdirplus(fh, 0, |_, next, name, _, _| {
             seen.push((next, name.to_owned()));
             seen.len() > 3
         })
@@ -1381,7 +1413,7 @@ mod tests {
         assert_eq!(seen.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), [".", "..", "README.md", "src"]);
         let resume = seen[2].0;
         let mut rest = Vec::new();
-        fs.readdirplus(fh, resume, |_, _, name, attr| {
+        fs.readdirplus(fh, resume, |_, _, name, attr, _| {
             rest.push((name.to_owned(), attr.kind));
             false
         })
@@ -1397,6 +1429,50 @@ mod tests {
     }
 
     #[test]
+    fn listings_with_attributes_leave_unknown_sizes_to_the_kernel() {
+        /// A source that lists no sizes and counts the files it reads.
+        #[derive(Debug)]
+        struct Sizeless(MemorySource, std::sync::atomic::AtomicUsize);
+        impl sandfs_core::Source for Sizeless {
+            fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+                self.0.root()
+            }
+            fn read_dir(&self, key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+                let mut listing = self.0.read_dir(key)?;
+                listing.values_mut().for_each(|entry| entry.size = None);
+                Ok(listing)
+            }
+            fn read_file(&self, key: &str) -> sandfs_core::Result<bytes::Bytes> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                self.0.read_file(key)
+            }
+        }
+        let source = Arc::new(Sizeless(
+            MemorySource::from_files([("README.md", "hello\n"), ("src/lib.rs", "")]).unwrap(),
+            Default::default(),
+        ));
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", source.clone()).unwrap();
+        let root = VPath::parse("/mnt").unwrap();
+        let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        let fh = fs.opendir(ROOT_INO).unwrap();
+        let mut seen = Vec::new();
+        fs.readdirplus(fh, 2, |ino, _, name, attr, ttl| {
+            seen.push((name.to_owned(), ino, attr.size, ttl));
+            false
+        })
+        .unwrap();
+        fs.releasedir(fh);
+        let readme = seen.iter().find(|(name, ..)| name == "README.md").unwrap();
+        assert_eq!((readme.2, readme.3), (0, Duration::ZERO), "no size yet, and nothing to keep");
+        let src = seen.iter().find(|(name, ..)| name == "src").unwrap();
+        assert_eq!(src.3, TTL);
+        assert_eq!(source.1.load(Ordering::SeqCst), 0, "listing read no file");
+        // The kernel asks again, and gets the real size.
+        assert_eq!(fs.attr(readme.1).unwrap().size, 6);
+    }
+
+    #[test]
     fn listings_with_attributes_never_publish_stale_names() {
         let mut fs = fs();
         let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
@@ -1405,7 +1481,7 @@ mod tests {
         fs.rename(ROOT_INO, name("README.md"), ROOT_INO, name("NOTES.md"), RenameFlags::empty()).unwrap();
         fs.forget(src, 1);
         let mut seen = Vec::new();
-        fs.readdirplus(fh, 2, |ino, _, name, attr| {
+        fs.readdirplus(fh, 2, |ino, _, name, attr, _| {
             seen.push((name.to_owned(), ino, attr.kind));
             false
         })
@@ -1425,7 +1501,7 @@ mod tests {
         let fh = fs.opendir(src).unwrap();
         fs.forget(src, 1);
         let mut names = Vec::new();
-        fs.readdirplus(fh, 2, |_, _, name, _| {
+        fs.readdirplus(fh, 2, |_, _, name, _, _| {
             names.push(name.to_owned());
             false
         })
