@@ -290,7 +290,7 @@ def test_a_walk_that_reads_asks_a_python_source_to_prefetch() -> None:
             if path == "/":
                 return [DirEntry("photos", kind="dir")]
             if path == "/photos":
-                return [DirEntry("2024", kind="dir"), DirEntry("2025", kind="dir")]
+                return [DirEntry(year, kind="dir") for year in ("2024", "2025", "2026")]
             return [DirEntry("a.jpg"), DirEntry("b.jpg"), DirEntry("c.jpg")]
 
         def read(self, path: str) -> bytes:
@@ -313,10 +313,13 @@ def test_a_walk_that_reads_asks_a_python_source_to_prefetch() -> None:
     ws.read("/bucket/photos/2024/b.jpg")
     ws.read("/bucket/photos/2024/c.jpg")
     assert bucket.prefetches == [("/photos/2024", False)]
-    # Two files of a second folder prefetch everything below the folder holding both.
+    # A file in a third folder shows the walk is reading through them, so everything
+    # below the folder holding all three is prefetched.
     ws.list("/bucket/photos/2025")
     ws.read("/bucket/photos/2025/a.jpg")
-    ws.read("/bucket/photos/2025/b.jpg")
+    assert bucket.prefetches == [("/photos/2024", False)]
+    ws.list("/bucket/photos/2026")
+    ws.read("/bucket/photos/2026/a.jpg")
     assert bucket.prefetches == [("/photos/2024", False), ("/photos", True)]
 
 

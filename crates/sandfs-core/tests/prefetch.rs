@@ -1,6 +1,6 @@
 //! When the workspace asks a source to prefetch: a folder once two of its files are
 //! needed (sizes missing from its listing, or reads in a walk), and everything below a
-//! folder once a walk has read through two folders in it. Never a single lookup or
+//! folder once a walk has needed files in three folders in it. Never a single lookup or
 //! read, and never a walk that only lists.
 
 use std::collections::HashSet;
@@ -130,7 +130,7 @@ fn a_walk_that_only_lists_prefetches_nothing() {
 }
 
 #[test]
-fn a_walk_prefetches_a_folder_it_reads_two_files_in_and_below_two_such_folders() {
+fn a_walk_prefetches_a_folder_it_reads_two_files_in_and_below_three_folders_it_reads() {
     let source = Arc::new(Remote::new(&[
         "w/1.txt",
         "w/2.txt",
@@ -143,9 +143,10 @@ fn a_walk_prefetches_a_folder_it_reads_two_files_in_and_below_two_such_folders()
     ]));
     let ws = mounted(&source);
     assert_eq!(walk(&ws, "/data/w", true).len(), 8);
-    // `w`'s own files are read before the walk shows itself. `w/b` is the first folder
-    // the walk reads two files in, so its files are prefetched; `w/d` is the second, so
-    // everything below `w`, which holds both, is prefetched, and `w/d` needs no more.
+    // `w`'s own files are read before the walk shows itself. The walk reads two files in
+    // `w/b`, so its files are prefetched. `w/d` is the third folder it reads in, so
+    // everything below `w`, which holds all three, is prefetched, and `w/d` needs no
+    // more of its own.
     assert_eq!(source.prefetches(), vec![("w".to_owned(), true), ("w/b".to_owned(), false)]);
     // Walking again, or from a fork, finds every file read already.
     walk(&ws, "/data/w", true);
@@ -165,8 +166,8 @@ fn looking_around_prefetches_no_more_than_a_folder() {
     assert!(ws.exists("/data/a/b/c/three.txt"));
     assert_eq!(ws.stat("/data/a/d/four.txt").unwrap().size, "a/d/four.txt!".len() as u64);
     assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
-    // Two sizes in one folder prefetch that folder, and nothing below where the walk
-    // started.
+    // Two sizes in one folder prefetch that folder. Two folders are still not a walk
+    // reading through, so nothing below them is prefetched.
     ws.list("/data/s").unwrap();
     ws.stat("/data/s/x.txt").unwrap();
     ws.stat("/data/s/y.txt").unwrap();

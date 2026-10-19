@@ -6,7 +6,6 @@
 //! exactly the change set. Base content is read through a cache shared by every fork,
 //! so a file fetched once is never fetched again.
 
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,9 +54,11 @@ struct Cache {
     /// Directories a walk listed (listed inside a listed directory), and the one it
     /// started from, each with the path the walk started at.
     walks: Mutex<HashMap<CacheKey, VPath>>,
-    /// For each walk, by mount id and start path, the directory below which it reads:
-    /// the first directory it read two files in, then the common parent of those.
-    hot: Mutex<HashMap<(u64, VPath), VPath>>,
+    /// For each walk, by mount id and start path, the directory holding every directory
+    /// it needed files in, and how many those are.
+    hot: Mutex<HashMap<(u64, VPath), (VPath, usize)>>,
+    /// Directories a walk needed files in, each counted once.
+    walk_touched: Mutex<HashSet<CacheKey>>,
     /// Directories already prefetched, and whether recursively, so each is asked once.
     prefetched: Mutex<HashSet<(CacheKey, bool)>>,
     /// Base files each directory needed fetched: sizes missing from its listing, and
@@ -652,9 +653,10 @@ impl Workspace {
 
     /// Count a base file of the directory `dir` at `path` that needs fetching. One file
     /// says nothing about the rest; the second shows the directory is being gone
-    /// through. Reads count only inside a walk. When a walk has gone through two
-    /// directories, everything below the directory holding both is prefetched once: two
-    /// is a pattern (`grep -r`), where one directory read is still just a look around.
+    /// through. Reads count only inside a walk. Once a walk has needed files in
+    /// [`WALK_DIRS`] directories, it is reading through them (`grep -r`, a copy) rather
+    /// than looking around, so everything below the directory holding them all is
+    /// prefetched, once.
     fn touch(&self, path: &VPath, mount: &Arc<Mount>, dir: &SourceKey, read: bool) -> Result<Touch> {
         let cache_key = (mount.id, dir.clone());
         let start = self.cache.walks.lock().expect("cache lock").get(&cache_key).cloned();
@@ -663,37 +665,41 @@ impl Workspace {
         }
         let count = {
             let mut touches = self.cache.touches.lock().expect("cache lock");
-            let count = touches.entry(cache_key).or_default();
+            let count = touches.entry(cache_key.clone()).or_default();
             *count = count.saturating_add(1);
             *count
         };
-        match count {
-            0 | 1 => return Ok(Touch::Cold),
-            2 => {}
-            _ => return Ok(Touch::Warm),
+        if let Some(start) = start {
+            self.walk_touched(start, path, mount, cache_key)?;
         }
-        let Some(start) = start else { return Ok(Touch::Warmed) };
+        Ok(match count {
+            0 | 1 => Touch::Cold,
+            2 => Touch::Warmed,
+            _ => Touch::Warm,
+        })
+    }
+
+    /// Record that the walk from `start` needed a file in the directory at `path`, and
+    /// prefetch everything below the directory holding all such directories once there
+    /// are [`WALK_DIRS`] of them.
+    fn walk_touched(&self, start: VPath, path: &VPath, mount: &Arc<Mount>, dir: CacheKey) -> Result<()> {
+        if !self.cache.walk_touched.lock().expect("cache lock").insert(dir) {
+            return Ok(());
+        }
         let below = {
             let mut hot = self.cache.hot.lock().expect("cache lock");
-            match hot.entry((mount.id, start)) {
-                Entry::Occupied(mut hot) => {
-                    let below = common_ancestor(hot.get(), path);
-                    hot.insert(below.clone());
-                    Some(below)
-                }
-                Entry::Vacant(hot) => {
-                    hot.insert(path.clone());
-                    None
-                }
-            }
+            let (below, dirs) = hot.entry((mount.id, start)).or_insert_with(|| (path.clone(), 0));
+            *below = common_ancestor(below, path);
+            *dirs += 1;
+            (*dirs >= WALK_DIRS).then(|| below.clone())
         };
-        let Some(below) = below else { return Ok(Touch::Warmed) };
+        let Some(below) = below else { return Ok(()) };
         if let Some(key) = self.base_dir(&below, mount)? {
             if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, key.clone()), true)) {
                 mount.source.prefetch(&key, true);
             }
         }
-        Ok(Touch::Warmed)
+        Ok(())
     }
 
     /// Ask the source to prefetch the files of the directory `dir` at `path`, once,
@@ -930,6 +936,11 @@ impl Workspace {
 fn source_is_dir(resolved: &Resolved) -> bool {
     matches!(resolved, Resolved::Dir { .. })
 }
+
+/// How many directories a walk must need files in before everything below them is
+/// prefetched: one or two may be a look around (`cat src/main.rs`), three is a walk
+/// reading through (`grep -r`).
+const WALK_DIRS: usize = 3;
 
 /// What counting one more file needing a fetch in a directory found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
