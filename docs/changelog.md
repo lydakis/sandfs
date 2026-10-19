@@ -3,6 +3,7 @@
 ## 0.4.1
 
 - **Mounting on macOS**: `sandfs mount` works on macOS with nothing to install. The mount's process serves the workspace over NFS on localhost and macOS's own NFS client mounts it, with no kernel extension, macFUSE or sudo. Writes are saved by the same rule as on Linux, except that `fsync` doesn't reach the server and saves nothing by itself. Like a FUSE mount, it answers only the user who mounted it (and root).
+- **README**: rewritten for newcomers. It explains what sandfs is for in plain terms, starts with one short example, then covers each kind of source (with a git example), giving a workspace to an agent, mounting it as a folder, a performance table and the limits.
 - **sandfs-cli speed**: the FUSE mount tells the kernel it needn't open or close files, so a first read of a small file is about a quarter faster and rereads and overwrites take about 40% less time.
 - **sandfs-cli saving**: closing a file no longer commits it. A write is saved once its file has gone 250 ms without a write, on `fsync`, or at `unmount`, `fork` or `changes`. A program that writes a file, closes it and exits still has it saved a moment later, but not at the instant of the close.
 - **sandfs-cli ranged reads**: large host-folder files read in ranges go back to the folder only for the parts the kernel hasn't kept in its page cache.
