@@ -71,7 +71,9 @@ impl GitSource {
     ///
     /// Sizes are looked up when a directory is first listed. In a partial clone that
     /// means the directory's blobs are fetched then, all in one request, rather than one
-    /// request per file on first read. Directories that are never listed cost nothing.
+    /// request per file on first read; a directory holding at most 1,000 missing files
+    /// in all, subdirectories included, has them all fetched in that request. Directories
+    /// that are never listed, and lie outside a listed small one, cost nothing.
     pub fn with_sizes(mut self) -> Result<Self> {
         self.promisor = promisor_remote(&self.repo);
         self.sizes = Some(Mutex::new(Batch::spawn(&self.repo, "--batch-check")?));
@@ -98,16 +100,17 @@ impl GitSource {
         Ok(())
     }
 
-    /// Fetch the blobs directly inside the tree `id` that a partial clone lacks, in one
-    /// request. Best effort: whatever this misses, git still fetches one blob at a time.
+    /// Fetch the blobs of the tree `id` that a partial clone lacks, in one request: the
+    /// whole subtree when it lacks at most [`SUBTREE_LIMIT`] of them, so a folder that
+    /// is about to be walked costs one round trip, and otherwise only the files directly
+    /// inside it. Best effort: whatever this misses, git still fetches one blob at a time.
     fn fetch_missing(&self, id: &str, remote: &str) {
-        // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
         // `tree:1` stops the walk at the tree's direct children.
-        let Ok(objects) = git_output(&self.repo, &["rev-list", "--objects", "--missing=print", "--filter=tree:1", id])
+        let Some(missing) = missing_objects(&self.repo, id, &[], Some(SUBTREE_LIMIT))
+            .or_else(|| missing_objects(&self.repo, id, &["--filter=tree:1"], None))
         else {
             return;
         };
-        let missing: Vec<&str> = objects.lines().filter_map(|line| line.strip_prefix('?')).collect();
         if missing.is_empty() {
             return;
         }
@@ -181,6 +184,42 @@ fn parse_tree(data: &[u8], hash_len: usize) -> Result<Listing> {
         listing.insert(name.to_owned(), SourceEntry { kind, key: id.as_str().into(), size: None });
     }
     Ok(listing)
+}
+
+/// The most missing blobs [`GitSource::fetch_missing`] fetches for a whole subtree.
+const SUBTREE_LIMIT: usize = 1000;
+
+/// The objects reachable from `id` that the repository lacks, walking with the extra
+/// rev-list `args`; `None` if the walk fails or finds more than `limit` of them, in
+/// which case it stops there rather than walking the rest of a large tree.
+fn missing_objects(repo: &Path, id: &str, args: &[&str], limit: Option<usize>) -> Option<Vec<String>> {
+    // `--missing=print` lists absent objects as `?<id>` instead of fetching them.
+    let mut walk = git(repo)
+        .args(["rev-list", "--objects", "--missing=print"])
+        .args(args)
+        .arg(id)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = walk.stdout.take()?;
+    let mut missing = Vec::new();
+    let mut over = false;
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        if let Some(object) = line.strip_prefix('?') {
+            if limit.is_some_and(|limit| missing.len() == limit) {
+                over = true;
+                break;
+            }
+            missing.push(object.to_owned());
+        }
+    }
+    if over {
+        let _ = walk.kill();
+    }
+    let finished = walk.wait().ok()?.success();
+    (finished && !over).then_some(missing)
 }
 
 fn hex(bytes: &[u8]) -> String {

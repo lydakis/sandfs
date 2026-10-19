@@ -98,32 +98,71 @@ fn partial_clone_fetches_only_the_blobs_that_are_read() {
     assert_eq!(missing(clone.path()), before - 1, "exactly one blob was fetched");
 }
 
-#[test]
-fn sizes_fetch_a_directory_of_a_partial_clone_in_one_request() {
-    let origin = tempfile::tempdir().unwrap();
-    make_repo(origin.path());
-    git(origin.path(), &["config", "uploadpack.allowFilter", "true"]);
-    git(origin.path(), &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+/// A blobless partial clone of `origin`, and a count of the blobs of its head commit
+/// that it still lacks.
+fn partial_clone(origin: &Path) -> (tempfile::TempDir, impl Fn(&Path) -> usize) {
+    git(origin, &["config", "uploadpack.allowFilter", "true"]);
+    git(origin, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
     let clone = tempfile::tempdir().unwrap();
-    let url = format!("file://{}", origin.path().display());
+    let url = format!("file://{}", origin.display());
     git(clone.path(), &["clone", "-q", "--bare", "--filter=blob:none", &url, "."]);
     let missing = |clone: &Path| {
-        git(clone, &["rev-list", "--objects", "--missing=print", "HEAD"]).lines().filter(|l| l.starts_with('?')).count()
+        git(clone, &["rev-list", "--objects", "--missing=print", "HEAD^{tree}"])
+            .lines()
+            .filter(|l| l.starts_with('?'))
+            .count()
     };
-    let before = missing(clone.path());
+    (clone, missing)
+}
+
+#[test]
+fn sizes_fetch_a_small_directory_of_a_partial_clone_whole_in_one_request() {
+    let origin = tempfile::tempdir().unwrap();
+    make_repo(origin.path());
+    let (clone, missing) = partial_clone(origin.path());
+    assert!(missing(clone.path()) >= 4);
 
     let mut ws = Workspace::new();
     ws.mount("/repo", Arc::new(GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap())).unwrap();
     let src = ws.list("/repo/src").unwrap();
     assert_eq!(src.iter().find(|e| e.name == "lib.rs").unwrap().size, Some(13));
     assert_eq!(ws.stat("/repo/src/lib.rs").unwrap().size, 13);
-    // Reaching /repo/src lists /repo too: its blobs (README.md, run.sh and, where the
-    // repository has it, the symlink) and lib.rs were fetched, while src/deep, never
-    // listed, still has its blob missing.
-    let root_blobs = if cfg!(unix) { 3 } else { 2 };
-    assert_eq!(missing(clone.path()), before - root_blobs - 1);
+    // Reaching /repo/src lists /repo first, and the whole repository is small enough to
+    // fetch at once, so src/deep's blob came too although it was never listed.
+    assert_eq!(missing(clone.path()), 0);
 
     let root = ws.list("/repo").unwrap();
     assert_eq!(root.iter().find(|e| e.name == "README.md").unwrap().size, Some(7));
     assert_eq!(root.iter().find(|e| e.name == "src").unwrap().size, None);
+    assert_eq!(ws.read_text("/repo/src/deep/data.txt").unwrap(), "data\n");
+}
+
+#[test]
+fn sizes_fetch_only_the_direct_files_of_a_large_directory() {
+    let origin = tempfile::tempdir().unwrap();
+    let dir = origin.path();
+    git(dir, &["init", "-q"]);
+    std::fs::create_dir_all(dir.join("big/many")).unwrap();
+    std::fs::create_dir_all(dir.join("big/few")).unwrap();
+    std::fs::write(dir.join("README.md"), "top\n").unwrap();
+    std::fs::write(dir.join("big/notes.txt"), "notes\n").unwrap();
+    std::fs::write(dir.join("big/few/one.txt"), "one\n").unwrap();
+    // Distinct contents, so each file is its own blob: one more than a subtree fetch takes.
+    for i in 0..1001 {
+        std::fs::write(dir.join(format!("big/many/{i}.txt")), format!("{i}\n")).unwrap();
+    }
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "first"]);
+    let (clone, missing) = partial_clone(dir);
+    assert_eq!(missing(clone.path()), 1004);
+
+    let mut ws = Workspace::new();
+    ws.mount("/repo", Arc::new(GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap())).unwrap();
+    // /repo and /repo/big each lack too many files below them: only their own come.
+    ws.list("/repo/big").unwrap();
+    assert_eq!(missing(clone.path()), 1002);
+    // A small folder inside comes whole.
+    ws.list("/repo/big/few").unwrap();
+    assert_eq!(missing(clone.path()), 1001);
+    assert_eq!(ws.read_text("/repo/big/many/1000.txt").unwrap(), "1000\n");
 }

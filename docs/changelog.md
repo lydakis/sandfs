@@ -5,6 +5,7 @@
 - **sandfs-cli speed**: the FUSE mount tells the kernel it needn't open or close files, so a first read of a small file is about a quarter faster and rereads and overwrites take about 40% less time.
 - **sandfs-cli saving**: closing a file no longer commits it. A write is saved once its file has gone 250 ms without a write, on `fsync`, or at `unmount`, `fork` or `changes`. A program that writes a file, closes it and exits still has it saved a moment later, but not at the instant of the close.
 - **sandfs-cli ranged reads**: large host-folder files read in ranges go back to the folder only for the parts the kernel hasn't kept in its page cache.
+- **sandfs-git**: with sizes on (as in a `sandfs mount` of a remote repository), listing a folder of a partial clone that lacks at most 1,000 files in all, subfolders included, fetches every one of them in one request, so searching such a folder no longer costs a request per subfolder. Larger folders still fetch only the files directly inside them.
 - **Benchmarks**: `sandfs-bench --remote URL` mounts a large repository from a git server and compares it with full, shallow, blobless and sparse clones: time until the files are readable, scattered reads, a folder search, a second copy, peak memory and disk.
 
 ## 0.4.0 (2026-10-19)
