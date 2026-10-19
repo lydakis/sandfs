@@ -34,7 +34,7 @@ dev = [
   "pytest>=8.0",
   "mypy>=2.4.0",
   "ruff>=0.14",
-  "pre-commit>=4.0",
+  "pre-commit>=4.7.0",
 ]
 
 [project.urls]
