@@ -90,7 +90,7 @@ class Tickets:
 base.mount("/tickets", Tickets())
 ```
 
-A source must return the same answer every time, because what it returns is cached and shared between forks. The size in `DirEntry` is optional.
+A source must return the same answer every time, because what it returns is cached and shared between forks. The size in `DirEntry` is optional. A source that pays per request, like an API or a remote store, can also define `prefetch(path, recursive)`: sandfs calls it when a folder's files are about to be read, such as during a search, so the source can fetch them in one trip.
 
 ## Giving a workspace to an agent
 
@@ -170,6 +170,19 @@ Each mounted fork is its own process with its own cache today, which is why moun
 cargo build --release -p sandfs-bench -p sandfs-cli
 sudo ./target/release/sandfs-bench --scratch /dev/shm --only workflow
 ```
+
+### A large repository from a git server
+
+Mounting the latest commit straight from GitHub, against cloning it. "Ready" is the time until files can be read, starting with nothing local:
+
+| | VS Code (20,807 files): ready | on disk | Chromium (510,507 files): ready | on disk |
+| --- | ---: | ---: | ---: | ---: |
+| `sandfs mount git:URL` | 0.6 s | 10 MiB | 2.8 s | 35 MiB |
+| sparse checkout, told in advance which files will be read | 2.8 s | 41 MiB | 9.2 s | 249 MiB |
+| shallow clone | 9.4 s | 758 MiB | didn't fit | |
+| full clone | 124 s | 2.3 GiB | didn't fit | |
+
+A second copy of the mount (`sandfs fork`) takes 20 ms, against 0.2 to 4.4 s for another git worktree. The cost moves to reading: a file's contents arrive over the network the first time they are needed, and one round trip took about 0.35 s here. On the VS Code mount, with a folder of 992 files fetched fresh, `ls` took 21 ms, `cat` 0.39 s, editing a file 0.38 s, `find` 0.85 s and `grep -r` 3.2 s; a clone answers each in milliseconds because it paid for everything up front. Measured on the same VM through its proxy to GitHub, one run each, so network speed dominates. Rerun with `--only remote --remote URL` and `--only everyday --remote URL`.
 
 ## Limits
 
