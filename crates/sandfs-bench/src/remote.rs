@@ -229,16 +229,16 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         }
         Method::Full => {
             git(None, &["clone", "-q", "--no-checkout", &plan.url, copy_str])?;
-            git(Some(&copy), &["checkout", "-q", "--detach", &plan.commit])?;
+            checkout(&copy, &plan.commit)?;
         }
         Method::Shallow => {
             git(None, &["init", "-q", copy_str])?;
             git(Some(&copy), &["fetch", "-q", "--depth", "1", &plan.url, &plan.commit])?;
-            git(Some(&copy), &["checkout", "-q", "--detach", &plan.commit])?;
+            checkout(&copy, &plan.commit)?;
         }
         Method::Blobless => {
             git(None, &["clone", "-q", "--filter=blob:none", "--no-checkout", &plan.url, copy_str])?;
-            git(Some(&copy), &["checkout", "-q", "--detach", &plan.commit])?;
+            checkout(&copy, &plan.commit)?;
         }
         Method::Sparse => {
             // The leanest clone git offers: one commit, its trees, no file contents.
@@ -256,7 +256,7 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
             let mut args = vec!["sparse-checkout"];
             args.extend(patterns.iter().map(String::as_str));
             git(Some(&copy), &args)?;
-            git(Some(&copy), &["checkout", "-q", "--detach", &plan.commit])?;
+            checkout(&copy, &plan.commit)?;
         }
     }
     let ready = start.elapsed();
@@ -314,6 +314,16 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     let commands = u64::try_from(getrusage(UsageWho::RUSAGE_CHILDREN)?.max_rss())? * 1024;
     let disk = disk_usage(root)?;
     Ok(RemoteResult { method, ready, first, samples, search, fork, matches, bytes, peak_rss: commands + serving, disk })
+}
+
+/// Check out `commit` in the clone at `dir` byte for byte, as sandfs serves it. The
+/// clone's own attributes file outranks the repository's, so line ending, encoding,
+/// `ident` and filter rules can't change what is written; worktrees share it.
+fn checkout(dir: &Path, commit: &str) -> Result<()> {
+    let info = dir.join(".git/info");
+    std::fs::create_dir_all(&info)?;
+    std::fs::write(info.join("attributes"), "* -text -eol -ident -filter -working-tree-encoding\n")?;
+    git(Some(dir), &["checkout", "-q", "--detach", commit])
 }
 
 /// `SAMPLES + 1` positions spread evenly over `len` items, from the first to the last.
