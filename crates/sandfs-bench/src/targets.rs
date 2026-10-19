@@ -22,12 +22,22 @@ pub trait Target {
     fn name(&self) -> &'static str;
     /// A fresh view of the data set. Writable views may be written and forked.
     fn open(&self, writable: bool) -> Result<Box<dyn View>>;
+    /// Processes serving this target's views, whose memory counts toward its own.
+    fn helper_pids(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// One view of the data set, addressed by paths relative to its root.
-pub trait View {
+pub trait View: Send {
     /// Read a whole file; returns its length.
     fn read(&self, path: &str) -> Result<usize>;
+    /// Read a whole file.
+    fn contents(&self, path: &str) -> Result<Vec<u8>>;
+    /// The directory this view is, for targets that are real directories.
+    fn root_dir(&self) -> Option<&Path> {
+        None
+    }
     /// Read part of a file; returns the bytes read.
     fn read_range(&self, path: &str, offset: u64, len: u64) -> Result<usize>;
     /// A file's size.
@@ -74,6 +84,10 @@ impl Target for Sandfs {
 impl View for SandfsView {
     fn read(&self, path: &str) -> Result<usize> {
         Ok(self.0.read(&ws_path(path))?.len())
+    }
+
+    fn contents(&self, path: &str) -> Result<Vec<u8>> {
+        Ok(self.0.read(&ws_path(path))?.to_vec())
     }
 
     fn read_range(&self, path: &str, offset: u64, len: u64) -> Result<usize> {
@@ -284,6 +298,15 @@ impl Target for Fuse {
     fn open(&self, _writable: bool) -> Result<Box<dyn View>> {
         self.open_dir(&self.data)
     }
+
+    fn helper_pids(&self) -> Vec<u32> {
+        // Each mounted workspace records the process serving it in mount.json.
+        let Ok(dirs) = fs::read_dir(self.home.path().join("workspaces")) else { return Vec::new() };
+        dirs.filter_map(|dir| fs::read(dir.ok()?.path().join("mount.json")).ok())
+            .filter_map(|json| serde_json::from_slice::<serde_json::Value>(&json).ok()?["pid"].as_u64())
+            .map(|pid| pid as u32)
+            .collect()
+    }
 }
 
 enum Backend {
@@ -302,6 +325,14 @@ struct DirView {
 impl View for DirView {
     fn read(&self, path: &str) -> Result<usize> {
         Ok(fs::read(self.root.join(path))?.len())
+    }
+
+    fn contents(&self, path: &str) -> Result<Vec<u8>> {
+        Ok(fs::read(self.root.join(path))?)
+    }
+
+    fn root_dir(&self) -> Option<&Path> {
+        Some(&self.root)
     }
 
     fn read_range(&self, path: &str, offset: u64, len: u64) -> Result<usize> {
@@ -455,11 +486,27 @@ fn compare_trees(original: &Path, copy: &Path) -> Result<usize> {
             continue;
         }
         let (a, b) = (original.join(path), copy.join(path));
-        if fs::metadata(&a)?.len() != fs::metadata(&b)?.len() || fs::read(&a)? != fs::read(&b)? {
+        if fs::metadata(&a)?.len() != fs::metadata(&b)?.len() || !same_bytes(&a, &b)? {
             changed += 1;
         }
     }
     Ok(changed)
+}
+
+/// Compare two files of equal size in chunks, so the large file is never held whole.
+fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+    let (mut a, mut b) = (fs::File::open(a)?, fs::File::open(b)?);
+    let (mut left, mut right) = (vec![0; 1 << 16], vec![0; 1 << 16]);
+    loop {
+        let n = a.read(&mut left)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut right[..n])?;
+        if left[..n] != right[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Files an overlay's upper layer adds, modifies or deletes. A whiteout over a lower

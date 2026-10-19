@@ -48,3 +48,9 @@ Every timed run starts from a fresh view (a new workspace or a new mount), so sa
 | changes | list the changes after 1,000 creates, 1,000 overwrites and 100 deletes |
 
 The lazy-source table mounts 1,000 of the small files from a source that sleeps for a fixed delay per call (1 ms by default), like an API or an object store, and compares reading them through sandfs with fetching everything up front.
+
+## Workflow
+
+`--only workflow` runs a whole task several times side by side (`--attempts 8` by default), the way a harness runs parallel attempts at one job. Each attempt gets its own fork of one prepared view, then searches every small file for a byte pattern, rewrites the 50 files it picked (matches first), adds 10 notes and deletes 5, checks its work by running `cksum` over two directories and the rewritten files, and lists its changes. Forks are made one after another; the attempts then run on a thread each. On targets that are real directories the check is a separate process reading through the filesystem; through the Rust API the same checksums are computed in-process. Every checksum is compared with the contents the attempt should have left, so a target that writes the wrong bytes fails the run.
+
+Besides wall time and the median of each step, the table shows peak memory and the bytes the attempts left in the scratch directory. Each target's workflow runs in a fresh process, so its memory peak holds only its own work: that process plus any serving processes, each counted whole, so shared pages are counted more than once. A host fork is a full copy, so it pays in time and disk for every attempt; the FUSE mount saves each fork's changes to disk when they are listed.
