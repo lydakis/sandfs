@@ -188,7 +188,7 @@ uv run pytest
 cargo test --workspace
 ```
 
-[AGENTS.md](https://github.com/lydakis/sandfs/blob/main/AGENTS.md) has the repository layout and every check CI runs. See also the [roadmap](https://github.com/lydakis/sandfs/blob/main/docs/roadmap.md), the [changelog](https://github.com/lydakis/sandfs/blob/main/docs/changelog.md) and [how releases are published](https://github.com/lydakis/sandfs/blob/main/docs/publishing.md).
+[AGENTS.md](https://github.com/lydakis/sandfs/blob/main/AGENTS.md) has the repository layout and the checks to run before opening a pull request. See also the [roadmap](https://github.com/lydakis/sandfs/blob/main/docs/roadmap.md), the [changelog](https://github.com/lydakis/sandfs/blob/main/docs/changelog.md) and [how releases are published](https://github.com/lydakis/sandfs/blob/main/docs/publishing.md).
 
 ## License
 
