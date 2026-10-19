@@ -16,6 +16,7 @@ A rewrite. sandfs is now a general-purpose sandbox filesystem with a Rust core, 
 - **Concurrency**: calls release the GIL, and forks reading the same uncached file fetch it from the source once.
 - **sandfs-mcp**: an MCP server exposing a copy-on-write workspace as nine file tools (read, list, glob, grep, write, edit, move, delete, changes); `sandfs-mcp --dir MOUNT=PATH`.
 - **sandfs-cli**: the `sandfs` command mounts a workspace as a real directory over FUSE on Linux; `sandfs mount`, `fork`, `changes`, `unmount`. Sources are a host folder or `git:<path or url>[@rev]`, and changes are saved on disk between mounts. `sandfs serve --mcp NAME` serves a workspace to an agent as MCP file tools instead.
+- **Benchmarks**: `sandfs-bench`, an unpublished crate, times sandfs through the Rust API and the FUSE mount against the host filesystem and overlayfs; `cargo run --release -p sandfs-bench -- --scratch /dev/shm`.
 - **Packaging**: one abi3 wheel per platform covers Python 3.11 and later. The Rust crates `sandfs-core`, `sandfs-git`, `sandfs-mcp` and `sandfs-cli` are published alongside.
 - **Removed**: the bash-like shell, host-command bridge, Python executor, access policies, storage adapters, write hooks, symlinks, text edit and unified diffs.
 

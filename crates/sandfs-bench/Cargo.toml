@@ -1,0 +1,24 @@
+[package]
+name = "sandfs-bench"
+description = "Benchmarks for sandfs against the host filesystem and kernel overlayfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "sandfs-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytes.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+sandfs-core.workspace = true
+serde_json = "1"
+tempfile = "3"
+
+[lints]
+workspace = true
