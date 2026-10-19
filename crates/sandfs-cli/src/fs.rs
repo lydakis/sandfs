@@ -625,6 +625,9 @@ impl Inner {
         let fh = self.next_fh;
         self.next_fh += 1;
         self.handles.insert(fh, Handle::Dir { ino, entries });
+        // Like a file handle, the listing keeps its folder's inode until releasedir,
+        // since readdirplus resolves names through it.
+        *self.open.entry(ino).or_default() += 1;
         Ok(fh)
     }
 
@@ -685,7 +688,14 @@ impl Inner {
     }
 
     pub fn releasedir(&mut self, fh: u64) {
-        self.handles.remove(&fh);
+        let Some(Handle::Dir { ino, .. }) = self.handles.remove(&fh) else { return };
+        if let Some(count) = self.open.get_mut(&ino) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.open.remove(&ino);
+            }
+        }
+        self.maybe_drop(ino);
     }
 }
 
@@ -1241,6 +1251,23 @@ mod tests {
         assert_eq!((name_seen.as_str(), *kind), ("src", FileType::Directory), "the forgotten child is still listed");
         assert_eq!(fs.path(*ino).unwrap().as_str(), "/mnt/src");
         assert_eq!(fs.nodes[ino].lookups, 1);
+    }
+
+    #[test]
+    fn an_open_folder_outlives_its_last_lookup() {
+        let mut fs = fs();
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let fh = fs.opendir(src).unwrap();
+        fs.forget(src, 1);
+        let mut names = Vec::new();
+        fs.readdirplus(fh, 2, |_, _, name, _| {
+            names.push(name.to_owned());
+            false
+        })
+        .unwrap();
+        assert!(!names.is_empty(), "the folder's entries are still listed");
+        fs.releasedir(fh);
+        assert!(!fs.nodes.contains_key(&src), "dropped once the handle is released");
     }
 
     #[test]
