@@ -1,14 +1,20 @@
 //! The `sandfs` binary against a real FUSE mount.
 //!
-//! Skipped where FUSE is unavailable (no `/dev/fuse` or no `fusermount3`), unless
-//! `SANDFS_REQUIRE_FUSE` is set, as CI does, in which case that is a failure.
+//! Skipped where FUSE is unavailable (on Linux no `/dev/fuse` or no `fusermount3`, on
+//! macOS no macFUSE), unless `SANDFS_REQUIRE_FUSE` is set, as CI does on Linux, in
+//! which case that is a failure.
+#![cfg(fuse)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn fuse_available() -> bool {
-    let tool = Command::new("fusermount3").arg("--version").output().is_ok_and(|out| out.status.success());
-    let available = Path::new("/dev/fuse").exists() && tool;
+    let available = if cfg!(target_os = "macos") {
+        Path::new("/Library/Filesystems/macfuse.fs").exists()
+    } else {
+        let tool = Command::new("fusermount3").arg("--version").output().is_ok_and(|out| out.status.success());
+        Path::new("/dev/fuse").exists() && tool
+    };
     if !available {
         assert!(std::env::var_os("SANDFS_REQUIRE_FUSE").is_none(), "FUSE is required but unavailable");
         eprintln!("skipping: FUSE is not available here");
@@ -66,7 +72,11 @@ impl Sandfs {
 impl Drop for Sandfs {
     fn drop(&mut self) {
         for dir in &self.mounts {
-            let _ = Command::new("fusermount3").arg("-u").arg(dir).status();
+            let _ = if cfg!(target_os = "macos") {
+                Command::new("umount").arg(dir).status()
+            } else {
+                Command::new("fusermount3").arg("-u").arg(dir).status()
+            };
         }
     }
 }
@@ -175,7 +185,7 @@ fn a_directory_source_is_never_written() {
     let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&mount_json).unwrap()).unwrap();
     let pid = info["pid"].as_u64().unwrap().to_string();
     assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
-    while Path::new(&format!("/proc/{pid}")).exists() {
+    while Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     // The crash released the workspace too, so another process may take it over.
@@ -275,8 +285,14 @@ fn spawn(sandfs: &Sandfs, args: &[&str]) -> std::process::Child {
 
 /// How many filesystems are mounted at `dir`.
 fn mounts_at(dir: &Path) -> usize {
-    let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-    table.lines().filter(|line| line.split(' ').nth(4) == Some(dir.to_str().unwrap())).count()
+    let dir = dir.to_str().unwrap();
+    if cfg!(target_os = "macos") {
+        let table = String::from_utf8(Command::new("mount").output().unwrap().stdout).unwrap();
+        table.lines().filter(|line| line.contains(&format!(" on {dir} ("))).count()
+    } else {
+        let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        table.lines().filter(|line| line.split(' ').nth(4) == Some(dir)).count()
+    }
 }
 
 #[test]

@@ -18,7 +18,7 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 1. **Core** (`sandfs-core`): sources, overlay, fork, changes. Done.
 2. **Python bindings** (`sandfs-py`, PyO3 and maturin): `sandfs.Workspace`, built-in directory, in-memory and git sources, and sources written in Python. Done.
 3. **MCP server**: read, list, glob, grep, write, edit, move, delete and changes over one workspace. Text edit, glob and search live here, built from read and a versioned write. Done (`sandfs-mcp`).
-4. **CLI and FUSE** (`sandfs-cli`, Linux): `sandfs mount`, `sandfs fork`, `sandfs changes`, `sandfs serve --mcp`. Done.
+4. **CLI and FUSE** (`sandfs-cli`, Linux and macOS): `sandfs mount`, `sandfs fork`, `sandfs changes`, `sandfs serve --mcp`. Done.
 5. **Ranged reads**: `read_range` on sources and workspaces, so a large file is read in pieces instead of whole. Done.
 6. **TypeScript bindings**, when a caller needs them.
 
@@ -33,4 +33,4 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 - A mounted workspace holds its writes in memory until they are saved, so it costs memory in proportion to what was written.
 - Only the executable bit of a file's mode is kept; owners, other mode bits and extended attributes are not.
 - No hard links, symlinks or special files, matching the core.
-- Linux only; macOS would need macFUSE or FSKit.
+- macOS mounts through macFUSE, which needs a system extension; a mount without one (FSKit, or a local NFS server) would be easier to install. Windows has no mount.

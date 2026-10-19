@@ -637,6 +637,7 @@ dependencies = [
  "clap",
  "fuser",
  "libc",
+ "nix",
  "sandfs-core",
  "sandfs-git",
  "sandfs-mcp",

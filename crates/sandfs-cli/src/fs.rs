@@ -24,6 +24,7 @@ use fuser::{
 use sandfs_core::{Error, Kind, VPath, Workspace};
 
 use crate::persist::{Saved, Snapshot};
+use crate::store::subtree_keys;
 
 /// How long the kernel may cache attributes and names. Every change goes through this
 /// filesystem, so the kernel already sees its own updates and nothing goes stale;
@@ -34,6 +35,21 @@ const ROOT_INO: u64 = 1;
 const MAX_FILE_SIZE: usize = 4 << 30;
 /// Base files larger than this are read in ranges rather than whole.
 const RANGED_READ_SIZE: u64 = 64 << 20;
+
+// rename flags: Linux's renameat2 and macOS's renamex_np spell them differently.
+// Swapping two paths (and Linux's overlay whiteouts) is not supported.
+#[cfg(target_os = "linux")]
+const RENAME_NOREPLACE: u32 = libc::RENAME_NOREPLACE;
+#[cfg(target_os = "linux")]
+const RENAME_UNSUPPORTED: u32 = libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT;
+#[cfg(target_os = "macos")]
+const RENAME_NOREPLACE: u32 = libc::RENAME_EXCL;
+#[cfg(target_os = "macos")]
+const RENAME_UNSUPPORTED: u32 = libc::RENAME_SWAP;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const RENAME_NOREPLACE: u32 = 0;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const RENAME_UNSUPPORTED: u32 = 0;
 
 pub type FsResult<T> = Result<T, Errno>;
 
@@ -386,7 +402,7 @@ impl Inner {
         new_name: &OsStr,
         flags: RenameFlags,
     ) -> FsResult<()> {
-        if flags.contains(RenameFlags::RENAME_EXCHANGE) || flags.contains(RenameFlags::RENAME_WHITEOUT) {
+        if flags.bits() & RENAME_UNSUPPORTED != 0 {
             return Err(Errno::EINVAL);
         }
         let from = self.child(parent, name)?;
@@ -400,7 +416,7 @@ impl Inner {
         }
         let replacing = match self.ws.stat(to.as_str()) {
             Ok(meta) => {
-                if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+                if flags.bits() & RENAME_NOREPLACE != 0 {
                     return Err(Errno::EEXIST);
                 }
                 match (moving_dir, meta.kind.is_dir()) {
@@ -698,15 +714,6 @@ impl Inner {
         }
         self.maybe_drop(ino);
     }
-}
-
-/// The keys of `map` equal to `prefix` or below it.
-pub(crate) fn subtree_keys<T>(map: &BTreeMap<String, T>, prefix: &VPath) -> Vec<String> {
-    let p = prefix.as_str();
-    let mut keys: Vec<String> = map.contains_key(p).then(|| p.to_owned()).into_iter().collect();
-    // '0' is the byte after '/', so this range is exactly the paths below `prefix`.
-    keys.extend(map.range(format!("{p}/")..format!("{p}0")).map(|(key, _)| key.clone()));
-    keys
 }
 
 /// The filesystem state plus what saving needs, shared with the saver thread.
@@ -1169,7 +1176,14 @@ mod tests {
             Errno::EISDIR
         );
         assert_eq!(
-            fs.rename(code, name("util.rs"), ROOT_INO, name("README.md"), RenameFlags::RENAME_NOREPLACE).unwrap_err(),
+            fs.rename(
+                code,
+                name("util.rs"),
+                ROOT_INO,
+                name("README.md"),
+                RenameFlags::from_bits_retain(RENAME_NOREPLACE)
+            )
+            .unwrap_err(),
             Errno::EEXIST
         );
     }

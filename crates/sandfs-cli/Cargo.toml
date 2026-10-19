@@ -16,17 +16,27 @@ homepage.workspace = true
 name = "sandfs"
 path = "src/main.rs"
 
+[features]
+default = ["mount"]
+# The FUSE mount, on Linux and macOS. On macOS it links macFUSE, which must be
+# installed to build; without it, build with --no-default-features to get everything
+# but mounting.
+mount = ["dep:fuser"]
+
 [dependencies]
 anyhow = "1"
-libc = "0.2"
 bytes.workspace = true
 clap = { version = "4.5", features = ["derive"] }
-fuser = "0.18"
 sandfs-core.workspace = true
 sandfs-git.workspace = true
 sandfs-mcp.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.18", optional = true }
+libc = "0.2"
+nix = { version = "0.31", features = ["signal"] }
 
 [dev-dependencies]
 tempfile = "3"
