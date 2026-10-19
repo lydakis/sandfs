@@ -122,7 +122,7 @@ sandfs changes ~/ws/cleanup                      # A/M/D for each changed file
 sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sandfs mount cleanup ~/ws/cleanup` brings them back
 ```
 
-`git:<path or url>[@rev]` mounts a commit instead of a folder. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second. Listing a folder then fetches that folder's files in one request, since a real folder has to show their sizes. When a program walks through a folder, which shows as two of its subfolders being listed, files come in bigger batches: the whole folder in one request if it holds at most 1,000 files, and otherwise each subfolder of at most 1,000 files in one request as it is listed:
+`git:<path or url>[@rev]` mounts a commit instead of a folder. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second. Listing a folder then fetches that folder's files in one request, since a real folder has to show their sizes:
 
 ```bash
 sandfs mount git:https://github.com/pallets/flask@3.1.0 ~/ws/flask
