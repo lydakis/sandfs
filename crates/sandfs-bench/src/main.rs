@@ -3,14 +3,17 @@
 //! Targets are the host filesystem used directly (the floor), sandfs through its Rust
 //! API, Linux overlayfs (the kernel's copy-on-write filesystem, when this process can
 //! mount it) and the `sandfs` command's FUSE mount (when FUSE is available). A second
-//! table compares a slow, lazily read source with copying it all up front, and a third
-//! runs a whole task (search, edit, check, list changes) in several parallel attempts.
+//! table compares a slow, lazily read source with copying it all up front, a third
+//! runs a whole task (search, edit, check, list changes) in several parallel attempts,
+//! and with `--remote URL` a fourth mounts a large repository from a git server and
+//! compares it with cloning it.
 //!
 //! Every timed run starts from a fresh view: a new workspace or mount, so caches start
 //! empty except the kernel's page cache, which is warm for every target alike.
 
 mod data;
 mod lazy;
+mod remote;
 mod targets;
 mod workflow;
 mod workloads;
@@ -19,7 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use serde_json::json;
 
@@ -76,6 +79,24 @@ struct Args {
     /// workflow runs each target this way so its memory peak is its own.
     #[arg(long, hide = true)]
     workflow_child: bool,
+    /// A git repository URL to mount with sandfs and compare with cloning it; needs the
+    /// network. `--only remote` runs just this table.
+    #[arg(long)]
+    remote: Option<String>,
+    /// The folder of the remote repository to search (default: the largest folder of
+    /// at most 1,000 files).
+    #[arg(long)]
+    remote_folder: Option<String>,
+    /// Ways to get the remote repository's files, comma-separated: sandfs, sparse,
+    /// shallow, blobless, full. Default: all of them.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    remote_methods: Option<Vec<remote::Method>>,
+    /// Run one remote method against listings already fetched to this directory and
+    /// report it as JSON, so its memory peak is its own.
+    #[arg(long, hide = true, requires = "remote_child_method")]
+    remote_child: Option<PathBuf>,
+    #[arg(long, hide = true, value_enum)]
+    remote_child_method: Option<remote::Method>,
 }
 
 fn main() {
@@ -94,10 +115,35 @@ fn run(args: Args) -> Result<()> {
     if let Some(iters) = args.iters {
         scale.iters = iters as usize;
     }
+    let bin = match &args.sandfs_bin {
+        Some(bin) => bin.clone(),
+        None => std::env::current_exe()?.with_file_name("sandfs"),
+    };
+    if let (Some(plan_dir), Some(method)) = (&args.remote_child, args.remote_child_method) {
+        let url = args.remote.as_deref().context("--remote-child needs --remote")?;
+        let plan = remote::Plan::read(&plan_dir.with_file_name("plan.json"))?;
+        ensure!(plan.url == url, "the plan is for {}, not {url}", plan.url);
+        let root = plan_dir.with_file_name(method.arg());
+        std::fs::create_dir(&root)?;
+        let result = remote::run(&plan, method, &root, &bin)?;
+        let path = args.json.as_ref().context("--remote-child needs --json")?;
+        std::fs::write(path, serde_json::to_string(&remote_json(&result))?)?;
+        return Ok(());
+    }
     // A directory of this run's own, so the workflow's disk count sees nothing else.
     let parent = args.scratch.clone().unwrap_or_else(std::env::temp_dir);
     let run_dir = tempfile::Builder::new().prefix("sandfs-bench-").tempdir_in(&parent)?;
     let scratch = run_dir.path().to_owned();
+    if args.only.as_deref() == Some("remote") {
+        let url = args.remote.as_deref().context("--only remote needs --remote URL")?;
+        let (plan, results) = run_remote(&args, url, &scratch)?;
+        print_remote(&plan, &results);
+        if let Some(path) = &args.json {
+            let rows: Vec<_> = results.iter().map(remote_json).collect();
+            std::fs::write(path, serde_json::to_string_pretty(&json!({ "remote": rows }))?)?;
+        }
+        return Ok(());
+    }
     eprintln!("generating the data set in {}", scratch.display());
     let data = Data::generate(scale, &scratch)?;
     let root = data.root().to_owned();
@@ -127,11 +173,7 @@ fn run(args: Args) -> Result<()> {
         }
     }
     if wanted(TargetArg::Fuse) {
-        let bin = match &args.sandfs_bin {
-            Some(bin) => bin.clone(),
-            None => std::env::current_exe()?.with_file_name("sandfs"),
-        };
-        match Fuse::new(root.clone(), scratch.clone(), bin) {
+        match Fuse::new(root.clone(), scratch.clone(), bin.clone()) {
             Ok(fuse) => {
                 targets.push(Box::new(fuse));
                 kinds.push(TargetArg::Fuse);
@@ -177,8 +219,16 @@ fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
+    let remote = match &args.remote {
+        Some(url) => Some(run_remote(&args, url, &scratch)?),
+        None => None,
+    };
+
     print_report(&args, &data, &targets, &skipped, &workloads, &table, &lazy);
     print_workflow(&args, &flows);
+    if let Some((plan, results)) = &remote {
+        print_remote(plan, results);
+    }
     if let Some(path) = &args.json {
         let rows: Vec<_> = workloads
             .iter()
@@ -208,6 +258,7 @@ fn run(args: Args) -> Result<()> {
             "workloads": rows,
             "lazy": lazy_rows,
             "workflow": workflow_json(&flows),
+            "remote": remote.iter().flat_map(|(_, results)| results.iter().map(remote_json)).collect::<Vec<_>>(),
         });
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     }
@@ -215,6 +266,125 @@ fn run(args: Args) -> Result<()> {
 }
 
 const WORKFLOW: &str = "workflow/attempts";
+
+/// Fetch the remote repository's listings once, then run each method in a fresh copy
+/// of this program, so the memory peak it reports is its own. Every method must read
+/// the same bytes and find the same matches.
+fn run_remote(args: &Args, url: &str, scratch: &std::path::Path) -> Result<(remote::Plan, Vec<remote::RemoteResult>)> {
+    let base = scratch.join("remote");
+    std::fs::create_dir(&base)?;
+    let plan_dir = base.join("listings");
+    let plan = remote::Plan::fetch(url, args.remote_folder.as_deref(), &plan_dir)?;
+    plan.save(&base.join("plan.json"))?;
+    let methods = args.remote_methods.clone().unwrap_or_else(|| remote::Method::value_variants().to_vec());
+    let mut results: Vec<remote::RemoteResult> = Vec::new();
+    for method in methods {
+        eprintln!("remote/{}", method.arg());
+        let report = base.join(format!("{}.json", method.arg()));
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg("--remote")
+            .arg(url)
+            .arg("--remote-child")
+            .arg(&plan_dir)
+            .args(["--remote-child-method", method.arg(), "--json"])
+            .arg(&report);
+        if let Some(folder) = &args.remote_folder {
+            command.arg("--remote-folder").arg(folder);
+        }
+        if let Some(bin) = &args.sandfs_bin {
+            command.arg("--sandfs-bin").arg(bin);
+        }
+        let status = command.status().context("starting the remote benchmark process")?;
+        if !status.success() {
+            bail!("the remote benchmark for {} failed ({status})", method.name());
+        }
+        let row: serde_json::Value = serde_json::from_slice(&std::fs::read(&report)?)?;
+        let result = remote_from_json(method, &row)?;
+        if let Some(first) = results.first() {
+            if (result.bytes, result.matches) != (first.bytes, first.matches) {
+                bail!(
+                    "{} read {} bytes with {} matches, but {} read {} bytes with {} matches",
+                    method.name(),
+                    result.bytes,
+                    result.matches,
+                    first.method.name(),
+                    first.bytes,
+                    first.matches
+                );
+            }
+        }
+        results.push(result);
+        // Each method's copy can be large; only its numbers are kept.
+        std::fs::remove_dir_all(base.join(method.arg()))?;
+    }
+    Ok((plan, results))
+}
+
+fn remote_json(result: &remote::RemoteResult) -> serde_json::Value {
+    json!({
+        "method": result.method.arg(),
+        "ready_nanos": result.ready.as_nanos() as u64,
+        "first_nanos": result.first.as_nanos() as u64,
+        "samples_nanos": result.samples.as_nanos() as u64,
+        "search_nanos": result.search.as_nanos() as u64,
+        "fork_nanos": result.fork.as_nanos() as u64,
+        "matches": result.matches,
+        "bytes": result.bytes,
+        "peak_rss_bytes": result.peak_rss,
+        "disk_bytes": result.disk,
+    })
+}
+
+fn remote_from_json(method: remote::Method, row: &serde_json::Value) -> Result<remote::RemoteResult> {
+    let number = |key: &str| row[key].as_u64().with_context(|| format!("remote JSON has no {key}"));
+    let nanos = |key: &str| number(key).map(Duration::from_nanos);
+    Ok(remote::RemoteResult {
+        method,
+        ready: nanos("ready_nanos")?,
+        first: nanos("first_nanos")?,
+        samples: nanos("samples_nanos")?,
+        search: nanos("search_nanos")?,
+        fork: nanos("fork_nanos")?,
+        matches: usize::try_from(number("matches")?)?,
+        bytes: number("bytes")?,
+        peak_rss: number("peak_rss_bytes")?,
+        disk: number("disk_bytes")?,
+    })
+}
+
+fn print_remote(plan: &remote::Plan, results: &[remote::RemoteResult]) {
+    let short = &plan.commit[..plan.commit.len().min(12)];
+    println!();
+    println!(
+        "{} at {short}: {} files. Each method starts with nothing local, reads one file, then {} more spread across the tree, then searches {}/ ({} files), then makes a second copy to work in. The sparse checkout is told in advance exactly which files will be read. One run each.",
+        plan.url,
+        plan.files,
+        remote::SAMPLES,
+        plan.subtree,
+        plan.subtree_files.len()
+    );
+    println!();
+    println!(
+        "| method | ready | first file | {} files | search {}/ | second copy | peak memory | on disk |",
+        remote::SAMPLES,
+        plan.subtree
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
+    for result in results {
+        println!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            result.method.name(),
+            fmt_duration(result.ready),
+            fmt_duration(result.first),
+            fmt_duration(result.samples),
+            fmt_duration(result.search),
+            fmt_duration(result.fork),
+            fmt_bytes(result.peak_rss),
+            fmt_bytes(result.disk),
+        );
+    }
+}
 
 /// Every workflow run as JSON rows.
 fn workflow_json(flows: &[Vec<workflow::WorkflowResult>]) -> serde_json::Value {

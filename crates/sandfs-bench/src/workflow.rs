@@ -263,7 +263,7 @@ pub fn run(target: &dyn Target, data: &Data, scratch: &Path, attempts: usize) ->
 }
 
 /// Bytes allocated below `dir`, staying on its filesystem so mounts are not counted.
-fn disk_usage(dir: &Path) -> Result<u64> {
+pub(crate) fn disk_usage(dir: &Path) -> Result<u64> {
     let output = Command::new("du").args(["-s", "-x", "--block-size=1"]).arg(dir).output().context("running du")?;
     let text = String::from_utf8_lossy(&output.stdout);
     let bytes = text.split_whitespace().next().and_then(|n| n.parse().ok());
@@ -276,7 +276,7 @@ fn reset_peak_rss() -> Result<()> {
 }
 
 /// A process's peak resident memory in bytes, from `VmHWM`.
-fn peak_rss(pid: u32) -> Result<u64> {
+pub(crate) fn peak_rss(pid: u32) -> Result<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
     let kib = status
         .lines()
@@ -286,9 +286,40 @@ fn peak_rss(pid: u32) -> Result<u64> {
     Ok(kib * 1024)
 }
 
+/// The peak resident memory of `pid` and of every process still running below it, in
+/// bytes. Helpers that already exited aren't counted: their peaks went to `pid`'s own
+/// child usage, which only `pid` can read.
+pub(crate) fn tree_peak_rss(pid: u32) -> Result<u64> {
+    let mut parents: Vec<(u32, u32)> = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Ok(child) = entry?.file_name().to_string_lossy().parse::<u32>() else { continue };
+        // A process may exit between the listing and the read.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else { continue };
+        // The parent is the second field after the command name, which may hold spaces
+        // and parentheses itself, so split after its last closing parenthesis.
+        let parent = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok());
+        if let Some(parent) = parent {
+            parents.push((child, parent));
+        }
+    }
+    let mut tree = vec![pid];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        tree.extend(parents.iter().filter(|&&(_, p)| p == parent).map(|&(child, _)| child));
+        i += 1;
+    }
+    let mut total = peak_rss(pid)?;
+    for &process in &tree[1..] {
+        // A helper may exit before its status is read.
+        total += peak_rss(process).unwrap_or(0);
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::cksum_crc;
+    use super::{cksum_crc, peak_rss, tree_peak_rss};
 
     #[test]
     fn checksums_match_posix_cksum() {
@@ -296,5 +327,17 @@ mod tests {
         assert_eq!(cksum_crc(b""), 4_294_967_295);
         assert_eq!(cksum_crc(b"hello\n"), 3_015_617_425);
         assert_eq!(cksum_crc(&[0; 300]), 351_385_237);
+    }
+
+    #[test]
+    fn a_process_tree_counts_its_running_children() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let alone = peak_rss(std::process::id()).unwrap();
+        let tree = tree_peak_rss(std::process::id()).unwrap();
+        let sleeping = peak_rss(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(sleeping > 0);
+        assert!(tree >= alone + sleeping, "tree {tree}, alone {alone}, child {sleeping}");
     }
 }

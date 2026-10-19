@@ -623,6 +623,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "nix",
  "sandfs-core",
  "serde_json",
  "tempfile",
