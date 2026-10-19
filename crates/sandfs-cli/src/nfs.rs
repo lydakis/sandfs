@@ -521,12 +521,19 @@ async fn read_message(stream: &mut tokio::net::tcp::OwnedReadHalf) -> std::io::R
 }
 
 /// Whether an RPC call may reach the server: a ping (procedure 0) always, anything
-/// else only with Unix credentials naming one of `users`.
+/// else only with Unix credentials naming one of `users`. The mount protocol's
+/// listings (DUMP and EXPORT) never pass: EXPORT would name the secret export path,
+/// and Unix credentials are only what the caller claims, so the secret is what keeps
+/// other users out.
 fn call_allowed(call: &[u8], users: &[u32]) -> bool {
+    const MOUNT: u32 = 100005;
     let word = |at: usize| call.get(at..at + 4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()));
     // xid, CALL, RPC version, program, version, procedure, then the credentials:
     // flavor, length, and for AUTH_UNIX a stamp, the machine name and the uid.
     if word(4) != Some(0) {
+        return false;
+    }
+    if word(12) == Some(MOUNT) && matches!(word(20), Some(2 | 5)) {
         return false;
     }
     if word(20) == Some(0) {
@@ -759,11 +766,16 @@ mod tests {
 
     /// An RPC call to `procedure` with AUTH_UNIX credentials for `uid`.
     fn call(procedure: u32, machine: &str, uid: u32) -> Vec<u8> {
+        mount_call(100003, procedure, machine, uid)
+    }
+
+    /// An RPC call to `procedure` of `program` with AUTH_UNIX credentials for `uid`.
+    fn mount_call(program: u32, procedure: u32, machine: &str, uid: u32) -> Vec<u8> {
         let mut name = machine.as_bytes().to_vec();
         name.resize(machine.len().next_multiple_of(4), 0);
         let creds = [&[0, 0, 0, 0][..], &(machine.len() as u32).to_be_bytes(), &name, &uid.to_be_bytes(), &[0; 8]];
         let creds = creds.concat();
-        let head = [42u32, 0, 2, 100003, 3, procedure, 1, creds.len() as u32].map(u32::to_be_bytes).concat();
+        let head = [42u32, 0, 2, program, 3, procedure, 1, creds.len() as u32].map(u32::to_be_bytes).concat();
         [head, creds, vec![0; 8]].concat()
     }
 
@@ -780,6 +792,10 @@ mod tests {
         let mut reply = call(4, "mac", 501);
         reply[4..8].copy_from_slice(&1u32.to_be_bytes());
         assert!(!call_allowed(&reply, &[501, 0]), "not a call");
+        assert!(call_allowed(&mount_call(100005, 1, "mac", 501), &[501, 0]), "MNT");
+        assert!(call_allowed(&mount_call(100005, 3, "mac", 501), &[501, 0]), "UMNT");
+        assert!(!call_allowed(&mount_call(100005, 5, "mac", 501), &[501, 0]), "EXPORT names the secret");
+        assert!(!call_allowed(&mount_call(100005, 2, "mac", 0), &[501, 0]), "DUMP");
 
         let refused = refusal(&call(4, "mac", 502));
         assert_eq!(refused.len(), 24);
