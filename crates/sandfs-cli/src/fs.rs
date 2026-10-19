@@ -35,7 +35,7 @@ use crate::store::subtree_keys;
 /// How long the kernel may cache attributes and names. Every change goes through this
 /// filesystem, so the kernel already sees its own updates and nothing goes stale;
 /// a short TTL would only make it ask again (a round trip per path, per second).
-#[cfg(fuse)]
+#[cfg(any(fuse, test))]
 const TTL: Duration = Duration::from_secs(60);
 pub const ROOT_INO: u64 = 1;
 /// Files live in memory, so refuse sizes that could only be a mistake.
@@ -119,6 +119,7 @@ struct DirHandle {
     entries: Vec<(u64, FileType, String)>,
     /// Files the listing gave no size for, with their executable bits. Their sizes
     /// aren't looked up for `readdirplus`, since that can mean reading the file.
+    #[cfg_attr(not(any(fuse, test)), allow(dead_code))]
     sizeless: HashMap<String, bool>,
 }
 
