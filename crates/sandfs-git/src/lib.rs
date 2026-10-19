@@ -3,8 +3,9 @@
 //! It is an optional source built on the same `Source` trait any harness can
 //! implement, and a reference for writing one.
 //!
-//! [`GitSource`] reads trees and blobs on demand through one long-running
-//! `git cat-file --batch` process. Nothing is written to a working tree, and in a
+//! [`GitSource`] reads trees and blobs on demand through long-running
+//! `git cat-file --batch` processes: one, and a few more while several threads read at
+//! once. Nothing is written to a working tree, and in a
 //! partial clone (`git clone --filter=blob:none`) git fetches each blob from the
 //! remote only when a file is first read, so mounting a large repository costs the
 //! commit and tree objects plus whatever the agent actually opens.
@@ -20,7 +21,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use bytes::Bytes;
 use sandfs_core::{Error, Kind, Listing, Result, Source, SourceEntry, SourceKey};
@@ -30,7 +31,7 @@ pub struct GitSource {
     repo: PathBuf,
     tree: SourceKey,
     hash_len: usize,
-    batch: Mutex<Batch>,
+    readers: Readers,
     /// Set by [`GitSource::with_sizes`]: a `cat-file --batch-check` process for sizes.
     sizes: Option<Mutex<Batch>>,
     /// The remote a partial clone fetches missing blobs from.
@@ -66,13 +67,13 @@ impl GitSource {
             "sha256" => 32,
             other => return Err(Error::Source(format!("unsupported object format {other:?}"))),
         };
-        let batch = Batch::spawn(&repo, "--batch")?;
+        let readers = Readers::new(&repo)?;
         let promisor = promisor_remote(&repo);
         Ok(GitSource {
             repo,
             tree: tree.as_str().into(),
             hash_len,
-            batch: Mutex::new(batch),
+            readers,
             sizes: None,
             promisor,
             local: Mutex::default(),
@@ -174,8 +175,7 @@ impl GitSource {
     }
 
     fn object(&self, id: &str, expected: &str) -> Result<Bytes> {
-        let mut batch = self.batch.lock().map_err(|_| Error::Source("git reader poisoned".into()))?;
-        let (kind, data) = batch.read(id)?;
+        let (kind, data) = self.readers.read(id)?;
         if kind != expected {
             return Err(Error::Source(format!("object {id} is a {kind}, expected a {expected}")));
         }
@@ -276,6 +276,68 @@ fn git(repo: &Path) -> Command {
 
 fn io_error(err: std::io::Error) -> Error {
     Error::Source(format!("git: {err}"))
+}
+
+/// The `cat-file --batch` processes objects are read through. There is one to begin
+/// with; a read that finds every process busy starts another, up to one per CPU, so
+/// threads (or forks of a workspace) reading at once don't queue behind each other.
+struct Readers {
+    repo: PathBuf,
+    limit: usize,
+    /// The processes not reading right now, and how many there are in all.
+    idle: Mutex<(Vec<Batch>, usize)>,
+    returned: Condvar,
+}
+
+impl Readers {
+    fn new(repo: &Path) -> Result<Self> {
+        let first = Batch::spawn(repo, "--batch")?;
+        Ok(Readers {
+            repo: repo.to_path_buf(),
+            limit: std::thread::available_parallelism().map_or(1, usize::from),
+            idle: Mutex::new((vec![first], 1)),
+            returned: Condvar::new(),
+        })
+    }
+
+    fn read(&self, id: &str) -> Result<(String, Bytes)> {
+        let mut batch = self.take()?;
+        let read = batch.read(id);
+        let mut idle = self.idle.lock().map_err(poisoned)?;
+        // A failed read may leave the process midway through a reply, so it is replaced.
+        if read.is_ok() {
+            idle.0.push(batch);
+        } else {
+            idle.1 -= 1;
+        }
+        self.returned.notify_one();
+        read
+    }
+
+    /// An idle process; else a new one, if there is room; else the next to come free.
+    fn take(&self) -> Result<Batch> {
+        let mut idle = self.idle.lock().map_err(poisoned)?;
+        loop {
+            if let Some(batch) = idle.0.pop() {
+                return Ok(batch);
+            }
+            if idle.1 < self.limit {
+                idle.1 += 1;
+                drop(idle);
+                let spawned = Batch::spawn(&self.repo, "--batch");
+                if spawned.is_err() {
+                    self.idle.lock().map_err(poisoned)?.1 -= 1;
+                    self.returned.notify_one();
+                }
+                return spawned;
+            }
+            idle = self.returned.wait(idle).map_err(poisoned)?;
+        }
+    }
+}
+
+fn poisoned<T>(_: T) -> Error {
+    Error::Source("git reader poisoned".into())
 }
 
 /// A `git cat-file --batch` (or `--batch-check`) process: write an object id, read a

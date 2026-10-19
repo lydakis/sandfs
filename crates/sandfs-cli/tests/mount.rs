@@ -152,6 +152,67 @@ fn mount_fork_changes_and_remount() {
     assert!(!sandfs.stdout(&["list"]).contains("fix\t"));
 }
 
+/// The process serving `name`'s mount, from its mount.json.
+fn server_pid(sandfs: &Sandfs, name: &str) -> String {
+    let info = std::fs::read(sandfs.home.path().join("workspaces").join(name).join("mount.json")).unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&info).unwrap();
+    info["pid"].as_u64().unwrap().to_string()
+}
+
+fn alive(pid: &str) -> bool {
+    Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().unwrap().success()
+}
+
+#[test]
+fn one_process_serves_every_mount_until_the_last_is_gone() {
+    if !fuse_available() {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    std::fs::write(repo.path().join("notes.txt"), "draft\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "first"]);
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("rows.csv"), "id\n").unwrap();
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let [one, two, rows] = ["one", "two", "rows"].map(|name| dirs.path().join(name));
+    let source = format!("git:{}", repo.path().display());
+    sandfs.mount(&["mount", &source, one.to_str().unwrap()], &one);
+    sandfs.mount(&["fork", "one", two.to_str().unwrap()], &two);
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), rows.to_str().unwrap()], &rows);
+    let pid = server_pid(&sandfs, "one");
+    assert_eq!(server_pid(&sandfs, "two"), pid);
+    assert_eq!(server_pid(&sandfs, "rows"), pid);
+
+    // Copies of one commit share its git readers (here, reading one file at a time, one
+    // `cat-file` for contents and one for sizes) but not their changes.
+    std::fs::write(two.join("notes.txt"), "changed\n").unwrap();
+    assert_eq!(std::fs::read_to_string(one.join("notes.txt")).unwrap(), "draft\n");
+    assert_eq!(std::fs::read_to_string(two.join("notes.txt")).unwrap(), "changed\n");
+    let readers = Command::new("pgrep").args(["-P", &pid, "-f", "cat-file"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&readers.stdout).lines().count(), 2);
+
+    // The process stays while any mount is left, and exits after the last one.
+    sandfs.unmount(&one);
+    sandfs.unmount(&rows);
+    assert!(alive(&pid));
+    assert_eq!(std::fs::read_to_string(two.join("notes.txt")).unwrap(), "changed\n");
+    sandfs.unmount(&two);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while alive(&pid) {
+        assert!(std::time::Instant::now() < deadline, "the process outlived its mounts");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(sandfs.stdout(&["changes", "two"]), "M notes.txt\n");
+    // A mount after that starts a new process.
+    sandfs.mount(&["mount", "one", one.to_str().unwrap()], &one);
+    assert_ne!(server_pid(&sandfs, "one"), pid);
+    sandfs.unmount(&one);
+}
+
 #[test]
 fn a_directory_source_is_never_written() {
     if !fuse_available() {

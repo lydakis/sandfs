@@ -67,6 +67,36 @@ fn mounts_a_commit_without_a_checkout() {
 }
 
 #[test]
+fn threads_reading_at_once_each_get_their_own_file() {
+    use sandfs_core::Source;
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    for i in 0..50 {
+        std::fs::write(dir.path().join(format!("f{i}.txt")), format!("file {i}\n").repeat(i * 100)).unwrap();
+    }
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-q", "-m", "files"]);
+    let source = GitSource::open(dir.path(), "HEAD").unwrap();
+    let listing = source.read_dir(&source.root().unwrap()).unwrap();
+    // More readers than processes, so reads also wait for one to come free.
+    let threads = std::thread::available_parallelism().map_or(1, usize::from) * 2;
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                for _ in 0..5 {
+                    for i in 0..50 {
+                        let entry = &listing[format!("f{i}.txt").as_str()];
+                        let data = source.read_file(&entry.key).unwrap();
+                        assert_eq!(data, format!("file {i}\n").repeat(i * 100).as_bytes());
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
 fn rejects_unknown_and_option_like_revisions() {
     let dir = tempfile::tempdir().unwrap();
     make_repo(dir.path());
