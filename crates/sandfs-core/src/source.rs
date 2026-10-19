@@ -84,10 +84,11 @@ pub trait Source: Send + Sync + fmt::Debug {
     /// The workspace calls it without `recursive` once a second file in a directory is
     /// needed: a second size the listing left out (it then lists the directory once
     /// more, so a source can report the sizes it now has), or a second file read by a
-    /// walk (a directory listed inside one already listed). Once a walk has needed files
-    /// in three directories, it calls it with `recursive` for the directory holding
-    /// them. Each directory is asked once. A lookup, a single read and a walk that only
-    /// lists never call it.
+    /// walk (a directory listed inside one already listed). Once one workspace's walk
+    /// has needed files in three directories without pausing, it calls it with
+    /// `recursive` for the directory holding them. Each directory is asked once. A
+    /// lookup, a single read (even in pieces), a look around and a walk that only lists
+    /// never call it.
     ///
     /// A prefetch must not change any answer the source gives, only how quickly it
     /// arrives, except that a listing may now include sizes. A source may ignore it, and

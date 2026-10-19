@@ -306,7 +306,6 @@ impl Inner {
 
     pub fn attr(&self, ino: u64) -> FsResult<FileAttr> {
         let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
-        node.sized.set(true);
         if !node.linked {
             // A removed file the kernel may still have open.
             let size = match (self.buffers.get(&ino), &node.removed_from) {
@@ -314,10 +313,12 @@ impl Inner {
                 (None, Some(before)) => before.stat(node.path.as_str()).fs()?.size,
                 (None, None) => return Err(Errno::ENOENT),
             };
+            node.sized.set(true);
             return Ok(self.make_attr(ino, FileType::RegularFile, 0o644, size, self.base_time));
         }
         let path = node.path.as_str();
         let meta = self.ws.stat(path).fs()?;
+        node.sized.set(true);
         let size = match self.buffers.get(&ino) {
             Some(buffer) => buffer.data.len() as u64,
             None if meta.kind.is_dir() => 0,

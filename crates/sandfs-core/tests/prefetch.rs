@@ -176,6 +176,49 @@ fn looking_around_prefetches_no_more_than_a_folder() {
 }
 
 #[test]
+fn looking_around_with_pauses_or_from_forks_prefetches_nothing_below() {
+    let source = Arc::new(Remote::new(&["d1/a.txt", "d2/a.txt", "d3/a.txt", "d4/a.txt"]));
+    let ws = mounted(&source);
+    for dir in ["d1", "d2", "d3", "d4"] {
+        ws.list(&format!("/data/{dir}")).unwrap();
+    }
+    ws.list("/data").unwrap();
+    // Three forks, each listing and reading in its own folder: each is one look.
+    for dir in ["d1", "d2", "d3"] {
+        let fork = ws.fork();
+        fork.list("/data").unwrap();
+        fork.list(&format!("/data/{dir}")).unwrap();
+        fork.read(&format!("/data/{dir}/a.txt")).unwrap();
+    }
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
+    // One workspace reading in three folders, but pausing between looks.
+    let ws = mounted(&source);
+    ws.list("/data").unwrap();
+    for dir in ["d1", "d2", "d4"] {
+        ws.list(&format!("/data/{dir}")).unwrap();
+    }
+    ws.read_range("/data/d1/a.txt", 0, 1).unwrap();
+    ws.read_range("/data/d2/a.txt", 0, 1).unwrap();
+    thread::sleep(Duration::from_millis(2100));
+    ws.read_range("/data/d4/a.txt", 0, 1).unwrap();
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
+}
+
+#[test]
+fn a_file_read_in_pieces_counts_once() {
+    let source = Arc::new(Remote::new(TREE));
+    let ws = mounted(&source);
+    ws.list("/data").unwrap();
+    ws.list("/data/s").unwrap();
+    // Ranged reads don't keep the whole file, so each piece is fetched again, but it is
+    // still one file and says nothing about its folder.
+    for offset in 0..4 {
+        ws.read_range("/data/s/x.txt", offset, 1).unwrap();
+    }
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
+}
+
+#[test]
 fn one_missing_size_reads_the_file_and_more_prefetch_the_folder() {
     let source = Arc::new(Remote::new(TREE));
     let ws = mounted(&source);
