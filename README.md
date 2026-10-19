@@ -25,15 +25,15 @@ base = sandfs.Workspace()
 base.mount("/survey", sandfs.DirSource("./survey"))   # a folder on disk, never written to
 
 attempt = base.fork()                                # a private copy, made instantly
-rows = attempt.read_text("/survey/responses.csv")
-attempt.write("/survey/summary.md", f"{rows.count(chr(10)) - 1} responses\n")
+names = [entry.name for entry in attempt.list("/survey")]
+attempt.write("/survey/index.md", "".join(f"- {name}\n" for name in names))
 attempt.remove("/survey/raw.txt")
 
 for change in attempt.changes():
-    print(change.kind, change.path)                  # deleted /survey/raw.txt, added /survey/summary.md
+    print(change.kind, change.path)                  # added /survey/index.md, deleted /survey/raw.txt
 ```
 
-`./survey` on disk and `base` are untouched: the write and the delete exist only in `attempt`. To keep a change, read it from `attempt` and write it wherever you like.
+`./survey` on disk and `base` are untouched: the write and the delete exist only in `attempt`. To keep the results, copy each added or modified file out of `attempt` and delete each deleted path from wherever you keep them.
 
 That is the whole model:
 
@@ -45,7 +45,7 @@ That is the whole model:
 
 ### A git commit
 
-Mount any commit of a repository without checking it out. In a partial clone, git downloads a file's contents only when the file is first read.
+Mount any commit of a repository without checking it out. In a partial clone, git downloads a file's contents only when the file is first read or its size is first asked for with `stat`.
 
 ```python
 # git clone --filter=blob:none --no-checkout https://github.com/pallets/flask
@@ -129,8 +129,8 @@ Mounting needs Linux with FUSE 3 (`fusermount3`, package `fuse3`). On macOS and 
 
 ## More features
 
-- **Large files**: `read(path, offset=..., length=...)` reads one range without caching the file, so a multi-gigabyte data set or video is never held in memory whole. A Python source can define `read_range(path, offset, length)` to serve ranges itself.
-- **Safe concurrent writes**: `stat(path)` and `write(...)` return a file's version, and `write(path, data, expected_version=v)` raises `sandfs.VersionMismatch` if the file changed since.
+- **Large files**: `read(path, offset=..., length=...)` reads one range without caching the file. A folder source seeks on disk, so a multi-gigabyte data set or video is never held in memory whole. A Python source can define `read_range(path, offset, length)` to do the same; without it, and for a git commit, the whole file is read and then sliced.
+- **Safe concurrent writes**: `stat(path).version` and `write(...)` give a file's version, and `write(path, data, expected_version=v)` raises `sandfs.VersionMismatch` if the file changed since.
 - **Threads**: calls release the GIL, so a slow source never blocks other threads. Use one workspace per thread; forks are cheap.
 - **Rust**: the same calls are in the `sandfs-core` crate (`cargo add sandfs-core`), with git in `sandfs-git`.
 
@@ -159,6 +159,7 @@ Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADire
 Building from source compiles the Rust extension, so you need a Rust toolchain ([rustup](https://rustup.rs)).
 
 ```bash
+uv venv
 uv pip install -e .[dev]     # re-run after changing Rust code
 uv run pytest
 cargo test --workspace
