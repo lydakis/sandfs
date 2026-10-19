@@ -225,8 +225,9 @@ impl PyGitSource {
 
 /// A source written in Python: any object with `list(path)` returning `DirEntry`s and
 /// `read(path)` returning bytes or str, and optionally `read_range(path, offset, length)`
-/// for sources that can read part of a file. Paths are absolute within the source, so
-/// the root is `"/"`, and they double as the source keys.
+/// for sources that can read part of a file and `prefetch(path, recursive)` for sources
+/// that can fetch many files in one trip. Paths are absolute within the source, so the
+/// root is `"/"`, and they double as the source keys.
 struct PySource {
     object: Py<PyAny>,
 }
@@ -301,6 +302,20 @@ impl Source for PySource {
                 Ok(data.slice(start..end))
             }
         }
+    }
+
+    fn prefetch(&self, key: &str, recursive: bool) {
+        Python::attach(|py| {
+            let object = self.object.bind(py);
+            if !object.hasattr("prefetch").unwrap_or(false) {
+                return;
+            }
+            // A prefetch is only a hint, so a failure doesn't fail the read that caused
+            // it; Python reports it the way it reports an exception in `__del__`.
+            if let Err(err) = object.call_method1("prefetch", (key, recursive)) {
+                err.write_unraisable(py, Some(object));
+            }
+        });
     }
 }
 

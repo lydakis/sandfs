@@ -98,8 +98,8 @@ fn partial_clone_fetches_only_the_blobs_that_are_read() {
     assert_eq!(missing(clone.path()), before - 1, "exactly one blob was fetched");
 }
 
-#[test]
-fn sizes_fetch_a_directory_of_a_partial_clone_in_one_request() {
+/// A blobless clone of `make_repo`, which can fetch any blob by id.
+fn partial_clone() -> (tempfile::TempDir, tempfile::TempDir) {
     let origin = tempfile::tempdir().unwrap();
     make_repo(origin.path());
     git(origin.path(), &["config", "uploadpack.allowFilter", "true"]);
@@ -107,23 +107,78 @@ fn sizes_fetch_a_directory_of_a_partial_clone_in_one_request() {
     let clone = tempfile::tempdir().unwrap();
     let url = format!("file://{}", origin.path().display());
     git(clone.path(), &["clone", "-q", "--bare", "--filter=blob:none", &url, "."]);
-    let missing = |clone: &Path| {
-        git(clone, &["rev-list", "--objects", "--missing=print", "HEAD"]).lines().filter(|l| l.starts_with('?')).count()
-    };
+    (origin, clone)
+}
+
+/// How many blobs of `HEAD` the clone lacks.
+fn missing(clone: &Path) -> usize {
+    git(clone, &["rev-list", "--objects", "--missing=print", "HEAD^{tree}"])
+        .lines()
+        .filter(|l| l.starts_with('?'))
+        .count()
+}
+
+/// Every file below `dir`, read as found when `read` is set, like `grep -r`.
+fn walk(ws: &Workspace, dir: &str, read: bool) -> usize {
+    let mut files = 0;
+    for entry in ws.list(dir).unwrap() {
+        let path = format!("{dir}/{}", entry.name);
+        if entry.kind.is_dir() {
+            files += walk(ws, &path, read);
+        } else {
+            if read {
+                ws.read(&path).unwrap();
+            }
+            files += 1;
+        }
+    }
+    files
+}
+
+#[test]
+fn sizes_come_from_local_blobs_and_a_folder_prefetch() {
+    let (_origin, clone) = partial_clone();
+    let before = missing(clone.path());
+    // README.md, run.sh and, where the repository has it, the symlink.
+    let root_blobs = if cfg!(unix) { 3 } else { 2 };
+
+    let mut ws = Workspace::new();
+    ws.mount("/repo", Arc::new(GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap())).unwrap();
+    let root = ws.list("/repo").unwrap();
+    assert_eq!(root.iter().find(|e| e.name == "README.md").unwrap().size, None, "the blob isn't local");
+    assert_eq!(missing(clone.path()), before, "a listing fetches nothing");
+
+    // One file's size fetches that file alone.
+    assert_eq!(ws.stat("/repo/README.md").unwrap().size, 7);
+    assert_eq!(missing(clone.path()), before - 1);
+    // A second fetches the rest of the folder in one request, the symlink's blob too,
+    // which reading files one by one would never fetch.
+    assert_eq!(ws.stat("/repo/run.sh").unwrap().size, 10);
+    assert_eq!(missing(clone.path()), before - root_blobs);
+    let root = ws.list("/repo").unwrap();
+    assert_eq!(root.iter().find(|e| e.name == "run.sh").unwrap().size, Some(10));
+    assert_eq!(root.iter().find(|e| e.name == "src").unwrap().size, None);
+}
+
+#[test]
+fn a_walk_fetches_only_once_it_reads() {
+    let (_origin, clone) = partial_clone();
     let before = missing(clone.path());
 
     let mut ws = Workspace::new();
     ws.mount("/repo", Arc::new(GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap())).unwrap();
-    let src = ws.list("/repo/src").unwrap();
-    assert_eq!(src.iter().find(|e| e.name == "lib.rs").unwrap().size, Some(13));
-    assert_eq!(ws.stat("/repo/src/lib.rs").unwrap().size, 13);
-    // Reaching /repo/src lists /repo too: its blobs (README.md, run.sh and, where the
-    // repository has it, the symlink) and lib.rs were fetched, while src/deep, never
-    // listed, still has its blob missing.
-    let root_blobs = if cfg!(unix) { 3 } else { 2 };
-    assert_eq!(missing(clone.path()), before - root_blobs - 1);
+    // `find`: every name, no contents.
+    assert_eq!(walk(&ws, "/repo", false), 4);
+    assert_eq!(missing(clone.path()), before, "a walk that only lists fetches nothing");
 
-    let root = ws.list("/repo").unwrap();
-    assert_eq!(root.iter().find(|e| e.name == "README.md").unwrap().size, Some(7));
-    assert_eq!(root.iter().find(|e| e.name == "src").unwrap().size, None);
+    // Reading what the walk listed: the first file of a folder comes alone, the second
+    // brings the rest of the folder in one request, the symlink's blob too.
+    let root_blobs = if cfg!(unix) { 3 } else { 2 };
+    ws.read("/repo/README.md").unwrap();
+    assert_eq!(missing(clone.path()), before - 1);
+    ws.read("/repo/run.sh").unwrap();
+    assert_eq!(missing(clone.path()), before - root_blobs);
+    // One file in each of the other folders is no reason to fetch more.
+    ws.read("/repo/src/lib.rs").unwrap();
+    assert_eq!(missing(clone.path()), before - root_blobs - 1);
 }
