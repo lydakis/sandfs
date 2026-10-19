@@ -432,6 +432,23 @@ fn dir_source_refuses_reads_through_a_swapped_in_symlink() {
 }
 
 #[test]
+fn dir_source_never_reads_keys_that_leave_its_folder() {
+    let base = std::env::temp_dir().join(format!("sandfs-keys-{}", std::process::id()));
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("file"), "SECRET").unwrap();
+
+    let source = DirSource::new(&root).unwrap();
+    let absolute = outside.join("file").canonicalize().unwrap();
+    for key in [absolute.to_str().unwrap(), "../outside/file"] {
+        assert!(source.read_file(key).is_err(), "{key} was read");
+        assert!(source.read_range(key, 0, 3).is_err(), "{key} was read in a range");
+    }
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
 fn stat_finds_sizes_a_source_did_not_report() {
     let mut ws = Workspace::new();
     ws.mount("/api", Arc::new(Unsized(repo()))).unwrap();

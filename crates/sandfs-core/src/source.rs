@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -195,6 +195,11 @@ impl DirSource {
 
     /// Open the regular file at `key` inside `root`.
     fn open_file(&self, key: &str) -> Result<std::fs::File> {
+        // Keys from listings are plain relative names; an absolute key or `..` would
+        // name a file outside the folder that the check below would accept as-is.
+        if !Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
+            return Err(Error::Source(format!("{key} is outside the mounted directory")));
+        }
         let path = self.host_path(key);
         // Checked before opening, so a special file (a fifo) is never opened.
         if !path.symlink_metadata().map_err(io_error)?.is_file() {
