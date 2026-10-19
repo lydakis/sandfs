@@ -41,8 +41,6 @@ const TTL: Duration = Duration::from_secs(60);
 pub const ROOT_INO: u64 = 1;
 /// Files live in memory, so refuse sizes that could only be a mistake.
 pub const MAX_FILE_SIZE: usize = 4 << 30;
-/// Base files larger than this are read in ranges rather than whole.
-const RANGED_READ_SIZE: u64 = 64 << 20;
 /// How long a file goes without a write before its buffer is committed and saved.
 /// Nothing tells this filesystem when a file is closed, so a quiet spell stands in.
 pub const SETTLE: Duration = Duration::from_millis(250);
@@ -157,8 +155,10 @@ pub struct Inner {
     unsaved: bool,
     /// Set by every write, cleared once no buffer is left to commit.
     writing: bool,
-    /// Read large base files in ranges. Only worth it for sources that can seek (a
-    /// host folder): git reads a whole blob for every range.
+    /// Read base files in the ranges asked for, straight from the source, and keep no
+    /// copy: right for a source that can seek and that the OS already caches (a host
+    /// folder). Git reads a whole blob for every range, so its files are read whole
+    /// once and kept, shared by the workspace's forks.
     pub ranged_reads: bool,
     /// Keep a removed file readable for the handles still open on it, until the
     /// kernel forgets it. Off for NFS, which never forgets an inode and whose client
@@ -666,10 +666,10 @@ impl Inner {
             return Ok(Bytes::copy_from_slice(&buffer.data[range(buffer.data.len())]));
         }
         let (ws, path) = self.contents(ino)?;
-        if self.ranged_reads && ws.stat(path.as_str()).fs()?.size > RANGED_READ_SIZE {
+        if self.ranged_reads {
             return ws.read_range(path.as_str(), offset, size.into()).fs();
         }
-        // Other files are read whole once and served from the workspace's cache.
+        // Other sources are read whole once and served from the workspace's cache.
         let data = ws.read(path.as_str()).fs()?;
         Ok(data.slice(range(data.len())))
     }
@@ -1298,6 +1298,25 @@ mod tests {
         fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
             Err(Error::Source(format!("{key} was read")))
         }
+    }
+
+    #[test]
+    fn host_folder_files_are_read_in_ranges_and_never_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "before").unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(sandfs_core::DirSource::new(dir.path()).unwrap())).unwrap();
+        let root = VPath::parse("/mnt").unwrap();
+        let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        fs.ranged_reads = true;
+        let ino = fs.lookup(ROOT_INO, name("notes.txt")).unwrap().ino.0;
+        assert_eq!(&fs.read(ino, 2, 3).unwrap()[..], b"for");
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"before");
+
+        // The kernel caches what it read; the mount keeps no second copy, so a read the
+        // kernel passes on goes back to the folder.
+        std::fs::write(dir.path().join("notes.txt"), "after!").unwrap();
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"after!");
     }
 
     #[test]
