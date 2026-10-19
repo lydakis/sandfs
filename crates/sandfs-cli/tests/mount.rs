@@ -199,6 +199,11 @@ fn a_directory_source_is_never_written() {
     }
     // The crash released the workspace too, so another process may take it over.
     sandfs.run(&["serve", "--mcp", "data"]);
+    // Mounting it elsewhere would lose track of the dead mount, so it is refused.
+    let elsewhere = dirs.path().join("elsewhere");
+    let refused = sandfs.try_run(&["mount", "data", elsewhere.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("sandfs unmount data"), "says how to detach it");
     sandfs.unmount(&ws);
     sandfs.mount(&["mount", "data", ws.to_str().unwrap()], &ws);
     assert_eq!(std::fs::read_to_string(ws.join("out/summary.txt")).unwrap(), "2 rows\n", "saved before the crash");

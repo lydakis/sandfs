@@ -259,8 +259,13 @@ fn remove_unused(home: &Home, name: &str) {
 /// background process and wait until the mount is up.
 #[cfg(mount)]
 fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
-    if let Some(info) = home.mount_info(name) {
-        bail!("{name} is already mounted at {}", info.mountpoint.display());
+    if let Some(info) = home.attached_mount(name) {
+        let at = info.mountpoint.display();
+        if host::alive(info.pid) {
+            bail!("{name} is already mounted at {at}");
+        }
+        // Mounting again would forget where the old mount is, and nothing could detach it.
+        bail!("{name} is still attached at {at}, whose process has exited; `sandfs unmount {name}` detaches it");
     }
     // The source is read through its host path, so a mount on top of it or inside it
     // would read itself (and create the mount point inside a read-only source).
@@ -412,10 +417,13 @@ const SAVE_ERROR: &str = "save-error";
 fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     let state = home.workspace_dir(name);
     let mount_file = state.join("mount.json");
-    host::unmount(&info.mountpoint, !host::alive(info.pid))?;
+    // A live process holds the workspace; checking that too means a process that has
+    // since taken over a dead server's pid isn't waited for.
+    let serving = || host::alive(info.pid) && home.is_locked(name);
+    host::unmount(&info.mountpoint, !serving())?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut wait = Duration::from_millis(1);
-    while mount_file.exists() && host::alive(info.pid) {
+    while mount_file.exists() && serving() {
         if Instant::now() >= deadline {
             bail!("unmounted, but process {} is still saving the workspace's changes", info.pid);
         }

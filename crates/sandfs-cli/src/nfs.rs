@@ -707,11 +707,14 @@ mod tests {
             let (sub, _) = fs.mkdir(ROOT_INO, &name("sub")).await.unwrap();
             fs.create(sub, &name("._sub"), sattr3::default()).await.unwrap();
             fs.create(sub, &name("kept.txt"), sattr3::default()).await.unwrap();
+            // A folder with such a name is someone's: macOS only makes files.
+            fs.mkdir(ROOT_INO, &name("._cache")).await.unwrap();
             assert_eq!(fs.read(id, 0, 100).await.unwrap().0, b"xattrs", "served while mounted");
             fs.shared.lock().snapshot(Duration::ZERO)
         });
         let changed: Vec<String> = snapshot.ws.changes().unwrap().iter().map(|c| c.path.to_string()).collect();
         assert_eq!(changed, ["/mnt/sub/kept.txt"]);
+        assert!(snapshot.dirs.iter().any(|dir| dir.ends_with("/._cache")), "{:?}", snapshot.dirs);
         assert!(is_bookkeeping("._notes.txt") && is_bookkeeping(".DS_Store") && !is_bookkeeping("notes.txt"));
     }
 

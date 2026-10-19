@@ -212,6 +212,17 @@ impl Home {
         bail!("{what:?} is neither a workspace name nor a mounted workspace")
     }
 
+    /// Whether some process holds `name` (see [`Home::lock`]), checked once, without
+    /// waiting. A lock that can't be checked counts as held.
+    #[cfg(mount)]
+    pub fn is_locked(&self, name: &str) -> bool {
+        let path = self.workspace_dir(name).join("lock");
+        match File::options().write(true).open(path) {
+            Ok(file) => !matches!(file.try_lock(), Ok(())),
+            Err(_) => true,
+        }
+    }
+
     /// Take the right to save `name`, or fail saying who holds it. `holder` describes
     /// this process to whoever is refused next.
     pub fn lock(&self, name: &str, holder: &str) -> Result<Writer> {

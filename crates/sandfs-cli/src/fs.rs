@@ -210,17 +210,14 @@ impl Inner {
         self.commit_written(settle);
         self.unsaved = false;
         let mut ws = self.ws.fork();
-        let mut dirs = self.dirs.clone();
         if self.skip_bookkeeping {
-            let bookkeeping = |path: &VPath| path.name().is_some_and(is_bookkeeping);
             for change in ws.changes().unwrap_or_default() {
-                if change.kind == ChangeKind::Added && bookkeeping(&change.path) {
+                if change.kind == ChangeKind::Added && change.path.name().is_some_and(is_bookkeeping) {
                     let _ = ws.remove(change.path.as_str(), true);
                 }
             }
-            dirs.retain(|dir| VPath::parse(dir).map_or(true, |dir| !bookkeeping(&dir)));
         }
-        Snapshot { ws, times: self.times.clone(), dirs }
+        Snapshot { ws, times: self.times.clone(), dirs: self.dirs.clone() }
     }
 
     // NFS clients never forget an inode, and resume a listing after the inode its last
