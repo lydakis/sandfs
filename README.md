@@ -1,6 +1,6 @@
 # sandfs
 
-`sandfs` is a sandbox filesystem for agents. Mount any data without copying it (a folder, in-memory files, an API, a bucket, a git commit), let the agent read and write through a copy-on-write workspace, fork that workspace in O(1) for every attempt, and collect the files it changed. Files are bytes of any kind: documents, spreadsheets, images, data sets and code alike.
+`sandfs` is a sandbox filesystem for agents. Mount any data without copying it (a folder, in-memory files, an API, a bucket, a git commit), let the agent read and write through a copy-on-write workspace, fork that workspace in memory in O(1) for every attempt, and collect the files it changed. Files are bytes of any kind: documents, spreadsheets, images, data sets and code alike.
 
 > **Status**: early. The core is Rust (`crates/`), and the Python package is a thin binding over it. APIs may still change.
 
@@ -74,12 +74,12 @@ Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADire
 
 ## Mounting a workspace on disk
 
-The `sandfs` command (crate `sandfs-cli`) mounts a workspace as a real directory with FUSE, so any program can read and write it: a data pipeline, a notebook, a build, an agent's tools. The folder underneath is never modified, and forking is O(1). It needs Linux with FUSE 3 (`fusermount3`, package `fuse3`).
+The `sandfs` command (crate `sandfs-cli`) mounts a workspace as a real directory with FUSE, so any program can read and write it: a data pipeline, a notebook, a build, an agent's tools. The folder underneath is never modified, and forking never copies it. It needs Linux with FUSE 3 (`fusermount3`, package `fuse3`).
 
 ```bash
 cargo install --path crates/sandfs-cli
 sandfs mount ~/datasets/survey ~/ws/survey       # a host folder, never written to
-sandfs fork ~/ws/survey ~/ws/cleanup             # O(1): a copy with survey's changes so far
+sandfs fork ~/ws/survey ~/ws/cleanup             # survey's changes so far, without copying the folder
 python clean.py ~/ws/cleanup                     # real files, any tool
 sandfs changes ~/ws/cleanup                      # A/M/D against the source
 sandfs unmount ~/ws/cleanup                      # changes stay saved
@@ -88,11 +88,15 @@ sandfs mount cleanup ~/ws/cleanup                # and come back
 
 `sandfs serve --mcp NAME` gives an unmounted workspace to an agent as MCP file tools instead, with the source's files under `/mnt`; whatever the agent changes is saved for the next `mount` or `changes`.
 
-A workspace keeps its source from when it was created. Changes live in memory and are saved under `$SANDFS_HOME` (default `~/.local/share/sandfs`) shortly after each write. `git:<path or url>[@rev]` mounts a commit instead of a folder; for a remote repository sandfs keeps a partial clone and fetches a directory's files in one request when it is first listed.
+Changes live in memory and are saved under `$SANDFS_HOME` (default `~/.local/share/sandfs`) shortly after each write. A fork on disk costs more than a fork in memory. `sandfs fork` never copies the source, but it waits for the workspace's latest changes to be saved, links each changed file into the fork (copying it where the disk can't link), and starts a new mount, which reads the source again rather than sharing what the first mount has read. `git:<path or url>[@rev]` mounts a commit instead of a folder; for a remote repository sandfs keeps a partial clone and fetches a directory's files in one request when it is first listed.
 
 ## What sandfs is not
 
-sandfs does not run commands. Commands an agent wants to run belong in a real sandbox (a container or microVM) pointed at the files, for example through a FUSE mount of a workspace. It also has no symlinks and no text-editing or patch tools in the core; those are code concerns that live in the MCP tools, if anywhere. Earlier versions had a bash-like shell, a host-command bridge, a Python executor, access policies and storage adapters. They were dropped to keep the primitive small.
+**Not an execution sandbox.** sandfs does not run commands, and it does not contain the programs that use it. It keeps their writes out of the source, but a program working in a FUSE mount runs with its own process's access and can still read or change anything else its user can. Run untrusted programs in a real sandbox (a container or microVM) and point it at the mount.
+
+**Not a snapshot of a host folder.** A host folder is read when a path below it is first touched, and what was read is kept. If the folder changes while it is mounted, a workspace can show a mix of old and new: a listing or size read before the change next to contents read after it. Mount a folder nothing else writes to, copy it first, or mount a git commit when the view must not change.
+
+sandfs also has no symlinks and no text-editing or patch tools in the core; those are code concerns that live in the MCP tools, if anywhere. Earlier versions had a bash-like shell, a host-command bridge, a Python executor, access policies and storage adapters. They were dropped to keep the primitive small.
 
 ## Repository layout
 

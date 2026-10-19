@@ -163,7 +163,9 @@ impl Change {
     }
 }
 
-/// A read-only view of a host directory, read lazily. Symlinks and special files are skipped.
+/// A read-only view of a host directory, read lazily. It is not a snapshot: a directory
+/// that changes while mounted can show a mix of old and new contents. Symlinks and
+/// special files are skipped.
 #[pyclass(module = "sandfs", name = "DirSource", frozen)]
 struct PyDirSource {
     inner: Arc<dyn Source>,

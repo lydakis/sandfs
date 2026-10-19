@@ -2,7 +2,7 @@
 //! folder.
 //!
 //! The commands are the core's primitives. `mount` creates a workspace over a source
-//! and serves it with FUSE, `fork` mounts an O(1) copy of one, and `changes` lists the
+//! and serves it with FUSE, `fork` mounts a copy of one without copying its source, and `changes` lists the
 //! files a workspace changed. A working copy on disk is just a fork mounted at a path.
 //! `serve --mcp` hands a workspace to an agent as MCP file tools instead of a mount.
 
@@ -51,8 +51,8 @@ enum Cmd {
         #[arg(long, short)]
         foreground: bool,
     },
-    /// Fork a workspace, with its changes so far, and mount the fork at DIR. O(1) in
-    /// the size of the source.
+    /// Fork a workspace, with its changes so far, and mount the fork at DIR. The source
+    /// is never copied; each saved change is linked into the fork.
     Fork {
         /// The workspace to fork: its name or the directory it is mounted on.
         from: String,

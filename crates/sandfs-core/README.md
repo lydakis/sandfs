@@ -1,6 +1,6 @@
 # sandfs-core
 
-A lazy, copy-on-write sandbox filesystem for agents. A `Workspace` mounts read-only sources (a host folder, in-memory files, or any tree you implement with `read_dir` and `read_file`), keeps every write in an in-memory overlay, forks in O(1), and reports which files changed. Files are bytes of any kind, and sources are never modified.
+A lazy, copy-on-write sandbox filesystem for agents. A `Workspace` mounts read-only sources (a host folder, in-memory files, or any tree you implement with `read_dir` and `read_file`), keeps every write in an in-memory overlay, forks in O(1), and reports which files changed. Files are bytes of any kind, and sources are never modified. A host folder is read when each path is first touched, not copied, so mount one nothing else is changing.
 
 ```rust,no_run
 use std::sync::Arc;
