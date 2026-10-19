@@ -2,7 +2,7 @@
 
 An MCP server that gives an agent a [sandfs](https://crates.io/crates/sandfs-core) workspace as nine file tools instead of a bash tool: `read`, `list`, `glob`, `grep`, `write`, `edit`, `move`, `delete` and `changes`. Mounts stay read-only, every write lands in a copy-on-write overlay, and `changes` lists the files the agent added, modified or deleted.
 
-Install the binary with `cargo install sandfs-mcp` and point an MCP client at it. Each `--dir MOUNT=PATH` mounts a host folder, read lazily and never written to:
+Install the binary with `cargo install sandfs-mcp` and point an MCP client at it. Each `--dir MOUNT=PATH` mounts a host folder, read lazily and never written to (mount one nothing else is changing while the server runs):
 
 ```json
 { "mcpServers": { "sandfs": {
