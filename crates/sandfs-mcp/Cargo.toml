@@ -12,7 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 globset = { version = "0.4", default-features = false }
 regex = "1"
 sandfs-core.workspace = true
