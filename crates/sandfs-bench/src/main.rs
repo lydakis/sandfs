@@ -3,7 +3,8 @@
 //! Targets are the host filesystem used directly (the floor), sandfs through its Rust
 //! API, Linux overlayfs (the kernel's copy-on-write filesystem, when this process can
 //! mount it) and the `sandfs` command's FUSE mount (when FUSE is available). A second
-//! table compares a slow, lazily read source with copying it all up front.
+//! table compares a slow, lazily read source with copying it all up front, and a third
+//! runs a whole task (search, edit, check, list changes) in several parallel attempts.
 //!
 //! Every timed run starts from a fresh view: a new workspace or mount, so caches start
 //! empty except the kernel's page cache, which is warm for every target alike.
@@ -11,6 +12,7 @@
 mod data;
 mod lazy;
 mod targets;
+mod workflow;
 mod workloads;
 
 use std::path::PathBuf;
@@ -54,6 +56,9 @@ struct Args {
     /// Timed runs per workload (default depends on the scale).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     iters: Option<u64>,
+    /// Parallel attempts in the workflow benchmark.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
+    attempts: u64,
     /// Delay per call of the slow source, in microseconds.
     #[arg(long, default_value_t = 1000)]
     latency_us: u64,
@@ -122,7 +127,8 @@ fn run(args: Args) -> Result<()> {
 
     let selected = |name: &str| args.only.as_ref().is_none_or(|only| name.contains(only.as_str()));
     let workloads: Vec<_> = workloads::all(&data).into_iter().filter(|w| selected(w.name)).collect();
-    if workloads.is_empty() && !lazy::NAMES.iter().any(|name| selected(name)) {
+    let run_workflow = selected(WORKFLOW);
+    if workloads.is_empty() && !lazy::NAMES.iter().any(|name| selected(name)) && !run_workflow {
         bail!("--only {:?} matches no workload", args.only.as_deref().unwrap_or_default());
     }
     let mut table: Vec<Vec<Option<Vec<Duration>>>> = Vec::new();
@@ -135,8 +141,19 @@ fn run(args: Args) -> Result<()> {
         table.push(row);
     }
     let lazy = lazy::run(&data, Duration::from_micros(args.latency_us), scale.iters, &selected)?;
+    let mut flows = Vec::new();
+    if run_workflow {
+        eprintln!("{WORKFLOW}");
+        for target in &targets {
+            let runs = (0..scale.iters)
+                .map(|_| workflow::run(target.as_ref(), &data, &scratch, args.attempts as usize))
+                .collect::<Result<Vec<_>>>()?;
+            flows.push(runs);
+        }
+    }
 
     print_report(&args, &data, &targets, &skipped, &workloads, &table, &lazy);
+    print_workflow(&args, &flows);
     if let Some(path) = &args.json {
         let rows: Vec<_> = workloads
             .iter()
@@ -161,10 +178,81 @@ fn run(args: Args) -> Result<()> {
                 })
             })
             .collect();
-        let report = json!({ "scale": format!("{:?}", args.scale), "workloads": rows, "lazy": lazy_rows });
+        let flow_rows: Vec<_> = flows
+            .iter()
+            .flatten()
+            .map(|run| {
+                json!({
+                    "target": run.target,
+                    "attempts": run.steps.len(),
+                    "forks_nanos": run.forks.as_nanos() as u64,
+                    "wall_nanos": run.wall.as_nanos() as u64,
+                    "steps_nanos": run.steps.iter().map(|steps| steps.map(|t| t.as_nanos() as u64)).collect::<Vec<_>>(),
+                    "peak_rss_bytes": run.peak_rss,
+                    "disk_bytes": run.disk,
+                })
+            })
+            .collect();
+        let report = json!({
+            "scale": format!("{:?}", args.scale),
+            "workloads": rows,
+            "lazy": lazy_rows,
+            "workflow": flow_rows,
+        });
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     }
     Ok(())
+}
+
+const WORKFLOW: &str = "workflow/attempts";
+
+/// The workflow table: per target, the median run by wall time, with every attempt's
+/// step times pooled across runs.
+fn print_workflow(args: &Args, flows: &[Vec<workflow::WorkflowResult>]) {
+    if flows.is_empty() {
+        return;
+    }
+    let attempts = args.attempts;
+    println!();
+    println!(
+        "{attempts} parallel attempts, each on its own fork: search every small file, rewrite up to {} files, add {} and delete {}, `cksum` part of the tree, list the changes. Median of runs; step times are medians over attempts.",
+        workflow::REWRITES,
+        workflow::NOTES,
+        workflow::DELETES
+    );
+    println!();
+    println!(
+        "| target | {attempts} attempts, wall | forks | search | edit | check | changes | peak memory | left on disk |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for runs in flows {
+        let walls: Vec<Duration> = runs.iter().map(|run| run.wall).collect();
+        let forks: Vec<Duration> = runs.iter().map(|run| run.forks).collect();
+        let step = |i: usize| {
+            let times: Vec<Duration> =
+                runs.iter().flat_map(|run| run.steps.iter().map(move |steps| steps[i])).collect();
+            fmt_duration(median(&times))
+        };
+        let peak = runs.iter().map(|run| run.peak_rss).max().unwrap_or(0);
+        let disk = runs.iter().map(|run| run.disk).max().unwrap_or(0);
+        println!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            runs[0].target,
+            fmt_duration(median(&walls)),
+            fmt_duration(median(&forks)),
+            step(0),
+            step(1),
+            step(2),
+            step(3),
+            fmt_bytes(peak),
+            fmt_bytes(disk),
+        );
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    let mib = bytes as f64 / f64::from(1 << 20);
+    if mib < 10.0 { format!("{mib:.1} MiB") } else { format!("{mib:.0} MiB") }
 }
 
 /// Time `scale.iters` runs of `workload` on `target`, each on a fresh view.
