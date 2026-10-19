@@ -682,10 +682,8 @@ impl Inner {
                 }
                 return Ok(());
             }
-            if !dots {
-                if let Some(node) = self.nodes.get_mut(&ino) {
-                    node.lookups += 1;
-                }
+            if !dots && let Some(node) = self.nodes.get_mut(&ino) {
+                node.lookups += 1;
             }
         }
     }
