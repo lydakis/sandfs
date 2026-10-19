@@ -2,7 +2,7 @@
 
 sandfs gives an agent a private copy of your files to work in, without copying anything. Point it at a folder, a git commit or any data you can list and read. The agent reads and writes as it likes, your originals never change, and when it's done you get the list of files it added, changed or deleted, so you decide what to keep.
 
-- **Nothing is copied up front.** A file is read the first time someone opens it, so mounting a huge folder or repository is instant.
+- **Nothing is copied up front.** Files are fetched from their source as they are needed, so mounting a huge folder or repository is instant.
 - **Every attempt gets its own copy, for free.** Forking a workspace takes constant time however much data is mounted, so ten agents can try ten things side by side without seeing each other's changes.
 - **You see exactly what changed.** `changes()` lists the files, and you write back only the ones you want.
 
@@ -117,7 +117,7 @@ sandfs changes ~/ws/cleanup                      # A/M/D for each changed file
 sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sandfs mount cleanup ~/ws/cleanup` brings them back
 ```
 
-`git:<path or url>[@rev]` mounts a commit instead of a folder. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second:
+`git:<path or url>[@rev]` mounts a commit instead of a folder. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second. Listing a folder then fetches that folder's files in one request, since a real folder has to show their sizes:
 
 ```bash
 sandfs mount git:https://github.com/pallets/flask@3.1.0 ~/ws/flask
@@ -125,7 +125,7 @@ sandfs mount git:https://github.com/pallets/flask@3.1.0 ~/ws/flask
 
 `sandfs serve --mcp NAME` hands a saved workspace to an agent as MCP file tools instead of mounting it.
 
-Mounting needs Linux with FUSE 3 (`fusermount3`, package `fuse3`). On macOS and Windows every other command works, and `sandfs serve --mcp SOURCE` gives an agent a workspace there. When changes are saved, what a fork on disk costs and how offline git mounts behave are covered in [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md).
+Mounting needs Linux with FUSE 3 (`fusermount3`, package `fuse3`). On macOS and Windows, `changes`, `list`, `rm` and `serve --mcp` work, and `sandfs serve --mcp SOURCE` gives an agent a workspace there; `fork` and `unmount` need a mount. When changes are saved, what a fork on disk costs and how offline git mounts behave are covered in [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md).
 
 ## More features
 
