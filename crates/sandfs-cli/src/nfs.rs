@@ -16,7 +16,7 @@
 //! path, and every file handle carries another secret, so a program connecting to the
 //! server directly gets nothing. Credentials can be made up, but not those secrets.
 
-use std::collections::BTreeMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(nfs)]
@@ -42,26 +42,45 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::fs::{FsResult, Inner, MAX_FILE_SIZE, ROOT_INO, Shared};
 
-/// How often the server checks that its mount is still there, in case it went away
-/// without telling the server (a forced unmount).
+/// How often the server checks that its mount is still there.
 #[cfg(nfs)]
 const MOUNT_CHECK: Duration = Duration::from_millis(500);
 
-/// Listing pages kept track of, at most: past this some are forgotten, and a client
-/// resuming one of those resumes by the entry's current name.
-const PAGE_ENDS: usize = 1024;
+/// Listed names kept track of, at most: past this the oldest are forgotten, and a
+/// client resuming after one of those resumes by the entry's current name.
+const LISTED_NAMES: usize = 16384;
 
 /// The largest RPC message relayed to the server: a write of `wsize` and its header.
 #[cfg(nfs)]
 const MAX_MESSAGE: usize = 2 << 20;
 
+/// Names handed out in listings, forgetting the oldest past [`LISTED_NAMES`].
+#[derive(Default)]
+struct Listed {
+    names: HashMap<(fileid3, fileid3), String>,
+    order: VecDeque<(fileid3, fileid3)>,
+}
+
+impl Listed {
+    fn insert(&mut self, key: (fileid3, fileid3), name: String) {
+        if self.names.insert(key, name).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > LISTED_NAMES
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.names.remove(&oldest);
+            }
+        }
+    }
+}
+
 /// The [`NFSFileSystem`] handed to the NFS server.
 pub struct SandNfs {
     shared: Arc<Shared>,
-    /// The name each listing page ended on, by folder and the cookie (inode) the client
+    /// The names entries were listed under, by folder and inode, the cookie a client
     /// resumes from. The entry may be renamed before the next page is asked for, and
     /// the next page must start after where it was, not where it went.
-    page_ends: Mutex<BTreeMap<(fileid3, fileid3), String>>,
+    listed: Mutex<Listed>,
     /// Starts every file handle, so handles can't be made up.
     secret: [u8; 16],
     /// Whether the root's handle was handed out.
@@ -135,7 +154,7 @@ fn os_name(name: &filename3) -> &OsStr {
 impl SandNfs {
     /// Serve `shared` over NFS.
     pub fn new(shared: Arc<Shared>) -> std::io::Result<SandNfs> {
-        Ok(SandNfs { shared, page_ends: Mutex::default(), secret: random()?, mounted: AtomicBool::new(false) })
+        Ok(SandNfs { shared, listed: Mutex::default(), secret: random()?, mounted: AtomicBool::new(false) })
     }
 
     /// Run `op` on the filesystem, then wake the saver if it changed something.
@@ -296,10 +315,10 @@ impl NFSFileSystem for SandNfs {
         let listing = inner.readdir(fh, 2).map(<[_]>::to_vec);
         inner.releasedir(fh);
         let listing = listing.nfs()?;
-        let page_end = self.page_ends.lock().unwrap().get(&(dirid, start_after)).cloned();
+        let listed_as = self.listed.lock().unwrap().names.get(&(dirid, start_after)).cloned();
         let start = if start_after == 0 {
             0
-        } else if let Some(after) = page_end {
+        } else if let Some(after) = listed_as {
             listing.partition_point(|(_, _, name)| *name <= after)
         } else if let Some(position) = listing.iter().position(|(ino, ..)| *ino == start_after) {
             position + 1
@@ -309,24 +328,26 @@ impl NFSFileSystem for SandNfs {
             let after = inner.last_name_of(start_after).ok_or(nfsstat3::NFS3ERR_BAD_COOKIE)?;
             listing.partition_point(|(_, _, name)| *name <= after)
         };
-        let mut entries: Vec<DirEntry> = Vec::new();
+        let (mut entries, mut names) = (Vec::new(), Vec::new());
+        let mut end = true;
         for (ino, _, name) in listing.iter().skip(start) {
             if entries.len() == max_entries {
-                let mut page_ends = self.page_ends.lock().unwrap();
-                if page_ends.len() >= PAGE_ENDS {
-                    page_ends.pop_first();
-                }
-                if let Some(last) = entries.last() {
-                    page_ends.insert((dirid, last.fileid), String::from_utf8_lossy(&last.name.0).into_owned());
-                }
-                return Ok(ReadDirResult { entries, end: false });
+                end = false;
+                break;
             }
             // Gone since the listing was made.
             let Ok(attr) = inner.attr(*ino) else { continue };
             inner.hold(*ino);
             entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), attr: attributes(&attr) });
+            names.push(name.clone());
         }
-        Ok(ReadDirResult { entries, end: true })
+        // The server may send only some of these and end the page early, so the client
+        // can resume after any of them.
+        let mut listed = self.listed.lock().unwrap();
+        for (entry, name) in entries.iter().zip(names) {
+            listed.insert((dirid, entry.fileid), name);
+        }
+        Ok(ReadDirResult { entries, end })
     }
 
     /// The server's defaults, but with sandfs's own file size limit, and no symlinks.
@@ -377,8 +398,6 @@ pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u1
             .context("starting the NFS server")?;
         let export: String = random()?.iter().map(|byte| format!("{byte:02x}")).collect();
         server.with_export_name(format!("sandfs/{name}/{export}"));
-        let (mount_events, mut events) = tokio::sync::mpsc::channel(16);
-        server.set_mount_listener(mount_events);
         let server_port = server.get_listen_port();
         tokio::spawn(async move { server.handle_forever().await });
         let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("starting the NFS listener")?;
@@ -404,14 +423,11 @@ pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u1
             return Err(err);
         }
 
-        // The client says when it unmounts; checking the mount table as well catches an
-        // unmount that never told the server.
+        // The relay keeps the client's unmount call from the server, since anyone could
+        // send one, so the mount table says when the mount is gone.
         let mut check = tokio::time::interval(MOUNT_CHECK);
-        loop {
-            tokio::select! {
-                event = events.recv() => if event != Some(true) { break },
-                _ = check.tick() => if !crate::store::is_mounted(dir) { break },
-            }
+        while crate::store::is_mounted(dir) {
+            check.tick().await;
         }
         Ok(())
     })
@@ -478,7 +494,9 @@ async fn relay(client: tokio::net::TcpStream, server_port: u16, users: &[u32]) -
     };
     let result = async {
         while let Some((message, call)) = read_message(&mut from_client).await? {
-            if call_allowed(&call, users) {
+            if is_unmount_call(&call) {
+                to_client.lock().await.write_all(&unmounted(&call)).await?;
+            } else if call_allowed(&call, users) {
                 if is_access_call(&call) {
                     access_calls.lock().unwrap().insert(u32::from_be_bytes(call[..4].try_into().unwrap()));
                 }
@@ -542,6 +560,22 @@ fn call_allowed(call: &[u8], users: &[u32]) -> bool {
     let (Some(1), Some(name_len)) = (word(24), word(36)) else { return false };
     let uid = word(40 + (name_len as usize).next_multiple_of(4));
     uid.is_some_and(|uid| users.contains(&uid))
+}
+
+/// Whether `call` is a mount-protocol UMNT or UMNTALL call. The server stops serving
+/// when it gets one, whoever sent it, so the relay answers these itself; the server
+/// sees the mount go from the mount table instead.
+fn is_unmount_call(call: &[u8]) -> bool {
+    let word = |at: usize| call.get(at..at + 4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()));
+    word(4) == Some(0) && word(12) == Some(100005) && matches!(word(20), Some(3 | 4))
+}
+
+/// The reply to an unmount call: accepted, and done.
+fn unmounted(call: &[u8]) -> Vec<u8> {
+    let xid = call.get(..4).unwrap_or(&[0; 4]);
+    // REPLY, MSG_ACCEPTED, an empty AUTH_NULL verifier, SUCCESS, and no result.
+    let words = [1u32, 0, 0, 0, 0].map(u32::to_be_bytes).concat();
+    [&(0x8000_0000u32 | 24).to_be_bytes()[..], xid, &words].concat()
 }
 
 /// Whether `call` is an NFS ACCESS call (program 100003, procedure 4).
@@ -705,6 +739,14 @@ mod tests {
             fs.rename(ROOT_INO, &name("d"), ROOT_INO, &name("z")).await.unwrap();
             let rest = fs.readdir(ROOT_INO, first.entries.last().unwrap().fileid, 10).await.unwrap();
             assert_eq!(names(&rest), ["in", "notes.txt", "z"]);
+
+            // The server may send fewer entries than a page holds: the client resumes
+            // after the last one it got, which may also have been renamed.
+            let first = fs.readdir(ROOT_INO, 0, 3).await.unwrap();
+            assert_eq!(names(&first), ["b", "in", "notes.txt"]);
+            fs.rename(ROOT_INO, &name("b"), ROOT_INO, &name("y")).await.unwrap();
+            let rest = fs.readdir(ROOT_INO, first.entries[0].fileid, 10).await.unwrap();
+            assert_eq!(names(&rest), ["in", "notes.txt", "y", "z"]);
         });
     }
 
@@ -793,9 +835,15 @@ mod tests {
         reply[4..8].copy_from_slice(&1u32.to_be_bytes());
         assert!(!call_allowed(&reply, &[501, 0]), "not a call");
         assert!(call_allowed(&mount_call(100005, 1, "mac", 501), &[501, 0]), "MNT");
-        assert!(call_allowed(&mount_call(100005, 3, "mac", 501), &[501, 0]), "UMNT");
         assert!(!call_allowed(&mount_call(100005, 5, "mac", 501), &[501, 0]), "EXPORT names the secret");
         assert!(!call_allowed(&mount_call(100005, 2, "mac", 0), &[501, 0]), "DUMP");
+
+        // Unmounts are answered by the relay, from anyone, and never reach the server.
+        assert!(is_unmount_call(&mount_call(100005, 3, "mac", 0)) && is_unmount_call(&mount_call(100005, 4, "x", 7)));
+        assert!(!is_unmount_call(&mount_call(100005, 1, "mac", 501)) && !is_unmount_call(&call(3, "mac", 501)));
+        let done = unmounted(&mount_call(100005, 3, "mac", 0));
+        assert_eq!(done[..8], [(0x8000_0000u32 | 24).to_be_bytes(), 42u32.to_be_bytes()].concat()[..]);
+        assert_eq!(done[8..], [1u32, 0, 0, 0, 0].map(u32::to_be_bytes).concat()[..]);
 
         let refused = refusal(&call(4, "mac", 502));
         assert_eq!(refused.len(), 24);
