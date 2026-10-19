@@ -246,6 +246,8 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
         .context("starting the mount process")?;
     // Opening the workspace can fetch from a remote, so allow it some time.
     let deadline = Instant::now() + Duration::from_secs(120);
+    // Most mounts are up within a few milliseconds, so poll quickly at first.
+    let mut wait = Duration::from_millis(1);
     while Instant::now() < deadline {
         // The kernel shows the mount slightly before the daemon records it.
         if home.mount_info(name).is_some_and(|info| info.pid == child.id()) {
@@ -258,7 +260,8 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
             let tail: Vec<&str> = tail.into_iter().rev().collect();
             bail!("mounting failed ({status}):\n{}", tail.join("\n"));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_millis(50));
     }
     let _ = child.kill();
     bail!("timed out waiting for the mount at {}", dir.display())
@@ -322,11 +325,13 @@ fn unmount(info: &MountInfo, mount_file: &Path) -> Result<()> {
     }
     let proc = PathBuf::from(format!("/proc/{}", info.pid));
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut wait = Duration::from_millis(1);
     while mount_file.exists() && proc.exists() {
         if Instant::now() >= deadline {
             bail!("unmounted, but process {} is still saving the workspace's changes", info.pid);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_millis(50));
     }
     if mount_file.exists() {
         // The serving process died without cleaning up; its last save is what remains.
