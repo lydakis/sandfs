@@ -262,7 +262,23 @@ fn open_files_work_without_open_or_close_reaching_sandfs() {
     // Opening with O_TRUNC empties the file, and the kernel drops its pages.
     std::fs::write(ws.join("log.txt"), "new\n").unwrap();
     assert_eq!(std::fs::read_to_string(ws.join("log.txt")).unwrap(), "new\n");
-    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M log.txt\nD old.txt\n");
+
+    // A program that writes a file, closes it and exits, with no fsync, has it saved
+    // once the file goes quiet: a crash a second later keeps it.
+    std::fs::write(ws.join("report.txt"), "done\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let mount_json = sandfs.home.path().join("workspaces/ws/mount.json");
+    let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&mount_json).unwrap()).unwrap();
+    let pid = info["pid"].as_u64().unwrap().to_string();
+    assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    sandfs.unmount(&ws);
+    sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
+    assert_eq!(std::fs::read_to_string(ws.join("report.txt")).unwrap(), "done\n", "saved before the crash");
+    assert_eq!(std::fs::read_to_string(ws.join("log.txt")).unwrap(), "new\n");
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M log.txt\nD old.txt\nA report.txt\n");
     sandfs.unmount(&ws);
     assert_eq!(std::fs::read_to_string(folder.path().join("log.txt")).unwrap(), "base\n", "the folder is untouched");
 }
