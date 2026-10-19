@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use sandfs_core::{DirSource, Source, VPath, Workspace};
@@ -83,6 +83,10 @@ pub struct Writer {
 pub struct Home {
     root: PathBuf,
 }
+
+/// How often, and how long apart, [`Home::lock`] retries a lock that looks held.
+const LOCK_RETRIES: u32 = 20;
+const LOCK_RETRY_WAIT: Duration = Duration::from_millis(10);
 
 impl Home {
     /// The home directory from the environment.
@@ -212,7 +216,20 @@ impl Home {
         // Who holds the lock lives in a file of its own: on Windows a locked file can't
         // be read, even by the process that is refused.
         let holder_path = self.workspace_dir(name).join("holder");
-        match file.try_lock() {
+        // A child process this one is starting holds a copy of the lock until it runs
+        // its program, so a lock let go a moment ago can still look held. Retry briefly
+        // before calling it in use.
+        let mut attempt = 0;
+        let locked = loop {
+            match file.try_lock() {
+                Err(TryLockError::WouldBlock) if attempt < LOCK_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(LOCK_RETRY_WAIT);
+                }
+                result => break result,
+            }
+        };
+        match locked {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 let held_by = std::fs::read_to_string(&holder_path).unwrap_or_default();
