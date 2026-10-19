@@ -74,6 +74,8 @@ pub struct Plan {
     pub samples: Vec<String>,
     pub subtree: String,
     pub subtree_files: Vec<String>,
+    /// The file with the most folders above it.
+    pub deepest: String,
 }
 
 impl Plan {
@@ -114,7 +116,8 @@ impl Plan {
         let prefix = if subtree.is_empty() { String::new() } else { format!("{subtree}/") };
         let subtree_files: Vec<String> = files.iter().filter(|path| path.starts_with(&prefix)).cloned().collect();
         ensure!(!subtree_files.is_empty(), "{subtree} holds no files in {url}");
-        Ok(Plan { url: url.to_owned(), commit, files: files.len(), samples, subtree, subtree_files })
+        let deepest = files.iter().max_by_key(|path| path.matches('/').count()).cloned().unwrap_or_default();
+        Ok(Plan { url: url.to_owned(), commit, files: files.len(), samples, subtree, subtree_files, deepest })
     }
 }
 
@@ -129,6 +132,7 @@ impl Plan {
             "samples": self.samples,
             "subtree": self.subtree,
             "subtree_files": self.subtree_files,
+            "deepest": self.deepest,
         });
         Ok(std::fs::write(path, serde_json::to_vec(&json)?)?)
     }
@@ -152,6 +156,7 @@ impl Plan {
             samples: list("samples")?,
             subtree: text("subtree")?,
             subtree_files: list("subtree_files")?,
+            deepest: text("deepest")?,
         })
     }
 }
@@ -241,12 +246,7 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
             checkout(&copy, &plan.commit)?;
         }
         Method::Sparse => {
-            // The leanest clone git offers: one commit, its trees, no file contents.
-            git(None, &["init", "-q", copy_str])?;
-            git(Some(&copy), &["remote", "add", "origin", &plan.url])?;
-            git(Some(&copy), &["config", "remote.origin.promisor", "true"])?;
-            git(Some(&copy), &["config", "remote.origin.partialclonefilter", "blob:none"])?;
-            git(Some(&copy), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", &plan.commit])?;
+            blobless(&plan.url, &plan.commit, &copy)?;
             // Exactly the files the run will read, which only a caller that knows them
             // in advance can list.
             let folder =
@@ -329,6 +329,17 @@ fn checkout(dir: &Path, commit: &str) -> Result<()> {
 /// `SAMPLES + 1` positions spread evenly over `len` items, from the first to the last.
 fn spread(len: usize) -> impl Iterator<Item = usize> {
     (0..=SAMPLES).map(move |i| i * (len - 1) / SAMPLES)
+}
+
+/// The leanest copy git offers in a new directory `dir`: the commit and its folder
+/// listings, no file contents, fetching each file from `url` when it is first read.
+pub fn blobless(url: &str, commit: &str, dir: &Path) -> Result<()> {
+    let dir_str = dir.to_str().context("scratch path is not UTF-8")?;
+    git(None, &["init", "-q", dir_str])?;
+    git(Some(dir), &["remote", "add", "origin", url])?;
+    git(Some(dir), &["config", "remote.origin.promisor", "true"])?;
+    git(Some(dir), &["config", "remote.origin.partialclonefilter", "blob:none"])?;
+    git(Some(dir), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", commit])
 }
 
 /// Where the sandfs method mounts. Whatever is still mounted is unmounted first when
@@ -432,6 +443,7 @@ mod tests {
             samples: strings(&["a", "b/c"]),
             subtree: "b".to_owned(),
             subtree_files: strings(&["b/c"]),
+            deepest: "b/c".to_owned(),
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plan.json");
@@ -439,6 +451,7 @@ mod tests {
         let read = Plan::read(&path).unwrap();
         assert_eq!((read.url, read.commit, read.files), (plan.url, plan.commit, plan.files));
         assert_eq!((read.samples, read.subtree, read.subtree_files), (plan.samples, plan.subtree, plan.subtree_files));
+        assert_eq!(read.deepest, plan.deepest);
     }
 
     #[test]

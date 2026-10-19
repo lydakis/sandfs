@@ -24,6 +24,11 @@ pub struct Slow {
 }
 
 impl Slow {
+    /// `inner`, with `latency` added to every call.
+    pub fn new(inner: MemorySource, latency: Duration) -> Slow {
+        Slow { inner, latency, calls: AtomicUsize::new(0) }
+    }
+
     fn wait(&self) {
         self.calls.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(self.latency);
@@ -67,7 +72,7 @@ struct Setup {
 impl Setup {
     fn source(&self) -> Result<Arc<Slow>> {
         let inner = MemorySource::from_files(self.files.iter().map(|(path, data)| (path.as_str(), data.clone())))?;
-        Ok(Arc::new(Slow { inner, latency: self.latency, calls: AtomicUsize::new(0) }))
+        Ok(Arc::new(Slow::new(inner, self.latency)))
     }
 
     /// The bytes in the files at `paths`, to check every approach read them all.

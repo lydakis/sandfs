@@ -12,6 +12,7 @@
 //! empty except the kernel's page cache, which is warm for every target alike.
 
 mod data;
+mod everyday;
 mod lazy;
 mod remote;
 mod targets;
@@ -186,7 +187,8 @@ fn run(args: Args) -> Result<()> {
     let selected = |name: &str| args.only.as_ref().is_none_or(|only| name.contains(only.as_str()));
     let workloads: Vec<_> = workloads::all(&data).into_iter().filter(|w| selected(w.name)).collect();
     let run_workflow = selected(WORKFLOW);
-    if workloads.is_empty() && !lazy::NAMES.iter().any(|name| selected(name)) && !run_workflow {
+    let run_everyday = everyday::Op::ALL.iter().any(|op| selected(&format!("everyday/{}", op.name())));
+    if workloads.is_empty() && !lazy::NAMES.iter().any(|name| selected(name)) && !run_workflow && !run_everyday {
         bail!("--only {:?} matches no workload", args.only.as_deref().unwrap_or_default());
     }
     let mut table: Vec<Vec<Option<Vec<Duration>>>> = Vec::new();
@@ -219,13 +221,23 @@ fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
+    let mut days = Vec::new();
+    if run_everyday {
+        for group in everyday_groups(&args, &data, &scratch, &bin)? {
+            days.push(everyday::run(&group, &selected)?);
+        }
+    }
+
     let remote = match &args.remote {
-        Some(url) => Some(run_remote(&args, url, &scratch)?),
-        None => None,
+        Some(url) if selected("remote") => Some(run_remote(&args, url, &scratch)?),
+        _ => None,
     };
 
     print_report(&args, &data, &targets, &skipped, &workloads, &table, &lazy);
     print_workflow(&args, &flows);
+    for day in &days {
+        everyday::print(day);
+    }
     if let Some((plan, results)) = &remote {
         print_remote(plan, results);
     }
@@ -258,6 +270,7 @@ fn run(args: Args) -> Result<()> {
             "workloads": rows,
             "lazy": lazy_rows,
             "workflow": workflow_json(&flows),
+            "everyday": days.iter().map(everyday::json).collect::<Vec<_>>(),
             "remote": remote.iter().flat_map(|(_, results)| results.iter().map(remote_json)).collect::<Vec<_>>(),
         });
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
@@ -266,6 +279,91 @@ fn run(args: Args) -> Result<()> {
 }
 
 const WORKFLOW: &str = "workflow/attempts";
+
+/// The sources the everyday operations run on, each with the ways of reaching it that
+/// work here and `--targets` selects: the data set as a host folder, a slow source
+/// holding part of it, and the `--remote` repository. The Rust API columns count as
+/// `sandfs` and the mount columns as `fuse`.
+fn everyday_groups(
+    args: &Args,
+    data: &Data,
+    scratch: &std::path::Path,
+    bin: &std::path::Path,
+) -> Result<Vec<everyday::Group>> {
+    let wanted = |target: TargetArg| args.targets.as_ref().is_none_or(|list| list.contains(&target));
+    let mount = wanted(TargetArg::Fuse) && {
+        let mount = everyday::can_mount(scratch, bin);
+        if let Err(err) = &mount {
+            eprintln!("everyday: no mount columns ({err:#})");
+        }
+        mount.is_ok()
+    };
+    let api = wanted(TargetArg::Sandfs);
+    let root = data.root().to_owned();
+    let mut folder: Vec<Box<dyn Target>> = Vec::new();
+    if wanted(TargetArg::Host) {
+        folder.push(Box::new(Host { data: root.clone(), scratch: scratch.to_owned() }));
+    }
+    if api {
+        folder.push(Box::new(Sandfs { data: root.clone() }));
+    }
+    if mount {
+        folder.push(Box::new(Fuse::new(root, scratch.to_owned(), bin.to_owned())?));
+    }
+    let s = data.scale;
+    let latency = Duration::from_micros(args.latency_us);
+    let mut groups = vec![
+        everyday::Group {
+            source: format!("a host folder ({} small files below small/)", s.small_files()),
+            paths: everyday::data_paths(data, usize::MAX),
+            columns: folder,
+            iters: s.iters,
+        },
+        everyday::Group {
+            source: format!(
+                "a source taking {} µs per call ({} small files below small/)",
+                latency.as_micros(),
+                s.lazy_files.min(s.small_files())
+            ),
+            paths: everyday::data_paths(data, s.lazy_files),
+            columns: if api {
+                vec![Box::new(everyday::SlowSource::new(data, s.lazy_files, latency)?)]
+            } else {
+                Vec::new()
+            },
+            iters: s.iters,
+        },
+    ];
+    if let Some(url) = args.remote.as_ref().filter(|_| api || mount) {
+        let listings = scratch.join("everyday-listings");
+        let plan = remote::Plan::fetch(url, args.remote_folder.as_deref(), &listings)?;
+        let mut columns: Vec<Box<dyn Target>> = Vec::new();
+        if api {
+            columns.push(Box::new(everyday::RemoteLibrary {
+                url: url.clone(),
+                commit: plan.commit.clone(),
+                scratch: scratch.to_owned(),
+            }));
+        }
+        if mount {
+            columns.push(Box::new(everyday::RemoteMount {
+                url: url.clone(),
+                commit: plan.commit.clone(),
+                scratch: scratch.to_owned(),
+                bin: bin.to_owned(),
+            }));
+        }
+        let short = &plan.commit[..plan.commit.len().min(12)];
+        groups.push(everyday::Group {
+            source: format!("{url} at {short} ({} files), nothing fetched before each run", plan.files),
+            paths: everyday::remote_paths(&plan),
+            columns,
+            iters: 1,
+        });
+    }
+    groups.retain(|group| !group.columns.is_empty());
+    Ok(groups)
+}
 
 /// Fetch the remote repository's listings once, then run each method in a fresh copy
 /// of this program, so the memory peak it reports is its own. Every method must read
