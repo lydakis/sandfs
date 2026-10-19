@@ -293,13 +293,16 @@ mod tests {
         run(&repo, &["remote", "set-url", "origin", "file:///nowhere"]);
         assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, third);
         assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
-        let unreachable = remote.to_str().unwrap().trim_start_matches('/').replacen('/', ":", 1);
-        assert_eq!(repos.join(cache_path(&unreachable).unwrap()), repo);
-        assert!(fetch_commit(&repos, &unreachable, "main").is_err());
-        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
-        // The same holds for a commit mounted before, which needs no fetch.
-        assert!(fetch_commit(&repos, &unreachable, &third).is_ok());
-        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+        // (A Windows path has no '/' to turn into an ssh host.)
+        if cfg!(unix) {
+            let unreachable = remote.to_str().unwrap().trim_start_matches('/').replacen('/', ":", 1);
+            assert_eq!(repos.join(cache_path(&unreachable).unwrap()), repo);
+            assert!(fetch_commit(&repos, &unreachable, "main").is_err());
+            assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+            // The same holds for a commit mounted before, which needs no fetch.
+            assert!(fetch_commit(&repos, &unreachable, &third).is_ok());
+            assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+        }
         run(&repo, &["remote", "set-url", "origin", "file:///nowhere"]);
         assert_eq!(resolve(&repos, &format!("{url}@{third}")).unwrap().1, third);
         assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
