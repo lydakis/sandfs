@@ -76,7 +76,7 @@ struct Node {
 
 enum Handle {
     File { ino: u64 },
-    Dir { entries: Vec<(u64, FileType, String)> },
+    Dir { ino: u64, entries: Vec<(u64, FileType, String)> },
 }
 
 /// The filesystem state, behind one lock.
@@ -624,7 +624,7 @@ impl Inner {
         }
         let fh = self.next_fh;
         self.next_fh += 1;
-        self.handles.insert(fh, Handle::Dir { entries });
+        self.handles.insert(fh, Handle::Dir { ino, entries });
         Ok(fh)
     }
 
@@ -632,7 +632,7 @@ impl Inner {
     /// position plus one, which is where the next call resumes.
     pub fn readdir(&self, fh: u64, offset: u64) -> FsResult<&[(u64, FileType, String)]> {
         match self.handles.get(&fh) {
-            Some(Handle::Dir { entries }) => {
+            Some(Handle::Dir { entries, .. }) => {
                 Ok(entries.get(usize::try_from(offset).unwrap_or(usize::MAX)..).unwrap_or_default())
             }
             _ => Err(Errno::EBADF),
@@ -650,15 +650,33 @@ impl Inner {
     ) -> FsResult<()> {
         let mut position = usize::try_from(offset).unwrap_or(usize::MAX);
         loop {
-            let Some(Handle::Dir { entries }) = self.handles.get(&fh) else { return Err(Errno::EBADF) };
-            let Some((ino, _, name)) = entries.get(position).cloned() else { return Ok(()) };
+            let Some(Handle::Dir { ino: dir, entries }) = self.handles.get(&fh) else { return Err(Errno::EBADF) };
+            let dir = *dir;
+            let Some((saved, _, name)) = entries.get(position).cloned() else { return Ok(()) };
             position += 1;
-            // An entry removed since the directory was opened is left out.
-            let Ok(attr) = self.attr(ino) else { continue };
+            let dots = name == "." || name == "..";
+            // Every other name is resolved again: the kernel keeps what this returns for
+            // the cache TTL, so a child renamed, removed or forgotten since `opendir` must
+            // never be published under its old name or with a dropped inode.
+            let ino = if dots {
+                saved
+            } else {
+                let Ok(path) = self.path(dir).and_then(|path| path.join(&name).map_err(|_| Errno::EIO)) else {
+                    continue;
+                };
+                self.ino_for(&path)
+            };
+            let Ok(attr) = self.attr(ino) else {
+                self.maybe_drop(ino);
+                continue;
+            };
             if add(ino, position as u64, &name, &attr) {
+                if !dots {
+                    self.maybe_drop(ino);
+                }
                 return Ok(());
             }
-            if name != "." && name != ".." {
+            if !dots {
                 if let Some(node) = self.nodes.get_mut(&ino) {
                     node.lookups += 1;
                 }
@@ -1201,6 +1219,28 @@ mod tests {
         assert_eq!(fs.nodes[&readme].lookups, 2, "one from the listing, one from lookup");
         assert_eq!(fs.nodes[&src].lookups, 2, "counted once, when accepted");
         assert_eq!(fs.nodes[&ROOT_INO].lookups, 0, ". and .. are not counted");
+    }
+
+    #[test]
+    fn listings_with_attributes_never_publish_stale_names() {
+        let mut fs = fs();
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let fh = fs.opendir(ROOT_INO).unwrap();
+        // After opendir, one child moves and the kernel forgets the other.
+        fs.rename(ROOT_INO, name("README.md"), ROOT_INO, name("NOTES.md"), RenameFlags::empty()).unwrap();
+        fs.forget(src, 1);
+        let mut seen = Vec::new();
+        fs.readdirplus(fh, 2, |ino, _, name, attr| {
+            seen.push((name.to_owned(), ino, attr.kind));
+            false
+        })
+        .unwrap();
+        fs.releasedir(fh);
+        assert_eq!(seen.len(), 1, "the moved name is left out: {seen:?}");
+        let (name_seen, ino, kind) = &seen[0];
+        assert_eq!((name_seen.as_str(), *kind), ("src", FileType::Directory), "the forgotten child is still listed");
+        assert_eq!(fs.path(*ino).unwrap().as_str(), "/mnt/src");
+        assert_eq!(fs.nodes[ino].lookups, 1);
     }
 
     #[test]
