@@ -190,7 +190,14 @@ fn split_rev(spec: &str) -> (&str, Option<String>) {
 
 /// A URL, or scp-style `[user@]host:path`, as git reads it: a ':' before any '/'.
 fn is_url(location: &str) -> bool {
-    location.contains("://") || location.find(':').is_some_and(|colon| !location[..colon].contains('/'))
+    location.contains("://")
+        || location.find(':').is_some_and(|colon| !location[..colon].contains(['/', '\\']) && !drive_letter(location))
+}
+
+/// `C:\repo` or `C:/repo`: a local path on Windows, as git reads it there.
+fn drive_letter(location: &str) -> bool {
+    let bytes = location.as_bytes();
+    cfg!(windows) && bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// `https://github.com/owner/repo.git` becomes `github.com/owner/repo.git`.
@@ -377,5 +384,8 @@ mod tests {
         assert!(cache_path("https://host/../x").is_err());
         assert!(is_url("https://github.com/o/r") && is_url("git@github.com:o/r") && is_url("github.com:o/r"));
         assert!(!is_url("/home/me/repo") && !is_url("~/src/repo") && !is_url("./a:b"));
+        assert!(!is_url(r".\a:b"));
+        assert_eq!(is_url(r"C:\src\repo"), cfg!(unix));
+        assert_eq!(is_url("C:/src/repo"), cfg!(unix));
     }
 }

@@ -296,10 +296,11 @@ impl Home {
     }
 }
 
-/// Expand a leading `~/`.
+/// Expand a leading `~/` (or `~\` on Windows) to the user's home.
 pub fn expand(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+    let rest = path.strip_prefix("~/").or_else(|| if cfg!(windows) { path.strip_prefix("~\\") } else { None });
+    match (rest, std::env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
 }
