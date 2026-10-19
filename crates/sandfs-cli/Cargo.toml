@@ -6,8 +6,7 @@ keywords = ["fuse", "filesystem", "sandbox", "copy-on-write", "agents"]
 categories = ["filesystem", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
-# 1.89 for `File::lock`.
-rust-version = "1.89"
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

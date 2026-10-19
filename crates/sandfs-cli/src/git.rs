@@ -61,20 +61,27 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     } else if let Some(commit) = pinned(&dest, rev) {
         return Ok((dest, commit));
     }
-    // One fetch at a time per local copy: a shallow fetch rewrites the copy's list of
-    // shallow commits, which two git processes can't do at once. The lock is released
-    // when `lock` is dropped.
-    let lock = std::fs::File::create(dest.join("sandfs-fetch.lock"))?;
-    lock.lock().context("locking the local copy")?;
-    if let Some(commit) = pinned(&dest, rev) {
-        return Ok((dest, commit)); // fetched by whoever held the lock
-    }
-    let fetched = format!("refs/sandfs/fetch-{}", std::process::id());
+    // A ref of this fetch's own, so concurrent mounts of one repository don't race on
+    // FETCH_HEAD or on each other's results.
+    static FETCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fetched = format!("refs/sandfs/fetch-{}-{n}", std::process::id());
     let refspec = format!("+{rev}:{fetched}");
-    let fetch = git(
-        &dest,
-        &["fetch", "-q", "--depth=1", "--filter=blob:none", "--no-tags", "--recurse-submodules=no", "origin", &refspec],
-    );
+    let args =
+        ["fetch", "-q", "--depth=1", "--filter=blob:none", "--no-tags", "--recurse-submodules=no", "origin", &refspec];
+    // A shallow fetch rewrites the local copy's list of shallow commits, and git refuses
+    // to while another fetch is doing so ("shallow.lock: File exists", "shallow file has
+    // changed since we read it"). Of two mounts fetching at once, one waits and retries.
+    let mut waited = 0;
+    let fetch = loop {
+        match git(&dest, &args) {
+            Err(err) if waited < 300 && format!("{err:#}").contains("shallow") => {
+                waited += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result => break result,
+        }
+    };
     let commit = match fetch {
         Ok(_) => {
             let commit = commit_of(&dest, &fetched);
