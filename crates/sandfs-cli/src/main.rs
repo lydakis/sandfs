@@ -85,7 +85,8 @@ enum Cmd {
     },
     /// Delete an unmounted workspace and its changes.
     Rm { name: String },
-    /// Serve an unmounted workspace to an agent as MCP file tools over stdin and stdout.
+    /// Serve an unmounted workspace to an agent as MCP file tools over stdin and stdout,
+    /// or create one over a source and serve that.
     ///
     /// The agent gets read, list, glob, grep, write, edit, move, delete and changes,
     /// with the source's files under /mnt. Every change is saved before its reply, so
@@ -94,8 +95,11 @@ enum Cmd {
         /// Speak MCP (the only protocol so far).
         #[arg(long)]
         mcp: bool,
-        /// A workspace name.
+        /// A workspace name, or a source as for `mount`.
         workspace: String,
+        /// Name for a new workspace (default: the source's last component).
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Serve a workspace's FUSE mount in this process (used by `mount` and `fork`).
     #[command(hide = true)]
@@ -171,11 +175,19 @@ fn run(cli: Cli) -> Result<()> {
             let _writer = home.lock(&name, "sandfs rm")?;
             home.remove(&name)
         }
-        Cmd::Serve { mcp, workspace } => {
+        Cmd::Serve { mcp, workspace, name } => {
             if !mcp {
                 bail!("say what to serve: sandfs serve --mcp {workspace}");
             }
-            mcp::serve(&home, &home.find(&workspace)?)
+            // As with `mount`, a bare word naming a workspace serves it; anything else
+            // is a source. This is how workspaces are made where nothing mounts.
+            if home.exists(&workspace) && name.is_none() {
+                return mcp::serve(&home, &workspace);
+            }
+            let name = default_name(name, Path::new(&workspace))?;
+            let record = home.resolve(&workspace)?;
+            home.create(&name, &record)?;
+            mcp::serve(&home, &name)
         }
         Cmd::Daemon { name, dir } => serve(&home, &name, &dir),
     }
@@ -396,10 +408,11 @@ fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     Ok(())
 }
 
-// Without FUSE (Windows, or a build without the `mount` feature) everything works but
-// mounting.
+// Without FUSE (macOS, Windows, or a build without the `mount` feature) everything
+// works but mounting; `serve --mcp SOURCE` creates workspaces instead.
 #[cfg(not(fuse))]
-const NO_FUSE: &str = "mounting needs FUSE: Linux, or macOS with macFUSE and the `mount` feature";
+const NO_FUSE: &str =
+    "mounting needs FUSE, which this build of sandfs only has on Linux; `sandfs serve --mcp SOURCE` works here";
 
 #[cfg(not(fuse))]
 fn mount(_home: &Home, _name: &str, _dir: &Path, _foreground: bool) -> Result<()> {

@@ -36,21 +36,6 @@ const MAX_FILE_SIZE: usize = 4 << 30;
 /// Base files larger than this are read in ranges rather than whole.
 const RANGED_READ_SIZE: u64 = 64 << 20;
 
-// rename flags: Linux's renameat2 and macOS's renamex_np spell them differently.
-// Swapping two paths (and Linux's overlay whiteouts) is not supported.
-#[cfg(target_os = "linux")]
-const RENAME_NOREPLACE: u32 = libc::RENAME_NOREPLACE;
-#[cfg(target_os = "linux")]
-const RENAME_UNSUPPORTED: u32 = libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT;
-#[cfg(target_os = "macos")]
-const RENAME_NOREPLACE: u32 = libc::RENAME_EXCL;
-#[cfg(target_os = "macos")]
-const RENAME_UNSUPPORTED: u32 = libc::RENAME_SWAP;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const RENAME_NOREPLACE: u32 = 0;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const RENAME_UNSUPPORTED: u32 = 0;
-
 pub type FsResult<T> = Result<T, Errno>;
 
 /// The errno for a workspace error. Unexpected errors are logged, since EIO alone says
@@ -402,7 +387,7 @@ impl Inner {
         new_name: &OsStr,
         flags: RenameFlags,
     ) -> FsResult<()> {
-        if flags.bits() & RENAME_UNSUPPORTED != 0 {
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) || flags.contains(RenameFlags::RENAME_WHITEOUT) {
             return Err(Errno::EINVAL);
         }
         let from = self.child(parent, name)?;
@@ -416,7 +401,7 @@ impl Inner {
         }
         let replacing = match self.ws.stat(to.as_str()) {
             Ok(meta) => {
-                if flags.bits() & RENAME_NOREPLACE != 0 {
+                if flags.contains(RenameFlags::RENAME_NOREPLACE) {
                     return Err(Errno::EEXIST);
                 }
                 match (moving_dir, meta.kind.is_dir()) {
@@ -1176,14 +1161,7 @@ mod tests {
             Errno::EISDIR
         );
         assert_eq!(
-            fs.rename(
-                code,
-                name("util.rs"),
-                ROOT_INO,
-                name("README.md"),
-                RenameFlags::from_bits_retain(RENAME_NOREPLACE)
-            )
-            .unwrap_err(),
+            fs.rename(code, name("util.rs"), ROOT_INO, name("README.md"), RenameFlags::RENAME_NOREPLACE).unwrap_err(),
             Errno::EEXIST
         );
     }

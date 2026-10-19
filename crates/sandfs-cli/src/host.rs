@@ -1,8 +1,8 @@
 //! What differs between the systems the mount runs on: finding mounts, telling whether
 //! a process is alive, the mount's options and how to unmount.
 //!
-//! Linux mounts with the kernel's FUSE through `fusermount3`; macOS mounts with
-//! macFUSE. Elsewhere (Windows) nothing is ever mounted, so the lookups find nothing.
+//! Linux mounts with the kernel's FUSE through `fusermount3`. Elsewhere (macOS,
+//! Windows) nothing is mounted yet, so the lookups find nothing.
 
 use std::path::Path;
 
@@ -20,29 +20,9 @@ pub fn mount_source(dir: &Path) -> Option<String> {
     })
 }
 
-/// The source of the topmost macFUSE mount at `dir`, from `mount`'s table.
-#[cfg(target_os = "macos")]
-pub fn mount_source(dir: &Path) -> Option<String> {
-    let output = std::process::Command::new("/sbin/mount").output().ok()?;
-    let table = String::from_utf8_lossy(&output.stdout);
-    table.lines().rev().find_map(|line| {
-        parse_mount_line(line).filter(|(_, point)| Path::new(point) == dir).map(|(source, _)| source.to_owned())
-    })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 pub fn mount_source(_dir: &Path) -> Option<String> {
     None
-}
-
-/// A line of macOS `mount` output, `SOURCE on POINT (TYPE, OPTIONS...)`, as its source
-/// and mount point when it is a macFUSE mount.
-#[cfg(any(target_os = "macos", test))]
-fn parse_mount_line(line: &str) -> Option<(&str, &str)> {
-    let (source, rest) = line.split_once(" on ")?;
-    let (point, options) = rest.rsplit_once(" (")?;
-    let fstype = options.split([',', ')']).next()?;
-    matches!(fstype, "macfuse" | "osxfuse").then_some((source, point))
 }
 
 /// Undo mountinfo's octal escapes (`\040` for a space).
@@ -90,36 +70,19 @@ pub fn alive(_pid: u32) -> bool {
 pub fn mount_options(name: &str) -> Vec<fuser::MountOption> {
     use fuser::MountOption;
 
-    let mut options = vec![MountOption::FSName(format!("sandfs:{name}"))];
-    #[cfg(target_os = "linux")]
-    options.push(MountOption::Subtype("sandfs".to_owned()));
-    #[cfg(target_os = "macos")]
-    options.extend([
-        // The name Finder shows for the mount.
-        MountOption::CUSTOM(format!("volname={name}")),
-        // Without this, Finder and other apps write ._* and .DS_Store files into the
-        // workspace, and they would show up among its changes.
-        MountOption::CUSTOM("noappledouble".to_owned()),
-    ]);
-    options
+    vec![MountOption::FSName(format!("sandfs:{name}")), MountOption::Subtype("sandfs".to_owned())]
 }
-
-/// Commands that unmount a directory, tried in order, and what to do when none exists.
-#[cfg(all(fuse, target_os = "macos"))]
-const UNMOUNT: (&[&[&str]], &str) = (&[&["/sbin/umount"]], "/sbin/umount is missing");
-#[cfg(all(fuse, not(target_os = "macos")))]
-const UNMOUNT: (&[&[&str]], &str) =
-    (&[&["fusermount3", "-u"], &["fusermount", "-u"]], "fusermount3 is not installed; install fuse3");
 
 /// Unmount the FUSE filesystem at `dir`.
 #[cfg(fuse)]
 pub fn unmount(dir: &Path) -> anyhow::Result<()> {
-    let (commands, missing) = UNMOUNT;
-    let ran = commands.iter().find_map(|cmd| std::process::Command::new(cmd[0]).args(&cmd[1..]).arg(dir).status().ok());
+    let ran = [&["fusermount3", "-u"], &["fusermount", "-u"]]
+        .iter()
+        .find_map(|cmd| std::process::Command::new(cmd[0]).args(&cmd[1..]).arg(dir).status().ok());
     match ran {
         Some(status) if status.success() => Ok(()),
         Some(status) => anyhow::bail!("unmounting {} failed ({status})", dir.display()),
-        None => anyhow::bail!("{missing}"),
+        None => anyhow::bail!("fusermount3 is not installed; install fuse3"),
     }
 }
 
@@ -131,13 +94,6 @@ mod tests {
     fn mountinfo_escapes_decode() {
         assert_eq!(unescape(r"/home/me/my\040ws"), "/home/me/my ws");
         assert_eq!(unescape(r"/plain"), "/plain");
-    }
-
-    #[test]
-    fn macos_mount_lines_parse() {
-        let line = "sandfs:ws on /private/tmp/my ws (macfuse, nodev, nosuid, synchronous, mounted by me)";
-        assert_eq!(parse_mount_line(line), Some(("sandfs:ws", "/private/tmp/my ws")));
-        assert_eq!(parse_mount_line("/dev/disk3s1 on / (apfs, sealed, local, read-only, journaled)"), None);
     }
 
     #[cfg(unix)]

@@ -74,7 +74,7 @@ Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADire
 
 ## Mounting a workspace on disk
 
-The `sandfs` command (crate `sandfs-cli`) mounts a workspace as a real directory with FUSE, so any program can read and write it: a data pipeline, a notebook, a build, an agent's tools. The folder underneath is never modified, and forking never copies it. It mounts on Linux with FUSE 3 (`fusermount3`, package `fuse3`) and on macOS with [macFUSE](https://macfuse.github.io); on Windows it does everything but mount.
+The `sandfs` command (crate `sandfs-cli`) mounts a workspace as a real directory with FUSE, so any program can read and write it: a data pipeline, a notebook, a build, an agent's tools. The folder underneath is never modified, and forking never copies it. It mounts on Linux with FUSE 3 (`fusermount3`, package `fuse3`). On macOS and Windows it does everything but mount, and `sandfs serve --mcp SOURCE` creates workspaces there.
 
 ```bash
 cargo install --path crates/sandfs-cli
