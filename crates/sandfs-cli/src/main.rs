@@ -357,7 +357,7 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     inner.ranged_reads = matches!(opened.record.base, Base::Dir { .. });
     // NFS has no close to flush a file's writes, and macOS's NFS client adds files of
     // its own next to the ones people write.
-    inner.commit_on_save = cfg!(nfs);
+    inner.keep_removed = !cfg!(nfs);
     inner.skip_bookkeeping = cfg!(nfs);
     let shared = Shared::new(inner, opened.saved, root);
     let saver = shared.spawn_saver();

@@ -1,14 +1,13 @@
 //! The mount on macOS: an NFSv3 server on localhost that macOS's own NFS client mounts,
 //! so nothing has to be installed and no kernel extension approved.
 //!
-//! Requests go to the same [`Inner`] as the FUSE mount's, with two differences. NFS
-//! has no `open` or `close`, so writes stay in [`Inner`]'s buffers until the next save
-//! moves them into the workspace, and nothing is held open. And macOS's NFS client
-//! keeps extended attributes in `._name` files, which are kept out of saves.
-//!
-//! The server also answers save requests on a second localhost port, since `fsync` on
-//! a folder never reaches an NFS server: `sandfs changes` and `fork` connect to it to
-//! have everything written so far saved first.
+//! Requests go to the same [`Inner`] as the FUSE mount's, so writes are saved the same
+//! way: once a file has gone [`crate::fs::SETTLE`] without a write, or when a save is
+//! asked for. Two things differ. `fsync` never reaches an NFS server (writes are
+//! answered as already stable), so it saves nothing by itself; instead the server
+//! answers save requests on a second localhost port, which `sandfs changes`, `fork`
+//! and `unmount` use to have everything written so far saved first. And macOS's NFS
+//! client keeps extended attributes in `._name` files, which are kept out of saves.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -121,7 +120,7 @@ impl SandNfs {
         result.nfs()
     }
 
-    /// Create (and immediately close) a file. NFS creates are never open afterwards.
+    /// Create a file.
     fn create_file(
         &self,
         dirid: fileid3,
@@ -130,11 +129,7 @@ impl SandNfs {
         exclusive: bool,
         empty: bool,
     ) -> Result<FileAttr, nfsstat3> {
-        self.change(|inner| {
-            let (attr, fh) = inner.create(dirid, os_name(name), mode, exclusive, empty)?;
-            inner.release(fh)?;
-            inner.attr(attr.ino.0)
-        })
+        self.change(|inner| inner.create(dirid, os_name(name), mode, exclusive, empty))
     }
 }
 
@@ -191,7 +186,6 @@ impl NFSFileSystem for SandNfs {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let attr = self.change(|inner| {
             inner.write(id, offset, data)?;
-            inner.mark_unsaved();
             inner.attr(id)
         })?;
         Ok(attributes(&attr))
@@ -433,7 +427,7 @@ mod tests {
         ws.mount("/mnt", Arc::new(source)).unwrap();
         let root = VPath::parse("/mnt").unwrap();
         let mut inner = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), UNIX_EPOCH, (501, 20));
-        inner.commit_on_save = true;
+        inner.keep_removed = false;
         inner.skip_bookkeeping = true;
         let dir = tempfile::tempdir().unwrap();
         (SandNfs::new(Shared::new(inner, Saved::new(dir.path()), root)), dir)
@@ -461,7 +455,7 @@ mod tests {
             assert_eq!(fs.lookup(ROOT_INO, &name("new.txt")).await.unwrap(), id);
         });
         // A save moves the buffered writes into the workspace.
-        let snapshot = fs.shared.lock().snapshot();
+        let snapshot = fs.shared.lock().snapshot(Duration::ZERO);
         assert_eq!(snapshot.ws.read_text("/mnt/new.txt").unwrap(), "hello world");
     }
 
@@ -476,7 +470,7 @@ mod tests {
             fs.create(sub, &name("._sub"), sattr3::default()).await.unwrap();
             fs.create(sub, &name("kept.txt"), sattr3::default()).await.unwrap();
             assert_eq!(fs.read(id, 0, 100).await.unwrap().0, b"xattrs", "served while mounted");
-            fs.shared.lock().snapshot()
+            fs.shared.lock().snapshot(Duration::ZERO)
         });
         let changed: Vec<String> = snapshot.ws.changes().unwrap().iter().map(|c| c.path.to_string()).collect();
         assert_eq!(changed, ["/mnt/sub/kept.txt"]);
