@@ -156,6 +156,8 @@ pub fn run(group: &Group, selected: &dyn Fn(&str) -> bool) -> Result<GroupResult
                 if op == Op::Changes {
                     for op in [Op::Create, Op::Edit, Op::Rename, Op::Delete] {
                         perform(view.as_mut(), &group.paths, op)?;
+                        check(view.as_mut(), &group.paths, op)
+                            .with_context(|| format!("{} on {} didn't take", op.name(), column.name()))?;
                     }
                 }
                 let start = Instant::now();
