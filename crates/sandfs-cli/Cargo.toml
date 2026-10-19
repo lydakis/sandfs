@@ -6,7 +6,8 @@ keywords = ["fuse", "filesystem", "sandbox", "copy-on-write", "agents"]
 categories = ["filesystem", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# `File::try_lock`, which keeps one process saving each workspace, is 1.89+.
+rust-version = "1.89"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

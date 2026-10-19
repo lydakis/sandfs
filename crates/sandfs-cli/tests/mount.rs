@@ -178,6 +178,8 @@ fn a_directory_source_is_never_written() {
     while Path::new(&format!("/proc/{pid}")).exists() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    // The crash released the workspace too, so another process may take it over.
+    sandfs.run(&["serve", "--mcp", "data"]);
     sandfs.unmount(&ws);
     sandfs.mount(&["mount", "data", ws.to_str().unwrap()], &ws);
     assert_eq!(std::fs::read_to_string(ws.join("out/summary.txt")).unwrap(), "2 rows\n", "saved before the crash");
@@ -256,5 +258,104 @@ fn names_and_sizes_stay_fresh_within_the_cache_ttl() {
         std::fs::read_dir(&ws).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
     assert_eq!(names, ["out"], "listings follow the move");
+    sandfs.unmount(&ws);
+}
+
+/// Start `sandfs args...` without waiting for it.
+fn spawn(sandfs: &Sandfs, args: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", sandfs.home.path())
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// How many filesystems are mounted at `dir`.
+fn mounts_at(dir: &Path) -> usize {
+    let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    table.lines().filter(|line| line.split(' ').nth(4) == Some(dir.to_str().unwrap())).count()
+}
+
+#[test]
+fn one_process_serves_a_workspace_at_a_time() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(data.path().join("notes.txt"), "draft\n").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let (one, two) = (dirs.path().join("one"), dirs.path().join("two"));
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), one.to_str().unwrap(), "--name", "ws"], &one);
+    sandfs.unmount(&one);
+
+    // An MCP session holds the workspace until its client goes away.
+    let mut agent = spawn(&sandfs, &["serve", "--mcp", "ws"]);
+    let lock = sandfs.home.path().join("workspaces/ws/lock");
+    while !std::fs::read_to_string(&lock).unwrap_or_default().contains("MCP") {
+        assert!(agent.try_wait().unwrap().is_none(), "the session exited early");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for args in [&["mount", "ws", one.to_str().unwrap()][..], &["serve", "--mcp", "ws"], &["rm", "ws"]] {
+        let refused = sandfs.try_run(args);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success() && stderr.contains("ws is in use by an MCP session"), "{args:?}: {stderr}");
+    }
+    assert_eq!(mounts_at(&one.canonicalize().unwrap()), 0);
+    drop(agent.stdin.take());
+    assert!(agent.wait().unwrap().success());
+
+    // Two mounts of one workspace started together: one serves it, the other is refused.
+    let racers = [&one, &two].map(|dir| spawn(&sandfs, &["mount", "ws", dir.to_str().unwrap()]));
+    let won: Vec<bool> = racers.into_iter().map(|racer| racer.wait_with_output().unwrap().status.success()).collect();
+    assert_eq!(won.iter().filter(|w| **w).count(), 1, "{won:?}");
+    let winner = if won[0] { &one } else { &two };
+    sandfs.mounts.push(winner.clone());
+    assert_eq!(std::fs::read_to_string(winner.join("notes.txt")).unwrap(), "draft\n");
+    sandfs.unmount(winner);
+
+    // Two workspaces mounted on one directory together: only one mount is made.
+    sandfs.run(&["fork", "ws", two.to_str().unwrap(), "--name", "other"]);
+    sandfs.mounts.push(two.clone());
+    sandfs.unmount(&two);
+    let racers = ["ws", "other"].map(|name| spawn(&sandfs, &["mount", name, one.to_str().unwrap()]));
+    let won: Vec<bool> = racers.into_iter().map(|racer| racer.wait_with_output().unwrap().status.success()).collect();
+    assert_eq!(won.iter().filter(|w| **w).count(), 1, "{won:?}");
+    sandfs.mounts.push(one.clone());
+    assert_eq!(mounts_at(&one.canonicalize().unwrap()), 1);
+    sandfs.unmount(&one);
+}
+
+#[test]
+fn a_failed_final_save_fails_unmount() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+    std::fs::write(ws.join("saved.txt"), "saved\n").unwrap();
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "A saved.txt\n");
+
+    // A directory where the save writes its new index makes every save fail, as a full
+    // disk would.
+    let blocker = sandfs.home.path().join("workspaces/ws/changes.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    std::fs::write(ws.join("lost.txt"), "lost\n").unwrap();
+    let failed = sandfs.try_run(&["unmount", ws.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success() && stderr.contains("saving the last changes failed"), "{stderr}");
+    assert!(stderr.contains("changes.json"), "the reason is reported: {stderr}");
+    sandfs.mounts.clear();
+
+    std::fs::remove_dir(&blocker).unwrap();
+    sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
+    assert_eq!(std::fs::read_to_string(ws.join("saved.txt")).unwrap(), "saved\n");
+    assert!(!ws.join("lost.txt").exists());
     sandfs.unmount(&ws);
 }

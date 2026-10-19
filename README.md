@@ -86,7 +86,7 @@ sandfs unmount ~/ws/cleanup                      # changes stay saved
 sandfs mount cleanup ~/ws/cleanup                # and come back
 ```
 
-`sandfs serve --mcp NAME` gives an unmounted workspace to an agent as MCP file tools instead, with the source's files under `/mnt`; whatever the agent changes is saved for the next `mount` or `changes`.
+`sandfs serve --mcp NAME` gives an unmounted workspace to an agent as MCP file tools instead, with the source's files under `/mnt`; whatever the agent changes is saved for the next `mount` or `changes`. One process serves a workspace at a time: a second mount or MCP session is refused while the first runs, so parallel attempts each get their own fork.
 
 Changes live in memory and are saved under `$SANDFS_HOME` (default `~/.local/share/sandfs`) shortly after each write. A fork on disk costs more than a fork in memory. `sandfs fork` never copies the source, but it waits for the workspace's latest changes to be saved, links each changed file into the fork (copying it where the disk can't link), and starts a new mount, which reads the source again rather than sharing what the first mount has read. `git:<path or url>[@rev]` mounts a commit instead of a folder; for a remote repository sandfs keeps a partial clone and fetches a directory's files in one request when it is first listed.
 

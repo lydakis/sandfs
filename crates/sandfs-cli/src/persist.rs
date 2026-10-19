@@ -45,6 +45,11 @@ enum Entry {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Changes {
     entries: BTreeMap<String, Entry>,
+    /// The next object name. Names are never reused, even for objects that have since
+    /// been deleted, so a reader holding an older index finds an object gone rather
+    /// than replaced by unrelated bytes.
+    #[serde(default)]
+    next: u64,
 }
 
 /// What a save needs, taken under the filesystem lock. The workspace is a fork, so
@@ -62,6 +67,30 @@ pub struct Snapshot {
 pub struct Restored {
     pub times: BTreeMap<String, SystemTime>,
     pub dirs: BTreeSet<String>,
+}
+
+/// A saved object the index names has been deleted: a newer save replaced it while
+/// the index was being loaded.
+#[derive(Debug)]
+pub struct ObjectGone(String);
+
+impl std::fmt::Display for ObjectGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "saved object {} is gone; a newer save replaced it", self.0)
+    }
+}
+
+impl std::error::Error for ObjectGone {}
+
+/// A save wrote its new index, so it is what the next load sees, but could not flush
+/// it to disk: a crash could still lose it.
+#[derive(Debug)]
+pub struct NotDurable;
+
+impl std::fmt::Display for NotDurable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the changes were saved but could not be flushed to disk")
+    }
 }
 
 /// The saved changes of one workspace, in its state directory.
@@ -126,15 +155,16 @@ impl Saved {
                 }
             }
         }
-        // New objects must never reuse the name of one the index still names.
+        // New objects must never reuse the name of one the index still names, nor of any
+        // object an earlier save used.
         let last = self.objects.values().filter_map(|(_, object)| object.parse::<u64>().ok()).max();
-        self.next_object = self.next_object.max(last.unwrap_or(0) + 1);
+        self.next_object = self.next_object.max(last.unwrap_or(0) + 1).max(changes.next);
         Ok(restored)
     }
 
     /// Delete objects the loaded index does not use, left by a crash or by the last
-    /// session's delayed deletes. Only the process that serves the workspace may do
-    /// this: it alone writes objects.
+    /// session's delayed deletes. Only the process that serves the workspace, holding
+    /// its writer lock, may do this: it alone writes objects.
     pub fn collect_garbage(&mut self) {
         let live: HashSet<&str> = self.objects.values().map(|(_, object)| object.as_str()).collect();
         let mut last = 0;
@@ -149,7 +179,7 @@ impl Saved {
                 }
             }
         }
-        self.next_object = last + 1;
+        self.next_object = self.next_object.max(last + 1);
     }
 
     fn apply(&self, ws: &mut Workspace, path: &VPath, entry: &Entry) -> Result<()> {
@@ -181,8 +211,13 @@ impl Saved {
                 if current == Some(Kind::Dir) {
                     ws.remove(p, true)?;
                 }
-                let data = std::fs::read(self.objects_dir().join(object))
-                    .with_context(|| format!("reading saved object {object}"))?;
+                let data = match std::fs::read(self.objects_dir().join(object)) {
+                    Ok(data) => data,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(ObjectGone(object.clone()).into());
+                    }
+                    Err(err) => return Err(err).with_context(|| format!("reading saved object {object}")),
+                };
                 ws.write(p, data)?;
                 ws.set_executable(p, *executable)?;
             }
@@ -218,7 +253,7 @@ impl Saved {
             entries.insert(rel, entry);
         }
 
-        let index = serde_json::to_vec(&Changes { entries })?;
+        let index = serde_json::to_vec(&Changes { entries, next: self.next_object })?;
         let tmp = self.dir.join("changes.json.tmp");
         if durable {
             // Objects reach the disk before the index that names them.
@@ -236,17 +271,18 @@ impl Saved {
             sync_path(&tmp)?;
         }
         std::fs::rename(&tmp, self.index_path()).context("writing changes.json")?;
-        if durable {
-            sync_path(&self.dir)?;
-        }
 
-        // Objects replaced by the save before this one are now two indexes old.
+        // The new index is in place: objects replaced by the save before this one are
+        // now two indexes old.
         for object in std::mem::take(&mut self.doomed) {
             let _ = std::fs::remove_file(self.objects_dir().join(object));
         }
         let live: HashSet<&String> = kept.values().map(|(_, object)| object).collect();
         self.doomed = self.objects.values().map(|(_, object)| object).filter(|o| !live.contains(o)).cloned().collect();
         self.objects = kept;
+        if durable {
+            sync_path(&self.dir).map_err(|err| err.context(NotDurable))?;
+        }
         Ok(())
     }
 
@@ -446,6 +482,73 @@ mod tests {
         reopened.collect_garbage();
         assert_eq!(objects(state.path()), ["3"], "the serving process clears what the index no longer uses");
         assert_eq!(reopened.next_object, 4);
+    }
+
+    #[test]
+    fn object_names_are_never_reused() {
+        let state = tempfile::tempdir().unwrap();
+        let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
+        let mut ws = base();
+        ws.write("/mnt/one.txt", "1").unwrap();
+        ws.write("/mnt/two.txt", "2").unwrap();
+        let mut saved = Saved::new(state.path());
+        saved.save(&snap(&ws), &root(), false).unwrap();
+        ws.remove("/mnt/two.txt", false).unwrap();
+        saved.save(&snap(&ws), &root(), false).unwrap();
+
+        // The next session deletes object 2, which a reader of the older index may
+        // still be about to open, so it must never name a new object 2.
+        let mut next = base();
+        let mut saved = Saved::new(state.path());
+        saved.load(&mut next, &root()).unwrap();
+        saved.collect_garbage();
+        assert!(!state.path().join("objects/2").exists());
+        next.write("/mnt/three.txt", "3").unwrap();
+        saved.save(&snap(&next), &root(), false).unwrap();
+        assert!(!state.path().join("objects/2").exists());
+        assert_eq!(std::fs::read_to_string(state.path().join("objects/3")).unwrap(), "3");
+    }
+
+    #[test]
+    fn a_save_cut_short_leaves_the_last_one_intact() {
+        let state = tempfile::tempdir().unwrap();
+        let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
+        let mut ws = base();
+        ws.write("/mnt/a.txt", "saved").unwrap();
+        Saved::new(state.path()).save(&snap(&ws), &root(), true).unwrap();
+
+        // A process that died mid-save: objects written, the new index half written,
+        // never renamed over the old one.
+        std::fs::write(state.path().join("objects/2"), "unsaved").unwrap();
+        std::fs::write(state.path().join("objects/3"), "unsaved").unwrap();
+        std::fs::write(state.path().join("changes.json.tmp"), "{\"entries\": {\"a.t").unwrap();
+
+        let mut restarted = base();
+        let mut saved = Saved::new(state.path());
+        saved.load(&mut restarted, &root()).unwrap();
+        assert_eq!(restarted.read_text("/mnt/a.txt").unwrap(), "saved");
+        saved.collect_garbage();
+        assert!(!state.path().join("objects/2").exists() && !state.path().join("objects/3").exists());
+
+        // Saving again works, and a save that fails returns its error and leaves the
+        // previous save in place.
+        restarted.write("/mnt/b.txt", "next").unwrap();
+        saved.save(&snap(&restarted), &root(), true).unwrap();
+        std::fs::create_dir(state.path().join("changes.json.tmp")).unwrap();
+        restarted.write("/mnt/a.txt", "not saved").unwrap();
+        assert!(saved.save(&snap(&restarted), &root(), true).is_err());
+        std::fs::remove_dir(state.path().join("changes.json.tmp")).unwrap();
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "saved");
+        assert_eq!(loaded.read_text("/mnt/b.txt").unwrap(), "next");
+
+        // The failed save is retried by the next one.
+        saved.save(&snap(&restarted), &root(), true).unwrap();
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "not saved");
     }
 
     #[test]
