@@ -92,7 +92,7 @@ impl Plan {
         // Regular files only: sandfs has no symbolic links, and submodules are other
         // repositories. `-z` keeps names with unusual characters unquoted, and names
         // that aren't UTF-8 are skipped, as the sandfs source skips them. So are names
-        // holding a newline, which a sparse checkout pattern can't express.
+        // holding a line break, which a sparse checkout pattern can't express.
         let listing = git_bytes(Some(dir), &["ls-tree", "-r", "-z", "HEAD"])?;
         let mut files: Vec<String> = listing
             .split(|&byte| byte == 0)
@@ -100,7 +100,7 @@ impl Plan {
                 let line = std::str::from_utf8(line).ok()?;
                 let (meta, path) = line.split_once('\t')?;
                 let mode = meta.split(' ').next()?;
-                (matches!(mode, "100644" | "100755") && !path.contains('\n')).then(|| path.to_owned())
+                (matches!(mode, "100644" | "100755") && !path.contains(['\n', '\r'])).then(|| path.to_owned())
             })
             .collect();
         files.sort();
