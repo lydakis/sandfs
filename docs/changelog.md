@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (2026-10-18)
+## 0.4.0 (2026-10-19)
 
 A rewrite. sandfs is now a general-purpose sandbox filesystem with a Rust core, and the Python package is a thin binding over it. Nothing from the 0.2 API carries over.
 
