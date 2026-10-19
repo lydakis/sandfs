@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - **Mounting on macOS**: `sandfs mount` works on macOS with nothing to install. The mount's process serves the workspace over NFS on localhost and macOS's own NFS client mounts it, with no kernel extension, macFUSE or sudo. Any local user can reach that server.
 
