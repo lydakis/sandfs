@@ -105,8 +105,7 @@ impl Plan {
             .collect();
         files.sort();
         ensure!(files.len() > SAMPLES, "{url} has only {} files", files.len());
-        let step = files.len() / (SAMPLES + 1);
-        let samples = (0..=SAMPLES).map(|i| files[i * step].clone()).collect();
+        let samples = spread(files.len()).map(|i| files[i].clone()).collect();
         let subtree = match subtree {
             Some(subtree) => subtree.trim_matches('/').to_owned(),
             None => largest_folder(&files, SUBTREE_FILES).context("no folder to search")?,
@@ -317,6 +316,11 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     Ok(RemoteResult { method, ready, first, samples, search, fork, matches, bytes, peak_rss: commands + serving, disk })
 }
 
+/// `SAMPLES + 1` positions spread evenly over `len` items, from the first to the last.
+fn spread(len: usize) -> impl Iterator<Item = usize> {
+    (0..=SAMPLES).map(move |i| i * (len - 1) / SAMPLES)
+}
+
 /// Where the sandfs method mounts. Whatever is still mounted is unmounted first when
 /// this goes, so removing the directory never walks into a mount: that would list,
 /// and so fetch, the whole repository.
@@ -386,7 +390,15 @@ fn git_bytes(dir: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Plan, largest_folder, pattern};
+    use super::{Plan, SAMPLES, largest_folder, pattern, spread};
+
+    #[test]
+    fn samples_reach_the_end_of_the_tree() {
+        let positions: Vec<usize> = spread(41).collect();
+        assert_eq!((positions[0], positions[SAMPLES]), (0, 40));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(spread(20_807).last(), Some(20_806));
+    }
 
     #[test]
     fn the_searched_folder_is_the_largest_under_the_limit() {
