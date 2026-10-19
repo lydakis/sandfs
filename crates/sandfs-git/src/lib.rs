@@ -251,7 +251,10 @@ impl Batch {
         let fields: Vec<&str> = header.split_whitespace().collect();
         let (kind, size) = match fields.as_slice() {
             [_, kind, size] => (*kind, size.parse::<usize>().map_err(|_| Error::Source(format!("git: {header}")))?),
-            [_, "missing"] => return Err(Error::Source(format!("object {id} is missing"))),
+            // In a partial clone this also means the remote could not be reached.
+            [_, "missing"] => {
+                return Err(Error::Source(format!("object {id} is missing and could not be fetched from the remote")));
+            }
             _ => return Err(Error::Source(format!("git: unexpected reply {header:?}"))),
         };
         Ok((kind.to_owned(), size))

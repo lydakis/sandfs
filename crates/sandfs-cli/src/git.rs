@@ -50,17 +50,16 @@ pub fn open(repo: &Path, commit: &str) -> Result<Arc<dyn Source>> {
 ///
 /// Only the commit itself and its folder listings are fetched (depth 1, no file
 /// contents), which takes about a second even for a repository with years of history.
-/// A commit id that is already local needs no request at all.
+/// A full commit id that was mounted before is not looked up again, so it mounts
+/// offline; a branch or tag name is looked up on the server every time.
 fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)> {
     let dest = repos.join(cache_path(url)?);
     let existed = dest.join("HEAD").exists();
     if !existed {
         eprintln!("sandfs: fetching {url} (file contents are fetched when first read)");
         create_clone(&dest, url)?;
-    } else if is_commit_id(rev) {
-        if let Ok(commit) = commit_of(&dest, rev) {
-            return Ok((dest, commit));
-        }
+    } else if let Some(commit) = pinned(&dest, rev) {
+        return Ok((dest, commit));
     }
     // A per-process ref, so concurrent mounts of one repository don't race on FETCH_HEAD.
     let fetched = format!("refs/sandfs/fetch-{}", std::process::id());
@@ -75,15 +74,16 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
             let _ = git(&dest, &["update-ref", "-d", &fetched]);
             commit?
         }
-        // Offline, or a revision the server can't name (`main~3`): a commit that is
-        // already in the local copy still mounts.
-        Err(err) => match commit_of(&dest, rev) {
-            Ok(commit) if existed => {
-                eprintln!("sandfs: could not update {url}, using the local copy: {err:#}");
-                commit
-            }
-            _ => return Err(err).with_context(|| format!("could not fetch {rev:?} from {url}")),
-        },
+        // Offline, or a revision the server can't name (`main~3`). A commit id mounted
+        // before has already returned above, so only the server could answer this one.
+        Err(err) => {
+            let hint = if is_commit_id(rev) {
+                ""
+            } else {
+                " (a branch or tag name is looked up on the server; offline, only a full commit id that was mounted before mounts)"
+            };
+            return Err(err).with_context(|| format!("could not fetch {rev:?} from {url}{hint}"));
+        }
     };
     // Keep every mounted commit reachable, so git's maintenance never removes one a
     // workspace still reads from.
@@ -119,6 +119,16 @@ fn create_clone(dest: &Path, url: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The commit `rev` names if it is a full commit id that was mounted before.
+///
+/// This checks the pin ref rather than the object: in a partial clone, asking git
+/// about a commit it lacks makes it fetch that commit with all of its history.
+fn pinned(repo: &Path, rev: &str) -> Option<String> {
+    let id = rev.to_ascii_lowercase();
+    let pin = format!("refs/sandfs/commits/{id}");
+    (is_commit_id(&id) && git(repo, &["show-ref", "--verify", "--quiet", &pin]).is_ok()).then_some(id)
 }
 
 /// A full commit id, which names the same commit forever.
@@ -222,9 +232,7 @@ mod tests {
         let remote = tmp.path().join("remote");
         std::fs::create_dir(&remote).unwrap();
         run(&remote, &["init", "-q", "-b", "main"]);
-        // What GitHub allows: partial clones and fetching any commit by id.
         run(&remote, &["config", "uploadpack.allowFilter", "true"]);
-        run(&remote, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
         std::fs::write(remote.join("a.txt"), "one").unwrap();
         run(&remote, &["add", "a.txt"]);
         run(&remote, &["commit", "-q", "-m", "first"]);
@@ -232,28 +240,39 @@ mod tests {
         std::fs::write(remote.join("a.txt"), "two").unwrap();
         run(&remote, &["commit", "-q", "-am", "second"]);
         let second = run(&remote, &["rev-parse", "HEAD"]);
+        std::fs::write(remote.join("a.txt"), "three").unwrap();
+        run(&remote, &["commit", "-q", "-am", "third"]);
+        let third = run(&remote, &["rev-parse", "HEAD"]);
         let url = format!("file://{}", remote.display());
         let repos = tmp.path().join("repos");
 
         let (repo, commit) = resolve(&repos, &url).unwrap();
-        assert_eq!(commit, second);
+        assert_eq!(commit, third);
         // One commit and its listings: no history, and no file contents until read.
         assert_eq!(run(&repo, &["rev-list", "--count", "--all"]), "1");
         let objects = run(&repo, &["rev-list", "--objects", "--missing=print", &commit]);
         assert!(objects.lines().any(|line| line.starts_with('?')), "{objects}");
 
-        // Older commits, branches and tags are fetched the same way when asked for.
-        assert_eq!(resolve(&repos, &format!("{url}@{first}")).unwrap().1, first);
-        assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, second);
+        // Older commits, branches and tags are fetched the same way when asked for, still
+        // without the history behind them.
+        assert_eq!(resolve(&repos, &format!("{url}@{second}")).unwrap().1, second);
+        let commits = run(&repo, &["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"]);
+        assert_eq!(commits.lines().filter(|kind| *kind == "commit").count(), 2, "{commits}");
+        assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, third);
         let mut ws = sandfs_core::Workspace::new();
-        ws.mount("/old", open(&repo, &first).unwrap()).unwrap();
-        assert_eq!(&ws.read("/old/a.txt").unwrap()[..], b"one");
+        ws.mount("/old", open(&repo, &second).unwrap()).unwrap();
+        assert_eq!(&ws.read("/old/a.txt").unwrap()[..], b"two");
 
         // A commit id already fetched mounts with no request, so it works offline.
         std::fs::remove_dir_all(&remote).unwrap();
-        assert_eq!(resolve(&repos, &format!("{url}@{first}")).unwrap().1, first);
-        // A revision that needs the server fails clearly instead of mounting something stale.
-        assert!(resolve(&repos, &format!("{url}@main")).is_err());
+        assert_eq!(resolve(&repos, &format!("{url}@{second}")).unwrap().1, second);
+        let mut ws = sandfs_core::Workspace::new();
+        ws.mount("/old", open(&repo, &second).unwrap()).unwrap();
+        assert_eq!(&ws.read("/old/a.txt").unwrap()[..], b"two");
+        assert!(resolve(&repos, &format!("{url}@{first}")).is_err());
+        // A name needs the server, so it fails offline instead of mounting something stale.
+        let err = format!("{:#}", resolve(&repos, &format!("{url}@main")).unwrap_err());
+        assert!(err.contains("only a full commit id that was mounted before mounts"), "{err}");
     }
 
     #[test]
