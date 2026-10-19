@@ -159,12 +159,12 @@ Eight attempts at one task run side by side, each on its own fork of a folder ho
 
 | | 8 attempts, wall time | making the 8 forks | peak memory | left on disk |
 | --- | ---: | ---: | ---: | ---: |
-| sandfs, in process | 0.45 s | 4.5 µs | 142 MiB | 0 |
-| sandfs, mounted as folders | 1.9 s | 55 ms | 780 MiB | 4.6 MiB |
-| overlayfs (Linux, needs root) | 0.59 s | 36 ms | 7 MiB | 4.4 MiB |
-| a full copy per attempt | 6.0 s | 4.7 s | 36 MiB | 3.1 GiB |
+| sandfs, in process | 0.59 s | 8.4 µs | 172 MiB | 0 |
+| sandfs, mounted as folders | 2.0 s | 58 ms | 104 MiB | 4.6 MiB |
+| overlayfs (Linux, needs root) | 0.73 s | 39 ms | 7 MiB | 4.4 MiB |
+| a full copy per attempt | 9.6 s | 8.1 s | 36 MiB | 3.1 GiB |
 
-Each mounted fork is its own process with its own cache today, which is why mounted folders use the most memory. Measured on a 4-vCPU cloud VM with the data on tmpfs, on main shortly after 0.4.0 (October 2026); runs on that VM vary by up to about 1.5 times. To run it yourself, and for the other workloads (cold and warm reads, large files, slow sources), see [sandfs-bench](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-bench/README.md):
+In process, every file read is kept in memory once and shared by all the forks, so a second read costs nothing. A mounted folder keeps no copy of a host folder's files, since the kernel already caches them. Measured on a 4-vCPU cloud VM with the data on tmpfs, all rows in one run, on main in October 2026; runs on that VM vary by up to about 1.5 times. To run it yourself, and for the other workloads (cold and warm reads, large files, slow sources), see [sandfs-bench](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-bench/README.md):
 
 ```bash
 cargo build --release -p sandfs-bench -p sandfs-cli

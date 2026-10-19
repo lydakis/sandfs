@@ -12,8 +12,8 @@
 //! the same [`Inner`], which has no opens or closes either; fuser lends it the types
 //! but never mounts there.
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -41,8 +41,11 @@ const TTL: Duration = Duration::from_secs(60);
 pub const ROOT_INO: u64 = 1;
 /// Files live in memory, so refuse sizes that could only be a mistake.
 pub const MAX_FILE_SIZE: usize = 4 << 30;
-/// Base files larger than this are read in ranges rather than whole.
-const RANGED_READ_SIZE: u64 = 64 << 20;
+/// How many whole files, and bytes of them, [`Inner::read`] keeps for sources that
+/// can't read a range on its own. The kernel asks for a file in chunks and caches
+/// what it gets, so only the few files being read right now are worth keeping.
+const RECENT_FILES: usize = 16;
+const RECENT_BYTES: usize = 256 << 20;
 /// How long a file goes without a write before its buffer is committed and saved.
 /// Nothing tells this filesystem when a file is closed, so a quiet spell stands in.
 pub const SETTLE: Duration = Duration::from_millis(250);
@@ -157,9 +160,15 @@ pub struct Inner {
     unsaved: bool,
     /// Set by every write, cleared once no buffer is left to commit.
     writing: bool,
-    /// Read large base files in ranges. Only worth it for sources that can seek (a
-    /// host folder): git reads a whole blob for every range.
+    /// Read base files in the ranges asked for, straight from the source: right for a
+    /// source that can seek and that the OS already caches (a host folder). Git reads
+    /// a whole blob for every range, so its files are read whole into `recent`.
     pub ranged_reads: bool,
+    /// Whole files read lately, by inode and version, latest read last, so the kernel's
+    /// chunks of one file read it once. At most [`RECENT_FILES`] and [`RECENT_BYTES`],
+    /// except that the newest file stays however large it is. Nothing else is kept: the kernel caches
+    /// what it read, and a copy here for every file would hold each one twice.
+    recent: RefCell<VecDeque<(u64, u64, Bytes)>>,
     /// Keep a removed file readable for the handles still open on it, until the
     /// kernel forgets it. Off for NFS, which never forgets an inode and whose client
     /// renames a file that is still open instead of removing it, so keeping removed
@@ -204,6 +213,7 @@ impl Inner {
             unsaved: false,
             writing: false,
             ranged_reads: false,
+            recent: RefCell::default(),
             keep_removed: true,
             skip_bookkeeping: false,
         };
@@ -666,12 +676,43 @@ impl Inner {
             return Ok(Bytes::copy_from_slice(&buffer.data[range(buffer.data.len())]));
         }
         let (ws, path) = self.contents(ino)?;
-        if self.ranged_reads && ws.stat(path.as_str()).fs()?.size > RANGED_READ_SIZE {
+        if self.ranged_reads {
             return ws.read_range(path.as_str(), offset, size.into()).fs();
         }
-        // Other files are read whole once and served from the workspace's cache.
-        let data = ws.read(path.as_str()).fs()?;
+        let meta = ws.stat(path.as_str()).fs()?;
+        let data = match self.kept(ino, meta.version) {
+            Some(data) => data,
+            None => {
+                // A range covering the whole file is read from the source without the
+                // workspace keeping it.
+                let data = ws.read_range(path.as_str(), 0, meta.size).fs()?;
+                self.remember(ino, meta.version, data.clone());
+                data
+            }
+        };
         Ok(data.slice(range(data.len())))
+    }
+
+    /// The kept copy of `ino` at `version`, moved to the back as the latest read, so
+    /// a file read in chunks between other files stays kept.
+    fn kept(&self, ino: u64, version: u64) -> Option<Bytes> {
+        let mut recent = self.recent.borrow_mut();
+        let at = recent.iter().position(|(i, v, _)| (*i, *v) == (ino, version))?;
+        let entry = recent.remove(at)?;
+        let data = entry.2.clone();
+        recent.push_back(entry);
+        Some(data)
+    }
+
+    /// Keep a whole file in `recent`, dropping the oldest ones beyond the bounds.
+    fn remember(&self, ino: u64, version: u64, data: Bytes) {
+        let mut recent = self.recent.borrow_mut();
+        recent.retain(|(i, _, _)| *i != ino);
+        recent.push_back((ino, version, data));
+        let mut total: usize = recent.iter().map(|(_, _, data)| data.len()).sum();
+        while recent.len() > 1 && (recent.len() > RECENT_FILES || total > RECENT_BYTES) {
+            total -= recent.pop_front().map_or(0, |(_, _, data)| data.len());
+        }
     }
 
     /// The write buffer for `ino`, filled from the workspace on first use.
@@ -1298,6 +1339,79 @@ mod tests {
         fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
             Err(Error::Source(format!("{key} was read")))
         }
+    }
+
+    #[test]
+    fn host_folder_files_are_read_in_ranges_and_never_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "before").unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(sandfs_core::DirSource::new(dir.path()).unwrap())).unwrap();
+        let root = VPath::parse("/mnt").unwrap();
+        let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        fs.ranged_reads = true;
+        let ino = fs.lookup(ROOT_INO, name("notes.txt")).unwrap().ino.0;
+        assert_eq!(&fs.read(ino, 2, 3).unwrap()[..], b"for");
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"before");
+
+        // The kernel caches what it read; the mount keeps no second copy, so a read the
+        // kernel passes on goes back to the folder.
+        std::fs::write(dir.path().join("notes.txt"), "after!").unwrap();
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"after!");
+    }
+
+    /// A source that counts whole-file reads; a range reads the whole file, like git.
+    #[derive(Debug)]
+    struct Counting(MemorySource, std::sync::atomic::AtomicUsize);
+
+    impl sandfs_core::Source for Counting {
+        fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+            self.0.root()
+        }
+        fn read_dir(&self, key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+            self.0.read_dir(key)
+        }
+        fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.read_file(key)
+        }
+    }
+
+    #[test]
+    fn whole_file_sources_are_read_once_per_file_and_not_kept() {
+        let files = (0..20).map(|i| (format!("f{i:02}"), b"0123456789".to_vec()));
+        let source = Arc::new(Counting(MemorySource::from_files(files).unwrap(), Default::default()));
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", source.clone()).unwrap();
+        let root = VPath::parse("/mnt").unwrap();
+        let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        let reads = || source.1.load(std::sync::atomic::Ordering::SeqCst);
+        let inos: Vec<u64> = (0..20).map(|i| fs.lookup(ROOT_INO, name(&format!("f{i:02}"))).unwrap().ino.0).collect();
+
+        // The kernel asks for a file in chunks: the source is read once for all of them.
+        let chunks: Vec<u8> = (0..5).flat_map(|i| fs.read(inos[0], i * 2, 2).unwrap().to_vec()).collect();
+        assert_eq!(chunks, b"0123456789");
+        assert_eq!(reads(), 1);
+
+        // Only the files read last are kept; the kernel caches the rest itself.
+        for &ino in &inos {
+            fs.read(ino, 0, 100).unwrap();
+        }
+        assert_eq!(reads(), 20);
+        fs.read(inos[4], 0, 100).unwrap();
+        assert_eq!(reads(), 20, "kept while it is among the last read");
+        fs.read(inos[0], 0, 100).unwrap();
+        assert_eq!(reads(), 21, "dropped once later files took its place");
+        // Reading f04 again made it the latest read, so f05 went to make room instead.
+        fs.read(inos[4], 0, 100).unwrap();
+        assert_eq!(reads(), 21);
+        fs.read(inos[5], 0, 100).unwrap();
+        assert_eq!(reads(), 22);
+
+        // A file written since it was kept is read as written.
+        fs.write(inos[19], 0, b"new").unwrap();
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(&fs.read(inos[19], 0, 100).unwrap()[..], b"new3456789");
     }
 
     #[test]
