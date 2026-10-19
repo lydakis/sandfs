@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
 use nix::sys::resource::{UsageWho, getrusage};
 
-use crate::workflow::{disk_usage, peak_rss};
+use crate::workflow::{disk_usage, tree_peak_rss};
 
 /// Files read in step 2, besides the first one.
 pub const SAMPLES: usize = 20;
@@ -91,7 +91,8 @@ impl Plan {
         let commit = git_output(Some(dir), &["rev-parse", "HEAD"])?;
         // Regular files only: sandfs has no symbolic links, and submodules are other
         // repositories. `-z` keeps names with unusual characters unquoted, and names
-        // that aren't UTF-8 are skipped, as the sandfs source skips them.
+        // that aren't UTF-8 are skipped, as the sandfs source skips them. So are names
+        // holding a newline, which a sparse checkout pattern can't express.
         let listing = git_bytes(Some(dir), &["ls-tree", "-r", "-z", "HEAD"])?;
         let mut files: Vec<String> = listing
             .split(|&byte| byte == 0)
@@ -99,7 +100,7 @@ impl Plan {
                 let line = std::str::from_utf8(line).ok()?;
                 let (meta, path) = line.split_once('\t')?;
                 let mode = meta.split(' ').next()?;
-                (mode == "100644" || mode == "100755").then(|| path.to_owned())
+                (matches!(mode, "100644" | "100755") && !path.contains('\n')).then(|| path.to_owned())
             })
             .collect();
         files.sort();
@@ -295,14 +296,15 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     let fork = start.elapsed();
     ensure!(fork_dir.join(&plan.samples[0]).is_file(), "the fork has no {}", plan.samples[0]);
 
-    // The serving processes' peaks, read before they exit.
+    // The serving processes' peaks, with the git helpers they keep running, read
+    // before they exit.
     let mut serving = 0;
     if method == Method::Sandfs {
         for name in ["copy", "fork"] {
             let info = std::fs::read(home.join("workspaces").join(name).join("mount.json"))?;
             let info: serde_json::Value = serde_json::from_slice(&info)?;
             let pid = info["pid"].as_u64().context("mount.json has no pid")?;
-            serving += peak_rss(u32::try_from(pid)?)?;
+            serving += tree_peak_rss(u32::try_from(pid)?)?;
         }
         sandfs(&["unmount".as_ref(), dir.as_os_str()])?;
         sandfs(&["unmount".as_ref(), fork_dir.as_os_str()])?;
