@@ -48,6 +48,8 @@ pub trait View: Send {
     fn write(&mut self, path: &str, data: &[u8]) -> Result<()>;
     /// Delete a file.
     fn remove(&mut self, path: &str) -> Result<()>;
+    /// Move a file to a new path.
+    fn rename(&mut self, from: &str, to: &str) -> Result<()>;
     /// An independent copy that starts with this view's changes.
     fn fork(&mut self) -> Result<Box<dyn View>>;
     /// The number of files added, modified or deleted relative to the data set.
@@ -63,7 +65,15 @@ pub struct Sandfs {
     pub data: PathBuf,
 }
 
-struct SandfsView(Workspace);
+/// A workspace with what it reads from mounted at `/data`, and whatever must outlive
+/// it, such as the directory its source reads.
+struct SandfsView(Workspace, Option<Arc<TempDir>>);
+
+/// A view of `ws`, whose data is mounted at `/data`, keeping `dir` until the view and
+/// its forks are gone.
+pub fn workspace_view(ws: Workspace, dir: Option<TempDir>) -> Box<dyn View> {
+    Box::new(SandfsView(ws, dir.map(Arc::new)))
+}
 
 fn ws_path(path: &str) -> String {
     format!("/data/{path}")
@@ -77,7 +87,7 @@ impl Target for Sandfs {
     fn open(&self, _writable: bool) -> Result<Box<dyn View>> {
         let mut ws = Workspace::new();
         ws.mount("/data", Arc::new(DirSource::new(&self.data)?))?;
-        Ok(Box::new(SandfsView(ws)))
+        Ok(workspace_view(ws, None))
     }
 }
 
@@ -111,8 +121,12 @@ impl View for SandfsView {
         Ok(self.0.remove(&ws_path(path), false)?)
     }
 
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        Ok(self.0.rename(&ws_path(from), &ws_path(to))?)
+    }
+
     fn fork(&mut self) -> Result<Box<dyn View>> {
-        Ok(Box::new(SandfsView(self.0.fork())))
+        Ok(Box::new(SandfsView(self.0.fork(), self.1.clone())))
     }
 
     fn changes(&mut self) -> Result<usize> {
@@ -358,6 +372,10 @@ impl View for DirView {
 
     fn remove(&mut self, path: &str) -> Result<()> {
         Ok(fs::remove_file(self.root.join(path))?)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        Ok(fs::rename(self.root.join(from), self.root.join(to))?)
     }
 
     fn fork(&mut self) -> Result<Box<dyn View>> {

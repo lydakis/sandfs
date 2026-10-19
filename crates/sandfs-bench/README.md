@@ -11,6 +11,7 @@ sudo ./target/release/sandfs-bench --scratch /dev/shm  # root lets it mount over
 ./target/release/sandfs-bench --only lazy/ --latency-us 20000
 uv run python crates/sandfs-bench/python/bench.py --scratch /dev/shm   # the Python bindings
 ./target/release/sandfs-bench --only remote --remote https://github.com/microsoft/vscode --scratch /dev/shm
+./target/release/sandfs-bench --only everyday --remote https://github.com/microsoft/vscode --scratch /dev/shm
 ```
 
 Put the scratch directory on tmpfs (`/dev/shm`) when comparing numbers. sandfs keeps its changes in memory, so a disk under the other targets mostly measures the disk, and writeback makes their write and copy timings swing by several times between runs.
@@ -55,6 +56,29 @@ The lazy-source table mounts 1,000 of the small files from a source that sleeps 
 `--only workflow` runs a whole task several times side by side (`--attempts 8` by default), the way a harness runs parallel attempts at one job. Each attempt gets its own fork of one prepared view, then searches every small file for a byte pattern, rewrites the 50 files it picked (matches first), adds 10 notes and deletes 5, checks its work by running `cksum` over two directories and the rewritten files, and lists its changes. Forks are made one after another; the attempts then run on a thread each. On targets that are real directories the check is a separate process reading through the filesystem; through the Rust API the same checksums are computed in-process. Every checksum is compared with the contents the attempt should have left, so a target that writes the wrong bytes fails the run.
 
 Besides wall time and the median of each step, the table shows peak memory and the bytes the attempts left in the scratch directory. Each target's workflow runs in a fresh process, so its memory peak holds only its own work: that process plus any serving processes, each counted whole, so shared pages are counted more than once. A host fork is a full copy, so it pays in time and disk for every attempt; the FUSE mount saves each fork's changes to disk when they are listed.
+
+## Everyday operations
+
+`--only everyday` runs what an agent or a person does in a folder, one operation at a time, each on a fresh view so sandfs's caches start empty:
+
+| operation | what it does |
+|---|---|
+| ls, ls -l | list a folder, then also the size of every entry |
+| find | list every folder below one |
+| stat, cat | the size of the deepest file, and reading a file |
+| grep -r | read every file below a folder and count those holding a byte pattern |
+| create, edit, mv, rm | write a new file, replace 16 bytes in the middle of one, move one, delete one |
+| changes | list the changes after create, edit, mv and rm |
+
+It runs them on three kinds of source, by every way of reaching each one here:
+
+| source | columns |
+|---|---|
+| the data set as a host folder | the host directly (the floor), sandfs through the Rust API, the `sandfs` mount |
+| a source taking `--latency-us` per call (1 ms by default), holding the first 1,000 small files | sandfs through the Rust API |
+| the `--remote` repository, with nothing fetched before each operation | sandfs through the Rust API (a `GitSource` on a new blobless copy), the `sandfs` mount (with a `SANDFS_HOME` of its own) |
+
+The Rust API is what the Python package and the MCP server call, so its column stands for them too. Every column must agree on each operation's result (entries listed, bytes read, changes found). The remote operations run once each, since each needs a fresh copy.
 
 ## Remote repository
 

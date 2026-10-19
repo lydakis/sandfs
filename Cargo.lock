@@ -625,6 +625,7 @@ dependencies = [
  "clap",
  "nix",
  "sandfs-core",
+ "sandfs-git",
  "serde_json",
  "tempfile",
 ]
