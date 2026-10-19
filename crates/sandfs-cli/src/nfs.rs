@@ -8,12 +8,19 @@
 //! answers save requests on a second localhost port, which `sandfs changes`, `fork`
 //! and `unmount` use to have everything written so far saved first. And macOS's NFS
 //! client keeps extended attributes in `._name` files, which are kept out of saves.
+//!
+//! Any local user can connect to a port on localhost, so the server only answers its
+//! owner. The port the mount uses passes on only calls whose credentials name the user
+//! who mounted it (or root), as a FUSE mount only lets its owner in. The server behind
+//! it hands out the root's file handle once, to the mount, and every file handle
+//! carries a secret, so a program connecting to that server directly gets nothing.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(nfs)]
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,14 +30,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use fuser::{Errno, FileAttr, FileType, RenameFlags, TimeOrNow};
 use nfsserve::nfs::{
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, fattr3, fileid3, filename3, fsinfo3, ftype3, nfspath3, nfsstat3, nfstime3,
-    post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
+    FSF_CANSETTIME, FSF_HOMOGENEOUS, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3, nfsstat3,
+    nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
 };
 #[cfg(nfs)]
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 #[cfg(nfs)]
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::fs::{FsResult, Inner, MAX_FILE_SIZE, ROOT_INO, Shared};
 
@@ -43,6 +50,10 @@ const MOUNT_CHECK: Duration = Duration::from_millis(500);
 /// resuming one of those resumes by the entry's current name.
 const PAGE_ENDS: usize = 1024;
 
+/// The largest RPC message relayed to the server: a write of `wsize` and its header.
+#[cfg(nfs)]
+const MAX_MESSAGE: usize = 2 << 20;
+
 /// The [`NFSFileSystem`] handed to the NFS server.
 pub struct SandNfs {
     shared: Arc<Shared>,
@@ -50,6 +61,10 @@ pub struct SandNfs {
     /// resumes from. The entry may be renamed before the next page is asked for, and
     /// the next page must start after where it was, not where it went.
     page_ends: Mutex<BTreeMap<(fileid3, fileid3), String>>,
+    /// Starts every file handle, so handles can't be made up.
+    secret: [u8; 16],
+    /// Whether the root's handle was handed out.
+    mounted: AtomicBool,
 }
 
 /// The NFS status for an errno.
@@ -109,8 +124,12 @@ fn os_name(name: &filename3) -> &OsStr {
 
 impl SandNfs {
     /// Serve `shared` over NFS.
-    pub fn new(shared: Arc<Shared>) -> SandNfs {
-        SandNfs { shared, page_ends: Mutex::default() }
+    pub fn new(shared: Arc<Shared>) -> std::io::Result<SandNfs> {
+        use std::io::Read;
+
+        let mut secret = [0; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
+        Ok(SandNfs { shared, page_ends: Mutex::default(), secret, mounted: AtomicBool::new(false) })
     }
 
     /// Run `op` on the filesystem, then wake the saver if it changed something.
@@ -141,6 +160,29 @@ impl NFSFileSystem for SandNfs {
 
     fn root_dir(&self) -> fileid3 {
         ROOT_INO
+    }
+
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        nfs_fh3 { data: [&self.secret[..], &id.to_le_bytes()].concat() }
+    }
+
+    fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        match fh.data.split_at_checked(self.secret.len()) {
+            Some((secret, id)) if secret == self.secret => {
+                Ok(u64::from_le_bytes(id.try_into().map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?))
+            }
+            _ => Err(nfsstat3::NFS3ERR_BADHANDLE),
+        }
+    }
+
+    /// Only ever asked for by a mount request, which gets the root's handle the first
+    /// time only: that's the mount this process makes, before anything else can know
+    /// the port. A mount request that came first makes the mount fail instead.
+    async fn path_to_id(&self, path: &[u8]) -> Result<fileid3, nfsstat3> {
+        if path != b"/" || self.mounted.swap(true, Ordering::SeqCst) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
+        Ok(ROOT_INO)
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
@@ -323,14 +365,18 @@ impl NFSFileSystem for SandNfs {
 pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u16) -> Result<()>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
-        let mut server = NFSTcpListener::bind("127.0.0.1:0", SandNfs::new(shared.clone()))
+        let mut server = NFSTcpListener::bind("127.0.0.1:0", SandNfs::new(shared.clone())?)
             .await
             .context("starting the NFS server")?;
         server.with_export_name(format!("sandfs/{name}"));
         let (mount_events, mut events) = tokio::sync::mpsc::channel(16);
         server.set_mount_listener(mount_events);
-        let port = server.get_listen_port();
+        let server_port = server.get_listen_port();
         tokio::spawn(async move { server.handle_forever().await });
+        let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("starting the NFS listener")?;
+        let port = front.local_addr()?.port();
+        let users = vec![nix::unistd::getuid().as_raw(), 0];
+        tokio::spawn(guard(front, server_port, users));
         let saves = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("starting the save listener")?;
         let save_port = saves.local_addr()?.port();
         tokio::spawn(answer_saves(saves, shared.clone()));
@@ -385,6 +431,101 @@ fn mount_options(port: u16) -> String {
     .join(",")
 }
 
+/// Relay each connection to `front` to the NFS server on `server_port`, passing on
+/// only the calls [`call_allowed`] lets through for `users` and refusing the rest.
+#[cfg(nfs)]
+async fn guard(front: tokio::net::TcpListener, server_port: u16, users: Vec<u32>) {
+    while let Ok((client, _)) = front.accept().await {
+        let users = users.clone();
+        tokio::spawn(async move { relay(client, server_port, &users).await });
+    }
+}
+
+#[cfg(nfs)]
+async fn relay(client: tokio::net::TcpStream, server_port: u16, users: &[u32]) -> std::io::Result<()> {
+    let server = tokio::net::TcpStream::connect(("127.0.0.1", server_port)).await?;
+    client.set_nodelay(true)?;
+    server.set_nodelay(true)?;
+    let (mut from_client, to_client) = client.into_split();
+    let (mut from_server, mut to_server) = server.into_split();
+    // Replies and refusals both go to the client, a whole message at a time.
+    let to_client = Arc::new(tokio::sync::Mutex::new(to_client));
+    let replies = {
+        let to_client = to_client.clone();
+        tokio::spawn(async move {
+            while let Ok(Some((message, _))) = read_message(&mut from_server).await {
+                if to_client.lock().await.write_all(&message).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    let result = async {
+        while let Some((message, call)) = read_message(&mut from_client).await? {
+            if call_allowed(&call, users) {
+                to_server.write_all(&message).await?;
+            } else {
+                to_client.lock().await.write_all(&refusal(&call)).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    replies.abort();
+    result
+}
+
+/// Read one RPC message: its bytes as they came, record marks included, and its body.
+#[cfg(nfs)]
+async fn read_message(stream: &mut tokio::net::tcp::OwnedReadHalf) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let (mut message, mut body) = (Vec::new(), Vec::new());
+    loop {
+        let mut mark = [0; 4];
+        match stream.read_exact(&mut mark).await {
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof && message.is_empty() => return Ok(None),
+            result => result?,
+        };
+        let mark_value = u32::from_be_bytes(mark);
+        let len = (mark_value & 0x7fff_ffff) as usize;
+        if body.len() + len > MAX_MESSAGE {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "RPC message too large"));
+        }
+        let start = body.len();
+        body.resize(start + len, 0);
+        stream.read_exact(&mut body[start..]).await?;
+        message.extend_from_slice(&mark);
+        message.extend_from_slice(&body[start..]);
+        if mark_value & 0x8000_0000 != 0 {
+            return Ok(Some((message, body)));
+        }
+    }
+}
+
+/// Whether an RPC call may reach the server: a ping (procedure 0) always, anything
+/// else only with Unix credentials naming one of `users`.
+fn call_allowed(call: &[u8], users: &[u32]) -> bool {
+    let word = |at: usize| call.get(at..at + 4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()));
+    // xid, CALL, RPC version, program, version, procedure, then the credentials:
+    // flavor, length, and for AUTH_UNIX a stamp, the machine name and the uid.
+    if word(4) != Some(0) {
+        return false;
+    }
+    if word(20) == Some(0) {
+        return true;
+    }
+    let (Some(1), Some(name_len)) = (word(24), word(36)) else { return false };
+    let uid = word(40 + (name_len as usize).next_multiple_of(4));
+    uid.is_some_and(|uid| users.contains(&uid))
+}
+
+/// The record-marked reply refusing `call`: denied, its credentials too weak.
+fn refusal(call: &[u8]) -> Vec<u8> {
+    let xid = call.get(..4).unwrap_or(&[0; 4]);
+    // REPLY, MSG_DENIED, AUTH_ERROR, AUTH_TOOWEAK.
+    let words = [1u32, 1, 1, 5].map(u32::to_be_bytes).concat();
+    [&(0x8000_0000u32 | 20).to_be_bytes()[..], xid, &words].concat()
+}
+
 /// Answer each connection to `saves` by saving everything written so far, then
 /// replying `ok` or the error.
 #[cfg(nfs)]
@@ -437,7 +578,7 @@ mod tests {
         inner.keep_removed = false;
         inner.skip_bookkeeping = true;
         let dir = tempfile::tempdir().unwrap();
-        (SandNfs::new(Shared::new(inner, Saved::new(dir.path()), root)), dir)
+        (SandNfs::new(Shared::new(inner, Saved::new(dir.path()), root)).unwrap(), dir)
     }
 
     fn name(s: &str) -> filename3 {
@@ -547,6 +688,55 @@ mod tests {
         let info = block(fs.fsinfo(ROOT_INO)).unwrap();
         assert_eq!(info.maxfilesize, MAX_FILE_SIZE as u64);
         assert_eq!(info.properties & nfsserve::nfs::FSF_SYMLINK, 0, "symlinks are not supported");
+    }
+
+    #[test]
+    fn handles_carry_the_secret_and_the_root_is_handed_out_once() {
+        let (fs, _dir) = served();
+        let other = served().0;
+        let fh = fs.id_to_fh(7);
+        assert!(matches!(fs.fh_to_id(&fh), Ok(7)));
+        assert!(matches!(other.fh_to_id(&fh), Err(nfsstat3::NFS3ERR_BADHANDLE)), "another server's handle");
+        let mut forged = fh.data[16..].to_vec();
+        forged.splice(0..0, 0u64.to_le_bytes());
+        assert!(matches!(fs.fh_to_id(&nfs_fh3 { data: forged }), Err(nfsstat3::NFS3ERR_BADHANDLE)));
+        assert!(matches!(fs.fh_to_id(&nfs_fh3 { data: fh.data[..20].to_vec() }), Err(nfsstat3::NFS3ERR_BADHANDLE)));
+        block(async {
+            assert!(matches!(fs.path_to_id(b"/in").await, Err(nfsstat3::NFS3ERR_ACCES)));
+            assert!(matches!(fs.path_to_id(b"/").await, Ok(ROOT_INO)));
+            assert!(matches!(fs.path_to_id(b"/").await, Err(nfsstat3::NFS3ERR_ACCES)), "a second mount");
+        });
+    }
+
+    /// An RPC call to `procedure` with AUTH_UNIX credentials for `uid`.
+    fn call(procedure: u32, machine: &str, uid: u32) -> Vec<u8> {
+        let mut name = machine.as_bytes().to_vec();
+        name.resize(machine.len().next_multiple_of(4), 0);
+        let creds = [&[0, 0, 0, 0][..], &(machine.len() as u32).to_be_bytes(), &name, &uid.to_be_bytes(), &[0; 8]];
+        let creds = creds.concat();
+        let head = [42u32, 0, 2, 100003, 3, procedure, 1, creds.len() as u32].map(u32::to_be_bytes).concat();
+        [head, creds, vec![0; 8]].concat()
+    }
+
+    #[test]
+    fn only_calls_from_the_owner_reach_the_server() {
+        assert!(call_allowed(&call(4, "mac", 501), &[501, 0]));
+        assert!(call_allowed(&call(4, "longer-name", 0), &[501, 0]), "root");
+        assert!(!call_allowed(&call(4, "mac", 502), &[501, 0]), "another user");
+        assert!(!call_allowed(&call(4, "mac", 501)[..40], &[501, 0]), "cut short");
+        assert!(call_allowed(&call(0, "mac", 502), &[501, 0]), "a ping");
+        let mut unauthenticated = call(4, "mac", 501);
+        unauthenticated[24..28].copy_from_slice(&0u32.to_be_bytes());
+        assert!(!call_allowed(&unauthenticated, &[501, 0]), "AUTH_NULL");
+        let mut reply = call(4, "mac", 501);
+        reply[4..8].copy_from_slice(&1u32.to_be_bytes());
+        assert!(!call_allowed(&reply, &[501, 0]), "not a call");
+
+        let refused = refusal(&call(4, "mac", 502));
+        assert_eq!(refused.len(), 24);
+        assert_eq!(refused[..4], (0x8000_0000u32 | 20).to_be_bytes(), "one fragment of 20 bytes");
+        assert_eq!(refused[4..8], 42u32.to_be_bytes(), "the call's xid");
+        assert_eq!(refused[8..], [1u32, 1, 1, 5].map(u32::to_be_bytes).concat()[..]);
     }
 
     #[test]

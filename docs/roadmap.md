@@ -33,4 +33,4 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 - A mounted workspace holds its writes in memory until they are saved, so it costs memory in proportion to what was written.
 - Only the executable bit of a file's mode is kept; owners, other mode bits and extended attributes are not.
 - No hard links, symlinks or special files, matching the core.
-- macOS mounts over NFS on localhost, which any local user can reach. New `._name`, `.DS_Store` and `.nfs.*` files that macOS creates in a mount are kept out of saves. Windows has no mount.
+- macOS mounts over NFS on localhost, answering only the user who mounted it (and root). New `._name`, `.DS_Store` and `.nfs.*` files that macOS creates in a mount are kept out of saves. Windows has no mount.
