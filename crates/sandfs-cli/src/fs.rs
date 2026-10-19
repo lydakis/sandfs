@@ -506,16 +506,18 @@ impl Inner {
 
     /// Open a file. The flag says whether the kernel may keep the pages it cached
     /// for this inode: only when the file's version is the one it had at the last
-    /// open, since every change in between gets a new version.
+    /// open, since every change in between gets a new version. Files read in ranges
+    /// go back to the host folder on every open instead, so changes made there show.
     pub fn open(&mut self, ino: u64, truncate: bool) -> FsResult<(u64, bool)> {
         let path = self.path(ino)?;
         if truncate {
             self.buffers.insert(ino, Vec::new());
             self.touch(&path);
         }
-        let version = self.ws.stat(path.as_str()).fs()?.version;
-        let unchanged = self.opened_versions.insert(ino, version) == Some(version);
-        let keep_cache = unchanged && !self.buffers.contains_key(&ino);
+        let meta = self.ws.stat(path.as_str()).fs()?;
+        let unchanged = self.opened_versions.insert(ino, meta.version) == Some(meta.version);
+        let ranged = self.ranged_reads && meta.size > RANGED_READ_SIZE;
+        let keep_cache = unchanged && !ranged && !self.buffers.contains_key(&ino);
         let fh = self.next_fh;
         self.next_fh += 1;
         self.handles.insert(fh, Handle::File { ino });
@@ -1268,6 +1270,31 @@ mod tests {
         assert!(!names.is_empty(), "the folder's entries are still listed");
         fs.releasedir(fh);
         assert!(!fs.nodes.contains_key(&src), "dropped once the handle is released");
+    }
+
+    #[test]
+    fn only_unchanged_whole_read_files_keep_their_pages() {
+        let big = vec![7u8; RANGED_READ_SIZE as usize + 1];
+        let source = MemorySource::from_files([("small.txt", b"hi".to_vec()), ("big.bin", big)]).unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(source)).unwrap();
+        let root = VPath::parse("/mnt").unwrap();
+        let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        fs.ranged_reads = true;
+        let mut reopen = |file: &str| {
+            let ino = fs.lookup(ROOT_INO, name(file)).unwrap().ino.0;
+            let keep: Vec<bool> = (0..2)
+                .map(|_| {
+                    let (fh, keep) = fs.open(ino, false).unwrap();
+                    fs.release(fh).unwrap();
+                    keep
+                })
+                .collect();
+            keep
+        };
+        assert_eq!(reopen("small.txt"), [false, true]);
+        // Ranged reads go back to the host folder on every open.
+        assert_eq!(reopen("big.bin"), [false, false]);
     }
 
     #[test]
