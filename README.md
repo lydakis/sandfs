@@ -148,6 +148,24 @@ Mounting needs Linux with FUSE 3 (`fusermount3`, package `fuse3`). On macOS and 
 
 Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`. An exception raised inside a Python source surfaces as `OSError`.
 
+## Performance
+
+Eight attempts at one task run side by side, each on its own fork of a folder holding 10,000 small files and a 256 MiB file. Each one searches every small file, rewrites 50 files, adds 10, deletes 5, checks its work and lists its changes.
+
+| | 8 attempts, wall time | one fork | peak memory | left on disk |
+| --- | ---: | ---: | ---: | ---: |
+| sandfs, in process | 0.45 s | 4.5 µs | 142 MiB | 0 |
+| sandfs, mounted as folders | 1.9 s | 55 ms | 780 MiB | 4.6 MiB |
+| overlayfs (Linux, needs root) | 0.59 s | 36 ms | 7 MiB | 4.4 MiB |
+| a full copy per attempt | 6.0 s | 4.7 s | 36 MiB | 3.1 GiB |
+
+Each mounted fork is its own process with its own cache today, which is why mounted folders use the most memory. Measured on a 4-vCPU cloud VM with the data on tmpfs, on main shortly after 0.4.0 (October 2026); runs on that VM vary by up to about 1.5 times. To run it yourself, and for the other workloads (cold and warm reads, large files, slow sources), see [sandfs-bench](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-bench/README.md):
+
+```bash
+cargo build --release -p sandfs-bench -p sandfs-cli
+sudo ./target/release/sandfs-bench --scratch /dev/shm --only workflow
+```
+
 ## Limits
 
 - **sandfs is not an execution sandbox.** It never runs commands, and it doesn't contain the programs that use it. It keeps their writes out of your sources, but a program working in a mounted folder can still read or change anything else its user can. Run untrusted programs in a container or microVM pointed at the mount.
