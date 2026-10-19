@@ -880,6 +880,23 @@ mod tests {
     }
 
     #[test]
+    fn removed_files_are_forgotten() {
+        let (fs, _dir) = served();
+        block(async {
+            fs.readdir(ROOT_INO, 0, 1000).await.unwrap();
+            let known = fs.shared.lock().node_count();
+            for n in 0..100 {
+                let (id, _) = fs.create(ROOT_INO, &name(&format!("tmp{n}")), sattr3::default()).await.unwrap();
+                fs.write(id, 0, b"scratch").await.unwrap();
+                fs.readdir(ROOT_INO, 0, 1000).await.unwrap();
+                fs.remove(ROOT_INO, &name(&format!("tmp{n}"))).await.unwrap();
+                assert!(fs.getattr(id).await.is_err(), "its handle is gone");
+            }
+            assert_eq!(fs.shared.lock().node_count(), known, "nothing kept for removed files");
+        });
+    }
+
+    #[test]
     fn fsinfo_reports_the_real_limits() {
         let (fs, _dir) = served();
         let info = block(fs.fsinfo(ROOT_INO)).unwrap();

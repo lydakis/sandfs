@@ -233,6 +233,12 @@ impl Inner {
         Some(self.ino_for(&parent))
     }
 
+    /// How many inodes are known, to check none are kept for nothing.
+    #[cfg(test)]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// The name `ino` was last seen under, even if it is gone now.
     #[cfg(any(nfs, test))]
     pub fn last_name_of(&self, ino: u64) -> Option<String> {
@@ -374,6 +380,12 @@ impl Inner {
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.linked = false;
             node.removed_from = before.filter(|_| self.keep_removed);
+            // Without removed files kept readable (NFS), nothing ever says a client is
+            // done with an inode, so a removed one goes now; a client still holding its
+            // handle gets an error.
+            if !self.keep_removed {
+                node.lookups = 0;
+            }
         }
         if !self.keep_removed {
             self.buffers.remove(&ino);
