@@ -5,12 +5,14 @@
 //! 1. searches every small file for a byte pattern,
 //! 2. edits what it found: rewrites matching files, adds notes and deletes a few,
 //! 3. checks its work by running `cksum` over part of the tree (on targets that are
-//!    real directories; through the Rust API the same files are read in-process),
+//!    real directories; through the Rust API the same checksums are computed
+//!    in-process), and compares every checksum with the contents it expects,
 //! 4. lists its changes, which is also when the FUSE mount saves them.
 //!
 //! Forks are made one after another, as a harness would start attempts; the rest runs
 //! on one thread per attempt. Besides time, the report shows the peak memory of this
-//! process plus any serving processes, and the bytes the attempts left on disk.
+//! process plus any serving processes, and the bytes the attempts left on disk. The
+//! caller runs each target in a fresh process, so no target inherits another's memory.
 
 use std::path::Path;
 use std::process::Command;
@@ -50,6 +52,8 @@ struct Plan {
     rewrites: Vec<String>,
     deletes: Vec<String>,
     checked: Vec<String>,
+    /// The original bytes of every checked file, to work out the expected checksums.
+    originals: Vec<Vec<u8>>,
 }
 
 impl Plan {
@@ -83,8 +87,24 @@ impl Plan {
             .filter(|p| checked_dirs.iter().any(|d| p.starts_with(&format!("{d}/"))) && !deletes.contains(p))
             .chain(rewrites.iter())
             .cloned()
-            .collect();
-        Ok(Plan { needle, matches, rewrites, deletes, checked })
+            .collect::<Vec<_>>();
+        let originals = checked.iter().map(|path| std::fs::read(data.root().join(path))).collect::<Result<_, _>>()?;
+        Ok(Plan { needle, matches, rewrites, deletes, checked, originals })
+    }
+
+    /// The checksum and size `cksum` must report for each checked file after `attempt`.
+    fn expected_sums(&self, attempt: usize) -> Vec<(u32, u64)> {
+        self.checked
+            .iter()
+            .zip(&self.originals)
+            .map(|(path, original)| {
+                let mut bytes = original.clone();
+                if self.rewrites.contains(path) {
+                    bytes.extend_from_slice(stamp(attempt).as_bytes());
+                }
+                (cksum_crc(&bytes), bytes.len() as u64)
+            })
+            .collect()
     }
 
     fn notes(&self, data: &Data, attempt: usize) -> Vec<String> {
@@ -100,8 +120,49 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle)
 }
 
+/// The line an attempt appends to each file it rewrites.
+fn stamp(attempt: usize) -> String {
+    format!("\nreviewed by attempt {attempt}\n")
+}
+
+/// The table for POSIX `cksum`'s CRC: polynomial 0x04C11DB7, most significant bit first.
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04C1_1DB7 } else { crc << 1 };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// What `cksum` prints for `bytes`: the CRC of the bytes followed by their length
+/// (least significant byte first, no trailing zeros), complemented.
+fn cksum_crc(bytes: &[u8]) -> u32 {
+    let feed = |crc: u32, byte: u8| (crc << 8) ^ CRC_TABLE[usize::from((crc >> 24) as u8 ^ byte)];
+    let mut crc = bytes.iter().fold(0, |crc, byte| feed(crc, *byte));
+    let mut len = bytes.len();
+    while len > 0 {
+        crc = feed(crc, len as u8);
+        len >>= 8;
+    }
+    !crc
+}
+
 /// One attempt after its fork: the four timed steps.
-fn attempt(data: &Data, plan: &Plan, index: usize, view: &mut dyn View) -> Result<[Duration; 4]> {
+fn attempt(
+    data: &Data,
+    plan: &Plan,
+    index: usize,
+    expected: &[(u32, u64)],
+    view: &mut dyn View,
+) -> Result<[Duration; 4]> {
     let start = Instant::now();
     let mut found = 0;
     for path in &data.small {
@@ -115,7 +176,7 @@ fn attempt(data: &Data, plan: &Plan, index: usize, view: &mut dyn View) -> Resul
     let start = Instant::now();
     for path in &plan.rewrites {
         let mut bytes = view.contents(path)?;
-        bytes.extend_from_slice(format!("\nreviewed by attempt {index}\n").as_bytes());
+        bytes.extend_from_slice(stamp(index).as_bytes());
         view.write(path, &bytes)?;
     }
     for (i, path) in plan.notes(data, index).iter().enumerate() {
@@ -127,12 +188,19 @@ fn attempt(data: &Data, plan: &Plan, index: usize, view: &mut dyn View) -> Resul
     let edit = start.elapsed();
 
     let start = Instant::now();
-    let checked = match view.root_dir() {
+    let sums = match view.root_dir() {
         Some(root) => cksum(root, &plan.checked)?,
-        None => plan.checked.iter().map(|path| view.contents(path).map(drop)).collect::<Result<Vec<_>>>()?.len(),
+        None => plan
+            .checked
+            .iter()
+            .map(|path| view.contents(path).map(|bytes| (cksum_crc(&bytes), bytes.len() as u64)))
+            .collect::<Result<Vec<_>>>()?,
     };
-    ensure!(checked == plan.checked.len(), "checked {checked} files, expected {}", plan.checked.len());
     let check = start.elapsed();
+    ensure!(sums.len() == expected.len(), "checked {} files, expected {}", sums.len(), expected.len());
+    if let Some(i) = (0..sums.len()).find(|&i| sums[i] != expected[i]) {
+        bail!("{} has checksum {:?}, expected {:?}", plan.checked[i], sums[i], expected[i]);
+    }
 
     let start = Instant::now();
     let changed = view.changes()?;
@@ -141,21 +209,31 @@ fn attempt(data: &Data, plan: &Plan, index: usize, view: &mut dyn View) -> Resul
     Ok([search, edit, check, changes])
 }
 
-/// Run `cksum` over `files` below `root` as one process; returns the files it summed.
-fn cksum(root: &Path, files: &[String]) -> Result<usize> {
+/// Run `cksum` over `files` below `root` as one process; returns each file's checksum
+/// and size, in order.
+fn cksum(root: &Path, files: &[String]) -> Result<Vec<(u32, u64)>> {
     let output = Command::new("cksum").current_dir(root).args(files).output().context("running cksum")?;
     if !output.status.success() {
         bail!("cksum failed: {}", String::from_utf8_lossy(&output.stderr));
     }
-    Ok(output.stdout.split(|b| *b == b'\n').filter(|line| !line.is_empty()).count())
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let crc = fields.next().and_then(|f| f.parse().ok());
+            let size = fields.next().and_then(|f| f.parse().ok());
+            crc.zip(size).with_context(|| format!("cksum printed {line:?}"))
+        })
+        .collect()
 }
 
 /// Run `attempts` attempts on `target`.
 pub fn run(target: &dyn Target, data: &Data, scratch: &Path, attempts: usize) -> Result<WorkflowResult> {
     let plan = Plan::new(data)?;
+    let expected: Vec<_> = (0..attempts).map(|index| plan.expected_sums(index)).collect();
     let mut base = target.open(true)?;
     let disk_before = disk_usage(scratch)?;
-    reset_peak_rss();
+    reset_peak_rss()?;
 
     let start = Instant::now();
     let mut views = Vec::with_capacity(attempts);
@@ -168,8 +246,8 @@ pub fn run(target: &dyn Target, data: &Data, scratch: &Path, attempts: usize) ->
             .iter_mut()
             .enumerate()
             .map(|(index, view)| {
-                let plan = &plan;
-                scope.spawn(move || attempt(data, plan, index, view.as_mut()))
+                let (plan, expected) = (&plan, &expected[index]);
+                scope.spawn(move || attempt(data, plan, index, expected, view.as_mut()))
             })
             .collect();
         handles.into_iter().map(|handle| handle.join().expect("attempt thread")).collect::<Result<Vec<_>>>()
@@ -193,8 +271,8 @@ fn disk_usage(dir: &Path) -> Result<u64> {
 }
 
 /// Start measuring this process's peak memory from now (Linux 4.0 and later).
-fn reset_peak_rss() {
-    let _ = std::fs::write("/proc/self/clear_refs", "5");
+fn reset_peak_rss() -> Result<()> {
+    std::fs::write("/proc/self/clear_refs", "5").context("resetting the peak memory count")
 }
 
 /// A process's peak resident memory in bytes, from `VmHWM`.
@@ -206,4 +284,17 @@ fn peak_rss(pid: u32) -> Result<u64> {
         .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
         .context("no VmHWM in /proc status")?;
     Ok(kib * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cksum_crc;
+
+    #[test]
+    fn checksums_match_posix_cksum() {
+        // Values printed by GNU `cksum` for the same input.
+        assert_eq!(cksum_crc(b""), 4_294_967_295);
+        assert_eq!(cksum_crc(b"hello\n"), 3_015_617_425);
+        assert_eq!(cksum_crc(&[0; 300]), 351_385_237);
+    }
 }
