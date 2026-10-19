@@ -15,7 +15,7 @@ use sandfs_mcp::Server;
 use serde_json::{Value, json};
 
 use crate::fs::subtree_keys;
-use crate::persist::{Restored, Snapshot};
+use crate::persist::{NotDurable, Restored, Snapshot};
 use crate::store::{Home, ROOT};
 
 /// Serve `name` over stdin and stdout until the client closes stdin.
@@ -110,10 +110,16 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             // a change that a restart would lose.
             let snapshot = Snapshot { ws: ws.fork(), times: times.clone(), dirs: dirs.clone() };
             if let Err(err) = saved.save(&snapshot, &root, true) {
-                let ws;
-                (ws, times, dirs) = before;
-                server = Server::new(ws);
-                let message = format!("the change could not be saved, so it was undone: {err:#}");
+                // Past the point where the new index is in place, the change stays: a
+                // restart would bring it back, so it can't be reported as undone.
+                let message = if err.downcast_ref::<NotDurable>().is_some() {
+                    format!("the change was made, but a crash could still lose it: {err:#}")
+                } else {
+                    let ws;
+                    (ws, times, dirs) = before;
+                    server = Server::new(ws);
+                    format!("the change could not be saved, so it was undone: {err:#}")
+                };
                 if let Some(reply) = tool_error(&request, &message) {
                     writeln!(output, "{reply}")?;
                     output.flush()?;

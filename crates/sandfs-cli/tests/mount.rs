@@ -350,6 +350,7 @@ fn a_failed_final_save_fails_unmount() {
     let failed = sandfs.try_run(&["unmount", ws.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(!failed.status.success() && stderr.contains("saving the last changes failed"), "{stderr}");
+    assert!(stderr.contains("changes.json"), "the reason is reported: {stderr}");
     sandfs.mounts.clear();
 
     std::fs::remove_dir(&blocker).unwrap();

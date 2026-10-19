@@ -122,7 +122,7 @@ fn run(cli: Cli) -> Result<()> {
             let record = home.record(&from)?;
             let target = home.create(&name, &record)?;
             if let Err(err) = Saved::new(home.workspace_dir(&from)).copy_to(&target) {
-                let _ = home.remove(&name);
+                remove_unused(&home, &name);
                 return Err(err);
             }
             mount_new(&home, &name, &dir, foreground)
@@ -203,9 +203,17 @@ fn mount_new(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()
     let initial = std::fs::read(&index).ok();
     let result = mount(home, name, dir, foreground);
     if result.is_err() && std::fs::read(&index).ok() == initial {
-        let _ = home.remove(name);
+        remove_unused(home, name);
     }
     result
+}
+
+/// Remove a workspace that was just created, unless another process has started
+/// serving it meanwhile.
+fn remove_unused(home: &Home, name: &str) {
+    if let Ok(_writer) = home.lock(name, "sandfs, removing a workspace whose mount failed") {
+        let _ = home.remove(name);
+    }
 }
 
 /// Mount `name` at `dir`: serve it here with `foreground`, otherwise start a
@@ -320,11 +328,16 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     shared.stop();
     let _ = saver.join();
     let saved = shared.save(true);
-    if let Err(err) = &saved {
-        // `unmount` is waiting for mount.json to go; leave it the reason first.
-        let _ = std::fs::write(&save_error, format!("{err:#}"));
+    match &saved {
+        Ok(()) => home.set_mount_info(name, None)?,
+        Err(err) => {
+            // `unmount` is waiting for mount.json to go. A full disk may refuse a new
+            // file but not a rename, so the failure is signalled by moving mount.json
+            // to save-error, and the reason is added if it can be.
+            let _ = std::fs::rename(home.workspace_dir(name).join("mount.json"), &save_error);
+            let _ = std::fs::write(&save_error, format!("{err:#}"));
+        }
     }
-    home.set_mount_info(name, None)?;
     result.context("serving the mount")?;
     saved.context("saving changes at unmount")
 }
@@ -370,7 +383,13 @@ fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     }
     if let Ok(error) = std::fs::read_to_string(state.join(SAVE_ERROR)) {
         let _ = std::fs::remove_file(state.join(SAVE_ERROR));
-        bail!("unmounted, but saving the last changes failed, so changes since the last save are lost: {error}");
+        // Still the moved mount.json (or empty) when the reason could not be written.
+        let reason = if error.trim().is_empty() || error.starts_with('{') {
+            format!("see {}", state.join("mount.log").display())
+        } else {
+            error
+        };
+        bail!("unmounted, but saving the last changes failed, so changes since the last save are lost: {reason}");
     }
     Ok(())
 }
