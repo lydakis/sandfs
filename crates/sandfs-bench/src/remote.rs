@@ -118,6 +118,44 @@ impl Plan {
     }
 }
 
+impl Plan {
+    /// Write the plan to `path`, for a child process to [`Plan::read`] without running
+    /// git itself: whatever the child runs counts toward its method's peak memory.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::json!({
+            "url": self.url,
+            "commit": self.commit,
+            "files": self.files,
+            "samples": self.samples,
+            "subtree": self.subtree,
+            "subtree_files": self.subtree_files,
+        });
+        Ok(std::fs::write(path, serde_json::to_vec(&json)?)?)
+    }
+
+    /// A plan written by [`Plan::save`].
+    pub fn read(path: &Path) -> Result<Plan> {
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let text = |key: &str| json[key].as_str().map(str::to_owned).with_context(|| format!("plan has no {key}"));
+        let list = |key: &str| -> Result<Vec<String>> {
+            json[key]
+                .as_array()
+                .with_context(|| format!("plan has no {key}"))?
+                .iter()
+                .map(|path| path.as_str().map(str::to_owned).context("plan path is not a string"))
+                .collect()
+        };
+        Ok(Plan {
+            url: text("url")?,
+            commit: text("commit")?,
+            files: usize::try_from(json["files"].as_u64().context("plan has no files")?)?,
+            samples: list("samples")?,
+            subtree: text("subtree")?,
+            subtree_files: list("subtree_files")?,
+        })
+    }
+}
+
 /// The folder with the most files, counting those in its subfolders, of at most
 /// `limit`; the shallowest one on a tie. The root is the empty folder.
 fn largest_folder(files: &[String], limit: usize) -> Option<String> {
@@ -346,7 +384,7 @@ fn git_bytes(dir: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{largest_folder, pattern};
+    use super::{Plan, largest_folder, pattern};
 
     #[test]
     fn the_searched_folder_is_the_largest_under_the_limit() {
@@ -358,6 +396,25 @@ mod tests {
         assert_eq!(largest_folder(&files, 6).as_deref(), Some(""), "the whole repository fits");
         let flat: Vec<String> = ["x", "y"].iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(largest_folder(&flat, 10).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_saved_plan_reads_back_the_same() {
+        let strings = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let plan = Plan {
+            url: "https://example.com/data".to_owned(),
+            commit: "0123abcd".to_owned(),
+            files: 3,
+            samples: strings(&["a", "b/c"]),
+            subtree: "b".to_owned(),
+            subtree_files: strings(&["b/c"]),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.json");
+        plan.save(&path).unwrap();
+        let read = Plan::read(&path).unwrap();
+        assert_eq!((read.url, read.commit, read.files), (plan.url, plan.commit, plan.files));
+        assert_eq!((read.samples, read.subtree, read.subtree_files), (plan.samples, plan.subtree, plan.subtree_files));
     }
 
     #[test]

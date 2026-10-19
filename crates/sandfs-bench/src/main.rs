@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use serde_json::json;
 
@@ -121,7 +121,8 @@ fn run(args: Args) -> Result<()> {
     };
     if let (Some(plan_dir), Some(method)) = (&args.remote_child, args.remote_child_method) {
         let url = args.remote.as_deref().context("--remote-child needs --remote")?;
-        let plan = remote::Plan::load(url, args.remote_folder.as_deref(), plan_dir)?;
+        let plan = remote::Plan::read(&plan_dir.with_file_name("plan.json"))?;
+        ensure!(plan.url == url, "the plan is for {}, not {url}", plan.url);
         let root = plan_dir.with_file_name(method.arg());
         std::fs::create_dir(&root)?;
         let result = remote::run(&plan, method, &root, &bin)?;
@@ -274,6 +275,7 @@ fn run_remote(args: &Args, url: &str, scratch: &std::path::Path) -> Result<(remo
     std::fs::create_dir(&base)?;
     let plan_dir = base.join("listings");
     let plan = remote::Plan::fetch(url, args.remote_folder.as_deref(), &plan_dir)?;
+    plan.save(&base.join("plan.json"))?;
     let methods = args.remote_methods.clone().unwrap_or_else(|| remote::Method::value_variants().to_vec());
     let mut results: Vec<remote::RemoteResult> = Vec::new();
     for method in methods {
