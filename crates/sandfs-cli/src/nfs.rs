@@ -10,11 +10,12 @@
 //! a folder never reaches an NFS server: `sandfs changes` and `fork` connect to it to
 //! have everything written so far saved first.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(nfs)]
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(nfs)]
@@ -23,8 +24,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use fuser::{Errno, FileAttr, FileType, RenameFlags, TimeOrNow};
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_mode3, set_mtime, set_size3,
-    specdata3,
+    FSF_CANSETTIME, FSF_HOMOGENEOUS, fattr3, fileid3, filename3, fsinfo3, ftype3, nfspath3, nfsstat3, nfstime3,
+    post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
 };
 #[cfg(nfs)]
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -32,15 +33,25 @@ use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 #[cfg(nfs)]
 use tokio::io::AsyncWriteExt;
 
-use crate::fs::{FsResult, Inner, ROOT_INO, Shared};
+use crate::fs::{FsResult, Inner, MAX_FILE_SIZE, ROOT_INO, Shared};
 
 /// How often the server checks that its mount is still there, in case it went away
 /// without telling the server (a forced unmount).
 #[cfg(nfs)]
 const MOUNT_CHECK: Duration = Duration::from_millis(500);
 
+/// Listing pages kept track of, at most: past this some are forgotten, and a client
+/// resuming one of those resumes by the entry's current name.
+const PAGE_ENDS: usize = 1024;
+
 /// The [`NFSFileSystem`] handed to the NFS server.
-pub struct SandNfs(pub Arc<Shared>);
+pub struct SandNfs {
+    shared: Arc<Shared>,
+    /// The name each listing page ended on, by folder and the cookie (inode) the client
+    /// resumes from. The entry may be renamed before the next page is asked for, and
+    /// the next page must start after where it was, not where it went.
+    page_ends: Mutex<BTreeMap<(fileid3, fileid3), String>>,
+}
 
 /// The NFS status for an errno.
 fn status(err: Errno) -> nfsstat3 {
@@ -98,10 +109,15 @@ fn os_name(name: &filename3) -> &OsStr {
 }
 
 impl SandNfs {
+    /// Serve `shared` over NFS.
+    pub fn new(shared: Arc<Shared>) -> SandNfs {
+        SandNfs { shared, page_ends: Mutex::default() }
+    }
+
     /// Run `op` on the filesystem, then wake the saver if it changed something.
     fn change<T>(&self, op: impl FnOnce(&mut Inner) -> FsResult<T>) -> Result<T, nfsstat3> {
-        let result = op(&mut self.0.lock());
-        self.0.changed();
+        let result = op(&mut self.shared.lock());
+        self.shared.changed();
         result.nfs()
     }
 
@@ -133,7 +149,7 @@ impl NFSFileSystem for SandNfs {
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let mut inner = self.0.lock();
+        let mut inner = self.shared.lock();
         match &filename.0[..] {
             b"." => Ok(dirid),
             b".." => inner.parent_of(dirid).ok_or(nfsstat3::NFS3ERR_NOENT),
@@ -142,7 +158,7 @@ impl NFSFileSystem for SandNfs {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        Ok(attributes(&self.0.lock().attr(id).nfs()?))
+        Ok(attributes(&self.shared.lock().attr(id).nfs()?))
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
@@ -166,7 +182,7 @@ impl NFSFileSystem for SandNfs {
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let inner = self.0.lock();
+        let inner = self.shared.lock();
         let data = inner.read(id, offset, count).nfs()?;
         let eof = offset + data.len() as u64 >= inner.attr(id).nfs()?.size;
         Ok((data.to_vec(), eof))
@@ -231,25 +247,35 @@ impl NFSFileSystem for SandNfs {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let mut inner = self.0.lock();
+        let mut inner = self.shared.lock();
         let fh = inner.opendir(dirid).nfs()?;
         // Skip `.` and `..`: the client makes those up itself.
         let listing = inner.readdir(fh, 2).map(<[_]>::to_vec);
         inner.releasedir(fh);
         let listing = listing.nfs()?;
+        let page_end = self.page_ends.lock().unwrap().get(&(dirid, start_after)).cloned();
         let start = if start_after == 0 {
             0
+        } else if let Some(after) = page_end {
+            listing.partition_point(|(_, _, name)| *name <= after)
         } else if let Some(position) = listing.iter().position(|(ino, ..)| *ino == start_after) {
             position + 1
         } else {
-            // The entry the last page ended on was removed or renamed since: resume
-            // after its name, so nothing is listed twice or skipped.
+            // The entry a forgotten page ended on was removed since: resume after its
+            // name, so nothing is listed twice or skipped.
             let after = inner.last_name_of(start_after).ok_or(nfsstat3::NFS3ERR_BAD_COOKIE)?;
             listing.partition_point(|(_, _, name)| *name <= after)
         };
-        let mut entries = Vec::new();
+        let mut entries: Vec<DirEntry> = Vec::new();
         for (ino, _, name) in listing.iter().skip(start) {
             if entries.len() == max_entries {
+                let mut page_ends = self.page_ends.lock().unwrap();
+                if page_ends.len() >= PAGE_ENDS {
+                    page_ends.pop_first();
+                }
+                if let Some(last) = entries.last() {
+                    page_ends.insert((dirid, last.fileid), String::from_utf8_lossy(&last.name.0).into_owned());
+                }
                 return Ok(ReadDirResult { entries, end: false });
             }
             // Gone since the listing was made.
@@ -258,6 +284,27 @@ impl NFSFileSystem for SandNfs {
             entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), attr: attributes(&attr) });
         }
         Ok(ReadDirResult { entries, end: true })
+    }
+
+    /// The server's defaults, but with sandfs's own file size limit, and no symlinks.
+    async fn fsinfo(&self, root_fileid: fileid3) -> Result<fsinfo3, nfsstat3> {
+        let attributes = match self.getattr(root_fileid).await {
+            Ok(attr) => post_op_attr::attributes(attr),
+            Err(_) => post_op_attr::Void,
+        };
+        Ok(fsinfo3 {
+            obj_attributes: attributes,
+            rtmax: 1 << 20,
+            rtpref: 1 << 20,
+            rtmult: 1 << 20,
+            wtmax: 1 << 20,
+            wtpref: 1 << 20,
+            wtmult: 1 << 20,
+            dtpref: 1 << 20,
+            maxfilesize: MAX_FILE_SIZE as u64,
+            time_delta: nfstime3 { seconds: 0, nseconds: 1_000_000 },
+            properties: FSF_HOMOGENEOUS | FSF_CANSETTIME,
+        })
     }
 
     async fn symlink(
@@ -282,8 +329,9 @@ impl NFSFileSystem for SandNfs {
 pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u16) -> Result<()>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
-        let mut server =
-            NFSTcpListener::bind("127.0.0.1:0", SandNfs(shared.clone())).await.context("starting the NFS server")?;
+        let mut server = NFSTcpListener::bind("127.0.0.1:0", SandNfs::new(shared.clone()))
+            .await
+            .context("starting the NFS server")?;
         server.with_export_name(format!("sandfs/{name}"));
         let (mount_events, mut events) = tokio::sync::mpsc::channel(16);
         server.set_mount_listener(mount_events);
@@ -388,7 +436,7 @@ mod tests {
         inner.commit_on_save = true;
         inner.skip_bookkeeping = true;
         let dir = tempfile::tempdir().unwrap();
-        (SandNfs(Shared::new(inner, Saved::new(dir.path()), root)), dir)
+        (SandNfs::new(Shared::new(inner, Saved::new(dir.path()), root)), dir)
     }
 
     fn name(s: &str) -> filename3 {
@@ -413,7 +461,7 @@ mod tests {
             assert_eq!(fs.lookup(ROOT_INO, &name("new.txt")).await.unwrap(), id);
         });
         // A save moves the buffered writes into the workspace.
-        let snapshot = fs.0.lock().snapshot();
+        let snapshot = fs.shared.lock().snapshot();
         assert_eq!(snapshot.ws.read_text("/mnt/new.txt").unwrap(), "hello world");
     }
 
@@ -428,7 +476,7 @@ mod tests {
             fs.create(sub, &name("._sub"), sattr3::default()).await.unwrap();
             fs.create(sub, &name("kept.txt"), sattr3::default()).await.unwrap();
             assert_eq!(fs.read(id, 0, 100).await.unwrap().0, b"xattrs", "served while mounted");
-            fs.0.lock().snapshot()
+            fs.shared.lock().snapshot()
         });
         let changed: Vec<String> = snapshot.ws.changes().unwrap().iter().map(|c| c.path.to_string()).collect();
         assert_eq!(changed, ["/mnt/sub/kept.txt"]);
@@ -452,6 +500,13 @@ mod tests {
             fs.remove(ROOT_INO, &name("c")).await.unwrap();
             let rest = fs.readdir(ROOT_INO, last, 10).await.unwrap();
             assert_eq!((names(&rest), rest.end), (vec!["d".to_owned(), "in".to_owned(), "notes.txt".to_owned()], true));
+
+            // Or is renamed: the next page still starts after where it was.
+            let first = fs.readdir(ROOT_INO, 0, 2).await.unwrap();
+            assert_eq!(names(&first), ["b", "d"]);
+            fs.rename(ROOT_INO, &name("d"), ROOT_INO, &name("z")).await.unwrap();
+            let rest = fs.readdir(ROOT_INO, first.entries.last().unwrap().fileid, 10).await.unwrap();
+            assert_eq!(names(&rest), ["in", "notes.txt", "z"]);
         });
     }
 
@@ -483,6 +538,14 @@ mod tests {
             assert!(fs.create_exclusive(ROOT_INO, &name("in")).await.is_ok());
             assert!(matches!(fs.create_exclusive(ROOT_INO, &name("in")).await, Err(nfsstat3::NFS3ERR_EXIST)));
         });
+    }
+
+    #[test]
+    fn fsinfo_reports_the_real_limits() {
+        let (fs, _dir) = served();
+        let info = block(fs.fsinfo(ROOT_INO)).unwrap();
+        assert_eq!(info.maxfilesize, MAX_FILE_SIZE as u64);
+        assert_eq!(info.properties & nfsserve::nfs::FSF_SYMLINK, 0, "symlinks are not supported");
     }
 
     #[test]

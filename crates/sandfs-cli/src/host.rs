@@ -21,7 +21,8 @@ pub fn mount_source(dir: &Path) -> Option<String> {
     })
 }
 
-/// The source of the topmost sandfs mount at `dir`, from `mount`'s table.
+/// The source of the topmost mount at `dir`, from `mount`'s table (`sandfs:<name>` for
+/// a workspace).
 #[cfg(target_os = "macos")]
 pub fn mount_source(dir: &Path) -> Option<String> {
     let output = std::process::Command::new("/sbin/mount").output().ok()?;
@@ -38,16 +39,18 @@ pub fn mount_source(_dir: &Path) -> Option<String> {
 }
 
 /// A line of macOS `mount` output, `SOURCE on POINT (TYPE, OPTIONS...)`, as its source
-/// and mount point when it is a workspace's NFS mount. The NFS source names the
-/// workspace's export, `localhost:/sandfs/<name>`, which reads as `sandfs:<name>` like
-/// a FUSE mount's.
+/// and mount point. A workspace's NFS source names its export,
+/// `localhost:/sandfs/<name>`, which reads as `sandfs:<name>` like a FUSE mount's.
 #[cfg(any(target_os = "macos", test))]
 fn parse_mount_line(line: &str) -> Option<(String, &str)> {
     let (source, rest) = line.split_once(" on ")?;
     let (point, options) = rest.rsplit_once(" (")?;
     let fstype = options.split([',', ')']).next()?;
-    let name = source.strip_prefix("localhost:/sandfs/")?;
-    (fstype == "nfs").then(|| (format!("sandfs:{name}"), point))
+    let source = match source.strip_prefix("localhost:/sandfs/") {
+        Some(name) if fstype == "nfs" => format!("sandfs:{name}"),
+        _ => source.to_owned(),
+    };
+    Some((source, point))
 }
 
 /// Undo mountinfo's octal escapes (`\040` for a space).
@@ -135,9 +138,11 @@ mod tests {
     fn macos_mount_lines_parse() {
         let line = "localhost:/sandfs/ws on /private/tmp/my ws (nfs, nodev, nosuid, mounted by me)";
         assert_eq!(parse_mount_line(line), Some(("sandfs:ws".to_owned(), "/private/tmp/my ws")));
+        // Other filesystems count as mounts too, so nothing is mounted over them.
         let other = "localhost:/elsewhere on /Volumes/x (nfs, nodev, nosuid, mounted by me)";
-        assert_eq!(parse_mount_line(other), None);
-        assert_eq!(parse_mount_line("/dev/disk3s1 on / (apfs, sealed, local, read-only, journaled)"), None);
+        assert_eq!(parse_mount_line(other), Some(("localhost:/elsewhere".to_owned(), "/Volumes/x")));
+        let disk = "/dev/disk3s1 on / (apfs, sealed, local, read-only, journaled)";
+        assert_eq!(parse_mount_line(disk), Some(("/dev/disk3s1".to_owned(), "/")));
     }
 
     #[cfg(unix)]

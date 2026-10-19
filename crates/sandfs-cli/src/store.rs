@@ -192,9 +192,16 @@ impl Home {
         if self.exists(what) {
             return Ok(what.to_owned());
         }
-        // A mount whose process died cannot be canonicalized (ENOTCONN), but it is
-        // still found by its absolute path, so `unmount DIR` can detach it.
-        let dir = Path::new(what).canonicalize().or_else(|_| std::path::absolute(what));
+        // A mount whose process died cannot be canonicalized (ENOTCONN), but its parent
+        // can, which turns aliases such as macOS's `/tmp` into the path the mount was
+        // recorded under, so `unmount DIR` can detach it.
+        let dir = Path::new(what).canonicalize().or_else(|_| {
+            let dir = std::path::absolute(what)?;
+            Ok::<_, std::io::Error>(match (dir.parent().map(Path::canonicalize), dir.file_name()) {
+                (Some(Ok(parent)), Some(name)) => parent.join(name),
+                _ => dir,
+            })
+        });
         if let Ok(dir) = dir {
             for name in self.names()? {
                 if self.attached_mount(&name).is_some_and(|info| info.mountpoint == dir) {

@@ -36,7 +36,7 @@ use crate::store::subtree_keys;
 const TTL: Duration = Duration::from_secs(60);
 pub const ROOT_INO: u64 = 1;
 /// Files live in memory, so refuse sizes that could only be a mistake.
-const MAX_FILE_SIZE: usize = 4 << 30;
+pub const MAX_FILE_SIZE: usize = 4 << 30;
 /// Base files larger than this are read in ranges rather than whole.
 const RANGED_READ_SIZE: u64 = 64 << 20;
 
