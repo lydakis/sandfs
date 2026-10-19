@@ -1,8 +1,10 @@
 //! Git commits as sources: `git:<path or url>[@rev]`.
 //!
 //! Everything git-specific in the CLI lives here, so the rest of it only knows host
-//! folders. Remote repositories become bare partial clones under `<home>/repos`, so
-//! file contents are fetched only when a directory or file is first read.
+//! folders. Remote repositories become bare partial clones under `<home>/repos` that
+//! hold only the commits that were mounted, without their history, so a mount costs
+//! one request for the commit and its folder listings. File contents are fetched only
+//! when a directory or file is first read.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,18 +23,20 @@ pub fn resolve(repos: &Path, spec: &str) -> Result<(PathBuf, String)> {
     if location.is_empty() || rev.as_deref() == Some("") {
         bail!("incomplete source \"git:{spec}\"");
     }
-    let repo = if is_url(location) {
-        clone_or_fetch(repos, location)?
-    } else {
-        expand(location).canonicalize().with_context(|| format!("no repository at {location}"))?
-    };
     let rev = rev.as_deref().unwrap_or("HEAD");
     if rev.starts_with('-') {
         bail!("invalid revision {rev:?}");
     }
-    let commit = git(&repo, &["rev-parse", "--verify", "--end-of-options", &format!("{rev}^{{commit}}")])
-        .with_context(|| format!("{rev:?} is not a commit in {}", repo.display()))?;
-    Ok((repo, commit))
+    if is_url(location) {
+        return fetch_commit(repos, location, rev);
+    }
+    let repo = expand(location).canonicalize().with_context(|| format!("no repository at {location}"))?;
+    Ok((repo.clone(), commit_of(&repo, rev)?))
+}
+
+fn commit_of(repo: &Path, rev: &str) -> Result<String> {
+    git(repo, &["rev-parse", "--verify", "--end-of-options", &format!("{rev}^{{commit}}")])
+        .with_context(|| format!("{rev:?} is not a commit in {}", repo.display()))
 }
 
 /// The source for `commit` of `repo`.
@@ -41,46 +45,85 @@ pub fn open(repo: &Path, commit: &str) -> Result<Arc<dyn Source>> {
     Ok(Arc::new(GitSource::open(repo, commit)?.with_sizes()?))
 }
 
-/// The local partial clone of `url`, created on first use and fetched after.
-fn clone_or_fetch(repos: &Path, url: &str) -> Result<PathBuf> {
+/// Fetch `rev` of `url` into its local partial clone, creating the clone on first use,
+/// and return the clone and the commit id.
+///
+/// Only the commit itself and its folder listings are fetched (depth 1, no file
+/// contents), which takes about a second even for a repository with years of history.
+/// A commit id that is already local needs no request at all.
+fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)> {
     let dest = repos.join(cache_path(url)?);
-    if dest.join("HEAD").exists() {
-        // A stale clone still mounts, so a failed fetch (offline, say) only warns.
-        let refs = ["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
-        if let Err(err) = git(&dest, &[&["fetch", "-q", "--prune", "origin"][..], &refs[..]].concat()) {
-            eprintln!("sandfs: could not update {url}, using the local copy: {err:#}");
+    let existed = dest.join("HEAD").exists();
+    if !existed {
+        eprintln!("sandfs: fetching {url} (file contents are fetched when first read)");
+        create_clone(&dest, url)?;
+    } else if is_commit_id(rev) {
+        if let Ok(commit) = commit_of(&dest, rev) {
+            return Ok((dest, commit));
         }
-        return Ok(dest);
     }
+    // A per-process ref, so concurrent mounts of one repository don't race on FETCH_HEAD.
+    let fetched = format!("refs/sandfs/fetch-{}", std::process::id());
+    let refspec = format!("+{rev}:{fetched}");
+    let fetch = git(
+        &dest,
+        &["fetch", "-q", "--depth=1", "--filter=blob:none", "--no-tags", "--recurse-submodules=no", "origin", &refspec],
+    );
+    let commit = match fetch {
+        Ok(_) => {
+            let commit = commit_of(&dest, &fetched);
+            let _ = git(&dest, &["update-ref", "-d", &fetched]);
+            commit?
+        }
+        // Offline, or a revision the server can't name (`main~3`): a commit that is
+        // already in the local copy still mounts.
+        Err(err) => match commit_of(&dest, rev) {
+            Ok(commit) if existed => {
+                eprintln!("sandfs: could not update {url}, using the local copy: {err:#}");
+                commit
+            }
+            _ => return Err(err).with_context(|| format!("could not fetch {rev:?} from {url}")),
+        },
+    };
+    // Keep every mounted commit reachable, so git's maintenance never removes one a
+    // workspace still reads from.
+    git(&dest, &["update-ref", &format!("refs/sandfs/commits/{commit}"), &commit])?;
+    Ok((dest, commit))
+}
+
+/// An empty bare repository whose `origin` is `url`, set up as a partial clone.
+fn create_clone(dest: &Path, url: &str) -> Result<()> {
     let parent = dest.parent().context("bad cache path")?;
     std::fs::create_dir_all(parent)?;
-    // Clone beside the destination and rename, so an interrupted clone leaves nothing behind.
+    // Set up beside the destination and rename, so an interrupted setup leaves nothing behind.
     let tmp = parent.join(format!(
         ".{}.tmp-{}",
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("repo"),
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&tmp);
-    eprintln!("sandfs: cloning {url} (file contents are fetched when first read)");
     let tmp_str = tmp.to_str().context("non-UTF-8 home directory")?;
-    let status = Command::new("git")
-        .args(["clone", "-q", "--bare", "--filter=blob:none", "--", url, tmp_str])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .status()
-        .context("running git clone")?;
-    if !status.success() {
+    let setup = git(Path::new("."), &["init", "-q", "--bare", tmp_str])
+        .and_then(|_| git(&tmp, &["remote", "add", "origin", url]))
+        .and_then(|_| git(&tmp, &["config", "remote.origin.promisor", "true"]))
+        .and_then(|_| git(&tmp, &["config", "remote.origin.partialclonefilter", "blob:none"]));
+    if let Err(err) = setup {
         let _ = std::fs::remove_dir_all(&tmp);
-        bail!("git clone {url} failed");
+        return Err(err).context("setting up the local copy");
     }
-    if let Err(err) = std::fs::rename(&tmp, &dest) {
+    if let Err(err) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_dir_all(&tmp);
-        // Another mount of the same URL may have finished its clone first.
+        // Another mount of the same URL may have finished first.
         if !dest.join("HEAD").exists() {
-            return Err(err).context("moving the clone into place");
+            return Err(err).context("moving the local copy into place");
         }
     }
-    Ok(dest)
+    Ok(())
+}
+
+/// A full commit id, which names the same commit forever.
+fn is_commit_id(rev: &str) -> bool {
+    matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Split a trailing `@rev`, which may contain slashes (`@feature/x`) or a reflog
@@ -158,6 +201,59 @@ mod tests {
         assert_eq!(split("/srv/repo@HEAD@{1}"), ("/srv/repo".into(), Some("HEAD@{1}".into())));
         assert_eq!(split("/srv/repo@main@{2.days.ago}"), ("/srv/repo".into(), Some("main@{2.days.ago}".into())));
         assert!(resolve(Path::new("/nonexistent"), "repo@").is_err());
+    }
+
+    /// Run git in `dir` for a test, with an identity for commits.
+    fn run(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn remote_mounts_fetch_only_the_mounted_commit() {
+        // The cache refuses URL parts that start with a dot, as tempdir names do.
+        let tmp = tempfile::Builder::new().prefix("sandfs-git").tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        run(&remote, &["init", "-q", "-b", "main"]);
+        // What GitHub allows: partial clones and fetching any commit by id.
+        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        run(&remote, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        std::fs::write(remote.join("a.txt"), "one").unwrap();
+        run(&remote, &["add", "a.txt"]);
+        run(&remote, &["commit", "-q", "-m", "first"]);
+        let first = run(&remote, &["rev-parse", "HEAD"]);
+        std::fs::write(remote.join("a.txt"), "two").unwrap();
+        run(&remote, &["commit", "-q", "-am", "second"]);
+        let second = run(&remote, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", remote.display());
+        let repos = tmp.path().join("repos");
+
+        let (repo, commit) = resolve(&repos, &url).unwrap();
+        assert_eq!(commit, second);
+        // One commit and its listings: no history, and no file contents until read.
+        assert_eq!(run(&repo, &["rev-list", "--count", "--all"]), "1");
+        let objects = run(&repo, &["rev-list", "--objects", "--missing=print", &commit]);
+        assert!(objects.lines().any(|line| line.starts_with('?')), "{objects}");
+
+        // Older commits, branches and tags are fetched the same way when asked for.
+        assert_eq!(resolve(&repos, &format!("{url}@{first}")).unwrap().1, first);
+        assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, second);
+        let mut ws = sandfs_core::Workspace::new();
+        ws.mount("/old", open(&repo, &first).unwrap()).unwrap();
+        assert_eq!(&ws.read("/old/a.txt").unwrap()[..], b"one");
+
+        // A commit id already fetched mounts with no request, so it works offline.
+        std::fs::remove_dir_all(&remote).unwrap();
+        assert_eq!(resolve(&repos, &format!("{url}@{first}")).unwrap().1, first);
+        // A revision that needs the server fails clearly instead of mounting something stale.
+        assert!(resolve(&repos, &format!("{url}@main")).is_err());
     }
 
     #[test]
