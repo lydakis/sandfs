@@ -90,11 +90,13 @@ impl Plan {
     pub fn load(url: &str, subtree: Option<&str>, dir: &Path) -> Result<Plan> {
         let commit = git_output(Some(dir), &["rev-parse", "HEAD"])?;
         // Regular files only: sandfs has no symbolic links, and submodules are other
-        // repositories. `-z` keeps names with unusual characters unquoted.
-        let listing = git_output(Some(dir), &["ls-tree", "-r", "-z", "HEAD"])?;
+        // repositories. `-z` keeps names with unusual characters unquoted, and names
+        // that aren't UTF-8 are skipped, as the sandfs source skips them.
+        let listing = git_bytes(Some(dir), &["ls-tree", "-r", "-z", "HEAD"])?;
         let mut files: Vec<String> = listing
-            .split('\0')
+            .split(|&byte| byte == 0)
             .filter_map(|line| {
+                let line = std::str::from_utf8(line).ok()?;
                 let (meta, path) = line.split_once('\t')?;
                 let mode = meta.split(' ').next()?;
                 (mode == "100644" || mode == "100755").then(|| path.to_owned())
@@ -108,7 +110,8 @@ impl Plan {
             Some(subtree) => subtree.trim_matches('/').to_owned(),
             None => largest_folder(&files, SUBTREE_FILES).context("no folder to search")?,
         };
-        let prefix = format!("{subtree}/");
+        // The empty folder is the repository's root.
+        let prefix = if subtree.is_empty() { String::new() } else { format!("{subtree}/") };
         let subtree_files: Vec<String> = files.iter().filter(|path| path.starts_with(&prefix)).cloned().collect();
         ensure!(!subtree_files.is_empty(), "{subtree} holds no files in {url}");
         Ok(Plan { url: url.to_owned(), commit, files: files.len(), samples, subtree, subtree_files })
@@ -116,9 +119,10 @@ impl Plan {
 }
 
 /// The folder with the most files, counting those in its subfolders, of at most
-/// `limit`; the shallowest one on a tie.
+/// `limit`; the shallowest one on a tie. The root is the empty folder.
 fn largest_folder(files: &[String], limit: usize) -> Option<String> {
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    counts.insert("", files.len());
     for path in files {
         let mut end = 0;
         while let Some(slash) = path[end..].find('/') {
@@ -130,7 +134,10 @@ fn largest_folder(files: &[String], limit: usize) -> Option<String> {
     counts
         .into_iter()
         .filter(|(_, count)| *count <= limit)
-        .max_by_key(|(folder, count)| (*count, std::cmp::Reverse(folder.matches('/').count())))
+        .max_by_key(|(folder, count)| {
+            let depth = if folder.is_empty() { 0 } else { folder.matches('/').count() + 1 };
+            (*count, std::cmp::Reverse(depth))
+        })
         .map(|(folder, _)| folder.to_owned())
 }
 
@@ -162,10 +169,11 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         Ok(())
     };
     // sandfs mounts outside `root`, so the disk count sees only what sandfs keeps.
-    let mounts = Mounts {
+    let mut mounts = Mounts {
         dir: tempfile::Builder::new().prefix("remote-mounts-").tempdir_in(root.parent().context("root")?)?,
         bin: sandfs_bin.to_owned(),
         home: home.clone(),
+        mounted: false,
     };
     let (dir, fork_dir) = match method {
         Method::Sandfs => (mounts.dir.path().join("copy"), mounts.dir.path().join("fork")),
@@ -178,6 +186,7 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         Method::Sandfs => {
             std::fs::create_dir_all(&dir)?;
             let source = format!("git:{}@{}", plan.url, plan.commit);
+            mounts.mounted = true;
             sandfs(&["mount".as_ref(), source.as_ref(), dir.as_os_str(), "--name".as_ref(), "copy".as_ref()])?;
         }
         Method::Full => {
@@ -202,8 +211,10 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
             git(Some(&copy), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", &plan.commit])?;
             // Exactly the files the run will read, which only a caller that knows them
             // in advance can list.
-            let mut patterns = vec!["set".to_owned(), "--no-cone".to_owned(), format!("/{}/", plan.subtree)];
-            patterns.extend(plan.samples.iter().map(|path| format!("/{path}")));
+            let folder =
+                if plan.subtree.is_empty() { "/*".to_owned() } else { format!("/{}/", pattern(&plan.subtree)) };
+            let mut patterns = vec!["set".to_owned(), "--no-cone".to_owned(), folder];
+            patterns.extend(plan.samples.iter().map(|path| format!("/{}", pattern(path))));
             let mut args = vec!["sparse-checkout"];
             args.extend(patterns.iter().map(String::as_str));
             git(Some(&copy), &args)?;
@@ -257,6 +268,7 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         }
         sandfs(&["unmount".as_ref(), dir.as_os_str()])?;
         sandfs(&["unmount".as_ref(), fork_dir.as_os_str()])?;
+        mounts.mounted = false;
     }
     drop(mounts);
     // Every command this process ran has exited; the largest one's peak counts.
@@ -272,10 +284,16 @@ struct Mounts {
     dir: tempfile::TempDir,
     bin: std::path::PathBuf,
     home: std::path::PathBuf,
+    /// Whether a mount may still be up, so the clone methods, which never mount, and
+    /// a finished run start no unmount commands that would count toward peak memory.
+    mounted: bool,
 }
 
 impl Drop for Mounts {
     fn drop(&mut self) {
+        if !self.mounted {
+            return;
+        }
         for name in ["copy", "fork"] {
             let mountpoint = self.dir.path().join(name);
             let unmounted = Command::new(&self.bin)
@@ -292,11 +310,28 @@ impl Drop for Mounts {
     }
 }
 
+/// `path` as a sparse-checkout pattern matching only itself: a backslash makes git
+/// read a wildcard, bracket or space literally.
+fn pattern(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ' ') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<()> {
     git_output(dir, args).map(drop)
 }
 
 fn git_output(dir: Option<&Path>, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8(git_bytes(dir, args)?)?.trim().to_owned())
+}
+
+fn git_bytes(dir: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     if let Some(dir) = dir {
         command.arg("-C").arg(dir);
@@ -306,19 +341,28 @@ fn git_output(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     if !output.status.success() {
         bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
     }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::largest_folder;
+    use super::{largest_folder, pattern};
 
     #[test]
     fn the_searched_folder_is_the_largest_under_the_limit() {
         let files: Vec<String> =
             ["a/1", "a/2", "a/b/3", "a/b/4", "c/5", "top"].iter().map(|s| (*s).to_owned()).collect();
-        assert_eq!(largest_folder(&files, 10).as_deref(), Some("a"));
+        assert_eq!(largest_folder(&files, 5).as_deref(), Some("a"));
         assert_eq!(largest_folder(&files, 3).as_deref(), Some("a/b"));
         assert_eq!(largest_folder(&files, 1).as_deref(), Some("c"));
+        assert_eq!(largest_folder(&files, 6).as_deref(), Some(""), "the whole repository fits");
+        let flat: Vec<String> = ["x", "y"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(largest_folder(&flat, 10).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn sparse_patterns_match_names_literally() {
+        assert_eq!(pattern("app/[id]/page *.tsx"), r"app/\[id]/page\ \*.tsx");
+        assert_eq!(pattern(r"a\b?"), r"a\\b\?");
     }
 }
