@@ -118,9 +118,14 @@ fn mount_fork_changes_and_remount() {
     assert_eq!(sandfs.stdout(&["changes", "main"]), "M README.md\nA notes.txt\nA run.sh\nD src/lib.rs\n");
     assert_eq!(std::fs::read_to_string(repo.path().join("README.md")).unwrap(), "hello\n", "the repo is untouched");
 
-    // A fork starts from the workspace's changes and then goes its own way.
+    // A fork starts from the workspace's changes, writes to a file still open among
+    // them, and then goes its own way.
+    let mut draft = std::fs::File::create(main.join("draft.txt")).unwrap();
+    std::io::Write::write_all(&mut draft, b"draft\n").unwrap();
     sandfs.mount(&["fork", main.to_str().unwrap(), fix.to_str().unwrap()], &fix);
+    drop(draft);
     assert_eq!(std::fs::read_to_string(fix.join("notes.txt")).unwrap(), "notes\n");
+    assert_eq!(std::fs::read_to_string(fix.join("draft.txt")).unwrap(), "draft\n");
     std::fs::write(fix.join("fix.txt"), "only in the fork\n").unwrap();
     assert!(!main.join("fix.txt").exists());
     assert!(sandfs.stdout(&["changes", fix.to_str().unwrap()]).contains("A fix.txt\n"));

@@ -344,7 +344,11 @@ pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u1
         .await?
         .context("running mount_nfs")?;
         anyhow::ensure!(status.success(), "mount_nfs failed ({status})");
-        mounted(save_port)?;
+        if let Err(err) = mounted(save_port) {
+            // The server stops when this returns, so don't leave a dead mount over `dir`.
+            let _ = std::process::Command::new("/sbin/umount").arg("-f").arg(dir).status();
+            return Err(err);
+        }
 
         // The client says when it unmounts; checking the mount table as well catches an
         // unmount that never told the server.
@@ -372,6 +376,9 @@ fn mount_options(port: u16) -> String {
         // Fail instead of hanging forever if this process dies without unmounting.
         "soft",
         "intr",
+        // Send each write to the server before it returns, as FUSE does, instead of
+        // keeping it in the client's cache, so a save sees every write that returned.
+        "sync",
         "rsize=1048576",
         "wsize=1048576",
     ]
@@ -546,5 +553,6 @@ mod tests {
     fn mount_options_name_the_server_port() {
         let options = mount_options(4049);
         assert!(options.contains("port=4049,mountport=4049") && options.contains("vers=3"), "{options}");
+        assert!(options.split(',').any(|option| option == "sync"), "{options}");
     }
 }
