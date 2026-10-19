@@ -110,7 +110,7 @@ impl Paths {
             Op::Cat => format!("read {}", self.read),
             Op::Grep => format!("read every file below {}", folder(&self.subtree)),
             Op::Create => format!("write 4 KiB to {}", self.create),
-            Op::Edit => format!("replace 16 bytes in the middle of {}", self.edit),
+            Op::Edit => format!("insert 16 bytes in the middle of {}", self.edit),
             Op::Rename => format!("move {}", self.rename),
             Op::Delete => format!("delete {}", self.delete),
             Op::Changes => "list the changes after create, edit, mv and rm".to_owned(),
@@ -218,10 +218,9 @@ fn perform(view: &mut dyn View, paths: &Paths, op: Op) -> Result<u64> {
         }
         Op::Edit => {
             let mut data = view.contents(&paths.edit)?;
+            // Inserted rather than overwritten, so the file changes whatever it held.
             let middle = data.len() / 2;
-            let end = (middle + 16).min(data.len());
-            // Always 16 new bytes, so even a short or empty file changes.
-            data.splice(middle..end, EDIT);
+            data.splice(middle..middle, EDIT);
             view.write(&paths.edit, &data)?;
             data.len() as u64
         }
@@ -237,7 +236,7 @@ fn perform(view: &mut dyn View, paths: &Paths, op: Op) -> Result<u64> {
     })
 }
 
-/// The bytes the edit writes into the middle of a file.
+/// The bytes the edit inserts in the middle of a file.
 const EDIT: [u8; 16] = [b'e'; 16];
 
 /// After a write, untimed: the view must show what was written, so a view that drops
@@ -247,13 +246,16 @@ fn check(view: &mut dyn View, paths: &Paths, op: Op) -> Result<()> {
         Op::Create => ensure!(view.contents(&paths.create)? == [b'n'; 4096], "wrong contents"),
         Op::Edit => {
             let data = view.contents(&paths.edit)?;
-            ensure!(data.windows(EDIT.len()).any(|window| window == EDIT), "the edit is missing");
+            let middle = (data.len().saturating_sub(EDIT.len())) / 2;
+            ensure!(data.get(middle..middle + EDIT.len()) == Some(&EDIT[..]), "the edit is missing");
         }
         Op::Rename => {
             ensure!(view.stat(&paths.rename).is_err(), "the old name is still there");
             view.stat(&paths.renamed()).context("the new name is missing")?;
         }
         Op::Delete => ensure!(view.stat(&paths.delete).is_err(), "the file is still there"),
+        // Created, edited, moved (gone from one name, added at another) and deleted.
+        Op::Changes => ensure!(view.changes()? == 5, "expected 5 changes"),
         _ => {}
     }
     Ok(())

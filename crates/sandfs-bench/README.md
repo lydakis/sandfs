@@ -67,7 +67,7 @@ Besides wall time and the median of each step, the table shows peak memory and t
 | find | list every folder below one |
 | stat, cat | the size of the deepest file, and reading a file |
 | grep -r | read every file below a folder and count those holding a byte pattern |
-| create, edit, mv, rm | write a new file, replace 16 bytes in the middle of one, move one, delete one |
+| create, edit, mv, rm | write a new file, insert 16 bytes in the middle of one, move one, delete one |
 | changes | list the changes after create, edit, mv and rm |
 
 It runs them on three kinds of source, by every way of reaching each one here:
