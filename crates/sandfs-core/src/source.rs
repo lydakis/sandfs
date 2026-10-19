@@ -157,8 +157,8 @@ impl Source for MemorySource {
 }
 
 /// A read-only view of a host directory, read lazily. It is not a snapshot: each path is
-/// read when first touched, so a directory that changes while mounted can show a mix of
-/// old and new contents.
+/// read when first touched, and ranged reads go back to the directory every time, so a
+/// directory that changes while mounted can show a mix of old and new contents.
 ///
 /// Symlinks and special files (sockets, devices, fifos) are skipped, so a link cannot
 /// lead the workspace outside `root`. Each read also checks that the resolved host
