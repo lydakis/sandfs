@@ -188,7 +188,11 @@ impl Home {
                 // Readable by its owner only, since it holds the save secret.
                 #[cfg(unix)]
                 std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-                std::io::Write::write_all(&mut file.open(&path)?, &serde_json::to_vec(info)?)?;
+                let mut file = file.open(&path)?;
+                // The mode above only applies to a new file; an older record keeps its own.
+                #[cfg(unix)]
+                file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                std::io::Write::write_all(&mut file, &serde_json::to_vec(info)?)?;
             }
             None => {
                 let _ = std::fs::remove_file(path);
@@ -372,6 +376,28 @@ mod tests {
         for bad in ["", ".hidden", "a/b", "..", "a b"] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_records_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+        // A record left readable by an older release is made private before the secret goes in.
+        let path = home.workspace_dir("ws").join("mount.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let info = MountInfo {
+            pid: 1,
+            mountpoint: data.path().to_path_buf(),
+            save_port: Some(1),
+            save_secret: Some("00".into()),
+        };
+        home.set_mount_info("ws", Some(&info)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]
