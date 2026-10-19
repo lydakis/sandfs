@@ -10,6 +10,7 @@ sudo ./target/release/sandfs-bench --scratch /dev/shm  # root lets it mount over
 ./target/release/sandfs-bench --scale quick            # a few seconds per target
 ./target/release/sandfs-bench --only lazy/ --latency-us 20000
 uv run python crates/sandfs-bench/python/bench.py --scratch /dev/shm   # the Python bindings
+./target/release/sandfs-bench --only remote --remote https://github.com/microsoft/vscode --scratch /dev/shm
 ```
 
 Put the scratch directory on tmpfs (`/dev/shm`) when comparing numbers. sandfs keeps its changes in memory, so a disk under the other targets mostly measures the disk, and writeback makes their write and copy timings swing by several times between runs.
@@ -54,3 +55,17 @@ The lazy-source table mounts 1,000 of the small files from a source that sleeps 
 `--only workflow` runs a whole task several times side by side (`--attempts 8` by default), the way a harness runs parallel attempts at one job. Each attempt gets its own fork of one prepared view, then searches every small file for a byte pattern, rewrites the 50 files it picked (matches first), adds 10 notes and deletes 5, checks its work by running `cksum` over two directories and the rewritten files, and lists its changes. Forks are made one after another; the attempts then run on a thread each. On targets that are real directories the check is a separate process reading through the filesystem; through the Rust API the same checksums are computed in-process. Every checksum is compared with the contents the attempt should have left, so a target that writes the wrong bytes fails the run.
 
 Besides wall time and the median of each step, the table shows peak memory and the bytes the attempts left in the scratch directory. Each target's workflow runs in a fresh process, so its memory peak holds only its own work: that process plus any serving processes, each counted whole, so shared pages are counted more than once. A host fork is a full copy, so it pays in time and disk for every attempt; the FUSE mount saves each fork's changes to disk when they are listed.
+
+## Remote repository
+
+`--remote URL` adds a table for a large repository on a git server (it needs the network; `--only remote` runs just that table). Each method starts with nothing local, gets the commit at the server's `HEAD`, reads one file, reads 20 more spread evenly across the tree, searches one folder (reads every file in it and counts those holding a fixed byte pattern), and makes a second copy to work in:
+
+| method | how it gets the files | second copy |
+|---|---|---|
+| sandfs mount | `sandfs mount git:URL@COMMIT`: the commit and its folder listings, then each folder's files when it is first listed | `sandfs fork` |
+| sparse checkout | a depth-1 blobless fetch, then a checkout of exactly the files the run will read, listed in advance: git's best case, which needs to know what will be read | `git worktree add` |
+| shallow clone | a depth-1 fetch of the commit with every file, checked out | `git worktree add` |
+| blobless clone | `git clone --filter=blob:none`: all history without file contents, then a checkout of every file | `git worktree add` |
+| full clone | `git clone`, checked out | `git worktree add` |
+
+`--remote-folder` picks the folder to search (default: the largest folder of at most 1,000 files) and `--remote-methods` the methods (default: all). Each method runs once, in its own process, so its peak memory is the largest command it ran plus, for sandfs, its serving processes; "on disk" is everything it left in the scratch directory. Every method must read the same bytes and find the same matches. Timings depend on the network, so compare methods within one run rather than across runs.

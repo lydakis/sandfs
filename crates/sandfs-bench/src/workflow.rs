@@ -263,7 +263,7 @@ pub fn run(target: &dyn Target, data: &Data, scratch: &Path, attempts: usize) ->
 }
 
 /// Bytes allocated below `dir`, staying on its filesystem so mounts are not counted.
-fn disk_usage(dir: &Path) -> Result<u64> {
+pub(crate) fn disk_usage(dir: &Path) -> Result<u64> {
     let output = Command::new("du").args(["-s", "-x", "--block-size=1"]).arg(dir).output().context("running du")?;
     let text = String::from_utf8_lossy(&output.stdout);
     let bytes = text.split_whitespace().next().and_then(|n| n.parse().ok());
@@ -276,7 +276,7 @@ fn reset_peak_rss() -> Result<()> {
 }
 
 /// A process's peak resident memory in bytes, from `VmHWM`.
-fn peak_rss(pid: u32) -> Result<u64> {
+pub(crate) fn peak_rss(pid: u32) -> Result<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
     let kib = status
         .lines()
