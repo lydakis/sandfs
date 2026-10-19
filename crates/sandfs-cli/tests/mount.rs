@@ -221,6 +221,69 @@ fn rereading_a_changed_file_never_returns_cached_bytes() {
 }
 
 #[test]
+fn open_files_work_without_open_or_close_reaching_sandfs() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    if !fuse_available() {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("log.txt"), "base\n").unwrap();
+    std::fs::write(folder.path().join("old.txt"), "old\n").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+
+    // A file written slowly through one handle is committed between writes, and the
+    // writes after a commit carry on from it.
+    let mut log = std::fs::OpenOptions::new().append(true).open(ws.join("log.txt")).unwrap();
+    for line in ["one\n", "two\n", "three\n"] {
+        log.write_all(line.as_bytes()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    drop(log);
+    assert_eq!(std::fs::read_to_string(ws.join("log.txt")).unwrap(), "base\none\ntwo\nthree\n");
+
+    // A file removed while open still reads and writes through its handle.
+    let mut old = std::fs::OpenOptions::new().read(true).write(true).open(ws.join("old.txt")).unwrap();
+    std::fs::remove_file(ws.join("old.txt")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let mut text = String::new();
+    old.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "old\n");
+    old.write_all(b"more\n").unwrap();
+    old.seek(SeekFrom::Start(0)).unwrap();
+    text.clear();
+    old.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "old\nmore\n");
+    drop(old);
+    assert!(!ws.join("old.txt").exists());
+
+    // Opening with O_TRUNC empties the file, and the kernel drops its pages.
+    std::fs::write(ws.join("log.txt"), "new\n").unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("log.txt")).unwrap(), "new\n");
+
+    // A program that writes a file, closes it and exits, with no fsync, has it saved
+    // once the file goes quiet: a crash a second later keeps it.
+    std::fs::write(ws.join("report.txt"), "done\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let mount_json = sandfs.home.path().join("workspaces/ws/mount.json");
+    let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&mount_json).unwrap()).unwrap();
+    let pid = info["pid"].as_u64().unwrap().to_string();
+    assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    sandfs.unmount(&ws);
+    sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
+    assert_eq!(std::fs::read_to_string(ws.join("report.txt")).unwrap(), "done\n", "saved before the crash");
+    assert_eq!(std::fs::read_to_string(ws.join("log.txt")).unwrap(), "new\n");
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M log.txt\nD old.txt\nA report.txt\n");
+    sandfs.unmount(&ws);
+    assert_eq!(std::fs::read_to_string(folder.path().join("log.txt")).unwrap(), "base\n", "the folder is untouched");
+}
+
+#[test]
 fn names_and_sizes_stay_fresh_within_the_cache_ttl() {
     if !fuse_available() {
         return;

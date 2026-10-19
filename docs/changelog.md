@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- **sandfs-cli speed**: the FUSE mount tells the kernel it needn't open or close files, so a first read of a small file is about a quarter faster and rereads and overwrites take about 40% less time.
+- **sandfs-cli saving**: closing a file no longer commits it. A write is saved once its file has gone 250 ms without a write, on `fsync`, or at `unmount`, `fork` or `changes`. A program that writes a file, closes it and exits still has it saved a moment later, but not at the instant of the close.
+- **sandfs-cli ranged reads**: large host-folder files read in ranges go back to the folder only for the parts the kernel hasn't kept in its page cache.
+
 ## 0.4.0 (2026-10-19)
 
 A rewrite. sandfs is now a general-purpose sandbox filesystem with a Rust core, and the Python package is a thin binding over it. Nothing from the 0.2 API carries over.

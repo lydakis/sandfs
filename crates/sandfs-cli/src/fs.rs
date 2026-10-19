@@ -1,25 +1,27 @@
 //! The FUSE filesystem: kernel requests turned into workspace calls.
 //!
 //! The kernel addresses files by inode number and the workspace by path, so [`Inner`]
-//! keeps a table between the two and moves entries when something is renamed. Writes
-//! land in a per-inode buffer and reach the workspace when the file is flushed (on
-//! every `close`), so a file written in many small chunks is copied once, not once per
-//! chunk. [`Shared`] adds a background thread that saves the workspace's changes
-//! shortly after they happen, and the [`fuser::Filesystem`] impl at the bottom only
-//! locks, calls into [`Inner`] and replies.
+//! keeps a table between the two and moves entries when something is renamed. Files
+//! are never opened or closed here: the kernel is told it needn't ask (no-open mode),
+//! which saves two round trips per file, so reads and writes name only the inode.
+//! Writes land in a per-inode buffer that reaches the workspace once the file has gone
+//! [`SETTLE`] without a write, or on `fsync`, so a file written in many small chunks is
+//! copied once, not once per chunk. [`Shared`] adds a background thread that does that
+//! and saves the workspace's changes, and the [`fuser::Filesystem`] impl at the bottom
+//! only locks, calls into [`Inner`] and replies.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig,
-    LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use sandfs_core::{Error, Kind, VPath, Workspace};
 
@@ -35,6 +37,9 @@ const ROOT_INO: u64 = 1;
 const MAX_FILE_SIZE: usize = 4 << 30;
 /// Base files larger than this are read in ranges rather than whole.
 const RANGED_READ_SIZE: u64 = 64 << 20;
+/// How long a file goes without a write before its buffer is committed and saved.
+/// Nothing tells this filesystem when a file is closed, so a quiet spell stands in.
+pub const SETTLE: Duration = Duration::from_millis(250);
 
 pub type FsResult<T> = Result<T, Errno>;
 
@@ -73,11 +78,21 @@ struct Node {
     lookups: u64,
     /// False once the path was removed or replaced while the kernel still held the inode.
     linked: bool,
+    /// For a removed file, the workspace as it was before: the kernel may still have
+    /// it open, and an open file stays readable until the kernel forgets the inode.
+    removed_from: Option<Workspace>,
 }
 
-enum Handle {
-    File { ino: u64 },
-    Dir { ino: u64, entries: Vec<(u64, FileType, String)> },
+/// An open directory, listed once so `readdir` pages through a stable list.
+struct DirHandle {
+    ino: u64,
+    entries: Vec<(u64, FileType, String)>,
+}
+
+/// A file's contents with writes the workspace hasn't seen yet.
+struct Buffer {
+    data: Vec<u8>,
+    written: Instant,
 }
 
 /// The filesystem state, behind one lock.
@@ -87,15 +102,12 @@ pub struct Inner {
     /// Path to inode, ordered so a renamed directory's entries are one range.
     inos: BTreeMap<String, u64>,
     next_ino: u64,
-    handles: HashMap<u64, Handle>,
+    handles: HashMap<u64, DirHandle>,
     next_fh: u64,
-    /// Open handles per inode.
+    /// Open handles per directory.
     open: HashMap<u64, u32>,
-    /// File contents written but not yet flushed to the workspace.
-    buffers: HashMap<u64, Vec<u8>>,
-    /// The file version each inode had when it was last opened. A file opened again
-    /// at the same version keeps the kernel's page cache instead of reading it again.
-    opened_versions: HashMap<u64, u64>,
+    /// File contents written but not yet committed to the workspace.
+    buffers: HashMap<u64, Buffer>,
     /// Modification times of touched paths; others report `base_time`.
     times: BTreeMap<String, SystemTime>,
     /// Directories created or removed here, which a save must record.
@@ -105,6 +117,8 @@ pub struct Inner {
     gid: u32,
     /// Set by every change, cleared when a save takes a snapshot.
     unsaved: bool,
+    /// Set by every write, cleared once no buffer is left to commit.
+    writing: bool,
     /// Read large base files in ranges. Only worth it for sources that can seek (a
     /// host folder): git reads a whole blob for every range.
     pub ranged_reads: bool,
@@ -129,22 +143,24 @@ impl Inner {
             next_fh: 1,
             open: HashMap::new(),
             buffers: HashMap::new(),
-            opened_versions: HashMap::new(),
             times,
             dirs,
             base_time,
             uid,
             gid,
             unsaved: false,
+            writing: false,
             ranged_reads: false,
         };
         inner.inos.insert(root.to_string(), ROOT_INO);
-        inner.nodes.insert(ROOT_INO, Node { path: root.clone(), lookups: 0, linked: true });
+        inner.nodes.insert(ROOT_INO, Node { path: root.clone(), lookups: 0, linked: true, removed_from: None });
         inner
     }
 
-    /// A copy of what a save needs; the workspace part is an O(1) fork.
-    pub fn snapshot(&mut self) -> Snapshot {
+    /// A copy of what a save needs; the workspace part is an O(1) fork. Files written
+    /// within `settle` stay out (see [`Inner::commit_written`]).
+    pub fn snapshot(&mut self, settle: Duration) -> Snapshot {
+        self.commit_written(settle);
         self.unsaved = false;
         Snapshot { ws: self.ws.fork(), times: self.times.clone(), dirs: self.dirs.clone() }
     }
@@ -172,7 +188,7 @@ impl Inner {
         let ino = self.next_ino;
         self.next_ino += 1;
         self.inos.insert(path.to_string(), ino);
-        self.nodes.insert(ino, Node { path: path.clone(), lookups: 0, linked: true });
+        self.nodes.insert(ino, Node { path: path.clone(), lookups: 0, linked: true, removed_from: None });
         ino
     }
 
@@ -189,14 +205,18 @@ impl Inner {
     pub fn attr(&self, ino: u64) -> FsResult<FileAttr> {
         let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
         if !node.linked {
-            // A removed file that is still open lives on in its buffer.
-            let size = self.buffers.get(&ino).ok_or(Errno::ENOENT)?.len() as u64;
+            // A removed file the kernel may still have open.
+            let size = match (self.buffers.get(&ino), &node.removed_from) {
+                (Some(buffer), _) => buffer.data.len() as u64,
+                (None, Some(before)) => before.stat(node.path.as_str()).fs()?.size,
+                (None, None) => return Err(Errno::ENOENT),
+            };
             return Ok(self.make_attr(ino, FileType::RegularFile, 0o644, size, self.base_time));
         }
         let path = node.path.as_str();
         let meta = self.ws.stat(path).fs()?;
         let size = match self.buffers.get(&ino) {
-            Some(buffer) => buffer.len() as u64,
+            Some(buffer) => buffer.data.len() as u64,
             None if meta.kind.is_dir() => 0,
             None => meta.size,
         };
@@ -249,7 +269,8 @@ impl Inner {
         self.open.get(&ino).is_some_and(|count| *count > 0)
     }
 
-    /// Drop an inode the kernel no longer holds and nothing has open.
+    /// Drop an inode the kernel no longer holds and no listing has open. The kernel
+    /// holds every file that is open, so a forgotten file is a closed one.
     fn maybe_drop(&mut self, ino: u64) {
         let unused = self.nodes.get(&ino).is_some_and(|node| node.lookups == 0) && !self.is_open(ino);
         if unused && ino != ROOT_INO {
@@ -259,22 +280,17 @@ impl Inner {
                 self.inos.remove(node.path.as_str());
             }
             self.buffers.remove(&ino);
-            self.opened_versions.remove(&ino);
         }
     }
 
-    /// Mark the inode at `path` as removed. If it is open, its contents move into a
-    /// buffer first, so reads and writes through open handles keep working.
-    fn unlink_path(&mut self, path: &VPath) {
+    /// Mark the inode at `path` as removed. A removed file keeps `before`, the
+    /// workspace from before the removal, until the kernel forgets it, so reads and
+    /// writes through handles still open on it keep working. Forking is O(1).
+    fn unlink_path(&mut self, path: &VPath, before: Option<Workspace>) {
         let Some(ino) = self.inos.remove(path.as_str()) else { return };
-        if self.is_open(ino)
-            && !self.buffers.contains_key(&ino)
-            && let Ok(data) = self.ws.read(path.as_str())
-        {
-            self.buffers.insert(ino, data.to_vec());
-        }
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.linked = false;
+            node.removed_from = before;
         }
         self.maybe_drop(ino);
     }
@@ -300,17 +316,20 @@ impl Inner {
     ) -> FsResult<FileAttr> {
         if let Some(size) = size {
             let size = usize::try_from(size).ok().filter(|size| *size <= MAX_FILE_SIZE).ok_or(Errno::EFBIG)?;
-            self.buffer(ino)?.resize(size, 0);
+            if size == 0 {
+                // Emptying a file (O_TRUNC arrives this way) needn't read it first.
+                self.contents(ino)?;
+                self.buffers.insert(ino, Buffer { data: Vec::new(), written: Instant::now() });
+                self.writing = true;
+            } else {
+                self.buffer(ino)?.resize(size, 0);
+            }
             // ftruncate on a removed file that is still open changes only its buffer.
             if !self.nodes.get(&ino).is_some_and(|node| node.linked) {
                 return self.attr(ino);
             }
             let path = self.path(ino)?;
             self.touch(&path);
-            // truncate(2) on a file nobody has open: there will be no flush to wait for.
-            if !self.is_open(ino) {
-                self.commit(ino)?;
-            }
         }
         if let Some(mode) = mode {
             let path = self.path(ino)?;
@@ -345,14 +364,9 @@ impl Inner {
         if self.ws.stat(path.as_str()).fs()?.kind.is_dir() {
             return Err(Errno::EISDIR);
         }
-        // Keep open contents before the workspace forgets them.
-        let ino = self.inos.get(path.as_str()).copied();
-        if let Some(ino) = ino.filter(|ino| self.is_open(*ino) && !self.buffers.contains_key(ino)) {
-            let data = self.ws.read(path.as_str()).fs()?;
-            self.buffers.insert(ino, data.to_vec());
-        }
+        let before = self.ws.fork();
         self.ws.remove(path.as_str(), false).fs()?;
-        self.unlink_path(&path);
+        self.unlink_path(&path, Some(before));
         self.times.remove(path.as_str());
         self.touch_parent(&path);
         Ok(())
@@ -364,7 +378,7 @@ impl Inner {
             return Err(Errno::ENOTDIR);
         }
         self.ws.remove(path.as_str(), false).fs()?;
-        self.unlink_path(&path);
+        self.unlink_path(&path, None);
         self.times.remove(path.as_str());
         self.dirs.insert(path.to_string());
         self.touch_parent(&path);
@@ -421,7 +435,8 @@ impl Inner {
         }
         next.rename(from.as_str(), to.as_str()).fs()?;
         if replacing {
-            self.unlink_path(&to);
+            let before = (!moving_dir).then(|| self.ws.fork());
+            self.unlink_path(&to, before);
             self.times.remove(to.as_str());
         }
         self.ws = next;
@@ -471,8 +486,8 @@ impl Inner {
     // Files
     // ------------------------------------------------------------------
 
-    /// Create and open a file. With `exclusive` an existing file is an error; otherwise
-    /// it is opened, and emptied when `truncate` is set.
+    /// Create a file. With `exclusive` an existing file is an error; otherwise it is
+    /// emptied when `truncate` is set.
     pub fn create(
         &mut self,
         parent: u64,
@@ -480,7 +495,7 @@ impl Inner {
         mode: u32,
         exclusive: bool,
         truncate: bool,
-    ) -> FsResult<(FileAttr, u64)> {
+    ) -> FsResult<FileAttr> {
         let path = self.child(parent, name)?;
         match self.ws.stat(path.as_str()) {
             Ok(_) if exclusive => return Err(Errno::EEXIST),
@@ -488,7 +503,8 @@ impl Inner {
             Ok(_) => {
                 if truncate {
                     let ino = self.ino_for(&path);
-                    self.buffers.insert(ino, Vec::new());
+                    self.buffers.insert(ino, Buffer { data: Vec::new(), written: Instant::now() });
+                    self.writing = true;
                     self.touch(&path);
                 }
             }
@@ -501,30 +517,17 @@ impl Inner {
             }
             Err(err) => return Err(errno(&err)),
         }
-        let attr = self.entry(&path)?;
-        let (fh, _) = self.open(attr.ino.0, false)?;
-        Ok((attr, fh))
+        self.entry(&path)
     }
 
-    /// Open a file. The flag says whether the kernel may keep the pages it cached
-    /// for this inode: only when the file's version is the one it had at the last
-    /// open, since every change in between gets a new version. Files read in ranges
-    /// go back to the host folder on every open instead, so changes made there show.
-    pub fn open(&mut self, ino: u64, truncate: bool) -> FsResult<(u64, bool)> {
-        let path = self.path(ino)?;
-        if truncate {
-            self.buffers.insert(ino, Vec::new());
-            self.touch(&path);
+    /// The workspace and path holding `ino`'s contents: the workspace itself, or for
+    /// a removed file the kernel may still have open, the one from before the removal.
+    fn contents(&self, ino: u64) -> FsResult<(&Workspace, &VPath)> {
+        match self.nodes.get(&ino) {
+            Some(Node { linked: true, path, .. }) => Ok((&self.ws, path)),
+            Some(Node { removed_from: Some(before), path, .. }) => Ok((before, path)),
+            _ => Err(Errno::ENOENT),
         }
-        let meta = self.ws.stat(path.as_str()).fs()?;
-        let unchanged = self.opened_versions.insert(ino, meta.version) == Some(meta.version);
-        let ranged = self.ranged_reads && meta.size > RANGED_READ_SIZE;
-        let keep_cache = unchanged && !ranged && !self.buffers.contains_key(&ino);
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        self.handles.insert(fh, Handle::File { ino });
-        *self.open.entry(ino).or_default() += 1;
-        Ok((fh, keep_cache))
     }
 
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> FsResult<Bytes> {
@@ -532,32 +535,33 @@ impl Inner {
             let start = usize::try_from(offset).unwrap_or(usize::MAX).min(len);
             start..start.saturating_add(size as usize).min(len)
         };
-        match self.buffers.get(&ino) {
-            Some(buffer) => Ok(Bytes::copy_from_slice(&buffer[range(buffer.len())])),
-            None => {
-                let path = self.path(ino)?;
-                if self.ranged_reads && self.ws.stat(path.as_str()).fs()?.size > RANGED_READ_SIZE {
-                    return self.ws.read_range(path.as_str(), offset, size.into()).fs();
-                }
-                // Other files are read whole once and served from the workspace's cache.
-                let data = self.ws.read(path.as_str()).fs()?;
-                Ok(data.slice(range(data.len())))
-            }
+        if let Some(buffer) = self.buffers.get(&ino) {
+            return Ok(Bytes::copy_from_slice(&buffer.data[range(buffer.data.len())]));
         }
+        let (ws, path) = self.contents(ino)?;
+        if self.ranged_reads && ws.stat(path.as_str()).fs()?.size > RANGED_READ_SIZE {
+            return ws.read_range(path.as_str(), offset, size.into()).fs();
+        }
+        // Other files are read whole once and served from the workspace's cache.
+        let data = ws.read(path.as_str()).fs()?;
+        Ok(data.slice(range(data.len())))
     }
 
     /// The write buffer for `ino`, filled from the workspace on first use.
     fn buffer(&mut self, ino: u64) -> FsResult<&mut Vec<u8>> {
         if !self.buffers.contains_key(&ino) {
-            let path = self.path(ino)?;
+            let (ws, path) = self.contents(ino)?;
             // Check before reading: a large source file would otherwise be read whole.
-            if self.ws.stat(path.as_str()).fs()?.size > MAX_FILE_SIZE as u64 {
+            if ws.stat(path.as_str()).fs()?.size > MAX_FILE_SIZE as u64 {
                 return Err(Errno::EFBIG);
             }
-            let data = self.ws.read(path.as_str()).fs()?;
-            self.buffers.insert(ino, data.to_vec());
+            let data = ws.read(path.as_str()).fs()?.to_vec();
+            self.buffers.insert(ino, Buffer { data, written: Instant::now() });
         }
-        self.buffers.get_mut(&ino).ok_or(Errno::EIO)
+        self.writing = true;
+        let buffer = self.buffers.get_mut(&ino).ok_or(Errno::EIO)?;
+        buffer.written = Instant::now();
+        Ok(&mut buffer.data)
     }
 
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
@@ -574,34 +578,27 @@ impl Inner {
         Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
     }
 
-    /// Move a file's write buffer into the workspace. A removed file's buffer stays
-    /// where it is: it belongs to nobody but the handles still open on it.
-    /// Commit every open file's buffer, so a save includes writes not yet flushed.
-    pub fn commit_all(&mut self) -> FsResult<()> {
+    /// Move into the workspace every buffer that has gone `settle` without a write. A
+    /// file still being written stays buffered: committing it would copy it, and its
+    /// next write would copy it back. A removed file's buffer stays where it is: it
+    /// belongs to nobody but the handles still open on it.
+    pub fn commit_written(&mut self, settle: Duration) {
+        let now = Instant::now();
+        let mut waiting = false;
         let inos: Vec<u64> = self.buffers.keys().copied().collect();
-        inos.into_iter().try_for_each(|ino| self.commit(ino))
-    }
-
-    pub fn commit(&mut self, ino: u64) -> FsResult<()> {
-        let Ok(path) = self.path(ino) else { return Ok(()) };
-        let Some(buffer) = self.buffers.remove(&ino) else { return Ok(()) };
-        self.ws.write(path.as_str(), Bytes::from(buffer)).fs()?;
-        self.unsaved = true;
-        Ok(())
-    }
-
-    pub fn release(&mut self, fh: u64) -> FsResult<()> {
-        let Some(Handle::File { ino }) = self.handles.remove(&fh) else { return Ok(()) };
-        let result = self.commit(ino);
-        if let Some(count) = self.open.get_mut(&ino) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.open.remove(&ino);
-                self.buffers.remove(&ino);
+        for ino in inos {
+            let Ok(path) = self.path(ino) else { continue };
+            if now.duration_since(self.buffers[&ino].written) < settle {
+                waiting = true;
+                continue;
             }
+            let Some(buffer) = self.buffers.remove(&ino) else { continue };
+            // A failure is logged by `errno`; the write is lost either way, as it
+            // would be if a commit at close had failed.
+            let _ = self.ws.write(path.as_str(), Bytes::from(buffer.data)).fs();
+            self.unsaved = true;
         }
-        self.maybe_drop(ino);
-        result
+        self.writing = waiting;
     }
 
     // ------------------------------------------------------------------
@@ -628,9 +625,9 @@ impl Inner {
         }
         let fh = self.next_fh;
         self.next_fh += 1;
-        self.handles.insert(fh, Handle::Dir { ino, entries });
-        // Like a file handle, the listing keeps its folder's inode until releasedir,
-        // since readdirplus resolves names through it.
+        self.handles.insert(fh, DirHandle { ino, entries });
+        // The listing keeps its folder's inode until releasedir, since readdirplus
+        // resolves names through it.
         *self.open.entry(ino).or_default() += 1;
         Ok(fh)
     }
@@ -638,12 +635,8 @@ impl Inner {
     /// Directory entries from position `offset` on; each entry's offset is its
     /// position plus one, which is where the next call resumes.
     pub fn readdir(&self, fh: u64, offset: u64) -> FsResult<&[(u64, FileType, String)]> {
-        match self.handles.get(&fh) {
-            Some(Handle::Dir { entries, .. }) => {
-                Ok(entries.get(usize::try_from(offset).unwrap_or(usize::MAX)..).unwrap_or_default())
-            }
-            _ => Err(Errno::EBADF),
-        }
+        let handle = self.handles.get(&fh).ok_or(Errno::EBADF)?;
+        Ok(handle.entries.get(usize::try_from(offset).unwrap_or(usize::MAX)..).unwrap_or_default())
     }
 
     /// Like [`Inner::readdir`], with each entry's attributes, handed to `add` until it
@@ -657,7 +650,7 @@ impl Inner {
     ) -> FsResult<()> {
         let mut position = usize::try_from(offset).unwrap_or(usize::MAX);
         loop {
-            let Some(Handle::Dir { ino: dir, entries }) = self.handles.get(&fh) else { return Err(Errno::EBADF) };
+            let Some(DirHandle { ino: dir, entries }) = self.handles.get(&fh) else { return Err(Errno::EBADF) };
             let dir = *dir;
             let Some((saved, _, name)) = entries.get(position).cloned() else { return Ok(()) };
             position += 1;
@@ -690,7 +683,7 @@ impl Inner {
     }
 
     pub fn releasedir(&mut self, fh: u64) {
-        let Some(Handle::Dir { ino, .. }) = self.handles.remove(&fh) else { return };
+        let Some(DirHandle { ino, .. }) = self.handles.remove(&fh) else { return };
         if let Some(count) = self.open.get_mut(&ino) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -708,6 +701,8 @@ pub struct Shared {
     root: VPath,
     wake: Condvar,
     stop: AtomicBool,
+    /// Whether the kernel took no-open mode, so opens and flushes can be refused.
+    no_open: AtomicBool,
 }
 
 impl Shared {
@@ -718,6 +713,7 @@ impl Shared {
             root,
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
+            no_open: AtomicBool::new(false),
         })
     }
 
@@ -725,10 +721,16 @@ impl Shared {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Save the workspace's changes now; `durable` also flushes them to disk, as `fsync` promises.
+    /// Save the workspace's changes now, including every write; `durable` also
+    /// flushes them to disk, as `fsync` promises.
     pub fn save(&self, durable: bool) -> anyhow::Result<()> {
+        self.save_settled(Duration::ZERO, durable)
+    }
+
+    /// Save, leaving out files written within `settle`.
+    fn save_settled(&self, settle: Duration, durable: bool) -> anyhow::Result<()> {
         let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = self.lock().snapshot();
+        let snapshot = self.lock().snapshot(settle);
         let result = saved.save(&snapshot, &self.root, durable);
         if result.is_err() {
             self.lock().unsaved = true;
@@ -736,14 +738,15 @@ impl Shared {
         result
     }
 
-    /// Start a thread that saves shortly after each burst of changes, until [`Shared::stop`].
+    /// Start a thread that commits and saves shortly after each burst of changes,
+    /// until [`Shared::stop`].
     pub fn spawn_saver(self: &Arc<Self>) -> JoinHandle<()> {
         let shared = self.clone();
         std::thread::spawn(move || {
             loop {
                 {
                     let mut inner = shared.lock();
-                    while !inner.unsaved && !shared.stop.load(Ordering::SeqCst) {
+                    while !inner.unsaved && !inner.writing && !shared.stop.load(Ordering::SeqCst) {
                         inner = shared.wake.wait(inner).unwrap_or_else(PoisonError::into_inner);
                     }
                 }
@@ -751,8 +754,17 @@ impl Shared {
                     return;
                 }
                 // Let a burst of writes settle so it costs one save, not one per write.
-                std::thread::sleep(Duration::from_millis(250));
-                if let Err(err) = shared.save(false) {
+                std::thread::sleep(SETTLE);
+                let changed = {
+                    let mut inner = shared.lock();
+                    inner.commit_written(SETTLE);
+                    inner.unsaved
+                };
+                // Only files still being written: the next pass commits them.
+                if !changed {
+                    continue;
+                }
+                if let Err(err) = shared.save_settled(SETTLE, false) {
                     eprintln!("sandfs: saving changes failed: {err:#}");
                     std::thread::sleep(Duration::from_secs(1));
                 }
@@ -767,10 +779,13 @@ impl Shared {
     }
 
     /// Wake the saver if the last request left something unsaved. Most requests
-    /// (a close after a read) change nothing, and waking a thread costs more than the
-    /// request itself.
+    /// change nothing, and waking a thread costs more than the request itself.
     fn changed(&self) {
-        if self.lock().unsaved {
+        let pending = {
+            let inner = self.lock();
+            inner.unsaved || inner.writing
+        };
+        if pending {
             self.wake.notify_one();
         }
     }
@@ -804,6 +819,11 @@ impl Filesystem for SandFs {
         // without it fall back to plain listings.
         let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS);
         let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
+        // Opening a file costs a round trip and closing it another, which is half the
+        // cost of reading a small file. With no-open the kernel skips both; files are
+        // never told apart by handle here anyway.
+        let no_open = config.add_capabilities(InitFlags::FUSE_NO_OPEN_SUPPORT).is_ok();
+        self.0.no_open.store(no_open, Ordering::SeqCst);
         Ok(())
     }
 
@@ -881,18 +901,14 @@ impl Filesystem for SandFs {
         self.reply_empty(reply, result);
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
-        match self.0.lock().open(ino.0, writable && flags.0 & libc::O_TRUNC != 0) {
-            Ok((fh, keep_cache)) => {
-                let mut reply_flags = FopenFlags::empty();
-                reply_flags.set(FopenFlags::FOPEN_KEEP_CACHE, keep_cache);
-                // A read-only handle has nothing to commit when it is closed, so the
-                // kernel can skip the flush round trip.
-                reply_flags.set(FopenFlags::FOPEN_NOFLUSH, !writable);
-                reply.opened(FileHandle(fh), reply_flags)
-            }
-            Err(err) => reply.error(err),
+    /// Answered once at most: ENOSYS tells the kernel to stop sending opens and keep
+    /// every file's cached pages, since nothing changes a file behind its back. Kernels
+    /// without no-open get a handle that keeps no pages.
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.0.no_open.load(Ordering::SeqCst) {
+            reply.error(Errno::ENOSYS);
+        } else {
+            reply.opened(FileHandle(0), FopenFlags::empty());
         }
     }
 
@@ -925,34 +941,41 @@ impl Filesystem for SandFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.0.lock().write(ino.0, offset, data) {
+        let result = self.0.lock().write(ino.0, offset, data);
+        self.0.changed();
+        match result {
             Ok(written) => reply.written(written),
             Err(err) => reply.error(err),
         }
     }
 
-    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
-        let result = self.0.lock().commit(ino.0);
-        self.reply_empty(reply, result);
+    /// A close needs nothing from this filesystem: buffers are committed once they
+    /// settle. ENOSYS tells the kernel to stop asking, which saves a round trip per close.
+    fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        if self.0.no_open.load(Ordering::SeqCst) {
+            reply.error(Errno::ENOSYS);
+        } else {
+            reply.ok();
+        }
     }
 
     fn release(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        fh: FileHandle,
+        _fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let result = self.0.lock().release(fh.0);
-        self.reply_empty(reply, result);
+        // Only files made by `create` (or opened on kernels without no-open) are
+        // released, and their handles hold nothing.
+        reply.ok();
     }
 
-    fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        let result = self.0.lock().commit(ino.0);
-        let result = result.and_then(|()| self.0.save(true).map_err(|err| log_io(&err)));
+    fn fsync(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        let result = self.0.save(true).map_err(|err| log_io(&err));
         self.reply_empty(reply, result);
     }
 
@@ -996,8 +1019,7 @@ impl Filesystem for SandFs {
     /// `fsync` on a directory saves the whole workspace; the CLI uses it to make sure
     /// a fork or `changes` sees everything written so far.
     fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        let committed = self.0.lock().commit_all();
-        let result = committed.and_then(|()| self.0.save(true).map_err(|err| log_io(&err)));
+        let result = self.0.save(true).map_err(|err| log_io(&err));
         self.reply_empty(reply, result);
     }
 
@@ -1022,7 +1044,8 @@ impl Filesystem for SandFs {
         let result = self.0.lock().create(parent.0, name, mode, exclusive, truncate);
         self.0.changed();
         match result {
-            Ok((attr, fh)) => reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty()),
+            // No FOPEN_KEEP_CACHE: an existing file emptied here drops its cached pages.
+            Ok(attr) => reply.created(&TTL, &attr, Generation(0), FileHandle(0), FopenFlags::empty()),
             Err(err) => reply.error(err),
         }
     }
@@ -1074,67 +1097,86 @@ mod tests {
         assert_eq!(names(&mut fs, ROOT_INO), ["README.md", "src"]);
     }
 
+    /// Long enough that nothing written in a test has settled.
+    const LATER: Duration = Duration::from_secs(3600);
+
     #[test]
-    fn writes_are_buffered_until_flush() {
+    fn writes_are_committed_once_they_settle() {
         let mut fs = fs();
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
-        let (fh, _) = fs.open(ino, false).unwrap();
         fs.write(ino, 6, b"world\n").unwrap();
-        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\n", "not flushed yet");
+        assert!(fs.writing, "the saver has a buffer to come back for");
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\nworld\n", "reads see the buffer");
         assert_eq!(fs.attr(ino).unwrap().size, 12);
-        fs.release(fh).unwrap();
-        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\nworld\n");
-        assert!(fs.unsaved);
-    }
+        fs.commit_written(LATER);
+        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\n", "still being written");
+        assert!(fs.writing && !fs.unsaved);
 
-    #[test]
-    fn the_kernel_keeps_its_cache_only_for_unchanged_files() {
-        let mut fs = fs();
-        let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
-        let reopen = |fs: &mut Inner| {
-            let (fh, keep) = fs.open(ino, false).unwrap();
-            fs.release(fh).unwrap();
-            keep
-        };
-        assert!(!reopen(&mut fs), "nothing is cached on the first open");
-        assert!(reopen(&mut fs), "same version");
-        let (fh, _) = fs.open(ino, false).unwrap();
-        fs.write(ino, 0, b"HELLO\n").unwrap();
-        fs.release(fh).unwrap();
-        assert!(!reopen(&mut fs), "written since the last open");
-        assert!(reopen(&mut fs));
-        let (fh, keep) = fs.open(ino, true).unwrap();
-        assert!(!keep, "truncated");
-        fs.release(fh).unwrap();
-    }
-
-    #[test]
-    fn syncing_the_directory_commits_open_files() {
-        let mut fs = fs();
-        let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
-        let (fh, _) = fs.open(ino, false).unwrap();
-        fs.write(ino, 6, b"world\n").unwrap();
-        fs.commit_all().unwrap();
+        fs.commit_written(Duration::ZERO);
         assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\nworld\n");
+        assert!(!fs.writing && fs.unsaved);
         fs.write(ino, 12, b"!\n").unwrap();
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\nworld\n!\n", "writes go on after a commit");
-        fs.release(fh).unwrap();
-        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\nworld\n!\n");
+    }
+
+    #[test]
+    fn a_snapshot_leaves_out_files_still_being_written() {
+        let mut fs = fs();
+        let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        fs.write(ino, 0, b"HELLO\n").unwrap();
+        let snapshot = fs.snapshot(LATER);
+        assert_eq!(snapshot.ws.read_text("/mnt/README.md").unwrap(), "hello\n");
+        let snapshot = fs.snapshot(Duration::ZERO);
+        assert_eq!(snapshot.ws.read_text("/mnt/README.md").unwrap(), "HELLO\n", "fsync and unmount take everything");
+    }
+
+    /// A source whose listings work but whose files can't be read.
+    #[derive(Debug)]
+    struct Unreadable(MemorySource);
+
+    impl sandfs_core::Source for Unreadable {
+        fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+            self.0.root()
+        }
+        fn read_dir(&self, key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+            self.0.read_dir(key)
+        }
+        fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+            Err(Error::Source(format!("{key} was read")))
+        }
+    }
+
+    #[test]
+    fn emptying_a_file_does_not_read_it() {
+        let source = Unreadable(MemorySource::from_files([("big.bin", vec![7u8; 1 << 20])]).unwrap());
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(source)).unwrap();
+        let root = VPath::parse("/mnt").unwrap();
+        let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        let ino = fs.lookup(ROOT_INO, name("big.bin")).unwrap().ino.0;
+        // O_TRUNC arrives as a truncate to zero.
+        assert_eq!(fs.setattr(ino, None, Some(0), None).unwrap().size, 0);
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read("/mnt/big.bin").unwrap().len(), 0);
     }
 
     #[test]
     fn create_truncate_and_chmod() {
         let mut fs = fs();
-        let (attr, fh) = fs.create(ROOT_INO, name("run.sh"), 0o755, true, false).unwrap();
+        let attr = fs.create(ROOT_INO, name("run.sh"), 0o755, true, false).unwrap();
         assert_eq!(attr.perm, 0o755);
         fs.write(attr.ino.0, 0, b"#!/bin/sh\n").unwrap();
-        fs.release(fh).unwrap();
         assert_eq!(fs.create(ROOT_INO, name("run.sh"), 0o644, true, false).unwrap_err(), Errno::EEXIST);
 
         let attr = fs.setattr(attr.ino.0, Some(0o644), Some(2), None).unwrap();
         assert_eq!((attr.perm, attr.size), (0o644, 2));
-        assert_eq!(fs.ws.read_text("/mnt/run.sh").unwrap(), "#!", "truncate without an open file commits");
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read_text("/mnt/run.sh").unwrap(), "#!");
+
+        let attr = fs.create(ROOT_INO, name("run.sh"), 0o644, false, true).unwrap();
+        assert_eq!(attr.size, 0, "an existing file opened with O_TRUNC");
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read_text("/mnt/run.sh").unwrap(), "");
     }
 
     #[test]
@@ -1167,18 +1209,35 @@ mod tests {
     }
 
     #[test]
-    fn removed_files_stay_readable_while_open() {
+    fn removed_files_stay_readable_until_forgotten() {
         let mut fs = fs();
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
-        let (fh, _) = fs.open(ino, false).unwrap();
         fs.unlink(ROOT_INO, name("README.md")).unwrap();
         assert_eq!(fs.lookup(ROOT_INO, name("README.md")).unwrap_err(), Errno::ENOENT);
+        // The kernel still holds the inode, so a handle may be open on it.
+        assert_eq!(fs.attr(ino).unwrap().size, 6);
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\n");
         fs.write(ino, 0, b"HELLO\n").unwrap();
         assert_eq!(fs.setattr(ino, None, Some(2), None).unwrap().size, 2, "ftruncate on the open handle");
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"HE");
-        fs.release(fh).unwrap();
+        fs.commit_written(Duration::ZERO);
         assert!(!fs.ws.exists("/mnt/README.md"), "a removed file's writes go nowhere");
+        assert!(!fs.writing, "and keep nothing waiting");
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"HE");
+
+        fs.forget(ino, 1);
+        assert!(!fs.nodes.contains_key(&ino) && !fs.buffers.contains_key(&ino), "closed once forgotten");
+    }
+
+    #[test]
+    fn a_file_replaced_by_rename_stays_readable_until_forgotten() {
+        let mut fs = fs();
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let util = fs.lookup(src, name("util.rs")).unwrap().ino.0;
+        fs.rename(src, name("lib.rs"), src, name("util.rs"), RenameFlags::empty()).unwrap();
+        assert_eq!(&fs.read(util, 0, 100).unwrap()[..], b"", "the old util.rs");
+        fs.forget(util, 1);
+        assert!(!fs.nodes.contains_key(&util));
     }
 
     #[test]
@@ -1261,31 +1320,6 @@ mod tests {
         assert!(!names.is_empty(), "the folder's entries are still listed");
         fs.releasedir(fh);
         assert!(!fs.nodes.contains_key(&src), "dropped once the handle is released");
-    }
-
-    #[test]
-    fn only_unchanged_whole_read_files_keep_their_pages() {
-        let big = vec![7u8; RANGED_READ_SIZE as usize + 1];
-        let source = MemorySource::from_files([("small.txt", b"hi".to_vec()), ("big.bin", big)]).unwrap();
-        let mut ws = Workspace::new();
-        ws.mount("/mnt", Arc::new(source)).unwrap();
-        let root = VPath::parse("/mnt").unwrap();
-        let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
-        fs.ranged_reads = true;
-        let mut reopen = |file: &str| {
-            let ino = fs.lookup(ROOT_INO, name(file)).unwrap().ino.0;
-            let keep: Vec<bool> = (0..2)
-                .map(|_| {
-                    let (fh, keep) = fs.open(ino, false).unwrap();
-                    fs.release(fh).unwrap();
-                    keep
-                })
-                .collect();
-            keep
-        };
-        assert_eq!(reopen("small.txt"), [false, true]);
-        // Ranged reads go back to the host folder on every open.
-        assert_eq!(reopen("big.bin"), [false, false]);
     }
 
     #[test]
