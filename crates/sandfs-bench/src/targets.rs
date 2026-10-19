@@ -486,11 +486,27 @@ fn compare_trees(original: &Path, copy: &Path) -> Result<usize> {
             continue;
         }
         let (a, b) = (original.join(path), copy.join(path));
-        if fs::metadata(&a)?.len() != fs::metadata(&b)?.len() || fs::read(&a)? != fs::read(&b)? {
+        if fs::metadata(&a)?.len() != fs::metadata(&b)?.len() || !same_bytes(&a, &b)? {
             changed += 1;
         }
     }
     Ok(changed)
+}
+
+/// Compare two files of equal size in chunks, so the large file is never held whole.
+fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+    let (mut a, mut b) = (fs::File::open(a)?, fs::File::open(b)?);
+    let (mut left, mut right) = (vec![0; 1 << 16], vec![0; 1 << 16]);
+    loop {
+        let n = a.read(&mut left)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut right[..n])?;
+        if left[..n] != right[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Files an overlay's upper layer adds, modifies or deletes. A whiteout over a lower
