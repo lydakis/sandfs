@@ -45,6 +45,10 @@ type CacheKey = (u64, SourceKey);
 struct Cache {
     dirs: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
     blobs: Mutex<HashMap<CacheKey, Arc<Slot<Bytes>>>>,
+    /// Entries already found, by mount id and path below the mount, so resolving a
+    /// path costs one lookup instead of one listing lookup per component. Only
+    /// entries that exist are kept, so probing for missing names costs no memory.
+    entries: Mutex<HashMap<u64, HashMap<Box<str>, SourceEntry>>>,
 }
 
 impl Cache {
@@ -65,6 +69,14 @@ impl Cache {
         let fetched = fetch()?;
         *value = Some(fetched.clone());
         Ok(fetched)
+    }
+
+    fn entry(&self, mount: u64, rel: &str) -> Option<SourceEntry> {
+        self.entries.lock().expect("cache lock").get(&mount)?.get(rel).cloned()
+    }
+
+    fn remember_entry(&self, mount: u64, rel: &str, entry: SourceEntry) {
+        self.entries.lock().expect("cache lock").entry(mount).or_default().insert(rel.into(), entry);
     }
 
     /// The cached blob for `key`, if it is loaded and not being loaded right now.
@@ -459,10 +471,12 @@ impl Workspace {
 
     fn resolve(&self, path: &VPath) -> Result<Resolved> {
         let mut base_hidden = false;
-        for ancestor in path.ancestors() {
-            match self.overlay.get(&ancestor) {
+        // An untouched workspace has nothing above any path to check.
+        let ancestors = (!self.overlay.is_empty()).then(|| path.ancestor_strs()).into_iter().flatten();
+        for ancestor in ancestors {
+            match self.overlay.get(ancestor) {
                 Some(Overlay::Deleted { .. }) => return Err(Error::NotFound(path.to_string())),
-                Some(Overlay::File { .. }) => return Err(Error::NotADirectory(ancestor.to_string())),
+                Some(Overlay::File { .. }) => return Err(Error::NotADirectory(ancestor.to_owned())),
                 Some(Overlay::Dir { opaque: true }) => base_hidden = true,
                 Some(Overlay::Dir { opaque: false }) | None => {}
             }
@@ -516,23 +530,35 @@ impl Workspace {
             .filter(|(mount_path, _)| path.starts_with(mount_path))
             .max_by_key(|(mount_path, _)| mount_path.depth());
         let Some((mount_path, mount)) = owner else { return Ok(implicit) };
-        let rest = path.strip_prefix(mount_path).unwrap_or_default();
+        match self.source_entry(mount, mount_path, path)? {
+            // A file cannot sit where another mount needs a directory.
+            Some(entry) if implicit.is_none() || entry.kind.is_dir() => Ok(Some(BaseNode::Entry(mount.clone(), entry))),
+            _ => Ok(implicit),
+        }
+    }
+
+    /// The source entry at `path`, which lies below `mount_path`: from the cache of
+    /// paths already found, or by walking listings from the mount's root.
+    fn source_entry(&self, mount: &Arc<Mount>, mount_path: &VPath, path: &VPath) -> Result<Option<SourceEntry>> {
+        let rel = &path.as_str()[mount_path.as_str().len() + 1..];
+        if let Some(entry) = self.cache.entry(mount.id, rel) {
+            return Ok(Some(entry));
+        }
+        let mut parts = rel.split('/').peekable();
         let mut key = mount.root.clone();
-        for (idx, part) in rest.iter().enumerate() {
+        while let Some(part) = parts.next() {
             let listing = self.cached_listing(mount, &key)?;
-            let Some(entry) = listing.get(*part) else { return Ok(implicit) };
-            if idx + 1 == rest.len() {
-                if implicit.is_some() && !entry.kind.is_dir() {
-                    return Ok(implicit);
-                }
-                return Ok(Some(BaseNode::Entry(mount.clone(), entry.clone())));
+            let Some(entry) = listing.get(part) else { return Ok(None) };
+            if parts.peek().is_none() {
+                self.cache.remember_entry(mount.id, rel, entry.clone());
+                return Ok(Some(entry.clone()));
             }
             if !entry.kind.is_dir() {
-                return Ok(implicit);
+                return Ok(None);
             }
             key = entry.key.clone();
         }
-        Ok(implicit)
+        Ok(None)
     }
 
     fn base_listing(&self, node: &BaseNode) -> Result<Arc<Listing>> {
@@ -633,6 +659,10 @@ impl Workspace {
     }
 
     fn ensure_dir(&mut self, path: &VPath) -> Result<()> {
+        // A directory that resolves has every ancestor already, which is the usual case.
+        if let Ok(Resolved::Dir { .. }) = self.resolve(path) {
+            return Ok(());
+        }
         let mut chain = path.ancestors();
         chain.push(path.clone());
         for dir in chain {
@@ -710,9 +740,7 @@ impl Workspace {
     }
 
     fn base_hidden(&self, path: &VPath) -> bool {
-        path.ancestors()
-            .iter()
-            .any(|ancestor| matches!(self.overlay.get(ancestor), Some(Overlay::Dir { opaque: true })))
+        path.ancestor_strs().any(|ancestor| matches!(self.overlay.get(ancestor), Some(Overlay::Dir { opaque: true })))
     }
 }
 

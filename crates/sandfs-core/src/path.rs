@@ -1,5 +1,6 @@
 //! Normalized absolute paths inside a workspace.
 
+use std::borrow::Borrow;
 use std::fmt;
 
 use crate::error::{Error, Result};
@@ -22,6 +23,11 @@ impl VPath {
     pub fn parse(raw: &str) -> Result<Self> {
         if !raw.starts_with('/') {
             return Err(Error::InvalidPath(raw.to_owned()));
+        }
+        // Most paths arrive already normalized; keep them as they are.
+        let normal = |part: &str| !part.is_empty() && part != "." && part != ".." && !part.contains('\0');
+        if raw == "/" || raw.split('/').skip(1).all(normal) {
+            return Ok(VPath(raw.to_owned()));
         }
         let mut parts: Vec<&str> = Vec::new();
         for part in raw.split('/') {
@@ -112,6 +118,15 @@ impl VPath {
         out
     }
 
+    /// Every proper ancestor from the root down, as slices of this path, so walking
+    /// them allocates nothing.
+    pub(crate) fn ancestor_strs(&self) -> impl Iterator<Item = &str> {
+        let path = self.0.as_str();
+        let root = (!self.is_root()).then_some("/");
+        // Each '/' after the leading one ends an ancestor.
+        root.into_iter().chain(path.match_indices('/').skip(1).map(move |(idx, _)| &path[..idx]))
+    }
+
     /// The smallest string that sorts after every descendant of `self`, for range scans.
     pub(crate) fn descendants_end(&self) -> VPath {
         if self.is_root() {
@@ -125,6 +140,14 @@ impl VPath {
     /// The smallest string that sorts before every descendant of `self`.
     pub(crate) fn descendants_start(&self) -> VPath {
         VPath(if self.is_root() { "/".to_owned() } else { format!("{}/", self.0) })
+    }
+}
+
+/// Lets maps keyed by paths be searched with a `&str`, without building a `VPath`.
+/// Paths compare and hash exactly like their strings.
+impl Borrow<str> for VPath {
+    fn borrow(&self) -> &str {
+        &self.0
     }
 }
 
@@ -150,6 +173,10 @@ mod tests {
         assert_eq!(VPath::parse("/").unwrap().as_str(), "/");
         assert!(VPath::parse("/..").is_err());
         assert!(VPath::parse("relative").is_err());
+        assert_eq!(VPath::parse("/a/b").unwrap().as_str(), "/a/b");
+        assert_eq!(VPath::parse("/a/").unwrap().as_str(), "/a");
+        assert_eq!(VPath::parse("/a/.").unwrap().as_str(), "/a");
+        assert!(VPath::parse("/a\0b").is_err());
     }
 
     #[test]
@@ -161,5 +188,8 @@ mod tests {
         assert!(!path.starts_with(&VPath::parse("/rep").unwrap()));
         assert_eq!(path.strip_prefix(&VPath::parse("/repo").unwrap()).unwrap(), ["src", "lib.rs"]);
         assert_eq!(path.ancestors().iter().map(VPath::as_str).collect::<Vec<_>>(), ["/", "/repo", "/repo/src"]);
+        assert_eq!(path.ancestor_strs().collect::<Vec<_>>(), ["/", "/repo", "/repo/src"]);
+        assert_eq!(VPath::parse("/repo").unwrap().ancestor_strs().collect::<Vec<_>>(), ["/"]);
+        assert_eq!(VPath::root().ancestor_strs().count(), 0);
     }
 }

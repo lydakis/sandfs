@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -193,16 +193,37 @@ impl DirSource {
         if key.is_empty() { self.root.clone() } else { self.root.join(key) }
     }
 
-    /// The host path of a regular file inside `root`.
-    fn file_path(&self, key: &str) -> Result<PathBuf> {
+    /// Open the regular file at `key` inside `root`.
+    fn open_file(&self, key: &str) -> Result<std::fs::File> {
+        // Keys from listings are plain relative names; an absolute key or `..` would
+        // name a file outside the folder that the check below would accept as-is.
+        if !Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
+            return Err(Error::Source(format!("{key} is outside the mounted directory")));
+        }
         let path = self.host_path(key);
-        // A symlink in the final component is refused below, so only the parent needs
-        // checking.
-        self.check_inside(path.parent().unwrap_or(&self.root))?;
+        // Checked before opening, so a special file (a fifo) is never opened.
         if !path.symlink_metadata().map_err(io_error)?.is_file() {
             return Err(Error::Source(format!("{} is not a regular file", path.display())));
         }
-        Ok(path)
+        let file = std::fs::File::open(&path).map_err(io_error)?;
+        // On Linux the kernel names the file that was actually opened. It must be this
+        // very path: a symlink anywhere on the way would resolve to another one. That
+        // is one call, where resolving the parent costs one per component.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            if let Ok(opened) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+                return if opened == path {
+                    Ok(file)
+                } else {
+                    Err(Error::Source(format!("{} is outside the mounted directory", path.display())))
+                };
+            }
+        }
+        // Elsewhere, or without /proc, the parent is resolved instead; a symlink in
+        // the final component was refused above.
+        self.check_inside(path.parent().unwrap_or(&self.root))?;
+        Ok(file)
     }
 }
 
@@ -221,30 +242,36 @@ impl Source for DirSource {
             let Ok(name) = entry.file_name().into_string() else {
                 continue; // non-UTF-8 names cannot be addressed by a workspace path
             };
-            let meta = entry.path().symlink_metadata().map_err(io_error)?;
-            let kind = if meta.is_dir() {
-                Kind::Dir
-            } else if meta.is_file() {
-                Kind::File { executable: is_executable(&meta) }
+            // The entry's type usually comes with the listing, so only files, which
+            // need a size and a mode, cost a stat (relative to the open directory).
+            let file_type = entry.file_type().map_err(io_error)?;
+            let (kind, size) = if file_type.is_dir() {
+                (Kind::Dir, None)
+            } else if file_type.is_file() {
+                let meta = entry.metadata().map_err(io_error)?;
+                (Kind::File { executable: is_executable(&meta) }, Some(meta.len()))
             } else {
                 continue; // symlinks and special files are not part of a workspace
             };
             let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
-            let size = matches!(kind, Kind::File { .. }).then(|| meta.len());
             listing.insert(name, SourceEntry { kind, key: child_key.as_str().into(), size });
         }
         Ok(listing)
     }
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
-        let path = self.file_path(key)?;
-        std::fs::read(path).map(Bytes::from).map_err(io_error)
+        let mut file = self.open_file(key)?;
+        let size = file.metadata().map_err(io_error)?.len();
+        let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        file.read_to_end(&mut data).map_err(io_error)?;
+        Ok(Bytes::from(data))
     }
 
     fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
-        let mut file = std::fs::File::open(self.file_path(key)?).map_err(io_error)?;
+        let mut file = self.open_file(key)?;
+        let available = file.metadata().map_err(io_error)?.len().saturating_sub(offset);
         file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(usize::try_from(len.min(available)).unwrap_or(0));
         file.take(len).read_to_end(&mut data).map_err(io_error)?;
         Ok(Bytes::from(data))
     }

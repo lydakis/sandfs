@@ -250,6 +250,40 @@ fn nested_mounts_resolve_to_the_deepest_one() {
 }
 
 #[test]
+fn each_mount_resolves_its_own_entries() {
+    // Same relative paths under two mounts, with different contents and kinds.
+    let mut ws = Workspace::new();
+    ws.mount("/one", Arc::new(MemorySource::from_files([("data/same.csv", "1"), ("x/y", "file")]).unwrap())).unwrap();
+    ws.mount("/two", Arc::new(MemorySource::from_files([("data/same.csv", "22"), ("x/y/z", "dir")]).unwrap())).unwrap();
+    for _ in 0..2 {
+        assert_eq!(ws.stat("/one/data/same.csv").unwrap().size, 1);
+        assert_eq!(ws.stat("/two/data/same.csv").unwrap().size, 2);
+        assert_eq!(ws.stat("/one/x/y").unwrap().kind, Kind::File { executable: false });
+        assert_eq!(ws.stat("/two/x/y").unwrap().kind, Kind::Dir);
+        assert!(matches!(ws.stat("/one/x/y/z"), Err(Error::NotADirectory(_) | Error::NotFound(_))));
+    }
+    let fork = ws.fork();
+    assert_eq!(fork.read_text("/two/data/same.csv").unwrap(), "22");
+    assert_eq!(fork.read_text("/two/x/y/z").unwrap(), "dir");
+}
+
+#[test]
+fn a_deep_path_lists_each_directory_once() {
+    let deep: String = (0..40).map(|level| format!("level{level}/")).collect();
+    let source = Counting::new(MemorySource::from_files([(format!("{deep}leaf.bin"), "leaf")]).unwrap());
+    let mut ws = Workspace::new();
+    ws.mount("/deep", source.clone()).unwrap();
+    let leaf = format!("/deep/{deep}leaf.bin");
+    for _ in 0..3 {
+        assert_eq!(ws.stat(&leaf).unwrap().size, 4);
+    }
+    assert_eq!(source.reads(), (41, 0));
+    ws.write(&format!("/deep/{deep}new.bin"), "new").unwrap();
+    assert_eq!(ws.read_text(&leaf).unwrap(), "leaf");
+    assert_eq!(source.reads(), (41, 1));
+}
+
+#[test]
 fn copies_and_renames_of_base_files_stay_lazy() {
     let (mut ws, source) = workspace();
     ws.copy("/repo/src", "/repo/src2", true).unwrap();
@@ -394,6 +428,23 @@ fn dir_source_refuses_reads_through_a_swapped_in_symlink() {
     std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
 
     assert!(ws.read("/host/sub/file").is_err());
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn dir_source_never_reads_keys_that_leave_its_folder() {
+    let base = std::env::temp_dir().join(format!("sandfs-keys-{}", std::process::id()));
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("file"), "SECRET").unwrap();
+
+    let source = DirSource::new(&root).unwrap();
+    let absolute = outside.join("file").canonicalize().unwrap();
+    for key in [absolute.to_str().unwrap(), "../outside/file"] {
+        assert!(source.read_file(key).is_err(), "{key} was read");
+        assert!(source.read_range(key, 0, 3).is_err(), "{key} was read in a range");
+    }
     std::fs::remove_dir_all(&base).unwrap();
 }
 
