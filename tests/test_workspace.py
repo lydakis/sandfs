@@ -290,8 +290,8 @@ def test_a_walk_that_reads_asks_a_python_source_to_prefetch() -> None:
             if path == "/":
                 return [DirEntry("photos", kind="dir")]
             if path == "/photos":
-                return [DirEntry("2024", kind="dir"), DirEntry("cover.jpg")]
-            return [DirEntry("a.jpg"), DirEntry("b.jpg")]
+                return [DirEntry("2024", kind="dir"), DirEntry("2025", kind="dir")]
+            return [DirEntry("a.jpg"), DirEntry("b.jpg"), DirEntry("c.jpg")]
 
         def read(self, path: str) -> bytes:
             return path.encode()
@@ -309,16 +309,25 @@ def test_a_walk_that_reads_asks_a_python_source_to_prefetch() -> None:
     ws.list("/bucket/photos")
     ws.list("/bucket/photos/2024")
     assert bucket.prefetches == []
-    # Reading what the walk listed does, once per folder.
+    # Reading two files of a folder the walk listed prefetches that folder.
     ws.read("/bucket/photos/2024/b.jpg")
-    ws.read("/bucket/photos/cover.jpg")
-    assert bucket.prefetches == [("/photos", True), ("/photos/2024", True)]
+    ws.read("/bucket/photos/2024/c.jpg")
+    assert bucket.prefetches == [("/photos/2024", False)]
+    # Two files of a second folder prefetch everything below the folder holding both.
+    ws.list("/bucket/photos/2025")
+    ws.read("/bucket/photos/2025/a.jpg")
+    ws.read("/bucket/photos/2025/b.jpg")
+    assert bucket.prefetches == [("/photos/2024", False), ("/photos", True)]
 
 
 def test_a_failing_prefetch_does_not_fail_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
     class Flaky:
         def list(self, path: str) -> Iterable[DirEntry]:
-            return [DirEntry("d", kind="dir")] if path == "/" else [DirEntry("f.txt")]
+            return (
+                [DirEntry("d", kind="dir")]
+                if path == "/"
+                else [DirEntry("f.txt"), DirEntry("g.txt")]
+            )
 
         def read(self, path: str) -> bytes:
             return b"ok"
@@ -333,5 +342,6 @@ def test_a_failing_prefetch_does_not_fail_the_read(monkeypatch: pytest.MonkeyPat
     ws.list("/s")
     ws.list("/s/d")
     assert ws.read("/s/d/f.txt") == b"ok"
-    # Both hints, for where the walk started and for the folder it read in, failed.
-    assert [str(err) for err in reported] == ["store unavailable"] * 2
+    # The second file read asks to prefetch the folder, which fails.
+    assert ws.read("/s/d/g.txt") == b"ok"
+    assert [str(err) for err in reported] == ["store unavailable"]

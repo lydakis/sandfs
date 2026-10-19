@@ -81,12 +81,13 @@ pub trait Source: Send + Sync + fmt::Debug {
     /// directories. A source where each request is a slow trip (a server, an object
     /// store) can fetch them in one trip instead of one per file.
     ///
-    /// The workspace calls it with `recursive` when a walk (a directory listed inside one
-    /// already listed) reads a file or asks for its size: for where the walk started
-    /// and for the directory it reads in, each once. It calls it without `recursive`
-    /// when a second file in a directory needs a size the listing left out, then lists
-    /// the directory once more, so a source can report the sizes it now has. A lookup,
-    /// a single read and a walk that only lists never call it.
+    /// The workspace calls it without `recursive` once a second file in a directory is
+    /// needed: a second size the listing left out (it then lists the directory once
+    /// more, so a source can report the sizes it now has), or a second file read by a
+    /// walk (a directory listed inside one already listed). Once a walk has needed two
+    /// files in each of two directories, it calls it with `recursive` for the directory
+    /// holding both. Each directory is asked once. A lookup, a single read and a walk
+    /// that only lists never call it.
     ///
     /// A prefetch must not change any answer the source gives, only how quickly it
     /// arrives, except that a listing may now include sizes. A source may ignore it, and

@@ -6,6 +6,7 @@
 //! exactly the change set. Base content is read through a cache shared by every fork,
 //! so a file fetched once is never fetched again.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,13 +52,17 @@ struct Cache {
     entries: Mutex<HashMap<u64, HashMap<Box<str>, SourceEntry>>>,
     /// Directories listed through [`Workspace::list`].
     listed: Mutex<HashSet<CacheKey>>,
-    /// Directories a walk listed (listed inside a listed directory), each with the key
-    /// of the directory the walk started from.
-    walks: Mutex<HashMap<CacheKey, SourceKey>>,
-    /// Directories already prefetched with `recursive`, so each is asked for once.
-    prefetched: Mutex<HashSet<CacheKey>>,
-    /// Directories where a file's size was missing once already.
-    size_misses: Mutex<HashSet<CacheKey>>,
+    /// Directories a walk listed (listed inside a listed directory), and the one it
+    /// started from, each with the path the walk started at.
+    walks: Mutex<HashMap<CacheKey, VPath>>,
+    /// For each walk, by mount id and start path, the directory below which it reads:
+    /// the first directory it read two files in, then the common parent of those.
+    hot: Mutex<HashMap<(u64, VPath), VPath>>,
+    /// Directories already prefetched, and whether recursively, so each is asked once.
+    prefetched: Mutex<HashSet<(CacheKey, bool)>>,
+    /// Base files each directory needed fetched: sizes missing from its listing, and
+    /// files a walk read.
+    touches: Mutex<HashMap<CacheKey, u32>>,
     /// Directories listed again for their files' sizes, at most once each.
     sized: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
 }
@@ -607,26 +612,29 @@ impl Workspace {
     /// Record that `path`, whose base node is `node`, is being listed. Listing a
     /// directory inside one already listed is a walk (`find`, `grep -r`, a copy).
     /// Nothing is prefetched yet: a walk that only lists (`find`, `ls -R`) needs no
-    /// file, so the source is asked only once the walk reads one.
+    /// file, so the source is asked only once the walk reads files.
     fn note_listed(&self, path: &VPath, node: &BaseNode) -> Result<()> {
         let Some((mount, key)) = dir_key(node) else { return Ok(()) };
-        let parent = match path.parent() {
-            Some(parent) => self.base_dir(&parent, &mount)?,
-            None => None,
+        let Some(parent) = path.parent() else {
+            self.cache.listed.lock().expect("cache lock").insert((mount.id, key));
+            return Ok(());
         };
+        let parent_key = self.base_dir(&parent, &mount)?;
         let mut listed = self.cache.listed.lock().expect("cache lock");
         listed.insert((mount.id, key.clone()));
-        let Some(parent) = parent.filter(|parent| listed.contains(&(mount.id, parent.clone()))) else { return Ok(()) };
+        let Some(parent_key) = parent_key.filter(|parent| listed.contains(&(mount.id, parent.clone()))) else {
+            return Ok(());
+        };
         drop(listed);
         let mut walks = self.cache.walks.lock().expect("cache lock");
-        let start = walks.get(&(mount.id, parent.clone())).cloned().unwrap_or(parent);
+        let start = walks.entry((mount.id, parent_key)).or_insert(parent).clone();
         walks.insert((mount.id, key), start);
         Ok(())
     }
 
-    /// Before a base file's bytes are fetched: if a walk listed its directory, the walk
-    /// is reading the files it lists (`grep -r`, a copy), so the source prefetches. A
-    /// read outside a walk prefetches nothing.
+    /// Before a base file's bytes are fetched: a walk reading the files it lists
+    /// (`grep -r`, a copy) has the source prefetch, once it has read two files in one
+    /// directory. A read outside a walk prefetches nothing.
     fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<()> {
         // With no walk at all, a read costs nothing more.
         if self.cache.walks.lock().expect("cache lock").is_empty()
@@ -634,25 +642,73 @@ impl Workspace {
         {
             return Ok(());
         }
-        if let Some(dir) = path.parent().map(|parent| self.base_dir(&parent, mount)).transpose()?.flatten() {
-            self.walk_prefetch(mount, &dir);
+        let Some(parent) = path.parent() else { return Ok(()) };
+        let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(()) };
+        if self.touch(&parent, mount, &dir, true)? == Touch::Warmed {
+            self.prefetch_dir(&parent, mount, &dir)?;
         }
         Ok(())
     }
 
-    /// If a walk listed the directory `dir`, ask the source to prefetch everything
-    /// below where the walk started and below `dir`, each once, and return true.
-    fn walk_prefetch(&self, mount: &Arc<Mount>, dir: &SourceKey) -> bool {
-        let Some(start) = self.cache.walks.lock().expect("cache lock").get(&(mount.id, dir.clone())).cloned() else {
-            return false;
+    /// Count a base file of the directory `dir` at `path` that needs fetching. One file
+    /// says nothing about the rest; the second shows the directory is being gone
+    /// through. Reads count only inside a walk. When a walk has gone through two
+    /// directories, everything below the directory holding both is prefetched once: two
+    /// is a pattern (`grep -r`), where one directory read is still just a look around.
+    fn touch(&self, path: &VPath, mount: &Arc<Mount>, dir: &SourceKey, read: bool) -> Result<Touch> {
+        let cache_key = (mount.id, dir.clone());
+        let start = self.cache.walks.lock().expect("cache lock").get(&cache_key).cloned();
+        if read && start.is_none() {
+            return Ok(Touch::Cold);
+        }
+        let count = {
+            let mut touches = self.cache.touches.lock().expect("cache lock");
+            let count = touches.entry(cache_key).or_default();
+            *count = count.saturating_add(1);
+            *count
         };
-        for key in [start, dir.clone()] {
-            let first = self.cache.prefetched.lock().expect("cache lock").insert((mount.id, key.clone()));
-            if first {
+        match count {
+            0 | 1 => return Ok(Touch::Cold),
+            2 => {}
+            _ => return Ok(Touch::Warm),
+        }
+        let Some(start) = start else { return Ok(Touch::Warmed) };
+        let below = {
+            let mut hot = self.cache.hot.lock().expect("cache lock");
+            match hot.entry((mount.id, start)) {
+                Entry::Occupied(mut hot) => {
+                    let below = common_ancestor(hot.get(), path);
+                    hot.insert(below.clone());
+                    Some(below)
+                }
+                Entry::Vacant(hot) => {
+                    hot.insert(path.clone());
+                    None
+                }
+            }
+        };
+        let Some(below) = below else { return Ok(Touch::Warmed) };
+        if let Some(key) = self.base_dir(&below, mount)? {
+            if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, key.clone()), true)) {
                 mount.source.prefetch(&key, true);
             }
         }
-        true
+        Ok(Touch::Warmed)
+    }
+
+    /// Ask the source to prefetch the files of the directory `dir` at `path`, once,
+    /// unless everything below one of its parents was prefetched already.
+    fn prefetch_dir(&self, path: &VPath, mount: &Arc<Mount>, dir: &SourceKey) -> Result<()> {
+        for ancestor in path.ancestors().iter().chain([path]) {
+            let Some(key) = self.base_dir(ancestor, mount)? else { continue };
+            if self.cache.prefetched.lock().expect("cache lock").contains(&((mount.id, key), true)) {
+                return Ok(());
+            }
+        }
+        if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, dir.clone()), false)) {
+            mount.source.prefetch(dir, false);
+        }
+        Ok(())
     }
 
     /// The size of a base file already read.
@@ -663,23 +719,20 @@ impl Workspace {
 
     /// The size of the base file at `path` when its directory's listing left it out.
     /// The first such file in a directory is read to find it, since one file says
-    /// nothing about the rest. From the second on (`ls -l`), or inside a walk, the
-    /// source is asked to prefetch the directory and it is listed again, once, for
-    /// every size at once. `None` when the size must come from reading the file.
+    /// nothing about the rest. From the second on (`ls -l`), the source is asked to
+    /// prefetch the directory and it is listed again, once, for every size at once.
+    /// `None` when the size must come from reading the file.
     fn listed_size(&self, path: &VPath, content: &Content) -> Result<Option<u64>> {
         let Content::Base { mount, key, .. } = content else { return Ok(None) };
         let (Some(parent), Some(name)) = (path.parent(), path.name()) else { return Ok(None) };
         let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(None) };
-        let walked = self.walk_prefetch(mount, &dir);
-        let cache_key = (mount.id, dir.clone());
-        if !walked && self.cache.size_misses.lock().expect("cache lock").insert(cache_key.clone()) {
+        if self.touch(&parent, mount, &dir, false)? == Touch::Cold {
             return Ok(None);
         }
         // Single-flight, like every other cache entry: forks asking at once prefetch once.
+        let cache_key = (mount.id, dir.clone());
         let listing = Cache::get_or_load(&self.cache.sized, cache_key.clone(), || {
-            if !walked {
-                mount.source.prefetch(&dir, false);
-            }
+            self.prefetch_dir(&parent, mount, &dir)?;
             let listing = Arc::new(mount.source.read_dir(&dir)?);
             self.cache.replace_listing(cache_key.clone(), listing.clone());
             Ok(listing)
@@ -876,6 +929,29 @@ impl Workspace {
 
 fn source_is_dir(resolved: &Resolved) -> bool {
     matches!(resolved, Resolved::Dir { .. })
+}
+
+/// What counting one more file needing a fetch in a directory found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Touch {
+    /// The first: nothing to prefetch yet.
+    Cold,
+    /// The second, just now: the directory is being gone through.
+    Warmed,
+    /// Past the second.
+    Warm,
+}
+
+/// The deepest directory both `a` and `b` are in (or are).
+fn common_ancestor(a: &VPath, b: &VPath) -> VPath {
+    let mut common = VPath::root();
+    for path in a.ancestors().into_iter().chain([a.clone()]) {
+        if !b.starts_with(&path) {
+            break;
+        }
+        common = path;
+    }
+    common
 }
 
 /// The mount and source key of a base directory, if it has one.

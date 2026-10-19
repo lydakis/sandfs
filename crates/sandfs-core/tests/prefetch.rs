@@ -1,6 +1,7 @@
-//! When the workspace asks a source to prefetch: a walk that reads, and sizes missing
-//! for more than one file in a folder. Never a single lookup or read, and never a
-//! walk that only lists.
+//! When the workspace asks a source to prefetch: a folder once two of its files are
+//! needed (sizes missing from its listing, or reads in a walk), and everything below a
+//! folder once a walk has read through two folders in it. Never a single lookup or
+//! read, and never a walk that only lists.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,10 +106,6 @@ fn walk(ws: &Workspace, dir: &str, read: bool) -> Vec<String> {
     found
 }
 
-fn walked(dirs: &[&str]) -> Vec<(String, bool)> {
-    dirs.iter().map(|dir| ((*dir).to_owned(), true)).collect()
-}
-
 #[test]
 fn lookups_and_reads_never_prefetch() {
     let source = Arc::new(Remote::new(TREE));
@@ -133,28 +130,48 @@ fn a_walk_that_only_lists_prefetches_nothing() {
 }
 
 #[test]
-fn a_walk_that_reads_prefetches_each_folder_once() {
-    let source = Arc::new(Remote::new(TREE));
+fn a_walk_prefetches_a_folder_it_reads_two_files_in_and_below_two_such_folders() {
+    let source = Arc::new(Remote::new(&[
+        "w/1.txt",
+        "w/2.txt",
+        "w/b/1.txt",
+        "w/b/2.txt",
+        "w/b/c/1.txt",
+        "w/d/1.txt",
+        "w/d/2.txt",
+        "w/e/1.txt",
+    ]));
     let ws = mounted(&source);
-    assert_eq!(walk(&ws, "/data/a", true).len(), 4);
-    // `a/one.txt` is read before the walk shows itself; from `a/b` on, the walk's start
-    // and each folder it reads in are prefetched.
-    assert_eq!(source.prefetches(), walked(&["a", "a/b", "a/b/c", "a/d"]));
-    // Walking again, or from a fork, asks only for what wasn't asked for yet.
-    walk(&ws, "/data/a", true);
+    assert_eq!(walk(&ws, "/data/w", true).len(), 8);
+    // `w`'s own files are read before the walk shows itself. `w/b` is the first folder
+    // the walk reads two files in, so its files are prefetched; `w/d` is the second, so
+    // everything below `w`, which holds both, is prefetched, and `w/d` needs no more.
+    assert_eq!(source.prefetches(), vec![("w".to_owned(), true), ("w/b".to_owned(), false)]);
+    // Walking again, or from a fork, finds every file read already.
+    walk(&ws, "/data/w", true);
     walk(&ws.fork(), "/data", true);
-    assert_eq!(source.prefetches(), walked(&["", "a", "a/b", "a/b/c", "a/d", "e", "s"]));
+    assert_eq!(source.prefetches().len(), 2);
 }
 
 #[test]
-fn sizes_inside_a_walk_come_from_the_prefetch() {
+fn looking_around_prefetches_no_more_than_a_folder() {
     let source = Arc::new(Remote::new(TREE));
     let ws = mounted(&source);
+    // `ls`, `ls a`, `cat a/one.txt`, a lookup and a size further down: one file of each
+    // folder, which says nothing about the rest.
+    ws.list("/data").unwrap();
     ws.list("/data/a").unwrap();
-    ws.list("/data/a/b").unwrap();
-    assert_eq!(ws.stat("/data/a/b/two.txt").unwrap().size, "a/b/two.txt!".len() as u64);
-    assert_eq!(source.prefetches(), walked(&["a", "a/b"]));
-    assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+    ws.read("/data/a/one.txt").unwrap();
+    assert!(ws.exists("/data/a/b/c/three.txt"));
+    assert_eq!(ws.stat("/data/a/d/four.txt").unwrap().size, "a/d/four.txt!".len() as u64);
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
+    // Two sizes in one folder prefetch that folder, and nothing below where the walk
+    // started.
+    ws.list("/data/s").unwrap();
+    ws.stat("/data/s/x.txt").unwrap();
+    ws.stat("/data/s/y.txt").unwrap();
+    assert_eq!(source.prefetches(), vec![("s".to_owned(), false)]);
+    assert_eq!(source.reads.load(Ordering::SeqCst), 3);
 }
 
 #[test]

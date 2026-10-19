@@ -12,6 +12,7 @@
 //! the same [`Inner`], which has no opens or closes either; fuser lends it the types
 //! but never mounts there.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +109,9 @@ struct Node {
     lookups: u64,
     /// False once the path was removed or replaced while the kernel still held the inode.
     linked: bool,
+    /// Whether real attributes were worked out for this inode. Once they were, the
+    /// kernel may hold its real size, and working them out again costs nothing.
+    sized: Cell<bool>,
     /// For a removed file, the workspace as it was before: the kernel may still have
     /// it open, and an open file stays readable until the kernel forgets the inode.
     removed_from: Option<Workspace>,
@@ -204,7 +208,10 @@ impl Inner {
             skip_bookkeeping: false,
         };
         inner.inos.insert(root.to_string(), ROOT_INO);
-        inner.nodes.insert(ROOT_INO, Node { path: root.clone(), lookups: 0, linked: true, removed_from: None });
+        inner.nodes.insert(
+            ROOT_INO,
+            Node { path: root.clone(), lookups: 0, linked: true, sized: Cell::new(false), removed_from: None },
+        );
         inner
     }
 
@@ -280,7 +287,10 @@ impl Inner {
         let ino = self.next_ino;
         self.next_ino += 1;
         self.inos.insert(path.to_string(), ino);
-        self.nodes.insert(ino, Node { path: path.clone(), lookups: 0, linked: true, removed_from: None });
+        self.nodes.insert(
+            ino,
+            Node { path: path.clone(), lookups: 0, linked: true, sized: Cell::new(false), removed_from: None },
+        );
         ino
     }
 
@@ -296,6 +306,7 @@ impl Inner {
 
     pub fn attr(&self, ino: u64) -> FsResult<FileAttr> {
         let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
+        node.sized.set(true);
         if !node.linked {
             // A removed file the kernel may still have open.
             let size = match (self.buffers.get(&ino), &node.removed_from) {
@@ -763,9 +774,12 @@ impl Inner {
     /// every entry it accepts as a lookup, except `.` and `..`, so those entries count
     /// here too.
     ///
-    /// A file the listing has no size for gets size 0 and no time to keep it, so the
-    /// kernel asks for its attributes when something needs them (`ls -l`, a read) and
-    /// a walk that needs only names (`find`) reads no file to find sizes.
+    /// A file the listing has no size for, and whose real attributes were never worked
+    /// out, gets size 0 and no time to keep it, so the kernel asks for its attributes
+    /// when something needs them (`ls -l`, a read) and a walk that needs only names
+    /// (`find`) reads no file to find sizes. One whose attributes were worked out gets
+    /// them again: the kernel may hold its real size, and size 0 would shrink the file
+    /// under anything reading it, such as a program mapping it into memory.
     #[cfg(any(fuse, test))]
     pub fn readdirplus(
         &mut self,
@@ -794,7 +808,8 @@ impl Inner {
                 };
                 self.ino_for(&path)
             };
-            let attr = match executable.filter(|_| !self.buffers.contains_key(&ino)) {
+            let sized = self.nodes.get(&ino).is_some_and(|node| node.sized.get());
+            let attr = match executable.filter(|_| !sized && !self.buffers.contains_key(&ino)) {
                 Some(executable) => self.sizeless_attr(ino, executable).map(|attr| (attr, Duration::ZERO)),
                 None => self.attr(ino).map(|attr| (attr, TTL)),
             };
@@ -1471,6 +1486,18 @@ mod tests {
         assert_eq!(source.1.load(Ordering::SeqCst), 0, "listing read no file");
         // The kernel asks again, and gets the real size.
         assert_eq!(fs.attr(readme.1).unwrap().size, 6);
+        // Listing again must not shrink the file the kernel now knows to size 0 (a
+        // program mapping it would crash), and finding its size again reads nothing.
+        let fh = fs.opendir(ROOT_INO).unwrap();
+        let mut again = Vec::new();
+        fs.readdirplus(fh, 2, |_, _, name, attr, ttl| {
+            again.push((name.to_owned(), attr.size, ttl));
+            false
+        })
+        .unwrap();
+        fs.releasedir(fh);
+        assert!(again.contains(&("README.md".to_owned(), 6, TTL)), "{again:?}");
+        assert_eq!(source.1.load(Ordering::SeqCst), 1, "only the first size read the file");
     }
 
     #[test]

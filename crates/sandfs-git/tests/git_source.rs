@@ -171,7 +171,14 @@ fn a_walk_fetches_only_once_it_reads() {
     assert_eq!(walk(&ws, "/repo", false), 4);
     assert_eq!(missing(clone.path()), before, "a walk that only lists fetches nothing");
 
-    // `grep -r`: once the walk reads below its start, the whole tree comes in one request.
-    walk(&ws, "/repo", true);
-    assert_eq!(missing(clone.path()), 0);
+    // Reading what the walk listed: the first file of a folder comes alone, the second
+    // brings the rest of the folder in one request, the symlink's blob too.
+    let root_blobs = if cfg!(unix) { 3 } else { 2 };
+    ws.read("/repo/README.md").unwrap();
+    assert_eq!(missing(clone.path()), before - 1);
+    ws.read("/repo/run.sh").unwrap();
+    assert_eq!(missing(clone.path()), before - root_blobs);
+    // One file in each of the other folders is no reason to fetch more.
+    ws.read("/repo/src/lib.rs").unwrap();
+    assert_eq!(missing(clone.path()), before - root_blobs - 1);
 }
