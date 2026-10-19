@@ -184,7 +184,8 @@ fn run(cli: Cli) -> Result<()> {
             if home.exists(&workspace) && name.is_none() {
                 return mcp::serve(&home, &workspace);
             }
-            let name = default_name(name, Path::new(&workspace))?;
+            let named = workspace.strip_prefix("git:").map_or(workspace.as_str(), git::source_name);
+            let name = default_name(name, Path::new(named))?;
             let record = home.resolve(&workspace)?;
             home.create(&name, &record)?;
             mcp::serve(&home, &name)

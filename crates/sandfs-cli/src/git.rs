@@ -188,6 +188,14 @@ fn split_rev(spec: &str) -> (&str, Option<String>) {
     if at == 0 || rev.contains(':') || user_of_url { (spec, None) } else { (location, Some(rev.to_owned())) }
 }
 
+/// What a git source is called: its last path part without `@rev` or `.git`, so
+/// `https://host/team/data.git@v1` is `data`.
+pub fn source_name(spec: &str) -> &str {
+    let location = split_rev(spec).0.trim_end_matches(['/', '\\']);
+    let last = location.rsplit(['/', '\\', ':']).next().unwrap_or(location);
+    last.strip_suffix(".git").unwrap_or(last)
+}
+
 /// A URL, or scp-style `[user@]host:path`, as git reads it: a ':' before any '/'.
 fn is_url(location: &str) -> bool {
     location.contains("://")
@@ -385,6 +393,10 @@ mod tests {
         assert!(is_url("https://github.com/o/r") && is_url("git@github.com:o/r") && is_url("github.com:o/r"));
         assert!(!is_url("/home/me/repo") && !is_url("~/src/repo") && !is_url("./a:b"));
         assert!(!is_url(r".\a:b"));
+        assert_eq!(source_name("/tmp/repo@main"), "repo");
+        assert_eq!(source_name("https://host/team/data.git@v1"), "data");
+        assert_eq!(source_name("git@github.com:o/r.git"), "r");
+        assert_eq!(source_name(r"C:\src\repo@feature/x"), "repo");
         assert_eq!(is_url(r"C:\src\repo"), cfg!(unix));
         assert_eq!(is_url("C:/src/repo"), cfg!(unix));
     }
