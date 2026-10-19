@@ -114,6 +114,10 @@ fn mount_fork_changes_and_remount() {
         std::fs::set_permissions(main.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let out = Command::new(main.join("run.sh")).output().unwrap();
         assert_eq!(out.stdout, b"ran\n");
+        std::fs::write(main.join("plain.sh"), "#!/bin/sh\necho ran\n").unwrap();
+        let denied = Command::new(main.join("plain.sh")).output().unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied, "only executables run");
+        std::fs::remove_file(main.join("plain.sh")).unwrap();
     }
     assert_eq!(sandfs.stdout(&["changes", "main"]), "M README.md\nA notes.txt\nA run.sh\nD src/lib.rs\n");
     assert_eq!(std::fs::read_to_string(repo.path().join("README.md")).unwrap(), "hello\n", "the repo is untouched");

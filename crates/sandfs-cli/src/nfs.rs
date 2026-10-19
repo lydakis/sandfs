@@ -12,8 +12,9 @@
 //! Any local user can connect to a port on localhost, so the server only answers its
 //! owner. The port the mount uses passes on only calls whose credentials name the user
 //! who mounted it (or root), as a FUSE mount only lets its owner in. The server behind
-//! it hands out the root's file handle once, to the mount, and every file handle
-//! carries a secret, so a program connecting to that server directly gets nothing.
+//! it hands out the root's file handle once, to a mount request naming a secret export
+//! path, and every file handle carries another secret, so a program connecting to the
+//! server directly gets nothing. Credentials can be made up, but not those secrets.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -65,6 +66,15 @@ pub struct SandNfs {
     secret: [u8; 16],
     /// Whether the root's handle was handed out.
     mounted: AtomicBool,
+}
+
+/// 16 bytes no other process can guess.
+fn random() -> std::io::Result<[u8; 16]> {
+    use std::io::Read;
+
+    let mut bytes = [0; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The NFS status for an errno.
@@ -125,11 +135,7 @@ fn os_name(name: &filename3) -> &OsStr {
 impl SandNfs {
     /// Serve `shared` over NFS.
     pub fn new(shared: Arc<Shared>) -> std::io::Result<SandNfs> {
-        use std::io::Read;
-
-        let mut secret = [0; 16];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
-        Ok(SandNfs { shared, page_ends: Mutex::default(), secret, mounted: AtomicBool::new(false) })
+        Ok(SandNfs { shared, page_ends: Mutex::default(), secret: random()?, mounted: AtomicBool::new(false) })
     }
 
     /// Run `op` on the filesystem, then wake the saver if it changed something.
@@ -175,9 +181,10 @@ impl NFSFileSystem for SandNfs {
         }
     }
 
-    /// Only ever asked for by a mount request, which gets the root's handle the first
-    /// time only: that's the mount this process makes, before anything else can know
-    /// the port. A mount request that came first makes the mount fail instead.
+    /// Only ever asked for by a mount request naming the export, whose path holds a
+    /// secret only this process and its `mount_nfs` know until the mount is up. Only
+    /// the first gets the root's handle, so the export path being in the mount table
+    /// afterwards gives nothing away.
     async fn path_to_id(&self, path: &[u8]) -> Result<fileid3, nfsstat3> {
         if path != b"/" || self.mounted.swap(true, Ordering::SeqCst) {
             return Err(nfsstat3::NFS3ERR_ACCES);
@@ -368,7 +375,8 @@ pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u1
         let mut server = NFSTcpListener::bind("127.0.0.1:0", SandNfs::new(shared.clone())?)
             .await
             .context("starting the NFS server")?;
-        server.with_export_name(format!("sandfs/{name}"));
+        let export: String = random()?.iter().map(|byte| format!("{byte:02x}")).collect();
+        server.with_export_name(format!("sandfs/{name}/{export}"));
         let (mount_events, mut events) = tokio::sync::mpsc::channel(16);
         server.set_mount_listener(mount_events);
         let server_port = server.get_listen_port();
@@ -382,7 +390,7 @@ pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u1
         tokio::spawn(answer_saves(saves, shared.clone()));
 
         let options = mount_options(port);
-        let source = format!("localhost:/sandfs/{name}");
+        let source = format!("localhost:/sandfs/{name}/{export}");
         let point = dir.to_path_buf();
         let status = tokio::task::spawn_blocking(move || {
             std::process::Command::new("/sbin/mount_nfs").args(["-o", &options, &source]).arg(&point).status()
@@ -450,10 +458,18 @@ async fn relay(client: tokio::net::TcpStream, server_port: u16, users: &[u32]) -
     let (mut from_server, mut to_server) = server.into_split();
     // Replies and refusals both go to the client, a whole message at a time.
     let to_client = Arc::new(tokio::sync::Mutex::new(to_client));
+    // The calls asking what access a caller has, whose replies need correcting.
+    let access_calls = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let replies = {
         let to_client = to_client.clone();
+        let access_calls = access_calls.clone();
         tokio::spawn(async move {
-            while let Ok(Some((message, _))) = read_message(&mut from_server).await {
+            while let Ok(Some((mut message, mut reply))) = read_message(&mut from_server).await {
+                let xid = reply.get(..4).map(|xid| u32::from_be_bytes(xid.try_into().unwrap()));
+                if xid.is_some_and(|xid| access_calls.lock().unwrap().remove(&xid)) {
+                    limit_access(&mut reply);
+                    message = [&(0x8000_0000 | reply.len() as u32).to_be_bytes()[..], &reply].concat();
+                }
                 if to_client.lock().await.write_all(&message).await.is_err() {
                     break;
                 }
@@ -463,6 +479,9 @@ async fn relay(client: tokio::net::TcpStream, server_port: u16, users: &[u32]) -
     let result = async {
         while let Some((message, call)) = read_message(&mut from_client).await? {
             if call_allowed(&call, users) {
+                if is_access_call(&call) {
+                    access_calls.lock().unwrap().insert(u32::from_be_bytes(call[..4].try_into().unwrap()));
+                }
                 to_server.write_all(&message).await?;
             } else {
                 to_client.lock().await.write_all(&refusal(&call)).await?;
@@ -516,6 +535,36 @@ fn call_allowed(call: &[u8], users: &[u32]) -> bool {
     let (Some(1), Some(name_len)) = (word(24), word(36)) else { return false };
     let uid = word(40 + (name_len as usize).next_multiple_of(4));
     uid.is_some_and(|uid| users.contains(&uid))
+}
+
+/// Whether `call` is an NFS ACCESS call (program 100003, procedure 4).
+fn is_access_call(call: &[u8]) -> bool {
+    call.get(12..16) == Some(&100003u32.to_be_bytes()) && call.get(20..24) == Some(&4u32.to_be_bytes())
+}
+
+/// Take execute access out of an ACCESS reply for a file with no execute bit. The
+/// server grants whatever is asked, and macOS's client trusts it even to run a
+/// program, where Linux checks the bits itself; either way, only files marked
+/// executable run.
+fn limit_access(reply: &mut [u8]) {
+    const EXECUTE: u32 = 0x20;
+    const ATTRIBUTES: usize = 84;
+    let word =
+        |reply: &[u8], at: usize| reply.get(at..at + 4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()));
+    // xid, REPLY, MSG_ACCEPTED, the verifier (flavor, length, body), SUCCESS, NFS3_OK,
+    // then whether attributes follow, the attributes (type, mode, ...) and the access.
+    let Some(verifier) = word(reply, 16) else { return };
+    let at = 20 + (verifier as usize).next_multiple_of(4);
+    let header = [word(reply, 4), word(reply, 8), word(reply, at), word(reply, at + 4), word(reply, at + 8)];
+    if header != [Some(1), Some(0), Some(0), Some(0), Some(1)] {
+        return;
+    }
+    let access_at = at + 12 + ATTRIBUTES;
+    if let (Some(1), Some(mode), Some(access)) = (word(reply, at + 12), word(reply, at + 16), word(reply, access_at))
+        && mode & 0o111 == 0
+    {
+        reply[access_at..access_at + 4].copy_from_slice(&(access & !EXECUTE).to_be_bytes());
+    }
 }
 
 /// The record-marked reply refusing `call`: denied, its credentials too weak.
@@ -737,6 +786,37 @@ mod tests {
         assert_eq!(refused[..4], (0x8000_0000u32 | 20).to_be_bytes(), "one fragment of 20 bytes");
         assert_eq!(refused[4..8], 42u32.to_be_bytes(), "the call's xid");
         assert_eq!(refused[8..], [1u32, 1, 1, 5].map(u32::to_be_bytes).concat()[..]);
+    }
+
+    /// A successful ACCESS reply for a file of `kind` and `mode`, granting `access`.
+    fn access_reply(kind: u32, mode: u32, access: u32) -> Vec<u8> {
+        let head = [42u32, 1, 0, 0, 0, 0, 0, 1, kind, mode].map(u32::to_be_bytes).concat();
+        [head, vec![0; 76], access.to_be_bytes().to_vec()].concat()
+    }
+
+    #[test]
+    fn only_executable_files_get_execute_access() {
+        assert!(is_access_call(&call(4, "mac", 501)));
+        assert!(!is_access_call(&call(1, "mac", 501)), "GETATTR");
+
+        let granted = |kind, mode| {
+            let mut reply = access_reply(kind, mode, 0x3f);
+            limit_access(&mut reply);
+            u32::from_be_bytes(reply[reply.len() - 4..].try_into().unwrap())
+        };
+        assert_eq!(granted(1, 0o644), 0x1f, "a plain file");
+        assert_eq!(granted(1, 0o755), 0x3f, "an executable");
+        assert_eq!(granted(1, 0o610), 0x3f, "executable by its group");
+        assert_eq!(granted(2, 0o644), 0x3f, "a directory");
+        let mut failed = access_reply(1, 0o644, 0x3f);
+        failed[28..32].copy_from_slice(&2u32.to_be_bytes());
+        let before = failed.clone();
+        limit_access(&mut failed);
+        assert_eq!(failed, before, "an error reply is left alone");
+        // A reply cut short is left alone rather than read past its end.
+        let mut short = access_reply(1, 0o644, 0x3f)[..60].to_vec();
+        limit_access(&mut short);
+        assert_eq!(short, access_reply(1, 0o644, 0x3f)[..60]);
     }
 
     #[test]

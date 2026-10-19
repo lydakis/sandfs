@@ -40,14 +40,15 @@ pub fn mount_source(_dir: &Path) -> Option<String> {
 
 /// A line of macOS `mount` output, `SOURCE on POINT (TYPE, OPTIONS...)`, as its source
 /// and mount point. A workspace's NFS source names its export,
-/// `localhost:/sandfs/<name>`, which reads as `sandfs:<name>` like a FUSE mount's.
+/// `localhost:/sandfs/<name>/<secret>`, which reads as `sandfs:<name>` like a FUSE
+/// mount's.
 #[cfg(any(target_os = "macos", test))]
 fn parse_mount_line(line: &str) -> Option<(String, &str)> {
     let (source, rest) = line.split_once(" on ")?;
     let (point, options) = rest.rsplit_once(" (")?;
     let fstype = options.split([',', ')']).next()?;
     let source = match source.strip_prefix("localhost:/sandfs/") {
-        Some(name) if fstype == "nfs" => format!("sandfs:{name}"),
+        Some(export) if fstype == "nfs" => format!("sandfs:{}", export.split('/').next().unwrap_or(export)),
         _ => source.to_owned(),
     };
     Some((source, point))
@@ -136,7 +137,7 @@ mod tests {
 
     #[test]
     fn macos_mount_lines_parse() {
-        let line = "localhost:/sandfs/ws on /private/tmp/my ws (nfs, nodev, nosuid, mounted by me)";
+        let line = "localhost:/sandfs/ws/0f3a on /private/tmp/my ws (nfs, nodev, nosuid, mounted by me)";
         assert_eq!(parse_mount_line(line), Some(("sandfs:ws".to_owned(), "/private/tmp/my ws")));
         // Other filesystems count as mounts too, so nothing is mounted over them.
         let other = "localhost:/elsewhere on /Volumes/x (nfs, nodev, nosuid, mounted by me)";
