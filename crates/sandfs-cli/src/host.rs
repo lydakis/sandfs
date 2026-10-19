@@ -104,20 +104,22 @@ pub fn mount_options(name: &str) -> Vec<fuser::MountOption> {
     options
 }
 
-/// Commands that unmount a directory, tried in order.
+/// Commands that unmount a directory, tried in order, and what to do when none exists.
 #[cfg(all(fuse, target_os = "macos"))]
-const UNMOUNT: &[&[&str]] = &[&["/sbin/umount"]];
+const UNMOUNT: (&[&[&str]], &str) = (&[&["/sbin/umount"]], "/sbin/umount is missing");
 #[cfg(all(fuse, not(target_os = "macos")))]
-const UNMOUNT: &[&[&str]] = &[&["fusermount3", "-u"], &["fusermount", "-u"]];
+const UNMOUNT: (&[&[&str]], &str) =
+    (&[&["fusermount3", "-u"], &["fusermount", "-u"]], "fusermount3 is not installed; install fuse3");
 
 /// Unmount the FUSE filesystem at `dir`.
 #[cfg(fuse)]
 pub fn unmount(dir: &Path) -> anyhow::Result<()> {
-    let ran = UNMOUNT.iter().find_map(|cmd| std::process::Command::new(cmd[0]).args(&cmd[1..]).arg(dir).status().ok());
+    let (commands, missing) = UNMOUNT;
+    let ran = commands.iter().find_map(|cmd| std::process::Command::new(cmd[0]).args(&cmd[1..]).arg(dir).status().ok());
     match ran {
         Some(status) if status.success() => Ok(()),
         Some(status) => anyhow::bail!("unmounting {} failed ({status})", dir.display()),
-        None => anyhow::bail!("{} is not installed; install fuse3", UNMOUNT[0][0]),
+        None => anyhow::bail!("{missing}"),
     }
 }
 
