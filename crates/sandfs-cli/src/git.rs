@@ -58,7 +58,13 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     if !existed {
         eprintln!("sandfs: fetching {url} (file contents are fetched when first read)");
         create_clone(&dest, url)?;
-    } else if let Some(commit) = pinned(&dest, rev) {
+    } else if git(&dest, &["config", "remote.origin.url"]).ok().as_deref() != Some(url) {
+        // One local copy serves every URL that names the repository (https or ssh, with
+        // or without a user), so fetch commits and file contents from the one given now:
+        // an earlier URL may be the one that didn't work.
+        git(&dest, &["remote", "set-url", "origin", url])?;
+    }
+    if let Some(commit) = pinned(&dest, rev) {
         return Ok((dest, commit));
     }
     // A ref of this fetch's own, so concurrent mounts of one repository don't race on
@@ -262,6 +268,10 @@ mod tests {
 
         let (repo, commit) = resolve(&repos, &url).unwrap();
         assert_eq!(commit, third);
+        // A first mount through a URL that failed doesn't stick to the local copy.
+        run(&repo, &["remote", "set-url", "origin", "file:///nowhere"]);
+        assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, third);
+        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
         // One commit and its listings: no history, and no file contents until read.
         assert_eq!(run(&repo, &["rev-list", "--count", "--all"]), "1");
         let objects = run(&repo, &["rev-list", "--objects", "--missing=print", &commit]);
