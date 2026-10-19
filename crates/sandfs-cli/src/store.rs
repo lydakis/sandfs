@@ -9,11 +9,19 @@
 //! workspaces/<name>/changes.json    its saved changes (see `persist`)
 //! workspaces/<name>/objects/        bodies of saved files
 //! workspaces/<name>/mount.json      present while it is mounted
+//! workspaces/<name>/lock            held by the one process that may save it
 //! ```
 //!
 //! A workspace's base is pinned when it is created: a host folder, or a git commit
 //! id. Forks copy the record and the saved changes, never the base.
+//!
+//! Each process that serves a workspace (a mount or an MCP session) keeps its own copy
+//! in memory and saves it over whatever is on disk, so only one may serve it at a time.
+//! It holds the workspace's [`Writer`] lock for as long as it serves. Readers (`changes`,
+//! `fork`) need no lock.
 
+use std::fs::{File, TryLockError};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +30,7 @@ use anyhow::{Context, Result, bail};
 use sandfs_core::{DirSource, Source, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
-use crate::persist::{Restored, Saved};
+use crate::persist::{ObjectGone, Restored, Saved};
 
 /// Where a workspace's source is mounted inside the core workspace. The FUSE mount
 /// shows this directory as its root.
@@ -61,6 +69,12 @@ pub struct Opened {
     pub saved: Saved,
     pub restored: Restored,
     pub record: Record,
+}
+
+/// The right to save a workspace, held until dropped. The operating system releases it
+/// when the holder exits, crashed or not, so a dead process never keeps a workspace.
+pub struct Writer {
+    _file: File,
 }
 
 /// The CLI's home directory.
@@ -129,10 +143,10 @@ impl Home {
         let mut names = Vec::new();
         let Ok(entries) = std::fs::read_dir(self.root.join("workspaces")) else { return Ok(names) };
         for entry in entries {
-            if let Some(name) = entry?.file_name().to_str() {
-                if self.exists(name) {
-                    names.push(name.to_owned());
-                }
+            if let Some(name) = entry?.file_name().to_str()
+                && self.exists(name)
+            {
+                names.push(name.to_owned());
             }
         }
         names.sort();
@@ -182,18 +196,57 @@ impl Home {
         bail!("{what:?} is neither a workspace name nor a mounted workspace")
     }
 
+    /// Take the right to save `name`, or fail saying who holds it. `holder` describes
+    /// this process to whoever is refused next.
+    pub fn lock(&self, name: &str, holder: &str) -> Result<Writer> {
+        check_name(name)?;
+        let path = self.workspace_dir(name).join("lock");
+        // Not truncated on open: until the lock is ours, the text names the current holder.
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let mut held_by = String::new();
+                let _ = file.read_to_string(&mut held_by);
+                let held_by = if held_by.trim().is_empty() { "another sandfs process" } else { held_by.trim() };
+                bail!("{name} is in use by {held_by}");
+            }
+            Err(TryLockError::Error(err)) => return Err(err).with_context(|| format!("locking {}", path.display())),
+        }
+        file.set_len(0)?;
+        file.rewind()?;
+        file.write_all(holder.as_bytes())?;
+        Ok(Writer { _file: file })
+    }
+
     /// Open `name`: mount its base and replay its saved changes.
+    ///
+    /// A process that serves the workspace may be saving meanwhile and deleting the
+    /// objects its older saves used; if one goes missing, loading starts over from the
+    /// newer index.
     pub fn open(&self, name: &str) -> Result<Opened> {
         let record = self.record(name)?;
         let source: Arc<dyn Source> = match &record.base {
             Base::Dir { path } => Arc::new(DirSource::new(path)?),
             Base::Git { repo, commit } => crate::git::open(repo, commit)?,
         };
-        let mut ws = Workspace::new();
-        ws.mount(ROOT, source)?;
-        let mut saved = Saved::new(self.workspace_dir(name));
-        let restored = saved.load(&mut ws, &VPath::parse(ROOT)?)?;
-        Ok(Opened { ws, saved, restored, record })
+        let mut attempts = 0;
+        loop {
+            let mut ws = Workspace::new();
+            ws.mount(ROOT, source.clone())?;
+            let mut saved = Saved::new(self.workspace_dir(name));
+            match saved.load(&mut ws, &VPath::parse(ROOT)?) {
+                Ok(restored) => return Ok(Opened { ws, saved, restored, record }),
+                Err(err) if err.downcast_ref::<ObjectGone>().is_some() && attempts < 10 => attempts += 1,
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
@@ -297,6 +350,52 @@ mod tests {
     fn mountinfo_escapes_decode() {
         assert_eq!(unescape(r"/home/me/my\040ws"), "/home/me/my ws");
         assert_eq!(unescape(r"/plain"), "/plain");
+    }
+
+    #[test]
+    fn one_writer_at_a_time() {
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+
+        let first = home.lock("ws", "the first writer").unwrap();
+        let refused = home.lock("ws", "the second writer").err().unwrap();
+        assert_eq!(refused.to_string(), "ws is in use by the first writer");
+        drop(first);
+        let _second = home.lock("ws", "the second writer").unwrap();
+        assert!(home.lock("missing", "a writer").is_err(), "locking never creates a workspace");
+        assert!(!home.workspace_dir("missing").exists());
+    }
+
+    #[test]
+    fn readers_load_while_a_writer_keeps_saving() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::persist::Snapshot;
+
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+        let root = VPath::parse(ROOT).unwrap();
+        let mut writer = home.open("ws").unwrap();
+        writer.ws.write("/mnt/count.txt", "0").unwrap();
+        let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
+        writer.saved.save(&snap(&writer.ws), &root, false).unwrap();
+
+        // Every save replaces the file's object, and deletes the one before last, so a
+        // reader that loads an index just before two saves finds its object gone.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 1..=300 {
+                    writer.ws.write("/mnt/count.txt", i.to_string()).unwrap();
+                    writer.saved.save(&snap(&writer.ws), &root, false).unwrap();
+                }
+            });
+            for _ in 0..300 {
+                let read = home.open("ws").unwrap().ws.read_text("/mnt/count.txt").unwrap();
+                assert!(read.parse::<u32>().is_ok(), "{read:?}");
+            }
+        });
     }
 
     #[test]

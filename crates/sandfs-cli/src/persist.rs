@@ -64,6 +64,19 @@ pub struct Restored {
     pub dirs: BTreeSet<String>,
 }
 
+/// A saved object the index names has been deleted: a newer save replaced it while
+/// the index was being loaded.
+#[derive(Debug)]
+pub struct ObjectGone(String);
+
+impl std::fmt::Display for ObjectGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "saved object {} is gone; a newer save replaced it", self.0)
+    }
+}
+
+impl std::error::Error for ObjectGone {}
+
 /// The saved changes of one workspace, in its state directory.
 pub struct Saved {
     dir: PathBuf,
@@ -133,8 +146,8 @@ impl Saved {
     }
 
     /// Delete objects the loaded index does not use, left by a crash or by the last
-    /// session's delayed deletes. Only the process that serves the workspace may do
-    /// this: it alone writes objects.
+    /// session's delayed deletes. Only the process that serves the workspace, holding
+    /// its writer lock, may do this: it alone writes objects.
     pub fn collect_garbage(&mut self) {
         let live: HashSet<&str> = self.objects.values().map(|(_, object)| object.as_str()).collect();
         let mut last = 0;
@@ -181,8 +194,13 @@ impl Saved {
                 if current == Some(Kind::Dir) {
                     ws.remove(p, true)?;
                 }
-                let data = std::fs::read(self.objects_dir().join(object))
-                    .with_context(|| format!("reading saved object {object}"))?;
+                let data = match std::fs::read(self.objects_dir().join(object)) {
+                    Ok(data) => data,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(ObjectGone(object.clone()).into());
+                    }
+                    Err(err) => return Err(err).with_context(|| format!("reading saved object {object}")),
+                };
                 ws.write(p, data)?;
                 ws.set_executable(p, *executable)?;
             }
@@ -446,6 +464,48 @@ mod tests {
         reopened.collect_garbage();
         assert_eq!(objects(state.path()), ["3"], "the serving process clears what the index no longer uses");
         assert_eq!(reopened.next_object, 4);
+    }
+
+    #[test]
+    fn a_save_cut_short_leaves_the_last_one_intact() {
+        let state = tempfile::tempdir().unwrap();
+        let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
+        let mut ws = base();
+        ws.write("/mnt/a.txt", "saved").unwrap();
+        Saved::new(state.path()).save(&snap(&ws), &root(), true).unwrap();
+
+        // A process that died mid-save: objects written, the new index half written,
+        // never renamed over the old one.
+        std::fs::write(state.path().join("objects/2"), "unsaved").unwrap();
+        std::fs::write(state.path().join("objects/3"), "unsaved").unwrap();
+        std::fs::write(state.path().join("changes.json.tmp"), "{\"entries\": {\"a.t").unwrap();
+
+        let mut restarted = base();
+        let mut saved = Saved::new(state.path());
+        saved.load(&mut restarted, &root()).unwrap();
+        assert_eq!(restarted.read_text("/mnt/a.txt").unwrap(), "saved");
+        saved.collect_garbage();
+        assert!(!state.path().join("objects/2").exists() && !state.path().join("objects/3").exists());
+
+        // Saving again works, and a save that fails returns its error and leaves the
+        // previous save in place.
+        restarted.write("/mnt/b.txt", "next").unwrap();
+        saved.save(&snap(&restarted), &root(), true).unwrap();
+        std::fs::create_dir(state.path().join("changes.json.tmp")).unwrap();
+        restarted.write("/mnt/a.txt", "not saved").unwrap();
+        assert!(saved.save(&snap(&restarted), &root(), true).is_err());
+        std::fs::remove_dir(state.path().join("changes.json.tmp")).unwrap();
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "saved");
+        assert_eq!(loaded.read_text("/mnt/b.txt").unwrap(), "next");
+
+        // The failed save is retried by the next one.
+        saved.save(&snap(&restarted), &root(), true).unwrap();
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "not saved");
     }
 
     #[test]

@@ -252,10 +252,10 @@ impl Inner {
     fn maybe_drop(&mut self, ino: u64) {
         let unused = self.nodes.get(&ino).is_some_and(|node| node.lookups == 0) && !self.is_open(ino);
         if unused && ino != ROOT_INO {
-            if let Some(node) = self.nodes.remove(&ino) {
-                if self.inos.get(node.path.as_str()) == Some(&ino) {
-                    self.inos.remove(node.path.as_str());
-                }
+            if let Some(node) = self.nodes.remove(&ino)
+                && self.inos.get(node.path.as_str()) == Some(&ino)
+            {
+                self.inos.remove(node.path.as_str());
             }
             self.buffers.remove(&ino);
             self.opened_versions.remove(&ino);
@@ -266,10 +266,11 @@ impl Inner {
     /// buffer first, so reads and writes through open handles keep working.
     fn unlink_path(&mut self, path: &VPath) {
         let Some(ino) = self.inos.remove(path.as_str()) else { return };
-        if self.is_open(ino) && !self.buffers.contains_key(&ino) {
-            if let Ok(data) = self.ws.read(path.as_str()) {
-                self.buffers.insert(ino, data.to_vec());
-            }
+        if self.is_open(ino)
+            && !self.buffers.contains_key(&ino)
+            && let Ok(data) = self.ws.read(path.as_str())
+        {
+            self.buffers.insert(ino, data.to_vec());
         }
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.linked = false;

@@ -9,7 +9,7 @@ use std::io::{BufRead, Write};
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use sandfs_core::{VPath, Workspace};
 use sandfs_mcp::Server;
 use serde_json::{Value, json};
@@ -25,10 +25,9 @@ pub fn serve(home: &Home, name: &str) -> Result<()> {
 
 /// Serve `name`, reading requests from `input` and answering on `output`.
 fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write) -> Result<()> {
-    // A mount keeps its own copy in memory and saves over ours, so one writer at a time.
-    if let Some(info) = home.mount_info(name) {
-        bail!("{name} is mounted at {}; unmount it first", info.mountpoint.display());
-    }
+    // A mount or another session keeps its own copy in memory and would save over
+    // ours, so one writer at a time.
+    let _writer = home.lock(name, &format!("an MCP session (process {})", std::process::id()))?;
     let opened = home.open(name)?;
     let root = VPath::parse(ROOT)?;
     let (mut saved, Restored { mut times, mut dirs }) = (opened.saved, opened.restored);
@@ -47,7 +46,9 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             }
             continue;
         };
-        // What exists before the call, to tell which entries it creates or removes.
+        // The state before the call, to tell which entries it creates or removes, and
+        // to go back to if its change cannot be saved.
+        let before = (server.workspace().fork(), times.clone(), dirs.clone());
         let below_root = |p: &VPath| p.starts_with(&root) && *p != root;
         let existed: Vec<bool> = touched.iter().map(|p| server.workspace().exists(p.as_str())).collect();
         let missing: Vec<VPath> = touched
@@ -104,9 +105,21 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
                     }
                 }
             }
-            // Save before answering, so a reply means the change is on disk.
+            // Save before answering, so a reply means the change is on disk. A change
+            // that cannot be saved is undone and reported, so the agent never builds on
+            // a change that a restart would lose.
             let snapshot = Snapshot { ws: ws.fork(), times: times.clone(), dirs: dirs.clone() };
-            saved.save(&snapshot, &root, true)?;
+            if let Err(err) = saved.save(&snapshot, &root, true) {
+                let ws;
+                (ws, times, dirs) = before;
+                server = Server::new(ws);
+                let message = format!("the change could not be saved, so it was undone: {err:#}");
+                if let Some(reply) = tool_error(&request, &message) {
+                    writeln!(output, "{reply}")?;
+                    output.flush()?;
+                }
+                continue;
+            }
         }
         if let Some(reply) = reply {
             writeln!(output, "{reply}")?;
@@ -194,6 +207,62 @@ mod tests {
         let mut output = Vec::new();
         serve_on(home, "ws", input.as_bytes(), &mut output).unwrap();
         String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_workspace_in_use_is_refused() {
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+
+        let mount = home.lock("ws", "the mount at /work (process 7)").unwrap();
+        let input = call(1, "write", json!({ "path": "/mnt/a.txt", "content": "a" }));
+        let refused = serve_on(&home, "ws", input.as_bytes(), Vec::new()).unwrap_err();
+        assert_eq!(refused.to_string(), "ws is in use by the mount at /work (process 7)");
+        drop(mount);
+        assert!(!home.open("ws").unwrap().ws.exists("/mnt/a.txt"), "the refused session changed nothing");
+        session(&home, &input);
+        assert!(home.open("ws").unwrap().ws.exists("/mnt/a.txt"));
+    }
+
+    #[test]
+    fn a_change_that_cannot_be_saved_is_undone() {
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(data.path().join("notes.txt"), "draft\n").unwrap();
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+        session(&home, &call(1, "write", json!({ "path": "/mnt/kept.txt", "content": "kept" })));
+
+        // A directory where the save writes its new index makes every save fail, as a
+        // full disk would.
+        let blocker = home.workspace_dir("ws").join("changes.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        let replies = session(
+            &home,
+            &[
+                call(1, "write", json!({ "path": "/mnt/lost.txt", "content": "lost" })),
+                call(2, "delete", json!({ "path": "/mnt/notes.txt" })),
+                call(3, "read", json!({ "path": "/mnt/notes.txt" })),
+                call(4, "list", json!({ "path": "/mnt" })),
+            ]
+            .concat(),
+        );
+        for reply in &replies[..2] {
+            assert_eq!(reply["result"]["isError"], true);
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("the change could not be saved, so it was undone"), "{text}");
+        }
+        assert!(replies[2]["result"]["content"][0]["text"].as_str().unwrap().contains("draft"), "delete was undone");
+        let listing = replies[3]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(listing.contains("kept.txt") && !listing.contains("lost.txt"), "{listing}");
+
+        std::fs::remove_dir(&blocker).unwrap();
+        session(&home, &call(1, "write", json!({ "path": "/mnt/later.txt", "content": "later" })));
+        let reopened = home.open("ws").unwrap();
+        assert_eq!(reopened.ws.read_text("/mnt/kept.txt").unwrap(), "kept");
+        assert_eq!(reopened.ws.read_text("/mnt/later.txt").unwrap(), "later");
+        assert!(!reopened.ws.exists("/mnt/lost.txt"));
+        assert!(reopened.ws.exists("/mnt/notes.txt"));
     }
 
     #[test]

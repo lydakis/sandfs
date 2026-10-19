@@ -154,13 +154,14 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Unmount { workspace } => {
             let name = home.find(&workspace)?;
             let info = home.attached_mount(&name).with_context(|| format!("{name} is not mounted"))?;
-            unmount(&info, &home.workspace_dir(&name).join("mount.json"))
+            unmount(&home, &name, &info)
         }
         Cmd::Rm { name } => {
             if home.attached_mount(&name).is_some() {
                 bail!("{name} is mounted; unmount it first");
             }
             home.record(&name)?;
+            let _writer = home.lock(&name, "sandfs rm")?;
             home.remove(&name)
         }
         Cmd::Serve { mcp, workspace } => {
@@ -284,6 +285,18 @@ fn resolve_new(dir: &Path) -> Result<PathBuf> {
 
 /// Serve `name` at `dir` until it is unmounted, then save its changes.
 fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
+    let pid = std::process::id();
+    let _writer = home.lock(name, &format!("the mount at {} (process {pid})", dir.display()))?;
+    // Two workspaces mounted on one directory at once would stack. Locking the directory
+    // itself (the one underneath, which a mount covers) lets only one mount proceed;
+    // whoever comes after it sees the mount.
+    let point = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    if point.try_lock().is_err() || is_mounted(dir) {
+        bail!("something is already mounted at {}", dir.display());
+    }
+    // A failed final save is reported by the `unmount` that asked for it, not a later one.
+    let save_error = home.workspace_dir(name).join(SAVE_ERROR);
+    let _ = std::fs::remove_file(&save_error);
     let mut opened = home.open(name)?;
     opened.saved.collect_garbage();
     let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(dir)?);
@@ -300,21 +313,30 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     config.mount_options =
         vec![fuser::MountOption::FSName(format!("sandfs:{name}")), fuser::MountOption::Subtype("sandfs".to_owned())];
     let session = fuser::Session::new(SandFs(shared.clone()), dir, &config).context("mounting with FUSE")?;
-    home.set_mount_info(name, Some(&MountInfo { pid: std::process::id(), mountpoint: dir.to_path_buf() }))?;
+    home.set_mount_info(name, Some(&MountInfo { pid, mountpoint: dir.to_path_buf() }))?;
     eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
     let result = session.run();
 
     shared.stop();
     let _ = saver.join();
     let saved = shared.save(true);
+    if let Err(err) = &saved {
+        // `unmount` is waiting for mount.json to go; leave it the reason first.
+        let _ = std::fs::write(&save_error, format!("{err:#}"));
+    }
     home.set_mount_info(name, None)?;
     result.context("serving the mount")?;
     saved.context("saving changes at unmount")
 }
 
-/// Unmount and wait for the serving process to save, which it signals by removing
-/// `mount_file`.
-fn unmount(info: &MountInfo, mount_file: &Path) -> Result<()> {
+/// Where a mount's process leaves the error of a final save that failed.
+const SAVE_ERROR: &str = "save-error";
+
+/// Unmount `name` and wait for the serving process to save, which it signals by
+/// removing mount.json, and to let go of the workspace.
+fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
+    let state = home.workspace_dir(name);
+    let mount_file = state.join("mount.json");
     let ran = ["fusermount3", "fusermount"]
         .iter()
         .find_map(|tool| Command::new(tool).arg("-u").arg(&info.mountpoint).status().ok());
@@ -336,7 +358,19 @@ fn unmount(info: &MountInfo, mount_file: &Path) -> Result<()> {
     if mount_file.exists() {
         // The serving process died without cleaning up; its last save is what remains.
         eprintln!("sandfs: the mount's process had exited; changes since its last save are lost");
-        let _ = std::fs::remove_file(mount_file);
+        let _ = std::fs::remove_file(&mount_file);
+    }
+    // The process lets go of the workspace as it exits, just after removing mount.json.
+    // Wait for that too, so a command right after this one finds the workspace free.
+    while proc.exists() && home.lock(name, "sandfs unmount").is_err() {
+        if Instant::now() >= deadline {
+            bail!("unmounted, but process {} has not exited", info.pid);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if let Ok(error) = std::fs::read_to_string(state.join(SAVE_ERROR)) {
+        let _ = std::fs::remove_file(state.join(SAVE_ERROR));
+        bail!("unmounted, but saving the last changes failed, so changes since the last save are lost: {error}");
     }
     Ok(())
 }
