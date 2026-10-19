@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Mounting on macOS**: `sandfs mount` works on macOS with nothing to install. The mount's process serves the workspace over NFS on localhost and macOS's own NFS client mounts it, with no kernel extension, macFUSE or sudo. Any local user can reach that server.
+
 ## 0.4.0 (2026-10-19)
 
 A rewrite. sandfs is now a general-purpose sandbox filesystem with a Rust core, and the Python package is a thin binding over it. Nothing from the 0.2 API carries over.
@@ -16,7 +20,7 @@ A rewrite. sandfs is now a general-purpose sandbox filesystem with a Rust core, 
 - **sandfs-core speed**: workspaces resolve a path in one lookup instead of one per directory and host-folder reads check the file they opened instead of resolving each parent folder first, so a stat 64 folders deep is about 12× faster and creates and deletes about a third faster.
 - **sandfs-cli concurrency**: one process serves a workspace at a time. A second mount or `serve --mcp` of a workspace in use is refused instead of saving over the first, as is a second mount on the same directory. `unmount` fails if the final save failed, `serve --mcp` undoes and reports a change it couldn't save, and `changes` reads a workspace safely while another process is saving it. Building `sandfs-cli` now needs Rust 1.89 (the library crates still build with 1.85).
 - **Benchmarks**: `sandfs-bench`, an unpublished crate, times sandfs through the Rust API and the FUSE mount against the host filesystem and overlayfs, including a workflow of parallel attempts that search, edit and check their files (`--only workflow`); `cargo run --release -p sandfs-bench -- --scratch /dev/shm`.
-- **sandfs-cli on macOS and Windows**: on macOS the `sandfs` command serves a mount over NFS on localhost and mounts it with macOS's own NFS client, so nothing needs installing. It builds on Windows with everything but the mount, and `sandfs serve --mcp SOURCE` creates a workspace over a source. The library crates and the Python package are tested on macOS and Windows in CI.
+- **sandfs-cli on macOS and Windows**: the `sandfs` command builds there with everything but the mount, and `sandfs serve --mcp SOURCE` creates a workspace over a source. The library crates and the Python package are tested on macOS and Windows in CI.
 - **Packaging**: one abi3 wheel per platform covers Python 3.11 and later. The Rust crates `sandfs-core`, `sandfs-git`, `sandfs-mcp` and `sandfs-cli` are published alongside.
 - **Removed**: the bash-like shell, host-command bridge, Python executor, access policies, storage adapters, write hooks, symlinks, text edit and unified diffs.
 
