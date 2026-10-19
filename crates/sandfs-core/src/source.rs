@@ -214,6 +214,31 @@ impl DirSource {
         }
     }
 
+    /// Fail unless the directory at `key` is `dir`, inside `root`, with no symlink on
+    /// the way.
+    fn check_dir(&self, key: &str, dir: &Path) -> Result<()> {
+        // As in `open_file`: on Linux the kernel names the directory actually opened,
+        // which costs one call where resolving `dir` costs one per component.
+        #[cfg(target_os = "linux")]
+        if Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::OpenOptionsExt;
+            // A directory-only open fails at once on anything else, such as a fifo
+            // swapped in since the listing, which a plain open would block on.
+            let opened =
+                std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(dir).map_err(io_error)?;
+            if let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd())) {
+                return if path == dir {
+                    Ok(())
+                } else {
+                    Err(Error::Source(format!("{} is outside the mounted directory", dir.display())))
+                };
+            }
+        }
+        let _ = key;
+        self.check_inside(dir)
+    }
+
     fn host_path(&self, key: &str) -> PathBuf {
         if key.is_empty() { self.root.clone() } else { self.root.join(key) }
     }
@@ -259,7 +284,7 @@ impl Source for DirSource {
 
     fn read_dir(&self, key: &str) -> Result<Listing> {
         let dir = self.host_path(key);
-        self.check_inside(&dir)?;
+        self.check_dir(key, &dir)?;
         let entries = std::fs::read_dir(dir).map_err(io_error)?;
         let mut listing = Listing::new();
         for entry in entries {
