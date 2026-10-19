@@ -4,7 +4,12 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 fn sandfs(home: &std::path::Path, args: &[&str], input: &str) -> Output {
+    sandfs_in(home, &std::env::current_dir().unwrap(), args, input)
+}
+
+fn sandfs_in(home: &std::path::Path, dir: &std::path::Path, args: &[&str], input: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .current_dir(dir)
         .env("SANDFS_HOME", home)
         .args(args)
         .stdin(Stdio::piped())
@@ -45,4 +50,29 @@ fn serve_creates_a_workspace_over_a_source() {
     let named = sandfs(home.path(), &["serve", "--mcp", source, "--name", "copy"], "");
     assert!(named.status.success(), "{}", String::from_utf8_lossy(&named.stderr));
     assert_eq!(stdout(home.path(), &["changes", "copy"]), "");
+}
+
+#[test]
+fn served_sources_are_named_after_their_folder() {
+    let (home, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let folder = data.path().join("photos");
+    std::fs::create_dir(&folder).unwrap();
+    let here = sandfs_in(home.path(), &folder, &["serve", "--mcp", "."], "");
+    assert!(here.status.success(), "{}", String::from_utf8_lossy(&here.stderr));
+
+    let repo = data.path().join("notes");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    for args in
+        [&["init", "-q"][..], &["add", "a.txt"], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a"]]
+    {
+        assert!(Command::new("git").current_dir(&repo).args(args).status().unwrap().success());
+    }
+    let source = format!("git:{}@HEAD", repo.display());
+    let versioned = sandfs(home.path(), &["serve", "--mcp", &source], "");
+    assert!(versioned.status.success(), "{}", String::from_utf8_lossy(&versioned.stderr));
+
+    let names: Vec<String> =
+        stdout(home.path(), &["list"]).lines().map(|line| line.split('\t').next().unwrap().to_owned()).collect();
+    assert_eq!(names, ["notes", "photos"]);
 }

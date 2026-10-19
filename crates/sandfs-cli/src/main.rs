@@ -184,13 +184,26 @@ fn run(cli: Cli) -> Result<()> {
             if home.exists(&workspace) && name.is_none() {
                 return mcp::serve(&home, &workspace);
             }
-            let named = workspace.strip_prefix("git:").map_or(workspace.as_str(), git::source_name);
-            let name = default_name(name, Path::new(named))?;
+            // Named after the resolved folder or repository, so `.` and `repo@v1` work.
             let record = home.resolve(&workspace)?;
+            let name = default_name(name, &source_dir(&record.base))?;
             home.create(&name, &record)?;
             mcp::serve(&home, &name)
         }
         Cmd::Daemon { name, dir } => serve(&home, &name, &dir),
+    }
+}
+
+/// The folder a source's name comes from: `data` for `/srv/data`, `/srv/data/.git` or a
+/// cached `github.com/team/data.git`.
+fn source_dir(base: &Base) -> PathBuf {
+    match base {
+        Base::Dir { path } => path.clone(),
+        Base::Git { repo, .. } if repo.file_name().is_some_and(|name| name == ".git") => {
+            repo.parent().map_or_else(|| repo.clone(), Path::to_path_buf)
+        }
+        Base::Git { repo, .. } if repo.extension().is_some_and(|ext| ext == "git") => repo.with_extension(""),
+        Base::Git { repo, .. } => repo.clone(),
     }
 }
 
