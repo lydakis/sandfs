@@ -34,6 +34,8 @@ fn make_repo(dir: &Path) {
         std::os::unix::fs::symlink("README.md", dir.join("link")).unwrap();
     }
     git(dir, &["add", "-A"]);
+    // Hosts without an executable bit (Windows) need the mode set in the index.
+    git(dir, &["update-index", "--chmod=+x", "run.sh"]);
     git(dir, &["commit", "-q", "-m", "first"]);
     git(dir, &["tag", "v1"]);
     std::fs::write(dir.join("README.md"), "second\n").unwrap();
@@ -54,11 +56,9 @@ fn mounts_a_commit_without_a_checkout() {
     assert_eq!(ws.read_text("/head/src/deep/data.txt").unwrap(), "data\n");
     let names: Vec<String> = ws.list("/head").unwrap().into_iter().map(|e| e.name).collect();
     assert!(names.starts_with(&["README.md".to_owned()]) && names.contains(&"src".to_owned()));
+    assert_eq!(ws.stat("/head/run.sh").unwrap().kind, Kind::File { executable: true });
     #[cfg(unix)]
-    {
-        assert_eq!(ws.stat("/head/run.sh").unwrap().kind, Kind::File { executable: true });
-        assert!(!ws.exists("/head/link"), "symlinks are skipped");
-    }
+    assert!(!ws.exists("/head/link"), "symlinks are skipped");
 
     ws.write("/head/src/lib.rs", "changed\n").unwrap();
     let changes = ws.changes().unwrap();
