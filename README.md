@@ -3,7 +3,7 @@
 sandfs gives an agent a private copy of your files to work in, without copying anything. Point it at a folder, a git commit or any data you can list and read. The agent reads and writes as it likes, your originals never change, and when it's done you get the list of files it added, changed or deleted, so you decide what to keep.
 
 - **Nothing is copied up front.** Files are fetched from their source as they are needed, so mounting a huge folder or repository is instant.
-- **Every attempt gets its own copy, for free.** Forking a workspace takes constant time however much data is mounted, so ten agents can try ten things side by side without seeing each other's changes.
+- **Every attempt gets its own copy, for free.** Forking a workspace in Python or Rust takes constant time however much data is mounted (a fork mounted as a folder costs a few milliseconds more), so ten agents can try ten things side by side without seeing each other's changes.
 - **You see exactly what changed.** `changes()` lists the files, and you write back only the ones you want.
 
 Files are bytes of any kind: documents, spreadsheets, images, data sets and code alike.
@@ -19,7 +19,12 @@ pip install sandfs             # Python 3.11+, prebuilt for Linux, macOS and Win
 ## A first workspace
 
 ```python
+import pathlib
 import sandfs
+
+pathlib.Path("survey").mkdir(exist_ok=True)          # a small folder to try it on
+pathlib.Path("survey/responses.csv").write_text("id,answer\n1,yes\n")
+pathlib.Path("survey/raw.txt").write_text("draft\n")
 
 base = sandfs.Workspace()
 base.mount("/survey", sandfs.DirSource("./survey"))   # a folder on disk, never written to
@@ -152,7 +157,7 @@ Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADire
 
 Eight attempts at one task run side by side, each on its own fork of a folder holding 10,000 small files and a 256 MiB file. Each one searches every small file, rewrites 50 files, adds 10, deletes 5, checks its work and lists its changes.
 
-| | 8 attempts, wall time | one fork | peak memory | left on disk |
+| | 8 attempts, wall time | making the 8 forks | peak memory | left on disk |
 | --- | ---: | ---: | ---: | ---: |
 | sandfs, in process | 0.45 s | 4.5 µs | 142 MiB | 0 |
 | sandfs, mounted as folders | 1.9 s | 55 ms | 780 MiB | 4.6 MiB |
