@@ -360,7 +360,7 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     let mut ready = Some(ready);
     let mut mounted = |save: Option<(u16, String)>| -> Result<()> {
         let (save_port, save_secret) = save.unzip();
-        let info = MountInfo { pid, mountpoint: dir.to_path_buf(), save_port, save_secret };
+        let info = MountInfo { pid, mountpoint: dir.to_path_buf(), save_port, save_secret, id: mount_id() };
         home.set_mount_info(name, Some(&info))?;
         was_mounted.set(true);
         eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
@@ -400,6 +400,14 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     saved.context("saving changes at unmount")
 }
 
+/// A number for a new mount that differs from the ones before it.
+#[cfg(mount)]
+fn mount_id() -> u64 {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    now ^ COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Where a mount's process leaves the error of a final save that failed.
 #[cfg(mount)]
 const SAVE_ERROR: &str = "save-error";
@@ -409,24 +417,27 @@ const SAVE_ERROR: &str = "save-error";
 #[cfg(mount)]
 fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     let state = home.workspace_dir(name);
-    let mount_file = state.join("mount.json");
+    // One process serves every mount, so the workspace may be mounted again by it while
+    // this waits; mount.json's id says whether the mount recorded is still this one.
+    let recorded = || home.recorded_mount(name).map(|current| current.id);
+    let replaced = || recorded().is_some_and(|id| id != info.id);
     // The serving process holds the workspace; checking that too means a process that
     // has since taken over a dead server's pid isn't waited for.
-    let serving = || host::alive(info.pid) && home.locked_by(name, info.pid);
+    let serving = || host::alive(info.pid) && home.locked_by(name, info.pid) && !replaced();
     host::unmount(&info.mountpoint, !serving())?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut wait = Duration::from_millis(1);
-    while mount_file.exists() && serving() {
+    while recorded() == Some(info.id) && serving() {
         if Instant::now() >= deadline {
             bail!("unmounted, but process {} is still saving the workspace's changes", info.pid);
         }
         std::thread::sleep(wait);
         wait = (wait * 2).min(Duration::from_millis(50));
     }
-    if mount_file.exists() {
+    if recorded() == Some(info.id) {
         // The serving process died without cleaning up; its last save is what remains.
         eprintln!("sandfs: the mount's process had exited; changes since its last save are lost");
-        let _ = std::fs::remove_file(&mount_file);
+        let _ = std::fs::remove_file(state.join("mount.json"));
     }
     // The process lets go of the workspace just after removing mount.json. Wait for
     // that too, so a command right after this one finds the workspace free.

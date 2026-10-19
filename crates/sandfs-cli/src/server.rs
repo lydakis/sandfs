@@ -7,6 +7,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -28,10 +29,17 @@ const START: Duration = Duration::from_secs(10);
 const MOUNT: Duration = Duration::from_secs(120);
 
 /// A request to mount the workspace `name` at `dir`, which exists and is canonical.
+/// The directory goes as its bytes, since a path needn't be UTF-8.
 #[derive(Serialize, Deserialize)]
 struct Request {
     name: String,
-    dir: PathBuf,
+    dir: Vec<u8>,
+}
+
+impl Request {
+    fn dir(&self) -> PathBuf {
+        PathBuf::from(std::ffi::OsStr::from_bytes(&self.dir))
+    }
 }
 
 /// The answer, once the mount is up or has failed.
@@ -61,7 +69,7 @@ fn run_dir(home: &Home) -> Result<PathBuf> {
 /// Mount `name` at `dir` in the home's background process, starting the process if
 /// none is running, and wait until the mount is up.
 pub fn mount(home: &Home, name: &str, dir: &Path) -> Result<()> {
-    let request = serde_json::to_string(&Request { name: name.to_owned(), dir: dir.to_path_buf() })?;
+    let request = serde_json::to_string(&Request { name: name.to_owned(), dir: dir.as_os_str().as_bytes().to_vec() })?;
     let started = Instant::now();
     let mut server: Option<Child> = None;
     // A running process answers at once, and a new one within a few milliseconds.
@@ -172,10 +180,18 @@ pub fn run(home: Home) -> Result<()> {
 
 /// Read one request from `stream`, start the mount and answer once it is up or failed.
 fn answer(mut stream: &UnixStream, home: &Home, bases: &Arc<Bases>, ticket: Ticket) {
-    let mounted = read_request(stream).and_then(|request| start_mount(home, bases, request, ticket));
+    let request = read_request(stream);
+    let dir = request.as_ref().ok().map(Request::dir);
+    let mounted = request.and_then(|request| start_mount(home, bases, request, ticket));
+    let up = mounted.is_ok();
     let reply = Reply { error: mounted.err().map(|err| format!("{err:#}")) };
-    if let Ok(reply) = serde_json::to_string(&reply) {
-        let _ = stream.write_all(format!("{reply}\n").as_bytes());
+    let told =
+        serde_json::to_string(&reply).is_ok_and(|reply| stream.write_all(format!("{reply}\n").as_bytes()).is_ok());
+    // A requester that gave up (timed out, or was interrupted) has reported a failure,
+    // so a mount that came up after all is taken down again.
+    if let Some(dir) = dir.filter(|_| up && !told) {
+        eprintln!("sandfs: nobody waited for the mount at {}; unmounting it", dir.display());
+        let _ = crate::host::unmount(&dir, false);
     }
 }
 
@@ -196,7 +212,7 @@ fn start_mount(home: &Home, bases: &Arc<Bases>, request: Request, ticket: Ticket
         .name(format!("mount {}", request.name))
         .spawn(move || {
             let _ticket = ticket;
-            let served = crate::serve(&home, &request.name, &request.dir, &bases, move || {
+            let served = crate::serve(&home, &request.name, &request.dir(), &bases, move || {
                 let _ = up.send(Ok(()));
             });
             if let Err(err) = &served {
@@ -263,6 +279,14 @@ impl Drop for Ticket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_carry_any_directory_name() {
+        let dir = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9"));
+        let request = Request { name: "ws".into(), dir: dir.as_os_str().as_bytes().to_vec() };
+        let sent: Request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(sent.dir(), dir);
+    }
 
     #[test]
     fn the_process_closes_only_after_lingering_idle() {

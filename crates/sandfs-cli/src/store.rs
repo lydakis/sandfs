@@ -70,6 +70,9 @@ pub struct MountInfo {
     /// The secret a save request must carry, so only its owner can ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_secret: Option<String>,
+    /// Tells this mount apart from a later one of the workspace by the same process.
+    #[serde(default)]
+    pub id: u64,
 }
 
 /// A workspace opened from disk: its contents with the saved changes replayed.
@@ -187,10 +190,14 @@ impl Home {
     /// Where `name` was mounted, if that mount is still attached, even when the process
     /// serving it has died and left it disconnected.
     pub fn attached_mount(&self, name: &str) -> Option<MountInfo> {
-        let data = std::fs::read(self.workspace_dir(name).join("mount.json")).ok()?;
-        let info: MountInfo = serde_json::from_slice(&data).ok()?;
+        let info = self.recorded_mount(name)?;
         // Only this workspace's mount: another filesystem may have taken the path since.
         (mount_source(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
+    }
+
+    /// The mount recorded for `name`, attached or not.
+    pub fn recorded_mount(&self, name: &str) -> Option<MountInfo> {
+        serde_json::from_slice(&std::fs::read(self.workspace_dir(name).join("mount.json")).ok()?).ok()
     }
 
     pub fn set_mount_info(&self, name: &str, info: Option<&MountInfo>) -> Result<()> {
@@ -395,10 +402,12 @@ impl Bases {
         if !matches!(base, Base::Git { .. }) {
             return Ok((open_base(base)?, Lease { bases: self.clone(), base: None }));
         }
-        let lease = Lease { bases: self.clone(), base: Some(base.clone()) };
+        // A lease is made only once its use is counted, so dropping it never uncounts
+        // another mount's.
+        let lease = || Lease { bases: self.clone(), base: Some(base.clone()) };
         if let Some((ws, uses)) = self.open.lock().expect("bases lock").get_mut(base) {
             *uses += 1;
-            return Ok((ws.fork(), lease));
+            return Ok((ws.fork(), lease()));
         }
         // Opening a commit starts git, so other mounts aren't kept waiting meanwhile. Of
         // two mounts opening it at once, the second to finish uses the first one's.
@@ -406,7 +415,7 @@ impl Bases {
         let mut open = self.open.lock().expect("bases lock");
         let (ws, uses) = open.entry(base.clone()).or_insert((opened, 0));
         *uses += 1;
-        Ok((ws.fork(), lease))
+        Ok((ws.fork(), lease()))
     }
 }
 
@@ -487,6 +496,7 @@ mod tests {
             mountpoint: data.path().to_path_buf(),
             save_port: Some(1),
             save_secret: Some("00".into()),
+            id: 1,
         };
         home.set_mount_info("ws", Some(&info)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
