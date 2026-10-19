@@ -2,22 +2,24 @@
 //! folder.
 //!
 //! The commands are the core's primitives. `mount` creates a workspace over a source
-//! and serves it with FUSE, `fork` mounts a copy of one without copying its source, and `changes` lists the
+//! and serves it as a directory (FUSE on Linux, NFS on macOS), `fork` mounts a copy of one without copying its source, and `changes` lists the
 //! files a workspace changed. A working copy on disk is just a fork mounted at a path.
 //! `serve --mcp` hands a workspace to an agent as MCP file tools instead of a mount.
 
-// Without FUSE, mounting is stubbed out below, which leaves its helpers unused.
-#![cfg_attr(not(fuse), allow(dead_code, unused_imports))]
+// Without a mount, mounting is stubbed out below, which leaves its helpers unused.
+#![cfg_attr(not(mount), allow(dead_code, unused_imports))]
 
-#[cfg(fuse)]
+#[cfg(mount)]
 mod fs;
 mod git;
 mod host;
 mod mcp;
+#[cfg(any(nfs, all(test, fuse)))]
+mod nfs;
 mod persist;
 mod store;
 
-#[cfg(fuse)]
+#[cfg(mount)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,12 +30,14 @@ use clap::{Parser, Subcommand};
 use sandfs_core::{ChangeKind, VPath};
 
 #[cfg(fuse)]
-use crate::fs::{Inner, SandFs, Shared};
+use crate::fs::SandFs;
+#[cfg(mount)]
+use crate::fs::{Inner, Shared};
 use crate::persist::Saved;
 use crate::store::{Base, Home, MountInfo, ROOT, check_name, is_mounted};
 
 #[derive(Parser)]
-#[command(name = "sandfs", version, about = "Lazy, copy-on-write workspaces mounted with FUSE")]
+#[command(name = "sandfs", version, about = "Lazy, copy-on-write workspaces mounted as directories")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -101,7 +105,7 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Serve a workspace's FUSE mount in this process (used by `mount` and `fork`).
+    /// Serve a workspace's mount in this process (used by `mount` and `fork`).
     #[command(hide = true)]
     Daemon { name: String, dir: PathBuf },
 }
@@ -216,15 +220,17 @@ fn default_name(name: Option<String>, dir: &Path) -> Result<String> {
     Ok(name)
 }
 
-/// Ask a mounted workspace to save everything written so far. `fsync` on the mount's
-/// root directory makes the serving process save before it returns.
+/// Ask a mounted workspace to save everything written so far. `fsync` on a FUSE
+/// mount's root directory makes the serving process save before it returns; an NFS
+/// mount's process saves when asked on its save port, since `fsync` never reaches it.
 fn sync(home: &Home, name: &str) -> Result<()> {
-    if let Some(info) = home.mount_info(name) {
-        std::fs::File::open(&info.mountpoint)
-            .and_then(|dir| dir.sync_all())
-            .with_context(|| format!("saving {name} before reading it"))?;
-    }
-    Ok(())
+    let Some(info) = home.mount_info(name) else { return Ok(()) };
+    let saved = match info.save_port {
+        #[cfg(nfs)]
+        Some(port) => nfs::request_save(port),
+        _ => std::fs::File::open(&info.mountpoint).and_then(|dir| dir.sync_all()).map_err(anyhow::Error::from),
+    };
+    saved.with_context(|| format!("saving {name} before reading it"))
 }
 
 /// Mount a workspace that was just created, removing it again if the mount fails so
@@ -251,7 +257,7 @@ fn remove_unused(home: &Home, name: &str) {
 
 /// Mount `name` at `dir`: serve it here with `foreground`, otherwise start a
 /// background process and wait until the mount is up.
-#[cfg(fuse)]
+#[cfg(mount)]
 fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
     if let Some(info) = home.mount_info(name) {
         bail!("{name} is already mounted at {}", info.mountpoint.display());
@@ -326,7 +332,7 @@ fn resolve_new(dir: &Path) -> Result<PathBuf> {
 }
 
 /// Serve `name` at `dir` until it is unmounted, then save its changes.
-#[cfg(fuse)]
+#[cfg(mount)]
 fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let pid = std::process::id();
     let _writer = home.lock(name, &format!("the mount at {} (process {pid})", dir.display()))?;
@@ -349,15 +355,28 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let mut inner =
         Inner::new(opened.ws, &root, opened.restored.times, opened.restored.dirs, base_time, (owner, group));
     inner.ranged_reads = matches!(opened.record.base, Base::Dir { .. });
+    // NFS has no close to flush a file's writes, and macOS's NFS client adds files of
+    // its own next to the ones people write.
+    inner.commit_on_save = cfg!(nfs);
+    inner.skip_bookkeeping = cfg!(nfs);
     let shared = Shared::new(inner, opened.saved, root);
     let saver = shared.spawn_saver();
 
-    let mut config = fuser::Config::default();
-    config.mount_options = host::mount_options(name);
-    let session = fuser::Session::new(SandFs(shared.clone()), dir, &config).context("mounting with FUSE")?;
-    home.set_mount_info(name, Some(&MountInfo { pid, mountpoint: dir.to_path_buf() }))?;
-    eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
-    let result = session.run();
+    let mounted = |save_port: Option<u16>| -> Result<()> {
+        home.set_mount_info(name, Some(&MountInfo { pid, mountpoint: dir.to_path_buf(), save_port }))?;
+        eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
+        Ok(())
+    };
+    #[cfg(fuse)]
+    let result = {
+        let mut config = fuser::Config::default();
+        config.mount_options = host::mount_options(name);
+        let session = fuser::Session::new(SandFs(shared.clone()), dir, &config).context("mounting with FUSE")?;
+        mounted(None)?;
+        session.run().map_err(anyhow::Error::from)
+    };
+    #[cfg(nfs)]
+    let result = nfs::run(name, dir, &shared, |port| mounted(Some(port)));
 
     shared.stop();
     let _ = saver.join();
@@ -377,16 +396,16 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
 }
 
 /// Where a mount's process leaves the error of a final save that failed.
-#[cfg(fuse)]
+#[cfg(mount)]
 const SAVE_ERROR: &str = "save-error";
 
 /// Unmount `name` and wait for the serving process to save, which it signals by
 /// removing mount.json, and to let go of the workspace.
-#[cfg(fuse)]
+#[cfg(mount)]
 fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     let state = home.workspace_dir(name);
     let mount_file = state.join("mount.json");
-    host::unmount(&info.mountpoint)?;
+    host::unmount(&info.mountpoint, !host::alive(info.pid))?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut wait = Duration::from_millis(1);
     while mount_file.exists() && host::alive(info.pid) {
@@ -422,23 +441,23 @@ fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     Ok(())
 }
 
-// Without FUSE (macOS, Windows, or a build without the `mount` feature) everything
-// works but mounting; `serve --mcp SOURCE` creates workspaces instead.
-#[cfg(not(fuse))]
-const NO_FUSE: &str =
-    "mounting needs FUSE, which this build of sandfs only has on Linux; `sandfs serve --mcp SOURCE` works here";
+// Without a mount (Windows, or a build without the `mount` feature) everything works
+// but mounting; `serve --mcp SOURCE` creates workspaces instead.
+#[cfg(not(mount))]
+const NO_MOUNT: &str =
+    "this build of sandfs can't mount (that needs Linux or macOS); `sandfs serve --mcp SOURCE` works here";
 
-#[cfg(not(fuse))]
+#[cfg(not(mount))]
 fn mount(_home: &Home, _name: &str, _dir: &Path, _foreground: bool) -> Result<()> {
-    bail!(NO_FUSE)
+    bail!(NO_MOUNT)
 }
 
-#[cfg(not(fuse))]
+#[cfg(not(mount))]
 fn serve(_home: &Home, _name: &str, _dir: &Path) -> Result<()> {
-    bail!(NO_FUSE)
+    bail!(NO_MOUNT)
 }
 
-#[cfg(not(fuse))]
+#[cfg(not(mount))]
 fn unmount(_home: &Home, _name: &str, _info: &MountInfo) -> Result<()> {
-    bail!(NO_FUSE)
+    bail!(NO_MOUNT)
 }

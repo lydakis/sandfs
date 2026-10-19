@@ -1,12 +1,13 @@
-//! The FUSE filesystem: kernel requests turned into workspace calls.
+//! The mounted filesystem: kernel requests turned into workspace calls.
 //!
 //! The kernel addresses files by inode number and the workspace by path, so [`Inner`]
 //! keeps a table between the two and moves entries when something is renamed. Writes
 //! land in a per-inode buffer and reach the workspace when the file is flushed (on
 //! every `close`), so a file written in many small chunks is copied once, not once per
 //! chunk. [`Shared`] adds a background thread that saves the workspace's changes
-//! shortly after they happen, and the [`fuser::Filesystem`] impl at the bottom only
-//! locks, calls into [`Inner`] and replies.
+//! shortly after they happen, and the FUSE `Filesystem` impl at the bottom only locks,
+//! calls into [`Inner`] and replies. The NFS server on macOS (`nfs`) calls the same
+//! [`Inner`]; fuser lends it the types but never mounts there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -16,12 +17,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use fuser::{Errno, FileAttr, FileType, INodeNo, RenameFlags, TimeOrNow};
+#[cfg(fuse)]
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig,
-    LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    FileHandle, Filesystem, FopenFlags, Generation, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, Request, WriteFlags,
 };
-use sandfs_core::{Error, Kind, VPath, Workspace};
+use sandfs_core::{ChangeKind, Error, Kind, VPath, Workspace};
 
 use crate::persist::{Saved, Snapshot};
 use crate::store::subtree_keys;
@@ -29,12 +32,38 @@ use crate::store::subtree_keys;
 /// How long the kernel may cache attributes and names. Every change goes through this
 /// filesystem, so the kernel already sees its own updates and nothing goes stale;
 /// a short TTL would only make it ask again (a round trip per path, per second).
+#[cfg(fuse)]
 const TTL: Duration = Duration::from_secs(60);
-const ROOT_INO: u64 = 1;
+pub const ROOT_INO: u64 = 1;
 /// Files live in memory, so refuse sizes that could only be a mistake.
 const MAX_FILE_SIZE: usize = 4 << 30;
 /// Base files larger than this are read in ranges rather than whole.
 const RANGED_READ_SIZE: u64 = 64 << 20;
+
+// renameat2's flags, which only Linux's FUSE passes (NFS has none). Swapping two paths,
+// and overlay whiteouts, are not supported.
+#[cfg(target_os = "linux")]
+const RENAME_NOREPLACE: u32 = libc::RENAME_NOREPLACE;
+
+#[cfg(target_os = "linux")]
+fn rename_unsupported(flags: RenameFlags) -> bool {
+    flags.bits() & (libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT) != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_unsupported(_: RenameFlags) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(flags: RenameFlags) -> bool {
+    flags.bits() & RENAME_NOREPLACE != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_: RenameFlags) -> bool {
+    false
+}
 
 pub type FsResult<T> = Result<T, Errno>;
 
@@ -108,6 +137,19 @@ pub struct Inner {
     /// Read large base files in ranges. Only worth it for sources that can seek (a
     /// host folder): git reads a whole blob for every range.
     pub ranged_reads: bool,
+    /// Set when no `close` reaches this filesystem (NFS): buffered writes are moved
+    /// into the workspace at each save instead.
+    pub commit_on_save: bool,
+    /// Keep files macOS makes for its own bookkeeping out of saves, so they never
+    /// show up among the changes. See [`is_bookkeeping`].
+    pub skip_bookkeeping: bool,
+}
+
+/// Files macOS creates next to the ones people write: `._name` holds `name`'s extended
+/// attributes on filesystems without them (NFS), `.DS_Store` holds Finder's view
+/// settings, and `.nfs.*` is a removed file that is still open.
+pub fn is_bookkeeping(name: &str) -> bool {
+    name.starts_with("._") || name == ".DS_Store" || name.starts_with(".nfs.")
 }
 
 impl Inner {
@@ -137,6 +179,8 @@ impl Inner {
             gid,
             unsaved: false,
             ranged_reads: false,
+            commit_on_save: false,
+            skip_bookkeeping: false,
         };
         inner.inos.insert(root.to_string(), ROOT_INO);
         inner.nodes.insert(ROOT_INO, Node { path: root.clone(), lookups: 0, linked: true });
@@ -146,7 +190,55 @@ impl Inner {
     /// A copy of what a save needs; the workspace part is an O(1) fork.
     pub fn snapshot(&mut self) -> Snapshot {
         self.unsaved = false;
-        Snapshot { ws: self.ws.fork(), times: self.times.clone(), dirs: self.dirs.clone() }
+        if self.commit_on_save {
+            // A failed commit keeps its buffer, which the next save tries again.
+            let _ = self.commit_all();
+        }
+        let mut ws = self.ws.fork();
+        let mut dirs = self.dirs.clone();
+        if self.skip_bookkeeping {
+            let bookkeeping = |path: &VPath| path.name().is_some_and(is_bookkeeping);
+            for change in ws.changes().unwrap_or_default() {
+                if change.kind == ChangeKind::Added && bookkeeping(&change.path) {
+                    let _ = ws.remove(change.path.as_str(), true);
+                }
+            }
+            dirs.retain(|dir| VPath::parse(dir).map_or(true, |dir| !bookkeeping(&dir)));
+        }
+        Snapshot { ws, times: self.times.clone(), dirs }
+    }
+
+    /// Note a change the saver should pick up (a write over NFS, which has no close).
+    #[cfg(any(nfs, test))]
+    pub fn mark_unsaved(&mut self) {
+        self.unsaved = true;
+    }
+
+    // NFS clients never forget an inode, and resume a listing after the inode its last
+    // page ended on, which may have been removed or renamed since.
+
+    /// The folder holding `ino`.
+    #[cfg(any(nfs, test))]
+    pub fn parent_of(&mut self, ino: u64) -> Option<u64> {
+        if ino == ROOT_INO {
+            return Some(ROOT_INO);
+        }
+        let parent = self.path(ino).ok()?.parent()?;
+        Some(self.ino_for(&parent))
+    }
+
+    /// The name `ino` was last seen under, even if it is gone now.
+    #[cfg(any(nfs, test))]
+    pub fn last_name_of(&self, ino: u64) -> Option<String> {
+        self.nodes.get(&ino)?.path.name().map(str::to_owned)
+    }
+
+    /// Count a listed entry as looked up, so its inode outlives its name.
+    #[cfg(any(nfs, test))]
+    pub fn hold(&mut self, ino: u64) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.lookups += 1;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -235,6 +327,7 @@ impl Inner {
         self.entry(&path)
     }
 
+    #[cfg(any(fuse, test))]
     pub fn forget(&mut self, ino: u64, count: u64) {
         if ino == ROOT_INO {
             return;
@@ -387,7 +480,7 @@ impl Inner {
         new_name: &OsStr,
         flags: RenameFlags,
     ) -> FsResult<()> {
-        if flags.contains(RenameFlags::RENAME_EXCHANGE) || flags.contains(RenameFlags::RENAME_WHITEOUT) {
+        if rename_unsupported(flags) {
             return Err(Errno::EINVAL);
         }
         let from = self.child(parent, name)?;
@@ -401,7 +494,7 @@ impl Inner {
         }
         let replacing = match self.ws.stat(to.as_str()) {
             Ok(meta) => {
-                if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+                if rename_noreplace(flags) {
                     return Err(Errno::EEXIST);
                 }
                 match (moving_dir, meta.kind.is_dir()) {
@@ -649,6 +742,7 @@ impl Inner {
     /// Like [`Inner::readdir`], with each entry's attributes, handed to `add` until it
     /// reports the reply full. The kernel counts every entry it accepts as a lookup,
     /// except `.` and `..`, so those entries count here too.
+    #[cfg(any(fuse, test))]
     pub fn readdirplus(
         &mut self,
         fh: u64,
@@ -769,7 +863,7 @@ impl Shared {
     /// Wake the saver if the last request left something unsaved. Most requests
     /// (a close after a read) change nothing, and waking a thread costs more than the
     /// request itself.
-    fn changed(&self) {
+    pub fn changed(&self) {
         if self.lock().unsaved {
             self.wake.notify_one();
         }
@@ -777,8 +871,10 @@ impl Shared {
 }
 
 /// The [`Filesystem`] handed to fuser.
+#[cfg(fuse)]
 pub struct SandFs(pub Arc<Shared>);
 
+#[cfg(fuse)]
 impl SandFs {
     fn reply_entry(&self, reply: ReplyEntry, result: FsResult<FileAttr>) {
         self.0.changed();
@@ -797,6 +893,7 @@ impl SandFs {
     }
 }
 
+#[cfg(fuse)]
 impl Filesystem for SandFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         // Listings carry attributes, so a walk that stats every entry (`ls -l`, `find`)
@@ -1028,6 +1125,7 @@ impl Filesystem for SandFs {
     }
 }
 
+#[cfg(fuse)]
 fn log_io(err: &anyhow::Error) -> Errno {
     eprintln!("sandfs: saving changes failed: {err:#}");
     Errno::EIO
@@ -1160,8 +1258,16 @@ mod tests {
             fs.rename(ROOT_INO, name("README.md"), ROOT_INO, name("code"), RenameFlags::empty()).unwrap_err(),
             Errno::EISDIR
         );
+        #[cfg(target_os = "linux")]
         assert_eq!(
-            fs.rename(code, name("util.rs"), ROOT_INO, name("README.md"), RenameFlags::RENAME_NOREPLACE).unwrap_err(),
+            fs.rename(
+                code,
+                name("util.rs"),
+                ROOT_INO,
+                name("README.md"),
+                RenameFlags::from_bits_retain(RENAME_NOREPLACE)
+            )
+            .unwrap_err(),
             Errno::EEXIST
         );
     }

@@ -1,8 +1,8 @@
 [package]
 name = "sandfs-cli"
-description = "The sandfs command: mount, fork and list the changes of workspaces over FUSE, or serve one over MCP"
+description = "The sandfs command: mount, fork and list the changes of workspaces (over FUSE on Linux, NFS on macOS), or serve one over MCP"
 readme = "README.md"
-keywords = ["fuse", "filesystem", "sandbox", "copy-on-write", "agents"]
+keywords = ["fuse", "nfs", "filesystem", "sandbox", "copy-on-write"]
 categories = ["filesystem", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
@@ -18,9 +18,9 @@ path = "src/main.rs"
 
 [features]
 default = ["mount"]
-# The FUSE mount, on Linux. Elsewhere the feature does nothing yet: everything but
-# mounting works.
-mount = ["dep:fuser"]
+# The mount: FUSE on Linux, and on macOS an NFS server on localhost that macOS's own
+# NFS client mounts, so nothing needs installing.
+mount = ["dep:fuser", "dep:nfsserve", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
 anyhow = "1"
@@ -39,8 +39,21 @@ nix = { version = "0.31", features = ["signal"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18", optional = true }
 
+# On macOS fuser only lends the NFS mount its types; it never mounts.
+[target.'cfg(target_os = "macos")'.dependencies]
+async-trait = { version = "0.1", optional = true }
+fuser = { version = "0.18", optional = true, features = ["macos-no-mount"] }
+nfsserve = { version = "0.11", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+
 [dev-dependencies]
 tempfile = "3"
+
+# The NFS server's unit tests also run on Linux, where it isn't used.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+async-trait = "0.1"
+nfsserve = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 
 [lints]
 workspace = true

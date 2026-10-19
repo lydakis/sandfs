@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::host::mount_source;
 use crate::persist::{ObjectGone, Restored, Saved};
 
-/// Where a workspace's source is mounted inside the core workspace. The FUSE mount
+/// Where a workspace's source is mounted inside the core workspace. The mount
 /// shows this directory as its root.
 pub const ROOT: &str = "/mnt";
 
@@ -63,6 +63,9 @@ pub struct Record {
 pub struct MountInfo {
     pub pid: u32,
     pub mountpoint: PathBuf,
+    /// Where an NFS mount's process answers save requests (see `nfs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_port: Option<u16>,
 }
 
 /// A workspace opened from disk: its contents with the saved changes replayed.
@@ -323,7 +326,7 @@ pub(crate) fn subtree_keys<T>(map: &BTreeMap<String, T>, prefix: &VPath) -> Vec<
     keys
 }
 
-/// Whether a FUSE filesystem is mounted at `dir`.
+/// Whether a sandfs workspace or other FUSE filesystem is mounted at `dir`.
 pub fn is_mounted(dir: &Path) -> bool {
     mount_source(dir).is_some()
 }
