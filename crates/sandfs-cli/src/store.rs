@@ -10,6 +10,7 @@
 //! workspaces/<name>/objects/        bodies of saved files
 //! workspaces/<name>/mount.json      present while it is mounted
 //! workspaces/<name>/lock            held by the one process that may save it
+//! workspaces/<name>/holder          who holds the lock, for whoever it refuses
 //! ```
 //!
 //! A workspace's base is pinned when it is created: a host folder, or a git commit
@@ -22,7 +23,6 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, TryLockError};
-use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -203,27 +203,25 @@ impl Home {
     pub fn lock(&self, name: &str, holder: &str) -> Result<Writer> {
         check_name(name)?;
         let path = self.workspace_dir(name).join("lock");
-        // Not truncated on open: until the lock is ours, the text names the current holder.
-        let mut file = File::options()
-            .read(true)
+        let file = File::options()
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
+        // Who holds the lock lives in a file of its own: on Windows a locked file can't
+        // be read, even by the process that is refused.
+        let holder_path = self.workspace_dir(name).join("holder");
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let mut held_by = String::new();
-                let _ = file.read_to_string(&mut held_by);
+                let held_by = std::fs::read_to_string(&holder_path).unwrap_or_default();
                 let held_by = if held_by.trim().is_empty() { "another sandfs process" } else { held_by.trim() };
                 bail!("{name} is in use by {held_by}");
             }
             Err(TryLockError::Error(err)) => return Err(err).with_context(|| format!("locking {}", path.display())),
         }
-        file.set_len(0)?;
-        file.rewind()?;
-        file.write_all(holder.as_bytes())?;
+        std::fs::write(&holder_path, holder).with_context(|| format!("writing {}", holder_path.display()))?;
         Ok(Writer { _file: file })
     }
 
