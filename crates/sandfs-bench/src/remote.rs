@@ -299,11 +299,15 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     // before they exit.
     let mut serving = 0;
     if method == Method::Sandfs {
+        // One process serves both mounts, so it is counted once.
+        let mut pids = std::collections::BTreeSet::new();
         for name in ["copy", "fork"] {
             let info = std::fs::read(home.join("workspaces").join(name).join("mount.json"))?;
             let info: serde_json::Value = serde_json::from_slice(&info)?;
-            let pid = info["pid"].as_u64().context("mount.json has no pid")?;
-            serving += tree_peak_rss(u32::try_from(pid)?)?;
+            pids.insert(u32::try_from(info["pid"].as_u64().context("mount.json has no pid")?)?);
+        }
+        for pid in pids {
+            serving += tree_peak_rss(pid)?;
         }
         sandfs(&["unmount".as_ref(), dir.as_os_str()])?;
         sandfs(&["unmount".as_ref(), fork_dir.as_os_str()])?;

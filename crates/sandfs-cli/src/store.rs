@@ -11,6 +11,7 @@
 //! workspaces/<name>/mount.json      present while it is mounted
 //! workspaces/<name>/lock            held by the one process that may save it
 //! workspaces/<name>/holder          who holds the lock, for whoever it refuses
+//! run/                              the process serving every mount (see `server`)
 //! ```
 //!
 //! A workspace's base is pinned when it is created: a host folder, or a git commit
@@ -21,10 +22,10 @@
 //! It holds the workspace's [`Writer`] lock for as long as it serves. Readers (`changes`,
 //! `fork`) need no lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -39,7 +40,7 @@ use crate::persist::{ObjectGone, Restored, Saved};
 pub const ROOT: &str = "/mnt";
 
 /// What a workspace is based on.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Base {
     /// A host folder, read lazily and never written to.
@@ -69,6 +70,9 @@ pub struct MountInfo {
     /// The secret a save request must carry, so only its owner can ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_secret: Option<String>,
+    /// Tells this mount apart from a later one of the workspace by the same process.
+    #[serde(default)]
+    pub id: u64,
 }
 
 /// A workspace opened from disk: its contents with the saved changes replayed.
@@ -86,6 +90,7 @@ pub struct Writer {
 }
 
 /// The CLI's home directory.
+#[derive(Clone)]
 pub struct Home {
     root: PathBuf,
 }
@@ -106,7 +111,9 @@ impl Home {
         } else {
             bail!("set SANDFS_HOME so sandfs knows where to keep workspaces");
         };
-        Ok(Home { root })
+        // The process serving mounts runs from `/`, so a relative home must not depend on
+        // where it was started.
+        Ok(Home { root: std::path::absolute(root)? })
     }
 
     /// A home directory at an explicit path.
@@ -115,8 +122,18 @@ impl Home {
         Home { root: root.into() }
     }
 
+    /// The home directory itself, always absolute.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn workspace_dir(&self, name: &str) -> PathBuf {
         self.root.join("workspaces").join(name)
+    }
+
+    /// Where the process serving every mount keeps its socket, lock and log.
+    pub fn run_dir(&self) -> PathBuf {
+        self.root.join("run")
     }
 
     /// Create the workspace `name`. Fails if it exists.
@@ -173,10 +190,14 @@ impl Home {
     /// Where `name` was mounted, if that mount is still attached, even when the process
     /// serving it has died and left it disconnected.
     pub fn attached_mount(&self, name: &str) -> Option<MountInfo> {
-        let data = std::fs::read(self.workspace_dir(name).join("mount.json")).ok()?;
-        let info: MountInfo = serde_json::from_slice(&data).ok()?;
+        let info = self.recorded_mount(name)?;
         // Only this workspace's mount: another filesystem may have taken the path since.
         (mount_source(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
+    }
+
+    /// The mount recorded for `name`, attached or not.
+    pub fn recorded_mount(&self, name: &str) -> Option<MountInfo> {
+        serde_json::from_slice(&std::fs::read(self.workspace_dir(name).join("mount.json")).ok()?).ok()
     }
 
     pub fn set_mount_info(&self, name: &str, info: Option<&MountInfo>) -> Result<()> {
@@ -287,14 +308,24 @@ impl Home {
     /// newer index.
     pub fn open(&self, name: &str) -> Result<Opened> {
         let record = self.record(name)?;
-        let source: Arc<dyn Source> = match &record.base {
-            Base::Dir { path } => Arc::new(DirSource::new(path)?),
-            Base::Git { repo, commit } => crate::git::open(repo, commit)?,
-        };
+        let base = open_base(&record.base)?;
+        self.load(name, record, &base)
+    }
+
+    /// Open `name` over a base `bases` shares with the other workspaces this process
+    /// serves. The base stays open until the returned [`Lease`] is dropped.
+    #[cfg(mount)]
+    pub fn open_shared(&self, name: &str, bases: &Arc<Bases>) -> Result<(Opened, Lease)> {
+        let record = self.record(name)?;
+        let (base, lease) = bases.lease(&record.base)?;
+        Ok((self.load(name, record, &base)?, lease))
+    }
+
+    /// Replay `name`'s saved changes onto a fork of `base`.
+    fn load(&self, name: &str, record: Record, base: &Workspace) -> Result<Opened> {
         let mut attempts = 0;
         loop {
-            let mut ws = Workspace::new();
-            ws.mount(ROOT, source.clone())?;
+            let mut ws = base.fork();
             let mut saved = Saved::new(self.workspace_dir(name));
             match saved.load(&mut ws, &VPath::parse(ROOT)?) {
                 Ok(restored) => return Ok(Opened { ws, saved, restored, record }),
@@ -331,6 +362,76 @@ impl Home {
             Base::Dir { path }
         };
         Ok(Record { source: source.to_owned(), base, created })
+    }
+}
+
+/// An empty workspace with `base` mounted at [`ROOT`].
+fn open_base(base: &Base) -> Result<Workspace> {
+    let source: Arc<dyn Source> = match base {
+        Base::Dir { path } => Arc::new(DirSource::new(path)?),
+        Base::Git { repo, commit } => crate::git::open(repo, commit)?,
+    };
+    let mut ws = Workspace::new();
+    ws.mount(ROOT, source)?;
+    Ok(ws)
+}
+
+/// The git commits open in a process that serves several workspaces, each kept as an
+/// empty workspace that the workspaces over it are forks of. Their mounts share one
+/// source, with its git helpers, and every folder listing and size read from it.
+///
+/// A host folder is opened afresh for each workspace instead: its listings are cached
+/// once read, and a new mount should see the folder as it is now.
+#[cfg(mount)]
+#[derive(Default)]
+pub struct Bases {
+    open: Mutex<HashMap<Base, (Workspace, usize)>>,
+}
+
+/// One workspace's use of a shared base, which is closed when its last use ends.
+#[cfg(mount)]
+pub struct Lease {
+    bases: Arc<Bases>,
+    base: Option<Base>,
+}
+
+#[cfg(mount)]
+impl Bases {
+    /// An empty workspace over `base` to fork, and the lease that keeps it shared.
+    fn lease(self: &Arc<Self>, base: &Base) -> Result<(Workspace, Lease)> {
+        if !matches!(base, Base::Git { .. }) {
+            return Ok((open_base(base)?, Lease { bases: self.clone(), base: None }));
+        }
+        // A lease is made only once its use is counted, so dropping it never uncounts
+        // another mount's.
+        let lease = || Lease { bases: self.clone(), base: Some(base.clone()) };
+        if let Some((ws, uses)) = self.open.lock().expect("bases lock").get_mut(base) {
+            *uses += 1;
+            return Ok((ws.fork(), lease()));
+        }
+        // Opening a commit starts git, so other mounts aren't kept waiting meanwhile. Of
+        // two mounts opening it at once, the second to finish uses the first one's.
+        let opened = open_base(base)?;
+        let mut open = self.open.lock().expect("bases lock");
+        let (ws, uses) = open.entry(base.clone()).or_insert((opened, 0));
+        *uses += 1;
+        Ok((ws.fork(), lease()))
+    }
+}
+
+#[cfg(mount)]
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let Some(base) = self.base.take() else { return };
+        let mut open = self.bases.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((_, uses)) = open.get_mut(&base) else { return };
+        *uses -= 1;
+        if *uses == 0 {
+            // Closing the source waits for its git helpers to exit; nobody waits on that.
+            let closed = open.remove(&base);
+            drop(open);
+            drop(closed);
+        }
     }
 }
 
@@ -395,6 +496,7 @@ mod tests {
             mountpoint: data.path().to_path_buf(),
             save_port: Some(1),
             save_secret: Some("00".into()),
+            id: 1,
         };
         home.set_mount_info("ws", Some(&info)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);

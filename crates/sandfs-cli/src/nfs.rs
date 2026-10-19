@@ -403,7 +403,9 @@ pub fn run(
     shared: &Arc<Shared>,
     mounted: impl FnOnce(u16, String) -> Result<()>,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    // Each mount has a runtime of its own, so everything it started stops with it. Calls
+    // take turns on the workspace, so a couple of threads keep up.
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     runtime.block_on(async {
         let fs = SandNfs::new(shared.clone())?;
         let root = fs.id_to_fh(ROOT_INO).data;

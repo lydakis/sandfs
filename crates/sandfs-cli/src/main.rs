@@ -5,6 +5,7 @@
 //! and serves it as a directory (FUSE on Linux, NFS on macOS), `fork` mounts a copy of one without copying its source, and `changes` lists the
 //! files a workspace changed. A working copy on disk is just a fork mounted at a path.
 //! `serve --mcp` hands a workspace to an agent as MCP file tools instead of a mount.
+//! One background process serves every mount (see `server`).
 
 // Without a mount, mounting is stubbed out below, which leaves its helpers unused.
 #![cfg_attr(not(mount), allow(dead_code, unused_imports))]
@@ -17,12 +18,13 @@ mod mcp;
 #[cfg(any(nfs, all(test, fuse)))]
 mod nfs;
 mod persist;
+#[cfg(mount)]
+mod server;
 mod store;
 
-#[cfg(mount)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(mount)]
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -34,6 +36,8 @@ use crate::fs::SandFs;
 #[cfg(mount)]
 use crate::fs::{Inner, Shared};
 use crate::persist::Saved;
+#[cfg(mount)]
+use crate::store::Bases;
 use crate::store::{Base, Home, MountInfo, ROOT, check_name, is_mounted};
 
 #[derive(Parser)]
@@ -105,9 +109,9 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Serve a workspace's mount in this process (used by `mount` and `fork`).
+    /// Serve every mount in this process (started by `mount` and `fork`).
     #[command(hide = true)]
-    Daemon { name: String, dir: PathBuf },
+    Daemon,
 }
 
 fn main() {
@@ -194,7 +198,7 @@ fn run(cli: Cli) -> Result<()> {
             home.create(&name, &record)?;
             mcp::serve(&home, &name)
         }
-        Cmd::Daemon { name, dir } => serve(&home, &name, &dir),
+        Cmd::Daemon => serve_mounts(home),
     }
 }
 
@@ -289,42 +293,17 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
         bail!("something is already mounted at {}", dir.display());
     }
     if foreground {
-        return serve(home, name, &dir);
+        return serve(home, name, &dir, &Arc::default(), || {});
     }
+    server::mount(home, name, &dir)?;
+    println!("{name} mounted at {}", dir.display());
+    Ok(())
+}
 
-    let log_path = home.workspace_dir(name).join("mount.log");
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .arg("daemon")
-        .arg(name)
-        .arg(&dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log)
-        .process_group(0) // keep running when the terminal goes away
-        .spawn()
-        .context("starting the mount process")?;
-    // Opening the workspace can fetch from a remote, so allow it some time.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    // Most mounts are up within a few milliseconds, so poll quickly at first.
-    let mut wait = Duration::from_millis(1);
-    while Instant::now() < deadline {
-        // The kernel shows the mount slightly before the daemon records it.
-        if home.mount_info(name).is_some_and(|info| info.pid == child.id()) {
-            println!("{name} mounted at {}", dir.display());
-            return Ok(());
-        }
-        if let Some(status) = child.try_wait()? {
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            let tail: Vec<&str> = log.lines().rev().take(5).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            bail!("mounting failed ({status}):\n{}", tail.join("\n"));
-        }
-        std::thread::sleep(wait);
-        wait = (wait * 2).min(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    bail!("timed out waiting for the mount at {}", dir.display())
+/// Serve every mount asked of this home's background process (see `server`).
+#[cfg(mount)]
+fn serve_mounts(home: Home) -> Result<()> {
+    server::run(home)
 }
 
 /// The canonical path `dir` will have once created: its nearest existing ancestor,
@@ -342,9 +321,11 @@ fn resolve_new(dir: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-/// Serve `name` at `dir` until it is unmounted, then save its changes.
+/// Serve `name` at `dir` until it is unmounted, then save its changes. `ready` is called
+/// once the mount is up, and never if mounting fails. Workspaces over a commit share it
+/// through `bases` with the others this process serves.
 #[cfg(mount)]
-fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
+pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, ready: impl FnOnce()) -> Result<()> {
     let pid = std::process::id();
     let _writer = home.lock(name, &format!("the mount at {} (process {pid})", dir.display()))?;
     // Two workspaces mounted on one directory at once would stack. Locking the directory
@@ -357,7 +338,7 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     // A failed final save is reported by the `unmount` that asked for it, not a later one.
     let save_error = home.workspace_dir(name).join(SAVE_ERROR);
     let _ = std::fs::remove_file(&save_error);
-    let mut opened = home.open(name)?;
+    let (mut opened, _base) = home.open_shared(name, bases)?;
     opened.saved.collect_garbage();
     let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(dir)?);
     let group = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(dir)?);
@@ -376,12 +357,16 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     // A mount that never came up has nothing to save, and saving would make a new
     // workspace look used to the `mount_new` that removes it again.
     let was_mounted = std::cell::Cell::new(false);
-    let mounted = |save: Option<(u16, String)>| -> Result<()> {
+    let mut ready = Some(ready);
+    let mut mounted = |save: Option<(u16, String)>| -> Result<()> {
         let (save_port, save_secret) = save.unzip();
-        let info = MountInfo { pid, mountpoint: dir.to_path_buf(), save_port, save_secret };
+        let info = MountInfo { pid, mountpoint: dir.to_path_buf(), save_port, save_secret, id: mount_id() };
         home.set_mount_info(name, Some(&info))?;
         was_mounted.set(true);
         eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
+        if let Some(ready) = ready.take() {
+            ready();
+        }
         Ok(())
     };
     #[cfg(fuse)]
@@ -415,6 +400,14 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     saved.context("saving changes at unmount")
 }
 
+/// A number for a new mount that differs from the ones before it.
+#[cfg(mount)]
+fn mount_id() -> u64 {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    now ^ COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Where a mount's process leaves the error of a final save that failed.
 #[cfg(mount)]
 const SAVE_ERROR: &str = "save-error";
@@ -424,30 +417,33 @@ const SAVE_ERROR: &str = "save-error";
 #[cfg(mount)]
 fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     let state = home.workspace_dir(name);
-    let mount_file = state.join("mount.json");
+    // One process serves every mount, so the workspace may be mounted again by it while
+    // this waits; mount.json's id says whether the mount recorded is still this one.
+    let recorded = || home.recorded_mount(name).map(|current| current.id);
+    let replaced = || recorded().is_some_and(|id| id != info.id);
     // The serving process holds the workspace; checking that too means a process that
     // has since taken over a dead server's pid isn't waited for.
-    let serving = || host::alive(info.pid) && home.locked_by(name, info.pid);
+    let serving = || host::alive(info.pid) && home.locked_by(name, info.pid) && !replaced();
     host::unmount(&info.mountpoint, !serving())?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut wait = Duration::from_millis(1);
-    while mount_file.exists() && serving() {
+    while recorded() == Some(info.id) && serving() {
         if Instant::now() >= deadline {
             bail!("unmounted, but process {} is still saving the workspace's changes", info.pid);
         }
         std::thread::sleep(wait);
         wait = (wait * 2).min(Duration::from_millis(50));
     }
-    if mount_file.exists() {
+    if recorded() == Some(info.id) {
         // The serving process died without cleaning up; its last save is what remains.
         eprintln!("sandfs: the mount's process had exited; changes since its last save are lost");
-        let _ = std::fs::remove_file(&mount_file);
+        let _ = std::fs::remove_file(state.join("mount.json"));
     }
-    // The process lets go of the workspace as it exits, just after removing mount.json.
-    // Wait for that too, so a command right after this one finds the workspace free.
+    // The process lets go of the workspace just after removing mount.json. Wait for
+    // that too, so a command right after this one finds the workspace free.
     while serving() {
         if Instant::now() >= deadline {
-            bail!("unmounted, but process {} has not exited", info.pid);
+            bail!("unmounted, but process {} has not let go of {name}", info.pid);
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -455,7 +451,7 @@ fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
         let _ = std::fs::remove_file(state.join(SAVE_ERROR));
         // Still the moved mount.json (or empty) when the reason could not be written.
         let reason = if error.trim().is_empty() || error.starts_with('{') {
-            format!("see {}", state.join("mount.log").display())
+            format!("see {}", server::log_path(home).display())
         } else {
             error
         };
@@ -476,7 +472,7 @@ fn mount(_home: &Home, _name: &str, _dir: &Path, _foreground: bool) -> Result<()
 }
 
 #[cfg(not(mount))]
-fn serve(_home: &Home, _name: &str, _dir: &Path) -> Result<()> {
+fn serve_mounts(_home: Home) -> Result<()> {
     bail!(NO_MOUNT)
 }
 

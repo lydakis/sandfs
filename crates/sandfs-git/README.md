@@ -1,6 +1,6 @@
 # sandfs-git
 
-An optional [sandfs](https://crates.io/crates/sandfs-core) source that mounts a git commit without checking it out. Trees and blobs are read on demand through one `git cat-file --batch` process, and in a partial clone (`git clone --filter=blob:none`) git fetches a file's contents only when it is first read. It needs the `git` command on `PATH`.
+An optional [sandfs](https://crates.io/crates/sandfs-core) source that mounts a git commit without checking it out. Trees and blobs are read on demand through a `git cat-file --batch` process (and a few more while several threads read at once), and in a partial clone (`git clone --filter=blob:none`) git fetches a file's contents only when it is first read. It needs the `git` command on `PATH`.
 
 ```rust,no_run
 use std::sync::Arc;

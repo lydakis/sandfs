@@ -314,12 +314,15 @@ impl Target for Fuse {
     }
 
     fn helper_pids(&self) -> Vec<u32> {
-        // Each mounted workspace records the process serving it in mount.json.
+        // Each mounted workspace records the process serving it in mount.json. One
+        // process serves them all, so each is counted once.
         let Ok(dirs) = fs::read_dir(self.home.path().join("workspaces")) else { return Vec::new() };
-        dirs.filter_map(|dir| fs::read(dir.ok()?.path().join("mount.json")).ok())
+        let pids: std::collections::BTreeSet<u32> = dirs
+            .filter_map(|dir| fs::read(dir.ok()?.path().join("mount.json")).ok())
             .filter_map(|json| serde_json::from_slice::<serde_json::Value>(&json).ok()?["pid"].as_u64())
             .map(|pid| pid as u32)
-            .collect()
+            .collect();
+        pids.into_iter().collect()
     }
 }
 
