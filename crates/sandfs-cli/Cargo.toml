@@ -18,8 +18,8 @@ path = "src/main.rs"
 
 [features]
 default = ["mount"]
-# The FUSE mount, on Linux. macOS has no FUSE of its own, so there the feature does
-# nothing yet: everything but mounting works.
+# The FUSE mount, on Linux. Elsewhere the feature does nothing yet: everything but
+# mounting works.
 mount = ["dep:fuser"]
 
 [dependencies]
@@ -36,7 +36,7 @@ serde_json = "1"
 libc = "0.2"
 nix = { version = "0.31", features = ["signal"] }
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18", optional = true }
 
 [dev-dependencies]
