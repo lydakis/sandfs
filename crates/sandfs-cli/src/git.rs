@@ -59,6 +59,11 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
         eprintln!("sandfs: fetching {url} (file contents are fetched when first read)");
         create_clone(&dest, url)?;
     } else if let Some(commit) = pinned(&dest, rev) {
+        // Nothing to fetch, but later file contents come from `origin`: switch it to a
+        // different URL given now only if that URL answers, so working offline still works.
+        if origin(&dest).as_deref() != Some(url) && git(&dest, &["ls-remote", url, "HEAD"]).is_ok() {
+            git(&dest, &["remote", "set-url", "origin", url])?;
+        }
         return Ok((dest, commit));
     }
     // A ref of this fetch's own, so concurrent mounts of one repository don't race on
@@ -88,7 +93,7 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
             // with or without a user), and file contents come from `origin`. Fetching from
             // `url` itself and only then making it `origin` replaces an earlier URL that
             // didn't work, but never one that did with one that doesn't.
-            if git(&dest, &["config", "remote.origin.url"]).ok().as_deref() != Some(url) {
+            if origin(&dest).as_deref() != Some(url) {
                 git(&dest, &["remote", "set-url", "origin", url])?;
             }
             let commit = commit_of(&dest, &fetched);
@@ -150,6 +155,11 @@ fn pinned(repo: &Path, rev: &str) -> Option<String> {
     let id = rev.to_ascii_lowercase();
     let pin = format!("refs/sandfs/commits/{id}");
     (is_commit_id(&id) && git(repo, &["show-ref", "--verify", "--quiet", &pin]).is_ok()).then_some(id)
+}
+
+/// The URL the local copy fetches file contents from.
+fn origin(repo: &Path) -> Option<String> {
+    git(repo, &["config", "remote.origin.url"]).ok()
 }
 
 /// Whether git refused a fetch only because another fetch was rewriting the local copy's
@@ -284,6 +294,12 @@ mod tests {
         let unreachable = remote.to_str().unwrap().trim_start_matches('/').replacen('/', ":", 1);
         assert_eq!(repos.join(cache_path(&unreachable).unwrap()), repo);
         assert!(fetch_commit(&repos, &unreachable, "main").is_err());
+        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+        // The same holds for a commit mounted before, which needs no fetch.
+        assert!(fetch_commit(&repos, &unreachable, &third).is_ok());
+        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+        run(&repo, &["remote", "set-url", "origin", "file:///nowhere"]);
+        assert_eq!(resolve(&repos, &format!("{url}@{third}")).unwrap().1, third);
         assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
         // One commit and its listings: no history, and no file contents until read.
         assert_eq!(run(&repo, &["rev-list", "--count", "--all"]), "1");
