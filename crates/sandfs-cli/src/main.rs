@@ -225,9 +225,9 @@ fn default_name(name: Option<String>, dir: &Path) -> Result<String> {
 /// mount's process saves when asked on its save port, since `fsync` never reaches it.
 fn sync(home: &Home, name: &str) -> Result<()> {
     let Some(info) = home.mount_info(name) else { return Ok(()) };
-    let saved = match info.save_port {
+    let saved = match (info.save_port, info.save_secret) {
         #[cfg(nfs)]
-        Some(port) => nfs::request_save(port),
+        (Some(port), Some(secret)) => nfs::request_save(port, &secret),
         _ => std::fs::File::open(&info.mountpoint).and_then(|dir| dir.sync_all()).map_err(anyhow::Error::from),
     };
     saved.with_context(|| format!("saving {name} before reading it"))
@@ -370,8 +370,10 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
     // A mount that never came up has nothing to save, and saving would make a new
     // workspace look used to the `mount_new` that removes it again.
     let was_mounted = std::cell::Cell::new(false);
-    let mounted = |save_port: Option<u16>| -> Result<()> {
-        home.set_mount_info(name, Some(&MountInfo { pid, mountpoint: dir.to_path_buf(), save_port }))?;
+    let mounted = |save: Option<(u16, String)>| -> Result<()> {
+        let (save_port, save_secret) = save.unzip();
+        let info = MountInfo { pid, mountpoint: dir.to_path_buf(), save_port, save_secret };
+        home.set_mount_info(name, Some(&info))?;
         was_mounted.set(true);
         eprintln!("sandfs: serving {name} at {} since {:?}", dir.display(), SystemTime::now());
         Ok(())
@@ -385,7 +387,7 @@ fn serve(home: &Home, name: &str, dir: &Path) -> Result<()> {
         session.run().map_err(anyhow::Error::from)
     };
     #[cfg(nfs)]
-    let result = nfs::run(name, dir, &shared, |port| mounted(Some(port)));
+    let result = nfs::run(name, dir, &shared, |port, secret| mounted(Some((port, secret))));
 
     shared.stop();
     let _ = saver.join();
@@ -417,9 +419,9 @@ const SAVE_ERROR: &str = "save-error";
 fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     let state = home.workspace_dir(name);
     let mount_file = state.join("mount.json");
-    // A live process holds the workspace; checking that too means a process that has
-    // since taken over a dead server's pid isn't waited for.
-    let serving = || host::alive(info.pid) && home.is_locked(name);
+    // The serving process holds the workspace; checking that too means a process that
+    // has since taken over a dead server's pid isn't waited for.
+    let serving = || host::alive(info.pid) && home.locked_by(name, info.pid);
     host::unmount(&info.mountpoint, !serving())?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut wait = Duration::from_millis(1);
@@ -437,7 +439,7 @@ fn unmount(home: &Home, name: &str, info: &MountInfo) -> Result<()> {
     }
     // The process lets go of the workspace as it exits, just after removing mount.json.
     // Wait for that too, so a command right after this one finds the workspace free.
-    while host::alive(info.pid) && home.lock(name, "sandfs unmount").is_err() {
+    while serving() {
         if Instant::now() >= deadline {
             bail!("unmounted, but process {} has not exited", info.pid);
         }

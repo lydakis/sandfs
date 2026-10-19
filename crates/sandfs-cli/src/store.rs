@@ -66,6 +66,9 @@ pub struct MountInfo {
     /// Where an NFS mount's process answers save requests (see `nfs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_port: Option<u16>,
+    /// The secret a save request must carry, so only its owner can ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_secret: Option<String>,
 }
 
 /// A workspace opened from disk: its contents with the saved changes replayed.
@@ -179,7 +182,14 @@ impl Home {
     pub fn set_mount_info(&self, name: &str, info: Option<&MountInfo>) -> Result<()> {
         let path = self.workspace_dir(name).join("mount.json");
         match info {
-            Some(info) => std::fs::write(path, serde_json::to_vec(info)?)?,
+            Some(info) => {
+                let mut file = File::options();
+                file.write(true).create(true).truncate(true);
+                // Readable by its owner only, since it holds the save secret.
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+                std::io::Write::write_all(&mut file.open(&path)?, &serde_json::to_vec(info)?)?;
+            }
             None => {
                 let _ = std::fs::remove_file(path);
             }
@@ -212,15 +222,18 @@ impl Home {
         bail!("{what:?} is neither a workspace name nor a mounted workspace")
     }
 
-    /// Whether some process holds `name` (see [`Home::lock`]), checked once, without
-    /// waiting. A lock that can't be checked counts as held.
+    /// Whether process `pid` holds `name` (see [`Home::lock`]): the lock is held, checked
+    /// once without waiting, and its holder names that process. A lock that can't be
+    /// checked counts as held.
     #[cfg(mount)]
-    pub fn is_locked(&self, name: &str) -> bool {
-        let path = self.workspace_dir(name).join("lock");
-        match File::options().write(true).open(path) {
+    pub fn locked_by(&self, name: &str, pid: u32) -> bool {
+        let dir = self.workspace_dir(name);
+        let held = match File::options().write(true).open(dir.join("lock")) {
             Ok(file) => !matches!(file.try_lock(), Ok(())),
             Err(_) => true,
-        }
+        };
+        held && std::fs::read_to_string(dir.join("holder"))
+            .is_ok_and(|holder| holder.ends_with(&format!("(process {pid})")))
     }
 
     /// Take the right to save `name`, or fail saying who holds it. `holder` describes

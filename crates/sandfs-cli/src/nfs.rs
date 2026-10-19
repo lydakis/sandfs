@@ -395,16 +395,20 @@ impl NFSFileSystem for SandNfs {
 
 /// Serve `shared` over NFS, mount it at `dir` as `name` and keep serving until it is
 /// unmounted. `mounted` is called once the mount is up, with the port that answers
-/// save requests.
+/// save requests and the secret they must carry.
 #[cfg(nfs)]
-pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u16) -> Result<()>) -> Result<()> {
+pub fn run(
+    name: &str,
+    dir: &Path,
+    shared: &Arc<Shared>,
+    mounted: impl FnOnce(u16, String) -> Result<()>,
+) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
         let fs = SandNfs::new(shared.clone())?;
         let root = fs.id_to_fh(ROOT_INO).data;
         let server = NFSTcpListener::bind("127.0.0.1:0", fs).await.context("starting the NFS server")?;
-        let secret: String = random()?.iter().map(|byte| format!("{byte:02x}")).collect();
-        let export = format!("/sandfs/{name}/{secret}");
+        let export = format!("/sandfs/{name}/{}", hex(&random()?));
         let server_port = server.get_listen_port();
         tokio::spawn(async move { server.handle_forever().await });
         let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("starting the NFS listener")?;
@@ -414,7 +418,8 @@ pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u1
         tokio::spawn(guard(front, server_port, Arc::new(gate)));
         let saves = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("starting the save listener")?;
         let save_port = saves.local_addr()?.port();
-        tokio::spawn(answer_saves(saves, shared.clone()));
+        let save_secret = hex(&random()?);
+        tokio::spawn(answer_saves(saves, shared.clone(), save_secret.clone()));
 
         let options = mount_options(port);
         let source = format!("localhost:{export}");
@@ -425,7 +430,7 @@ pub fn run(name: &str, dir: &Path, shared: &Arc<Shared>, mounted: impl FnOnce(u1
         .await?
         .context("running mount_nfs")?;
         anyhow::ensure!(status.success(), "mount_nfs failed ({status})");
-        if let Err(err) = mounted(save_port) {
+        if let Err(err) = mounted(save_port, save_secret) {
             // The server stops when this returns, so don't leave a dead mount over `dir`.
             let _ = std::process::Command::new("/sbin/umount").arg("-f").arg(dir).status();
             return Err(err);
@@ -681,12 +686,19 @@ fn refusal(call: &[u8]) -> Vec<u8> {
 }
 
 /// Answer each connection to `saves` by saving everything written so far, then
-/// replying `ok` or the error.
+/// Answer each connection to `saves` that sends `secret` by saving everything written
+/// so far, then replying `ok` or the error. Other local users can reach the port too,
+/// so a connection without the secret is dropped unanswered.
 #[cfg(nfs)]
-async fn answer_saves(saves: tokio::net::TcpListener, shared: Arc<Shared>) {
+async fn answer_saves(saves: tokio::net::TcpListener, shared: Arc<Shared>, secret: String) {
     while let Ok((mut stream, _)) = saves.accept().await {
-        let shared = shared.clone();
+        let (shared, secret) = (shared.clone(), secret.clone());
         tokio::spawn(async move {
+            let mut asked = vec![0; secret.len()];
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut asked)).await;
+            if !matches!(read, Ok(Ok(_))) || !same_bytes(&asked, secret.as_bytes()) {
+                return;
+            }
             let saved = tokio::task::spawn_blocking(move || shared.save(true)).await;
             let reply = match saved {
                 Ok(Ok(())) => "ok\n".to_owned(),
@@ -700,10 +712,11 @@ async fn answer_saves(saves: tokio::net::TcpListener, shared: Arc<Shared>) {
 
 /// Ask the process serving a mount to save, through its save port.
 #[cfg(nfs)]
-pub fn request_save(port: u16) -> Result<()> {
-    use std::io::Read;
+pub fn request_save(port: u16, secret: &str) -> Result<()> {
+    use std::io::{Read, Write};
 
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(secret.as_bytes())?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
     match reply.trim() {
@@ -711,6 +724,16 @@ pub fn request_save(port: u16) -> Result<()> {
         "" => anyhow::bail!("the mount's process stopped before saving"),
         err => anyhow::bail!("{err}"),
     }
+}
+
+/// `bytes` in hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Whether `a` and `b` are equal, taking as long whichever byte differs.
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -893,6 +916,13 @@ mod tests {
         let creds = creds.concat();
         let head = [42u32, 0, 2, program, 3, procedure, 1, creds.len() as u32].map(u32::to_be_bytes).concat();
         [head, creds, vec![0; 8]].concat()
+    }
+
+    #[test]
+    fn secrets_are_hex_and_compared_whole() {
+        assert_eq!(hex(&[0x0f, 0xa0]), "0fa0");
+        assert!(same_bytes(b"0fa0", b"0fa0"));
+        assert!(!same_bytes(b"0fa0", b"0fa1") && !same_bytes(b"0fa", b"0fa0"));
     }
 
     #[test]
