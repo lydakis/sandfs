@@ -446,6 +446,10 @@ fn dir_source_refuses_listings_through_a_swapped_in_symlink() {
     std::os::unix::fs::symlink(&outside, root.join("a/b")).unwrap();
     assert!(source.read_dir("a/b").is_err());
     assert!(source.read_dir("a/b/c").is_err());
+    // A fifo in a folder's place fails at once instead of waiting for a writer.
+    std::fs::remove_file(root.join("a/b")).unwrap();
+    assert!(std::process::Command::new("mkfifo").arg(root.join("a/b")).status().unwrap().success());
+    assert!(source.read_dir("a/b").is_err());
     // On Linux, where the kernel names the folder it opened, a link to a folder inside
     // the root is refused too: the key names another path. Elsewhere the resolved path
     // is only checked to be inside the root.

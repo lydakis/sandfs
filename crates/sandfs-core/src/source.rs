@@ -222,7 +222,11 @@ impl DirSource {
         #[cfg(target_os = "linux")]
         if Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
             use std::os::fd::AsRawFd;
-            let opened = std::fs::File::open(dir).map_err(io_error)?;
+            use std::os::unix::fs::OpenOptionsExt;
+            // A directory-only open fails at once on anything else, such as a fifo
+            // swapped in since the listing, which a plain open would block on.
+            let opened =
+                std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(dir).map_err(io_error)?;
             if let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd())) {
                 return if path == dir {
                     Ok(())

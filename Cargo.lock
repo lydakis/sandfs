@@ -737,6 +737,7 @@ version = "0.4.0"
 dependencies = [
  "bytes",
  "imbl",
+ "libc",
  "thiserror",
 ]
 
