@@ -332,9 +332,15 @@ mod tests {
     #[test]
     fn a_process_tree_counts_its_running_children() {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        // Until the child has become `sleep`, it is a copy of this process with its peak.
+        let comm = format!("/proc/{}/comm", child.id());
+        while std::fs::read_to_string(&comm).unwrap().trim() != "sleep" {
+            std::thread::yield_now();
+        }
+        // Peaks only grow, so reading the parts before the whole keeps the sum below it.
         let alone = peak_rss(std::process::id()).unwrap();
-        let tree = tree_peak_rss(std::process::id()).unwrap();
         let sleeping = peak_rss(child.id()).unwrap();
+        let tree = tree_peak_rss(std::process::id()).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(sleeping > 0);

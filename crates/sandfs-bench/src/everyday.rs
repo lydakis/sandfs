@@ -118,7 +118,7 @@ impl Paths {
     }
 
     fn renamed(&self) -> String {
-        format!("{}.moved", self.rename)
+        format!("{}.sandfs-bench-moved", self.rename)
     }
 }
 
@@ -162,6 +162,8 @@ pub fn run(group: &Group, selected: &dyn Fn(&str) -> bool) -> Result<GroupResult
                 let result = perform(view.as_mut(), &group.paths, op)
                     .with_context(|| format!("{} on {}", op.name(), column.name()))?;
                 times.push(start.elapsed());
+                check(view.as_mut(), &group.paths, op)
+                    .with_context(|| format!("{} on {} didn't take", op.name(), column.name()))?;
                 drop(view);
                 match expected {
                     None => expected = Some((result, column.name())),
@@ -216,7 +218,8 @@ fn perform(view: &mut dyn View, paths: &Paths, op: Op) -> Result<u64> {
             let mut data = view.contents(&paths.edit)?;
             let middle = data.len() / 2;
             let end = (middle + 16).min(data.len());
-            data[middle..end].fill(b'e');
+            // Always 16 new bytes, so even a short or empty file changes.
+            data.splice(middle..end, EDIT);
             view.write(&paths.edit, &data)?;
             data.len() as u64
         }
@@ -230,6 +233,28 @@ fn perform(view: &mut dyn View, paths: &Paths, op: Op) -> Result<u64> {
         }
         Op::Changes => view.changes()? as u64,
     })
+}
+
+/// The bytes the edit writes into the middle of a file.
+const EDIT: [u8; 16] = [b'e'; 16];
+
+/// After a write, untimed: the view must show what was written, so a view that drops
+/// or misapplies a change fails instead of looking fast.
+fn check(view: &mut dyn View, paths: &Paths, op: Op) -> Result<()> {
+    match op {
+        Op::Create => ensure!(view.contents(&paths.create)? == [b'n'; 4096], "wrong contents"),
+        Op::Edit => {
+            let data = view.contents(&paths.edit)?;
+            ensure!(data.windows(EDIT.len()).any(|window| window == EDIT), "the edit is missing");
+        }
+        Op::Rename => {
+            ensure!(view.stat(&paths.rename).is_err(), "the old name is still there");
+            view.stat(&paths.renamed()).context("the new name is missing")?;
+        }
+        Op::Delete => ensure!(view.stat(&paths.delete).is_err(), "the file is still there"),
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Every file below `dir`, found by listing each folder once.

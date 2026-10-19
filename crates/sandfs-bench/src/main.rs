@@ -281,24 +281,33 @@ fn run(args: Args) -> Result<()> {
 const WORKFLOW: &str = "workflow/attempts";
 
 /// The sources the everyday operations run on, each with the ways of reaching it that
-/// work here: the data set as a host folder, a slow source holding part of it, and the
-/// `--remote` repository.
+/// work here and `--targets` selects: the data set as a host folder, a slow source
+/// holding part of it, and the `--remote` repository. The Rust API columns count as
+/// `sandfs` and the mount columns as `fuse`.
 fn everyday_groups(
     args: &Args,
     data: &Data,
     scratch: &std::path::Path,
     bin: &std::path::Path,
 ) -> Result<Vec<everyday::Group>> {
-    let mount = everyday::can_mount(scratch, bin);
-    if let Err(err) = &mount {
-        eprintln!("everyday: no mount columns ({err:#})");
-    }
+    let wanted = |target: TargetArg| args.targets.as_ref().is_none_or(|list| list.contains(&target));
+    let mount = wanted(TargetArg::Fuse) && {
+        let mount = everyday::can_mount(scratch, bin);
+        if let Err(err) = &mount {
+            eprintln!("everyday: no mount columns ({err:#})");
+        }
+        mount.is_ok()
+    };
+    let api = wanted(TargetArg::Sandfs);
     let root = data.root().to_owned();
-    let mut folder: Vec<Box<dyn Target>> = vec![
-        Box::new(Host { data: root.clone(), scratch: scratch.to_owned() }),
-        Box::new(Sandfs { data: root.clone() }),
-    ];
-    if mount.is_ok() {
+    let mut folder: Vec<Box<dyn Target>> = Vec::new();
+    if wanted(TargetArg::Host) {
+        folder.push(Box::new(Host { data: root.clone(), scratch: scratch.to_owned() }));
+    }
+    if api {
+        folder.push(Box::new(Sandfs { data: root.clone() }));
+    }
+    if mount {
         folder.push(Box::new(Fuse::new(root, scratch.to_owned(), bin.to_owned())?));
     }
     let s = data.scale;
@@ -317,19 +326,26 @@ fn everyday_groups(
                 s.lazy_files.min(s.small_files())
             ),
             paths: everyday::data_paths(data, s.lazy_files),
-            columns: vec![Box::new(everyday::SlowSource::new(data, s.lazy_files, latency)?)],
+            columns: if api {
+                vec![Box::new(everyday::SlowSource::new(data, s.lazy_files, latency)?)]
+            } else {
+                Vec::new()
+            },
             iters: s.iters,
         },
     ];
-    if let Some(url) = &args.remote {
+    if let Some(url) = args.remote.as_ref().filter(|_| api || mount) {
         let listings = scratch.join("everyday-listings");
         let plan = remote::Plan::fetch(url, args.remote_folder.as_deref(), &listings)?;
-        let mut columns: Vec<Box<dyn Target>> = vec![Box::new(everyday::RemoteLibrary {
-            url: url.clone(),
-            commit: plan.commit.clone(),
-            scratch: scratch.to_owned(),
-        })];
-        if mount.is_ok() {
+        let mut columns: Vec<Box<dyn Target>> = Vec::new();
+        if api {
+            columns.push(Box::new(everyday::RemoteLibrary {
+                url: url.clone(),
+                commit: plan.commit.clone(),
+                scratch: scratch.to_owned(),
+            }));
+        }
+        if mount {
             columns.push(Box::new(everyday::RemoteMount {
                 url: url.clone(),
                 commit: plan.commit.clone(),
@@ -345,6 +361,7 @@ fn everyday_groups(
             iters: 1,
         });
     }
+    groups.retain(|group| !group.columns.is_empty());
     Ok(groups)
 }
 
