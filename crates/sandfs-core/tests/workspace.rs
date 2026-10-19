@@ -184,7 +184,37 @@ fn versioned_writes_detect_conflicts() {
     ws.write_versioned("/repo/README.md", "mine", 0).unwrap();
     let err = ws.write_versioned("/repo/README.md", "stale", 0).unwrap_err();
     assert_eq!(err, Error::VersionMismatch { path: "/repo/README.md".into(), expected: 0, actual: 1 });
+    // A rejected write leaves the file exactly as it was, version included.
     assert_eq!(ws.read_text("/repo/README.md").unwrap(), "mine");
+    assert_eq!(ws.stat("/repo/README.md").unwrap().version, 1);
+    assert_eq!(changes(&ws), [("/repo/README.md".into(), ChangeKind::Modified)]);
+}
+
+#[test]
+fn a_replaced_file_gets_a_fresh_version() {
+    // The mount replaces a file (`mv` or `cp` over it) by removing it first.
+    let (mut ws, _) = workspace();
+    let draft = ws.write("/repo/docs/guide.md", "draft").unwrap();
+    ws.remove("/repo/docs/guide.md", false).unwrap();
+    ws.copy("/repo/README.md", "/repo/docs/guide.md", false).unwrap();
+    let copied = ws.stat("/repo/docs/guide.md").unwrap().version;
+    assert!(copied > draft);
+    assert_eq!(ws.stat("/repo/README.md").unwrap().version, 0, "the copied file is untouched");
+    assert!(matches!(ws.write_versioned("/repo/docs/guide.md", "stale", draft), Err(Error::VersionMismatch { .. })));
+
+    let base = ws.stat("/repo/src/lib.rs").unwrap().version;
+    ws.write("/new.txt", "new").unwrap();
+    ws.remove("/repo/src/lib.rs", false).unwrap();
+    ws.rename("/new.txt", "/repo/src/lib.rs").unwrap();
+    assert_ne!(ws.stat("/repo/src/lib.rs").unwrap().version, base);
+    assert!(matches!(ws.write_versioned("/repo/src/lib.rs", "stale", base), Err(Error::VersionMismatch { .. })));
+
+    assert_eq!(ws.read_text("/repo/docs/guide.md").unwrap(), "hello\n");
+    assert_eq!(ws.read_text("/repo/src/lib.rs").unwrap(), "new");
+    assert_eq!(
+        changes(&ws),
+        [("/repo/docs/guide.md".into(), ChangeKind::Modified), ("/repo/src/lib.rs".into(), ChangeKind::Modified)]
+    );
 }
 
 #[test]
