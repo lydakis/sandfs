@@ -18,4 +18,6 @@ fn every_workload_runs_on_every_available_target() {
         assert!(stdout.contains(row), "{row} missing from:\n{stdout}");
     }
     assert!(stdout.contains("| host | sandfs |"), "{stdout}");
+    assert!(stdout.contains("| target | 8 attempts, wall |"), "{stdout}");
+    assert!(stdout.contains("\n| sandfs | "), "{stdout}");
 }
