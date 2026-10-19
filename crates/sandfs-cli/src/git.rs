@@ -61,7 +61,14 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     } else if let Some(commit) = pinned(&dest, rev) {
         return Ok((dest, commit));
     }
-    // A per-process ref, so concurrent mounts of one repository don't race on FETCH_HEAD.
+    // One fetch at a time per local copy: a shallow fetch rewrites the copy's list of
+    // shallow commits, which two git processes can't do at once. The lock is released
+    // when `lock` is dropped.
+    let lock = std::fs::File::create(dest.join("sandfs-fetch.lock"))?;
+    lock.lock().context("locking the local copy")?;
+    if let Some(commit) = pinned(&dest, rev) {
+        return Ok((dest, commit)); // fetched by whoever held the lock
+    }
     let fetched = format!("refs/sandfs/fetch-{}", std::process::id());
     let refspec = format!("+{rev}:{fetched}");
     let fetch = git(
@@ -273,6 +280,40 @@ mod tests {
         // A name needs the server, so it fails offline instead of mounting something stale.
         let err = format!("{:#}", resolve(&repos, &format!("{url}@main")).unwrap_err());
         assert!(err.contains("only a full commit id that was mounted before mounts"), "{err}");
+    }
+
+    #[test]
+    fn concurrent_mounts_of_one_remote_wait_for_each_other() {
+        let tmp = tempfile::Builder::new().prefix("sandfs-git").tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        run(&remote, &["init", "-q", "-b", "main"]);
+        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        let commits: Vec<String> = (0..8)
+            .map(|i| {
+                std::fs::write(remote.join("a.txt"), i.to_string()).unwrap();
+                run(&remote, &["add", "a.txt"]);
+                run(&remote, &["commit", "-q", "-m", &i.to_string()]);
+                run(&remote, &["rev-parse", "HEAD"])
+            })
+            .collect();
+        let url = format!("file://{}", remote.display());
+        let repos = tmp.path().join("repos");
+
+        resolve(&repos, &url).unwrap();
+        // Every fetch rewrites the local copy's shallow list, so unserialized ones collide.
+        std::thread::scope(|scope| {
+            let mounts: Vec<_> = commits
+                .iter()
+                .map(|commit| {
+                    let (repos, spec) = (&repos, format!("{url}@{commit}"));
+                    scope.spawn(move || resolve(repos, &spec).map(|(_, id)| id))
+                })
+                .collect();
+            for (mount, commit) in mounts.into_iter().zip(&commits) {
+                assert_eq!(&mount.join().unwrap().unwrap(), commit);
+            }
+        });
     }
 
     #[test]
