@@ -58,13 +58,7 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     if !existed {
         eprintln!("sandfs: fetching {url} (file contents are fetched when first read)");
         create_clone(&dest, url)?;
-    } else if git(&dest, &["config", "remote.origin.url"]).ok().as_deref() != Some(url) {
-        // One local copy serves every URL that names the repository (https or ssh, with
-        // or without a user), so fetch commits and file contents from the one given now:
-        // an earlier URL may be the one that didn't work.
-        git(&dest, &["remote", "set-url", "origin", url])?;
-    }
-    if let Some(commit) = pinned(&dest, rev) {
+    } else if let Some(commit) = pinned(&dest, rev) {
         return Ok((dest, commit));
     }
     // A ref of this fetch's own, so concurrent mounts of one repository don't race on
@@ -74,14 +68,14 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     let fetched = format!("refs/sandfs/fetch-{}-{n}", std::process::id());
     let refspec = format!("+{rev}:{fetched}");
     let args =
-        ["fetch", "-q", "--depth=1", "--filter=blob:none", "--no-tags", "--recurse-submodules=no", "origin", &refspec];
+        ["fetch", "-q", "--depth=1", "--filter=blob:none", "--no-tags", "--recurse-submodules=no", url, &refspec];
     // A shallow fetch rewrites the local copy's list of shallow commits, and git refuses
     // to while another fetch is doing so ("shallow.lock: File exists", "shallow file has
     // changed since we read it"). Of two mounts fetching at once, one waits and retries.
     let mut waited = 0;
     let fetch = loop {
         match git(&dest, &args) {
-            Err(err) if waited < 300 && format!("{err:#}").contains("shallow") => {
+            Err(err) if waited < 300 && is_shallow_race(&format!("{err:#}")) => {
                 waited += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -90,6 +84,13 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     };
     let commit = match fetch {
         Ok(_) => {
+            // One local copy serves every URL that names the repository (https or ssh,
+            // with or without a user), and file contents come from `origin`. Fetching from
+            // `url` itself and only then making it `origin` replaces an earlier URL that
+            // didn't work, but never one that did with one that doesn't.
+            if git(&dest, &["config", "remote.origin.url"]).ok().as_deref() != Some(url) {
+                git(&dest, &["remote", "set-url", "origin", url])?;
+            }
             let commit = commit_of(&dest, &fetched);
             let _ = git(&dest, &["update-ref", "-d", &fetched]);
             commit?
@@ -149,6 +150,12 @@ fn pinned(repo: &Path, rev: &str) -> Option<String> {
     let id = rev.to_ascii_lowercase();
     let pin = format!("refs/sandfs/commits/{id}");
     (is_commit_id(&id) && git(repo, &["show-ref", "--verify", "--quiet", &pin]).is_ok()).then_some(id)
+}
+
+/// Whether git refused a fetch only because another fetch was rewriting the local copy's
+/// list of shallow commits at the same time.
+fn is_shallow_race(error: &str) -> bool {
+    error.contains("shallow.lock") || error.contains("shallow file has changed since we read it")
 }
 
 /// A full commit id, which names the same commit forever.
@@ -268,9 +275,15 @@ mod tests {
 
         let (repo, commit) = resolve(&repos, &url).unwrap();
         assert_eq!(commit, third);
-        // A first mount through a URL that failed doesn't stick to the local copy.
+        // A URL that failed doesn't stick to the local copy, and a URL that fails doesn't
+        // replace one that works. `tmp:sandfs-gitX/remote`, an ssh host that doesn't exist,
+        // shares the local copy of `file:///tmp/sandfs-gitX/remote`.
         run(&repo, &["remote", "set-url", "origin", "file:///nowhere"]);
         assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, third);
+        assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
+        let unreachable = remote.to_str().unwrap().trim_start_matches('/').replacen('/', ":", 1);
+        assert_eq!(repos.join(cache_path(&unreachable).unwrap()), repo);
+        assert!(fetch_commit(&repos, &unreachable, "main").is_err());
         assert_eq!(run(&repo, &["config", "remote.origin.url"]), url);
         // One commit and its listings: no history, and no file contents until read.
         assert_eq!(run(&repo, &["rev-list", "--count", "--all"]), "1");
