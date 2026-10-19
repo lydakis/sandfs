@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::host::mount_source;
 use crate::persist::{ObjectGone, Restored, Saved};
 
-/// Where a workspace's source is mounted inside the core workspace. The FUSE mount
+/// Where a workspace's source is mounted inside the core workspace. The mount
 /// shows this directory as its root.
 pub const ROOT: &str = "/mnt";
 
@@ -63,6 +63,12 @@ pub struct Record {
 pub struct MountInfo {
     pub pid: u32,
     pub mountpoint: PathBuf,
+    /// Where an NFS mount's process answers save requests (see `nfs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_port: Option<u16>,
+    /// The secret a save request must carry, so only its owner can ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_secret: Option<String>,
 }
 
 /// A workspace opened from disk: its contents with the saved changes replayed.
@@ -176,7 +182,18 @@ impl Home {
     pub fn set_mount_info(&self, name: &str, info: Option<&MountInfo>) -> Result<()> {
         let path = self.workspace_dir(name).join("mount.json");
         match info {
-            Some(info) => std::fs::write(path, serde_json::to_vec(info)?)?,
+            Some(info) => {
+                let mut file = File::options();
+                file.write(true).create(true).truncate(true);
+                // Readable by its owner only, since it holds the save secret.
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+                let mut file = file.open(&path)?;
+                // The mode above only applies to a new file; an older record keeps its own.
+                #[cfg(unix)]
+                file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                std::io::Write::write_all(&mut file, &serde_json::to_vec(info)?)?;
+            }
             None => {
                 let _ = std::fs::remove_file(path);
             }
@@ -189,9 +206,16 @@ impl Home {
         if self.exists(what) {
             return Ok(what.to_owned());
         }
-        // A mount whose process died cannot be canonicalized (ENOTCONN), but it is
-        // still found by its absolute path, so `unmount DIR` can detach it.
-        let dir = Path::new(what).canonicalize().or_else(|_| std::path::absolute(what));
+        // A mount whose process died cannot be canonicalized (ENOTCONN), but its parent
+        // can, which turns aliases such as macOS's `/tmp` into the path the mount was
+        // recorded under, so `unmount DIR` can detach it.
+        let dir = Path::new(what).canonicalize().or_else(|_| {
+            let dir = std::path::absolute(what)?;
+            Ok::<_, std::io::Error>(match (dir.parent().map(Path::canonicalize), dir.file_name()) {
+                (Some(Ok(parent)), Some(name)) => parent.join(name),
+                _ => dir,
+            })
+        });
         if let Ok(dir) = dir {
             for name in self.names()? {
                 if self.attached_mount(&name).is_some_and(|info| info.mountpoint == dir) {
@@ -200,6 +224,20 @@ impl Home {
             }
         }
         bail!("{what:?} is neither a workspace name nor a mounted workspace")
+    }
+
+    /// Whether process `pid` holds `name` (see [`Home::lock`]): the lock is held, checked
+    /// once without waiting, and its holder names that process. A lock that can't be
+    /// checked counts as held.
+    #[cfg(mount)]
+    pub fn locked_by(&self, name: &str, pid: u32) -> bool {
+        let dir = self.workspace_dir(name);
+        let held = match File::options().write(true).open(dir.join("lock")) {
+            Ok(file) => !matches!(file.try_lock(), Ok(())),
+            Err(_) => true,
+        };
+        held && std::fs::read_to_string(dir.join("holder"))
+            .is_ok_and(|holder| holder.ends_with(&format!("(process {pid})")))
     }
 
     /// Take the right to save `name`, or fail saying who holds it. `holder` describes
@@ -323,7 +361,7 @@ pub(crate) fn subtree_keys<T>(map: &BTreeMap<String, T>, prefix: &VPath) -> Vec<
     keys
 }
 
-/// Whether a FUSE filesystem is mounted at `dir`.
+/// Whether a sandfs workspace or other FUSE filesystem is mounted at `dir`.
 pub fn is_mounted(dir: &Path) -> bool {
     mount_source(dir).is_some()
 }
@@ -338,6 +376,28 @@ mod tests {
         for bad in ["", ".hidden", "a/b", "..", "a b"] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_records_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+        // A record left readable by an older release is made private before the secret goes in.
+        let path = home.workspace_dir("ws").join("mount.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let info = MountInfo {
+            pid: 1,
+            mountpoint: data.path().to_path_buf(),
+            save_port: Some(1),
+            save_secret: Some("00".into()),
+        };
+        home.set_mount_info("ws", Some(&info)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

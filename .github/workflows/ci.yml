@@ -59,7 +59,8 @@ jobs:
         run: cargo package --workspace --exclude sandfs-py
 
   # Everything but the benchmarks (overlayfs, Linux-only) works on macOS and Windows
-  # too, and the CLI does everything there but mount.
+  # too. macOS mounts with its own NFS client, so its mount tests run here as well;
+  # Windows builds the CLI without the mount.
   other-os:
     strategy:
       fail-fast: false
@@ -79,6 +80,11 @@ jobs:
         run: cargo clippy -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-py -p sandfs-cli --all-targets -- -D warnings
       - name: Run Rust tests
         run: cargo test -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-cli
+        env:
+          SANDFS_REQUIRE_FUSE: ${{ runner.os == 'macOS' && '1' || '' }}
+      - name: Build the CLI without the mount
+        if: runner.os == 'macOS'
+        run: cargo clippy -p sandfs-cli --no-default-features --all-targets -- -D warnings
       - name: Install uv
         run: pip install uv
       - name: Install the package (builds the Rust extension)

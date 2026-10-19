@@ -1,8 +1,9 @@
 //! What differs between the systems the mount runs on: finding mounts, telling whether
 //! a process is alive, the mount's options and how to unmount.
 //!
-//! Linux mounts with the kernel's FUSE through `fusermount3`. Elsewhere (macOS,
-//! Windows) nothing is mounted yet, so the lookups find nothing.
+//! Linux mounts with the kernel's FUSE through `fusermount3`; macOS mounts this
+//! process's NFS server with its own NFS client (see `nfs`). Elsewhere (Windows)
+//! nothing is ever mounted, so the lookups find nothing.
 
 use std::path::Path;
 
@@ -20,9 +21,37 @@ pub fn mount_source(dir: &Path) -> Option<String> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The source of the topmost mount at `dir`, from `mount`'s table (`sandfs:<name>` for
+/// a workspace).
+#[cfg(target_os = "macos")]
+pub fn mount_source(dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("/sbin/mount").output().ok()?;
+    let table = String::from_utf8_lossy(&output.stdout);
+    table
+        .lines()
+        .rev()
+        .find_map(|line| parse_mount_line(line).filter(|(_, point)| Path::new(point) == dir).map(|(source, _)| source))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn mount_source(_dir: &Path) -> Option<String> {
     None
+}
+
+/// A line of macOS `mount` output, `SOURCE on POINT (TYPE, OPTIONS...)`, as its source
+/// and mount point. A workspace's NFS source names its export,
+/// `localhost:/sandfs/<name>/<secret>`, which reads as `sandfs:<name>` like a FUSE
+/// mount's.
+#[cfg(any(target_os = "macos", test))]
+fn parse_mount_line(line: &str) -> Option<(String, &str)> {
+    let (source, rest) = line.split_once(" on ")?;
+    let (point, options) = rest.rsplit_once(" (")?;
+    let fstype = options.split([',', ')']).next()?;
+    let source = match source.strip_prefix("localhost:/sandfs/") {
+        Some(export) if fstype == "nfs" => format!("sandfs:{}", export.split('/').next().unwrap_or(export)),
+        _ => source.to_owned(),
+    };
+    Some((source, point))
 }
 
 /// Undo mountinfo's octal escapes (`\040` for a space).
@@ -73,16 +102,26 @@ pub fn mount_options(name: &str) -> Vec<fuser::MountOption> {
     vec![MountOption::FSName(format!("sandfs:{name}")), MountOption::Subtype("sandfs".to_owned())]
 }
 
-/// Unmount the FUSE filesystem at `dir`.
+/// Commands that unmount a directory, tried in order, and what to do when none exists.
+#[cfg(nfs)]
+const UNMOUNT: (&[&[&str]], &str) = (&[&["/sbin/umount"]], "/sbin/umount is missing");
 #[cfg(fuse)]
-pub fn unmount(dir: &Path) -> anyhow::Result<()> {
-    let ran = [&["fusermount3", "-u"], &["fusermount", "-u"]]
-        .iter()
-        .find_map(|cmd| std::process::Command::new(cmd[0]).args(&cmd[1..]).arg(dir).status().ok());
+const UNMOUNT: (&[&[&str]], &str) =
+    (&[&["fusermount3", "-u"], &["fusermount", "-u"]], "fusermount3 is not installed; install fuse3");
+#[cfg(mount)]
+const FORCED_UNMOUNT: (&[&[&str]], &str) = (&[&["/sbin/umount", "-f"]], "/sbin/umount is missing");
+
+/// Unmount the filesystem at `dir`. With `served_by_nobody` its process is gone: an NFS
+/// client would wait for the server to answer, so the unmount is forced. A FUSE mount
+/// without its process unmounts like any other.
+#[cfg(mount)]
+pub fn unmount(dir: &Path, served_by_nobody: bool) -> anyhow::Result<()> {
+    let (commands, missing) = if cfg!(nfs) && served_by_nobody { FORCED_UNMOUNT } else { UNMOUNT };
+    let ran = commands.iter().find_map(|cmd| std::process::Command::new(cmd[0]).args(&cmd[1..]).arg(dir).status().ok());
     match ran {
         Some(status) if status.success() => Ok(()),
         Some(status) => anyhow::bail!("unmounting {} failed ({status})", dir.display()),
-        None => anyhow::bail!("fusermount3 is not installed; install fuse3"),
+        None => anyhow::bail!("{missing}"),
     }
 }
 
@@ -94,6 +133,17 @@ mod tests {
     fn mountinfo_escapes_decode() {
         assert_eq!(unescape(r"/home/me/my\040ws"), "/home/me/my ws");
         assert_eq!(unescape(r"/plain"), "/plain");
+    }
+
+    #[test]
+    fn macos_mount_lines_parse() {
+        let line = "localhost:/sandfs/ws/0f3a on /private/tmp/my ws (nfs, nodev, nosuid, mounted by me)";
+        assert_eq!(parse_mount_line(line), Some(("sandfs:ws".to_owned(), "/private/tmp/my ws")));
+        // Other filesystems count as mounts too, so nothing is mounted over them.
+        let other = "localhost:/elsewhere on /Volumes/x (nfs, nodev, nosuid, mounted by me)";
+        assert_eq!(parse_mount_line(other), Some(("localhost:/elsewhere".to_owned(), "/Volumes/x")));
+        let disk = "/dev/disk3s1 on / (apfs, sealed, local, read-only, journaled)";
+        assert_eq!(parse_mount_line(disk), Some(("/dev/disk3s1".to_owned(), "/")));
     }
 
     #[cfg(unix)]

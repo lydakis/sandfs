@@ -130,7 +130,7 @@ sandfs mount git:https://github.com/pallets/flask@3.1.0 ~/ws/flask
 
 `sandfs serve --mcp NAME` hands a saved workspace to an agent as MCP file tools instead of mounting it.
 
-Mounting needs Linux with FUSE 3 (`fusermount3`, package `fuse3`). On macOS and Windows, `changes`, `list`, `rm` and `serve --mcp` work, and `sandfs serve --mcp SOURCE` gives an agent a workspace there; `fork` and `unmount` need a mount. When changes are saved, what a fork on disk costs and how offline git mounts behave are covered in [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md).
+On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there is nothing to install: the mount is served over NFS on localhost and mounted with macOS's own NFS client. On Windows, `changes`, `list`, `rm` and `serve --mcp` work, and `sandfs serve --mcp SOURCE` gives an agent a workspace there; `fork` and `unmount` need a mount. When changes are saved, what a fork on disk costs and how offline git mounts behave are covered in [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md).
 
 ## More features
 

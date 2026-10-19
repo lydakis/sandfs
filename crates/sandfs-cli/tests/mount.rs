@@ -1,18 +1,23 @@
-//! The `sandfs` binary against a real FUSE mount.
+//! The `sandfs` binary against a real mount: FUSE on Linux, NFS on macOS.
 //!
-//! Skipped where FUSE is unavailable (no `/dev/fuse` or no `fusermount3`), unless
-//! `SANDFS_REQUIRE_FUSE` is set, as CI does, in which case that is a failure.
-#![cfg(fuse)]
+//! Skipped where mounting is unavailable (on Linux no `/dev/fuse` or no `fusermount3`,
+//! on macOS no `mount_nfs`), unless `SANDFS_REQUIRE_FUSE` is set, as CI does, in which
+//! case that is a failure.
+#![cfg(mount)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn fuse_available() -> bool {
-    let tool = Command::new("fusermount3").arg("--version").output().is_ok_and(|out| out.status.success());
-    let available = Path::new("/dev/fuse").exists() && tool;
+    let available = if cfg!(target_os = "macos") {
+        Path::new("/sbin/mount_nfs").exists()
+    } else {
+        let tool = Command::new("fusermount3").arg("--version").output().is_ok_and(|out| out.status.success());
+        Path::new("/dev/fuse").exists() && tool
+    };
     if !available {
-        assert!(std::env::var_os("SANDFS_REQUIRE_FUSE").is_none(), "FUSE is required but unavailable");
-        eprintln!("skipping: FUSE is not available here");
+        assert!(std::env::var_os("SANDFS_REQUIRE_FUSE").is_none(), "mounting is required but unavailable");
+        eprintln!("skipping: mounting is not available here");
     }
     available
 }
@@ -67,7 +72,11 @@ impl Sandfs {
 impl Drop for Sandfs {
     fn drop(&mut self) {
         for dir in &self.mounts {
-            let _ = Command::new("fusermount3").arg("-u").arg(dir).status();
+            let _ = if cfg!(target_os = "macos") {
+                Command::new("umount").arg("-f").arg(dir).status()
+            } else {
+                Command::new("fusermount3").arg("-u").arg(dir).status()
+            };
         }
     }
 }
@@ -105,13 +114,22 @@ fn mount_fork_changes_and_remount() {
         std::fs::set_permissions(main.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let out = Command::new(main.join("run.sh")).output().unwrap();
         assert_eq!(out.stdout, b"ran\n");
+        std::fs::write(main.join("plain.sh"), "#!/bin/sh\necho ran\n").unwrap();
+        let denied = Command::new(main.join("plain.sh")).output().unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied, "only executables run");
+        std::fs::remove_file(main.join("plain.sh")).unwrap();
     }
     assert_eq!(sandfs.stdout(&["changes", "main"]), "M README.md\nA notes.txt\nA run.sh\nD src/lib.rs\n");
     assert_eq!(std::fs::read_to_string(repo.path().join("README.md")).unwrap(), "hello\n", "the repo is untouched");
 
-    // A fork starts from the workspace's changes and then goes its own way.
+    // A fork starts from the workspace's changes, writes to a file still open among
+    // them, and then goes its own way.
+    let mut draft = std::fs::File::create(main.join("draft.txt")).unwrap();
+    std::io::Write::write_all(&mut draft, b"draft\n").unwrap();
     sandfs.mount(&["fork", main.to_str().unwrap(), fix.to_str().unwrap()], &fix);
+    drop(draft);
     assert_eq!(std::fs::read_to_string(fix.join("notes.txt")).unwrap(), "notes\n");
+    assert_eq!(std::fs::read_to_string(fix.join("draft.txt")).unwrap(), "draft\n");
     std::fs::write(fix.join("fix.txt"), "only in the fork\n").unwrap();
     assert!(!main.join("fix.txt").exists());
     assert!(sandfs.stdout(&["changes", fix.to_str().unwrap()]).contains("A fix.txt\n"));
@@ -176,11 +194,16 @@ fn a_directory_source_is_never_written() {
     let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&mount_json).unwrap()).unwrap();
     let pid = info["pid"].as_u64().unwrap().to_string();
     assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
-    while Path::new(&format!("/proc/{pid}")).exists() {
+    while Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     // The crash released the workspace too, so another process may take it over.
     sandfs.run(&["serve", "--mcp", "data"]);
+    // Mounting it elsewhere would lose track of the dead mount, so it is refused.
+    let elsewhere = dirs.path().join("elsewhere");
+    let refused = sandfs.try_run(&["mount", "data", elsewhere.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("sandfs unmount data"), "says how to detach it");
     sandfs.unmount(&ws);
     sandfs.mount(&["mount", "data", ws.to_str().unwrap()], &ws);
     assert_eq!(std::fs::read_to_string(ws.join("out/summary.txt")).unwrap(), "2 rows\n", "saved before the crash");
@@ -271,9 +294,15 @@ fn open_files_work_without_open_or_close_reaching_sandfs() {
     let info: serde_json::Value = serde_json::from_slice(&std::fs::read(&mount_json).unwrap()).unwrap();
     let pid = info["pid"].as_u64().unwrap().to_string();
     assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
-    while Path::new(&format!("/proc/{pid}")).exists() {
+    while Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    // Another process may get the dead server's pid. Reading the workspace then uses its
+    // last save rather than asking that process to save.
+    let mut reused = info.clone();
+    reused["pid"] = std::process::id().into();
+    std::fs::write(&mount_json, serde_json::to_vec(&reused).unwrap()).unwrap();
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M log.txt\nD old.txt\nA report.txt\n");
     sandfs.unmount(&ws);
     sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
     assert_eq!(std::fs::read_to_string(ws.join("report.txt")).unwrap(), "done\n", "saved before the crash");
@@ -339,8 +368,14 @@ fn spawn(sandfs: &Sandfs, args: &[&str]) -> std::process::Child {
 
 /// How many filesystems are mounted at `dir`.
 fn mounts_at(dir: &Path) -> usize {
-    let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-    table.lines().filter(|line| line.split(' ').nth(4) == Some(dir.to_str().unwrap())).count()
+    let dir = dir.to_str().unwrap();
+    if cfg!(target_os = "macos") {
+        let table = String::from_utf8(Command::new("mount").output().unwrap().stdout).unwrap();
+        table.lines().filter(|line| line.contains(&format!(" on {dir} ("))).count()
+    } else {
+        let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        table.lines().filter(|line| line.split(' ').nth(4) == Some(dir)).count()
+    }
 }
 
 #[test]
@@ -421,5 +456,27 @@ fn a_failed_final_save_fails_unmount() {
     sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
     assert_eq!(std::fs::read_to_string(ws.join("saved.txt")).unwrap(), "saved\n");
     assert!(!ws.join("lost.txt").exists());
+    sandfs.unmount(&ws);
+}
+
+/// A mount that fails leaves no workspace behind, so the same command can be retried.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_mount_leaves_no_workspace_behind() {
+    use std::os::unix::fs::MetadataExt;
+    // A folder someone else owns, which macOS won't let this user mount on.
+    let theirs = Path::new("/var/empty");
+    let mine = nix::unistd::getuid().as_raw();
+    if !fuse_available() || std::fs::metadata(theirs).map_or(true, |meta| meta.uid() == mine) || mine == 0 {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    let mut sandfs = Sandfs::new();
+    let failed = sandfs.try_run(&["mount", "--name", "ws", folder.path().to_str().unwrap(), theirs.to_str().unwrap()]);
+    assert!(!failed.status.success());
+    assert!(!sandfs.stdout(&["list"]).contains("ws\t"), "the workspace is removed again");
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", "--name", "ws", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
     sandfs.unmount(&ws);
 }
