@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - **sandfs-cli speed**: the FUSE mount tells the kernel it needn't open or close files, so a first read of a small file is about a quarter faster and rereads and overwrites take about 40% less time.
 - **sandfs-cli saving**: closing a file no longer commits it. A write is saved once its file has gone 250 ms without a write, on `fsync`, or at `unmount`, `fork` or `changes`. A program that writes a file, closes it and exits still has it saved a moment later, but not at the instant of the close.
