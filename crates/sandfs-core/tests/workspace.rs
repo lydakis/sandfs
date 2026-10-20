@@ -404,10 +404,19 @@ fn two_attempts_from_one_checkpoint_compare_without_reading_the_source() {
     assert_eq!(source.reads(), before, "only what the attempts wrote is compared");
 }
 
-/// One file of [`COMPARE_LIMIT`] bytes, zeros but the last, read only in ranges.
+/// One file of `len` zero bytes but the last, counting whole reads of it.
 #[derive(Debug)]
 struct Large {
+    len: u64,
     last: u8,
+    listed: bool,
+    whole_reads: AtomicUsize,
+}
+
+impl Large {
+    fn new(last: u8) -> Self {
+        Large { len: COMPARE_LIMIT, last, listed: true, whole_reads: AtomicUsize::new(0) }
+    }
 }
 
 impl Source for Large {
@@ -419,19 +428,20 @@ impl Source for Large {
         let entry = sandfs_core::SourceEntry {
             kind: Kind::File { executable: false },
             key: "large.bin".into(),
-            size: Some(COMPARE_LIMIT),
+            size: self.listed.then_some(self.len),
         };
         Ok([("large.bin".to_owned(), entry)].into())
     }
 
-    fn read_file(&self, _key: &str) -> sandfs_core::Result<Bytes> {
-        panic!("a large file is read in ranges")
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        self.whole_reads.fetch_add(1, Ordering::SeqCst);
+        self.read_range(key, 0, self.len)
     }
 
     fn read_range(&self, _key: &str, offset: u64, len: u64) -> sandfs_core::Result<Bytes> {
-        let end = (offset + len).min(COMPARE_LIMIT);
-        let mut bytes = vec![0; (end - offset) as usize];
-        if end == COMPARE_LIMIT {
+        let end = (offset + len).min(self.len);
+        let mut bytes = vec![0; end.saturating_sub(offset) as usize];
+        if end == self.len && !bytes.is_empty() {
             *bytes.last_mut().unwrap() = self.last;
         }
         Ok(bytes.into())
@@ -440,13 +450,32 @@ impl Source for Large {
 
 #[test]
 fn large_files_mounted_separately_are_compared_in_pieces() {
-    let mounted = |last| {
+    let mounted = |source: &Arc<Large>| {
         let mut ws = Workspace::new();
-        ws.mount("/data", Arc::new(Large { last })).unwrap();
+        ws.mount("/data", source.clone()).unwrap();
         ws
     };
-    assert!(changes_since(&mounted(0), &mounted(0)).is_empty(), "same bytes, separate mounts");
-    assert_eq!(changes_since(&mounted(1), &mounted(0)), [("/data/large.bin".into(), ChangeKind::Modified)]);
+    let (zero, one) = (Arc::new(Large::new(0)), Arc::new(Large::new(1)));
+    assert!(changes_since(&mounted(&zero), &mounted(&Arc::new(Large::new(0)))).is_empty(), "same bytes");
+    assert_eq!(changes_since(&mounted(&one), &mounted(&zero)), [("/data/large.bin".into(), ChangeKind::Modified)]);
+    assert_eq!(zero.whole_reads.load(Ordering::SeqCst) + one.whole_reads.load(Ordering::SeqCst), 0);
+    // A source that doesn't list sizes may hold more than the other's listed size.
+    let longer = Arc::new(Large { len: COMPARE_LIMIT + 1, listed: false, ..Large::new(0) });
+    assert_eq!(changes_since(&mounted(&zero), &mounted(&longer)), [("/data/large.bin".into(), ChangeKind::Modified)]);
+}
+
+#[test]
+fn large_written_files_from_separate_stores_are_compared_in_pieces() {
+    // Saved workspaces loaded separately keep their files in stores of their own.
+    let written = |last| {
+        let mut ws = Workspace::new();
+        ws.mount("/data", Arc::new(MemorySource::from_files([("a.txt", "a")]).unwrap())).unwrap();
+        let source: Arc<dyn Source> = Arc::new(Large::new(last));
+        ws.write_stored("/data/large.bin", Stored { source, key: "large.bin".into(), size: COMPARE_LIMIT }).unwrap();
+        ws
+    };
+    assert!(changes_since(&written(0), &written(0)).is_empty());
+    assert_eq!(changes_since(&written(1), &written(0)), [("/data/large.bin".into(), ChangeKind::Modified)]);
 }
 
 #[test]

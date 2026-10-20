@@ -711,7 +711,10 @@ impl Workspace {
     ///
     /// Everything the two share since a fork is skipped without being looked at, so
     /// the cost follows what changed after they split, not the size of either.
-    /// Workspaces that share no mounts are compared file by file, reading both.
+    /// Workspaces that share no mounts are compared file by file, reading both. A
+    /// written file of [`COMPARE_LIMIT`] bytes or more against a source file counts as
+    /// modified without being read, as in `changes()`; two large source files, or two
+    /// large written files, are read a piece at a time.
     pub fn changes_since(&self, base: &Workspace) -> Result<Vec<Change>> {
         // Paths whose entries differ, and whether everything below them may differ too.
         let mut touched: BTreeMap<VPath, bool> = BTreeMap::new();
@@ -1090,19 +1093,24 @@ impl Workspace {
         if *content == theirs.0 {
             return Ok(true);
         }
-        match (content_size(content), content_size(&theirs.0)) {
-            (Some(a), Some(b)) if a != b => return Ok(false),
-            (Some(size), _) if size >= COMPARE_LIMIT => {
-                // A written file this large counts as modified without being read, since
-                // comparing would read both files at every call. Two source files (the
-                // same data mounted separately) are compared piece by piece instead.
-                let in_source = |content: &Content| matches!(content, Content::Base { .. });
-                if !(in_source(content) && in_source(&theirs.0)) {
-                    return Ok(false);
-                }
+        let sizes = (content_size(content), content_size(&theirs.0));
+        if let (Some(a), Some(b)) = sizes {
+            if a != b {
+                return Ok(false);
+            }
+        }
+        if sizes.0.or(sizes.1).is_some_and(|size| size >= COMPARE_LIMIT) {
+            // A written file this large counts as modified against the source file it
+            // replaced without being read, as in `changes()`, since that comparison
+            // would come at every call. Two source files, or two written files, are
+            // compared piece by piece once both sizes are known.
+            let in_source = |content: &Content| matches!(content, Content::Base { .. });
+            if in_source(content) != in_source(&theirs.0) {
+                return Ok(false);
+            }
+            if let (Some(size), Some(_)) = sizes {
                 return same_bytes_in_pieces(content, &theirs.0, size);
             }
-            _ => {}
         }
         Ok(self.content_bytes(content)? == other.content_bytes(&theirs.0)?)
     }
@@ -1366,8 +1374,8 @@ fn file(resolved: Option<Resolved>) -> Option<(Content, Kind)> {
     }
 }
 
-/// Whether two source files of `size` bytes hold the same bytes, read a piece at a time
-/// with ranged reads so neither is held in memory whole or cached.
+/// Whether two files of `size` bytes hold the same bytes, read a piece at a time with
+/// ranged reads so neither is held in memory whole or cached.
 fn same_bytes_in_pieces(a: &Content, b: &Content, size: u64) -> Result<bool> {
     const PIECE: u64 = 8 << 20;
     let range = |content: &Content, offset: u64| match content {
