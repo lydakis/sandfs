@@ -52,11 +52,10 @@ struct Cache {
     entries: Mutex<HashMap<u64, HashMap<Box<str>, SourceEntry>>>,
     /// Directories already prefetched, and whether recursively, so each is asked once.
     prefetched: Mutex<HashSet<(CacheKey, bool)>>,
-    /// Base files each directory needed fetched: sizes missing from its listing, and
-    /// files a walk read.
-    touches: Mutex<HashMap<CacheKey, u32>>,
-    /// Base files already counted in `touches`, so a file read in pieces counts once.
-    touched: Mutex<HashSet<CacheKey>>,
+    /// Base files each directory needed fetched in the current look: sizes missing
+    /// from its listing, and files a walk or a program reading by path read. A set,
+    /// so a file read in pieces counts once.
+    touched: Mutex<HashMap<CacheKey, HashSet<SourceKey>>>,
     /// Directories listed again for their files' sizes, at most once each.
     sized: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
 }
@@ -690,18 +689,16 @@ impl Workspace {
         let steady = self.walk_reads(start, path, mount)?;
         // A read by path after a pause starts the directory's count again: it is a new
         // look, its file the first (even one fetched before, as ranged reads do), and the
-        // file read right after it the second.
+        // next file read right after it the second.
         let fresh = read && !walking && !steady;
-        let first = self.cache.touched.lock().expect("cache lock").insert((mount.id, file.clone()));
-        let count = {
-            let mut touches = self.cache.touches.lock().expect("cache lock");
-            let count = touches.entry((mount.id, dir.clone())).or_default();
+        let (count, first) = {
+            let mut touched = self.cache.touched.lock().expect("cache lock");
+            let files = touched.entry((mount.id, dir.clone())).or_default();
             if fresh {
-                *count = 1;
-            } else if first {
-                *count = count.saturating_add(1);
+                files.clear();
             }
-            *count
+            let first = files.insert(file.clone());
+            (files.len(), first)
         };
         if fresh {
             return Ok(Touch::Cold);

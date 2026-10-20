@@ -278,6 +278,21 @@ fn looking_around_with_pauses_or_from_forks_prefetches_nothing_below() {
 }
 
 #[test]
+fn files_read_in_earlier_looks_count_again_in_a_new_one() {
+    let source = Arc::new(Remote::new(TREE));
+    let ws = mounted(&source);
+    // Pieces of two files, each in its own look, then of both one after another.
+    ws.read_range("/data/s/x.txt", 0, 1).unwrap();
+    thread::sleep(Duration::from_millis(2100));
+    ws.read_range("/data/s/y.txt", 0, 1).unwrap();
+    thread::sleep(Duration::from_millis(2100));
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
+    ws.read_range("/data/s/x.txt", 1, 1).unwrap();
+    ws.read_range("/data/s/y.txt", 1, 1).unwrap();
+    assert_eq!(source.prefetches(), vec![("s".to_owned(), false)]);
+}
+
+#[test]
 fn a_file_read_in_pieces_counts_once() {
     let source = Arc::new(Remote::new(TREE));
     let ws = mounted(&source);
