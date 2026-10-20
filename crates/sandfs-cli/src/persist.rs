@@ -313,6 +313,7 @@ impl Draft {
 
 /// Files a durable save flushes one by one; more are flushed with one call for the
 /// whole disk.
+#[cfg(target_os = "linux")]
 const SYNC_ONE_BY_ONE: usize = 64;
 
 /// Flush the whole disk holding `dir` in one call when `files` files need flushing
@@ -915,7 +916,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
         let mut ws = base();
-        for i in 0..=SYNC_ONE_BY_ONE {
+        // More than are flushed one by one on Linux.
+        for i in 0..100 {
             ws.write(&format!("/mnt/many/{i}.txt"), i.to_string()).unwrap();
         }
         let mut saved = Saved::new(state.path());
@@ -924,10 +926,7 @@ mod tests {
 
         let mut reloaded = base();
         Saved::new(state.path()).load(&mut reloaded, &root()).unwrap();
-        assert_eq!(
-            reloaded.read_text(&format!("/mnt/many/{SYNC_ONE_BY_ONE}.txt")).unwrap(),
-            SYNC_ONE_BY_ONE.to_string()
-        );
+        assert_eq!(reloaded.read_text("/mnt/many/99.txt").unwrap(), "99");
     }
 
     #[test]
