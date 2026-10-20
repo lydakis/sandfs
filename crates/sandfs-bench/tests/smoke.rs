@@ -40,9 +40,9 @@ fn a_command_runs_in_copies_of_a_folder() {
         log.path().display()
     );
     let scratch = tempfile::tempdir().unwrap();
-    let bench = |change: &str| {
+    let bench = |change: &str, parallel: &str| {
         Command::new(env!("CARGO_BIN_EXE_sandfs-bench"))
-            .args(["--only", "build", "--targets", "host", "--iters", "2", "--scratch"])
+            .args(["--only", "build", "--targets", "host", "--iters", "2", "--build-parallel", parallel, "--scratch"])
             .arg(scratch.path())
             .arg("--build-dir")
             .arg(dir.path())
@@ -51,7 +51,7 @@ fn a_command_runs_in_copies_of_a_folder() {
             .unwrap()
     };
 
-    let output = bench("change.txt");
+    let output = bench("change.txt", "1");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("| run again |"), "{stdout}");
@@ -62,14 +62,35 @@ fn a_command_runs_in_copies_of_a_folder() {
         .collect();
     let lines: Vec<&str> = runs.iter().map(|run| run[0].as_str()).collect();
     assert_eq!(lines, ["1", "2", "3"], "a blank line before each run after the first");
-    assert!(runs.iter().all(|run| run[1] == "1600000000" && run[2] == "cache-host"), "{runs:?}");
+    assert!(runs.iter().all(|run| run[1] == "1600000000" && run[2] == "cache-host-0"), "{runs:?}");
     assert!(runs.iter().all(|run| !run[3].starts_with(dir.path().to_str().unwrap())), "{runs:?}");
     assert_eq!(std::fs::read_to_string(dir.path().join("change.txt")).unwrap(), "x\n", "the folder is never changed");
+
+    // Two copies at once: each copy and each run gets different bytes.
+    std::fs::write(log.path(), "").unwrap();
+    let output = bench("change.txt", "2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("| | host folders |") && stdout.contains("2 at once"), "{stdout}");
+    let mut copies: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut caches: std::collections::BTreeSet<(String, String)> = Default::default();
+    for line in std::fs::read_to_string(log.path()).unwrap().lines() {
+        let run: Vec<&str> = line.split(' ').collect();
+        copies.entry(run[3].to_owned()).or_default().push(run[0].to_owned());
+        caches.insert((run[3].to_owned(), run[2].to_owned()));
+    }
+    // A cache folder of its own per copy, from the first run on.
+    let names: std::collections::BTreeSet<&str> = caches.iter().map(|(_, cache)| cache.as_str()).collect();
+    assert_eq!(names, ["cache-host-0", "cache-host-1"].into(), "{caches:?}");
+    assert_eq!(caches.len(), 2, "{caches:?}");
+    let mut lines: Vec<Vec<String>> = copies.into_values().collect();
+    lines.sort();
+    assert_eq!(lines, [["1", "2", "4"], ["1", "3", "5"]]);
 
     // A file outside the folder is refused before anything runs.
     let outside = dir.path().join("../outside.txt");
     std::fs::write(&outside, "z\n").unwrap();
-    let output = bench(outside.to_str().unwrap());
+    let output = bench(outside.to_str().unwrap(), "1");
     let _ = std::fs::remove_file(&outside);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("is no file in"));
