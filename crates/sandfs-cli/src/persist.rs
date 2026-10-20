@@ -268,6 +268,9 @@ impl Saved {
             match (entry, object) {
                 (Entry::File { .. }, Some(object)) => {
                     let version = ws.stat(path.as_str())?.version;
+                    // A save that wasn't durable may have left it unflushed before the
+                    // process that wrote it went away, so the next durable save flushes it.
+                    self.unsynced.insert(object.to_string());
                     self.objects.insert(rel.clone(), (version, object));
                 }
                 _ => {
@@ -617,7 +620,9 @@ mod tests {
         assert!(saved.unsynced.is_empty(), "a durable save flushes every object it wrote");
 
         let mut loaded = base();
-        let restored = Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        let mut reloaded = Saved::new(state.path());
+        let restored = reloaded.load(&mut loaded, &root()).unwrap();
+        assert_eq!(reloaded.unsynced.len(), 2, "a new process flushes what it loaded at its first durable save");
         assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "changed");
         assert_eq!(loaded.stat("/mnt/new/run.sh").unwrap().kind, Kind::File { executable: true });
         assert_eq!(listing(&loaded, "/mnt/dir"), ["b.txt"], "the removed directory stays removed");
