@@ -59,6 +59,9 @@ enum Entry {
         target: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<Time>,
+        /// Another name of the same link, as for a file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     /// Removed: a deleted base file or directory.
     Absent,
@@ -578,13 +581,14 @@ impl Saved {
                 }
                 None => ws.mkdir(p, true)?,
             },
+            Entry::File { link: Some(other), .. } | Entry::Symlink { link: Some(other), .. }
+                if self.relink(ws, root, path, other, current)? => {}
             Entry::Symlink { target, .. } => {
                 if current.is_some() {
                     ws.remove(p, true)?;
                 }
                 ws.symlink(p, target)?;
             }
-            Entry::File { link: Some(other), .. } if self.relink(ws, root, path, other, current)? => {}
             Entry::File { executable, .. } => {
                 let object = object.context("a saved file without its object")?;
                 check_object(&object)?;
@@ -755,12 +759,19 @@ impl Saved {
         let mtime = snap.times.get(p).map(|t| to_time(*t));
         match meta.kind {
             Kind::Dir => Ok(Entry::Dir { mtime }),
-            Kind::Symlink => Ok(Entry::Symlink { target: snap.ws.read_link(p)?, mtime }),
+            Kind::Symlink => Ok(Entry::Symlink { target: snap.ws.read_link(p)?, mtime, link }),
             Kind::File { executable } => {
                 // A hard-linked file shares the object of the name it links to.
                 let shared = link.as_ref().and_then(|first| kept.get(first)).filter(|(v, _)| *v == meta.version);
                 let object = match (shared, self.objects.get(rel)) {
-                    (Some((_, object)), _) => object.clone(),
+                    (Some((_, object)), _) => {
+                        // If this save wrote it, every name may move it out of memory, so
+                        // removing the first name meanwhile doesn't keep it there.
+                        if let Some((_, _, stored)) = written.iter().rev().find(|(.., stored)| stored.key == *object) {
+                            written.push((path.clone(), meta.version, stored.clone()));
+                        }
+                        object.clone()
+                    }
                     (None, Some((version, object))) if *version == meta.version => object.clone(),
                     // A saved file moved, copied or made executable keeps its object.
                     _ => match snap.ws.stored(p)? {
@@ -957,6 +968,8 @@ mod tests {
         ws.hard_link("/mnt/out/lib.rlib", "/mnt/cache/lib.rlib").unwrap();
         ws.hard_link("/mnt/out/lib.rlib", "/mnt/out/lib2.rlib").unwrap();
         ws.hard_link("/mnt/a.txt", "/mnt/a-link.txt").unwrap();
+        ws.symlink("/mnt/sym", "a.txt").unwrap();
+        ws.hard_link("/mnt/sym", "/mnt/sym2").unwrap();
         let dirs = ["/mnt/cache", "/mnt/out"].map(str::to_owned).into();
 
         let mut saved = Saved::new(state.path());
@@ -964,12 +977,20 @@ mod tests {
         assert_eq!(saved.objects.len(), 4);
         let objects: HashSet<&SourceKey> = saved.objects.values().map(|(_, object)| object).collect();
         assert_eq!(objects.len(), 2, "the three names of one file share an object");
+        let mut written: Vec<String> = saved.take_written().iter().map(|(path, ..)| path.to_string()).collect();
+        written.sort();
+        assert_eq!(
+            written,
+            ["/mnt/a-link.txt", "/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib"],
+            "any name can move the file out of memory"
+        );
 
         let mut loaded = base();
         Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
         let names = |path: &str| loaded.hard_links(path).unwrap().iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(names("/mnt/out/lib.rlib"), ["/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib"]);
         assert_eq!(names("/mnt/a-link.txt"), ["/mnt/a-link.txt", "/mnt/a.txt"]);
+        assert_eq!(names("/mnt/sym2"), ["/mnt/sym", "/mnt/sym2"], "a link's names stay one link");
         assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
         loaded.write("/mnt/cache/lib.rlib", "rebuilt").unwrap();
         assert_eq!(loaded.read_text("/mnt/out/lib2.rlib").unwrap(), "rebuilt");

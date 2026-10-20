@@ -457,10 +457,27 @@ impl Inner {
         let (kind, perm) = file_type(meta.kind);
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
         let mut attr = self.make_attr(ino, kind, perm, size, mtime);
-        if kind != FileType::Directory && self.ws.has_hard_links() {
-            attr.nlink = self.ws.hard_links(path).map_or(1, |names| names.len() as u32);
+        if kind != FileType::Directory {
+            attr.nlink = self.nlink(path);
         }
         Ok(attr)
+    }
+
+    /// How many names the file at `path` has: more than one through hard links.
+    fn nlink(&self, path: &str) -> u32 {
+        if !self.ws.has_hard_links() {
+            return 1;
+        }
+        self.ws.hard_links(path).map_or(1, |names| names.len() as u32)
+    }
+
+    /// Set the modification time of the file at `path` and of its other names, since
+    /// they are one inode and any of them may be the one asked about.
+    fn set_time(&mut self, path: &VPath, time: SystemTime) {
+        for other in self.other_names(path) {
+            self.times.insert(other.to_string(), time);
+        }
+        self.times.insert(path.to_string(), time);
     }
 
     /// Attributes for a file whose size isn't known without reading it: size 0, for
@@ -473,7 +490,9 @@ impl Inner {
             return Err(Errno::ENOENT);
         }
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
-        Ok(self.make_attr(ino, FileType::RegularFile, if executable { 0o755 } else { 0o644 }, 0, mtime))
+        let mut attr = self.make_attr(ino, FileType::RegularFile, if executable { 0o755 } else { 0o644 }, 0, mtime);
+        attr.nlink = self.nlink(path);
+        Ok(attr)
     }
 
     fn make_attr(&self, ino: u64, kind: FileType, perm: u16, size: u64, mtime: SystemTime) -> FileAttr {
@@ -627,7 +646,7 @@ impl Inner {
                 TimeOrNow::Now => SystemTime::now(),
                 TimeOrNow::SpecificTime(time) => time,
             };
-            self.times.insert(path.to_string(), time);
+            self.set_time(&path, time);
             self.unsaved = true;
         }
         self.attr(ino)
@@ -666,7 +685,12 @@ impl Inner {
         let to = self.child(new_parent, new_name)?;
         self.ws.hard_link(from.as_str(), to.as_str()).fs()?;
         self.inos.insert(to.to_string(), ino);
-        self.touch(&to);
+        // The file keeps its time; only the directory it gained a name in changes.
+        match self.times.get(from.as_str()).copied() {
+            Some(time) => self.times.insert(to.to_string(), time),
+            None => self.times.remove(to.as_str()),
+        };
+        self.touch_parent(&to);
         self.entry(&to)
     }
 
@@ -947,7 +971,7 @@ impl Inner {
         }
         let written = self.change_buffer(ino, |buffer| buffer.write(offset, data))?;
         if let Ok(path) = self.path(ino) {
-            self.times.insert(path.to_string(), SystemTime::now());
+            self.set_time(&path, SystemTime::now());
         }
         Ok(u32::try_from(written).unwrap_or(u32::MAX))
     }
@@ -1871,11 +1895,15 @@ mod tests {
         let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
         let attr = fs.link(readme, src, name("readme")).unwrap();
         assert_eq!((attr.ino.0, attr.nlink), (readme, 2));
+        assert_eq!(attr.mtime, SystemTime::UNIX_EPOCH, "a new name leaves the file's time alone");
+        assert_ne!(fs.attr(src).unwrap().mtime, SystemTime::UNIX_EPOCH, "its folder changed");
         assert_eq!(fs.lookup(src, name("readme")).unwrap().ino.0, readme);
 
         fs.write(readme, 0, b"HELLO").unwrap();
         fs.commit_written(Duration::ZERO);
         assert_eq!(fs.ws.read_text("/mnt/src/readme").unwrap(), "HELLO\n");
+        let written = fs.times["/mnt/README.md"];
+        assert_eq!(fs.times["/mnt/src/readme"], written, "every name has the time of the write");
 
         // Renaming one name onto the other changes nothing.
         fs.rename(ROOT_INO, name("README.md"), src, name("readme"), RenameFlags::empty()).unwrap();
@@ -1960,16 +1988,19 @@ mod tests {
         ws.mount("/mnt", source.clone()).unwrap();
         let root = VPath::parse("/mnt").unwrap();
         let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        fs.ws.hard_link("/mnt/README.md", "/mnt/README.txt").unwrap();
         let fh = fs.opendir(ROOT_INO).unwrap();
         let mut seen = Vec::new();
         fs.readdirplus(fh, 2, |ino, _, name, attr, ttl| {
-            seen.push((name.to_owned(), ino, attr.size, ttl));
+            seen.push((name.to_owned(), ino, attr.size, ttl, attr.nlink));
             false
         })
         .unwrap();
         fs.releasedir(fh);
         let readme = seen.iter().find(|(name, ..)| name == "README.md").unwrap();
         assert_eq!((readme.2, readme.3), (0, Duration::ZERO), "no size yet, and nothing to keep");
+        let other = seen.iter().find(|(name, ..)| name == "README.txt").unwrap();
+        assert_eq!((readme.4, other.1, other.4), (2, readme.1, 2), "one inode with two names: {seen:?}");
         let src = seen.iter().find(|(name, ..)| name == "src").unwrap();
         assert_eq!(src.3, TTL);
         assert_eq!(source.1.load(Ordering::SeqCst), 0, "listing read no file");
