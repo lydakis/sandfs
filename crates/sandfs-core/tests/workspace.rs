@@ -565,13 +565,23 @@ fn dir_source_lists_symlinks_without_following_them() {
     std::os::unix::fs::symlink(outside.join("secret"), root.join("secret")).unwrap();
     std::os::unix::fs::symlink("../outside", root.join("away")).unwrap();
     std::os::unix::fs::symlink("lib", root.join("lib64")).unwrap();
+    // Absolute links into the folder, which a mount must not lead back to.
+    std::os::unix::fs::symlink(root.join("data.csv"), root.join("lib/data.csv")).unwrap();
+    std::os::unix::fs::symlink(root.join("lib/../lib/x"), root.join("lib/x-abs")).unwrap();
+    std::os::unix::fs::symlink(&root, root.join("lib/top")).unwrap();
+    std::os::unix::fs::symlink(base.join("root/lib"), root.join("libs")).unwrap();
 
     let mut ws = Workspace::new();
     ws.mount("/host", Arc::new(DirSource::new(&root).unwrap())).unwrap();
-    assert_eq!(names(&ws, "/host"), ["away", "data.csv", "lib", "lib64", "secret"]);
+    assert_eq!(names(&ws, "/host"), ["away", "data.csv", "lib", "lib64", "libs", "secret"]);
     assert_eq!(ws.stat("/host/lib64").unwrap().kind, Kind::Symlink);
     assert_eq!(ws.read_link("/host/lib64").unwrap(), "lib");
     assert_eq!(ws.read_link("/host/away").unwrap(), "../outside");
+    assert_eq!(ws.read_link("/host/lib/data.csv").unwrap(), "../data.csv");
+    assert_eq!(ws.read_link("/host/lib/x-abs").unwrap(), "x", "a target that doesn't exist yet");
+    assert_eq!(ws.read_link("/host/lib/top").unwrap(), "..");
+    assert_eq!(ws.read_link("/host/libs").unwrap(), "lib");
+    assert_eq!(ws.stat("/host/lib/data.csv").unwrap().size, 11, "listed with its new length");
     assert!(changes(&ws).is_empty());
 
     // Nothing reads through a link out of the folder: the target is all there is.

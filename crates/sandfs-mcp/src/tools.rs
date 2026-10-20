@@ -82,20 +82,22 @@ impl Tools {
         let path = args.path("path")?;
         let byte_offset = args.opt_u64("byte_offset")?;
         let byte_length = args.opt_u64("byte_length")?;
-        if byte_offset.is_some() || byte_length.is_some() {
-            if args.has("offset") || args.has("limit") {
-                return Err("use either offset/limit (lines) or byte_offset/byte_length, not both".to_owned());
-            }
+        let bytes_wanted = byte_offset.is_some() || byte_length.is_some();
+        if bytes_wanted && (args.has("offset") || args.has("limit")) {
+            return Err("use either offset/limit (lines) or byte_offset/byte_length, not both".to_owned());
+        }
+        // A link has no bytes to page through, however it is read. Asking for its
+        // target first spares a file a stat, which may have to read it whole.
+        if let Ok(target) = self.workspace.read_link(&path) {
+            let version = self.workspace.stat(&path).map_err(err)?.version;
+            return Ok(format!("{}: symlink to {}, version {version}", shown(&path), shown(&target)));
+        }
+        if bytes_wanted {
             return self.read_bytes(&path, byte_offset.unwrap_or(0), byte_length.unwrap_or(DEFAULT_READ_BYTES));
         }
         let offset = args.opt_u64("offset")?.unwrap_or(1).max(1) as usize;
         let limit = args.opt_u64("limit")?.map_or(DEFAULT_READ_LINES, |n| n as usize).max(1);
-        let meta = self.workspace.stat(&path).map_err(err)?;
-        let version = meta.version;
-        if meta.kind.is_symlink() {
-            let target = self.workspace.read_link(&path).map_err(err)?;
-            return Ok(format!("{}: symlink to {}, version {version}", shown(&path), shown(&target)));
-        }
+        let version = self.workspace.stat(&path).map_err(err)?.version;
         let bytes = self.workspace.read(&path).map_err(err)?;
         let Some(text) = as_text(&bytes) else {
             let kind = detect_type(&bytes);

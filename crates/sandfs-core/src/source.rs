@@ -253,6 +253,47 @@ impl DirSource {
         self.check_inside(dir)
     }
 
+    /// The target of the link at `key`, if it is UTF-8 like every workspace path.
+    ///
+    /// An absolute target inside the folder is made relative to the link. Followed
+    /// through a mount, the link then stays in the mount and reaches the workspace's
+    /// copy of the file, instead of the folder itself, which a write must never reach.
+    fn link_target(&self, key: &str) -> Result<Bytes> {
+        let path = self.host_path(key);
+        let target = std::fs::read_link(&path).map_err(io_error)?;
+        let target = match self.inside(&target) {
+            Some(inside) => relative_link(Path::new(key).parent().unwrap_or(Path::new("")), &inside),
+            None => target,
+        };
+        match target.into_os_string().into_string() {
+            Ok(target) => Ok(Bytes::from(target)),
+            Err(_) => Err(Error::Source(format!("{}: link target is not UTF-8", path.display()))),
+        }
+    }
+
+    /// Where an absolute link target lies inside `root`, relative to it, if it does:
+    /// spelled out from the root, or through a folder that resolves into it.
+    fn inside(&self, target: &Path) -> Option<PathBuf> {
+        if !target.is_absolute() {
+            return None;
+        }
+        let mut plain = PathBuf::new();
+        for part in target.components() {
+            match part {
+                Component::ParentDir => {
+                    plain.pop();
+                }
+                Component::CurDir => {}
+                part => plain.push(part),
+            }
+        }
+        let resolved = match (plain.parent(), plain.file_name()) {
+            (Some(dir), Some(name)) => dir.canonicalize().map(|dir| dir.join(name)).unwrap_or_else(|_| plain.clone()),
+            _ => plain.clone(),
+        };
+        [resolved, plain].into_iter().find_map(|path| path.strip_prefix(&self.root).ok().map(Path::to_path_buf))
+    }
+
     fn host_path(&self, key: &str) -> PathBuf {
         if key.is_empty() { self.root.clone() } else { self.root.join(key) }
     }
@@ -271,7 +312,7 @@ impl DirSource {
         if file_type.is_symlink() {
             let parent = Path::new(key).parent().and_then(Path::to_str).unwrap_or_default();
             self.check_dir(parent, path.parent().unwrap_or(&self.root))?;
-            return Ok(Opened::Link(link_target(&path)?));
+            return Ok(Opened::Link(self.link_target(key)?));
         }
         if !file_type.is_file() {
             return Err(Error::Source(format!("{} is not a regular file", path.display())));
@@ -305,15 +346,6 @@ enum Opened {
     Link(Bytes),
 }
 
-/// The target of the link at `path`, if it is UTF-8 like every workspace path.
-fn link_target(path: &Path) -> Result<Bytes> {
-    let target = std::fs::read_link(path).map_err(io_error)?;
-    match target.into_os_string().into_string() {
-        Ok(target) => Ok(Bytes::from(target)),
-        Err(_) => Err(Error::Source(format!("{}: link target is not UTF-8", path.display()))),
-    }
-}
-
 impl Source for DirSource {
     fn root(&self) -> Result<SourceKey> {
         Ok("".into())
@@ -332,20 +364,20 @@ impl Source for DirSource {
             // The entry's type usually comes with the listing, so only files, which
             // need a size and a mode, cost a stat (relative to the open directory).
             let file_type = entry.file_type().map_err(io_error)?;
+            let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
             let (kind, size) = if file_type.is_dir() {
                 (Kind::Dir, None)
             } else if file_type.is_file() {
                 let meta = entry.metadata().map_err(io_error)?;
                 (Kind::File { executable: is_executable(&meta) }, Some(meta.len()))
             } else if file_type.is_symlink() {
-                match link_target(&entry.path()) {
+                match self.link_target(&child_key) {
                     Ok(target) => (Kind::Symlink, Some(target.len() as u64)),
                     Err(_) => continue, // a target no workspace path could hold
                 }
             } else {
                 continue; // special files are not part of a workspace
             };
-            let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
             listing.insert(name, SourceEntry { kind, key: child_key.as_str().into(), size });
         }
         Ok(listing)
@@ -373,6 +405,15 @@ impl Source for DirSource {
         file.take(len).read_to_end(&mut data).map_err(io_error)?;
         Ok(Bytes::from(data))
     }
+}
+
+/// The relative link from the folder `from` to `to`, both relative to one root.
+fn relative_link(from: &Path, to: &Path) -> PathBuf {
+    let (from, to): (Vec<_>, Vec<_>) = (from.components().collect(), to.components().collect());
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut link: PathBuf = from[common..].iter().map(|_| Component::ParentDir).collect();
+    link.extend(&to[common..]);
+    if link.as_os_str().is_empty() { PathBuf::from(".") } else { link }
 }
 
 fn io_error(err: std::io::Error) -> Error {

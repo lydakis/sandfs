@@ -415,6 +415,8 @@ fn links_are_shown_with_their_targets_and_never_followed() {
 
     assert!(ok(&mut s, "list", json!({ "path": "/env" })).starts_with("lib/\nlib64 -> lib\n"));
     assert!(ok(&mut s, "read", json!({ "path": "/env/lib64" })).starts_with("/env/lib64: symlink to lib, version "));
+    let paged = ok(&mut s, "read", json!({ "path": "/env/lib64", "byte_offset": 0, "byte_length": 2 }));
+    assert!(paged.starts_with("/env/lib64: symlink to lib, version "), "{paged}");
     assert!(ok(&mut s, "grep", json!({ "pattern": "x", "path": "/env" })).contains("1 matches in 1 file"));
     assert!(ok(&mut s, "changes", json!({})).starts_with("A /env/lib64 -> lib\n"));
     assert!(fails(&mut s, "write", json!({ "path": "/env/lib64", "content": "y" })).contains("symbolic link"));
