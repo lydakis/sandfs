@@ -21,6 +21,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 
 use bytes::Bytes;
@@ -43,6 +44,8 @@ pub struct GitSource {
     /// `None` inside when git couldn't say.
     absent: Arc<OnceLock<Option<Ids>>>,
     walk: Once,
+    /// Set when the source is dropped, which stops a walk still running.
+    cancel: Arc<AtomicBool>,
     /// Blobs read or fetched since, which [`GitSource::absent`] may still list.
     fetched: Mutex<HashSet<SourceKey>>,
 }
@@ -86,6 +89,7 @@ impl GitSource {
             local: Mutex::default(),
             absent: Arc::default(),
             walk: Once::new(),
+            cancel: Arc::default(),
             fetched: Mutex::default(),
         })
     }
@@ -142,20 +146,28 @@ impl GitSource {
         self.promisor.as_ref()?;
         self.walk.call_once(|| {
             let (repo, tree, absent) = (self.repo.clone(), self.tree.clone(), Arc::clone(&self.absent));
-            let hash_len = self.hash_len;
+            let (hash_len, cancel) = (self.hash_len, Arc::clone(&self.cancel));
             let _ = std::thread::Builder::new().name("sandfs-git-walk".into()).spawn(move || {
-                let ids = missing_blobs(&repo, &tree, true, usize::MAX).map(|ids| Ids::new(&ids, hash_len));
-                let _ = absent.set(ids);
+                let _ = absent.set(walk_missing(&repo, &tree, hash_len, &cancel));
             });
         });
         self.absent.get()?.as_ref()
     }
 
-    /// Note blobs that are local now, which the walk may have found missing.
+    /// Note blobs that are local now, which the walk may have found missing. Once its
+    /// answer is in, only blobs it lists need remembering.
     fn now_local<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
-        if self.promisor.is_some() && self.sizes.is_some() {
-            if let Ok(mut fetched) = self.fetched.lock() {
-                fetched.extend(ids.into_iter().map(SourceKey::from));
+        if self.promisor.is_none() || self.sizes.is_none() {
+            return;
+        }
+        let absent = self.absent.get();
+        if matches!(absent, Some(None)) {
+            return;
+        }
+        let Ok(mut fetched) = self.fetched.lock() else { return };
+        for id in ids {
+            if absent.is_none_or(|absent| absent.as_ref().is_some_and(|absent| absent.contains(id))) {
+                fetched.insert(id.into());
             }
         }
     }
@@ -164,7 +176,30 @@ impl GitSource {
     /// `recursive` every file below it. `None` when git can't say, or when more than
     /// `limit` are missing; git stops looking then.
     fn missing(&self, id: &str, recursive: bool, limit: usize) -> Option<Vec<String>> {
-        missing_blobs(&self.repo, id, recursive, limit)
+        // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
+        // `tree:1` stops the walk at the tree's direct children.
+        let mut command = git(&self.repo);
+        command.args(["rev-list", "--objects", "--missing=print"]);
+        if !recursive {
+            command.arg("--filter=tree:1");
+        }
+        let mut child = command.arg(id).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+        let mut missing = Vec::new();
+        for line in BufReader::new(child.stdout.take()?).lines() {
+            let Ok(line) = line else { break };
+            if let Some(object) = line.strip_prefix('?') {
+                missing.push(object.to_owned());
+                if missing.len() > limit {
+                    break;
+                }
+            }
+        }
+        let over = missing.len() > limit;
+        if over {
+            let _ = child.kill();
+        }
+        let status = child.wait().ok()?;
+        (!over && status.success()).then_some(missing)
     }
 
     /// Fetch these blobs from `remote` in one request. Best effort: whatever this
@@ -203,6 +238,12 @@ impl GitSource {
     }
 }
 
+impl Drop for GitSource {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Source for GitSource {
     fn root(&self) -> Result<SourceKey> {
         Ok(self.tree.clone())
@@ -234,6 +275,11 @@ impl Source for GitSource {
         let fetched = missing.is_empty() || self.fetch(remote, &missing);
         if fetched {
             self.now_local(missing.iter().map(String::as_str));
+            // The folder's files are all local now, including any fetched some other way
+            // since the walk, which its answer would otherwise still count as missing.
+            if let Ok(listing) = self.object(key, "tree").and_then(|tree| parse_tree(&tree, self.hash_len)) {
+                self.now_local(listing.values().filter(|entry| !entry.kind.is_dir()).map(|entry| &*entry.key));
+            }
         }
         if fetched && recursive {
             self.mark_local(key);
@@ -270,32 +316,30 @@ fn parse_tree(data: &[u8], hash_len: usize) -> Result<Listing> {
     Ok(listing)
 }
 
-/// The blobs a partial clone at `repo` lacks in the tree `id` (see [`GitSource::missing`]).
-fn missing_blobs(repo: &Path, id: &str, recursive: bool, limit: usize) -> Option<Vec<String>> {
-    // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
-    // `tree:1` stops the walk at the tree's direct children.
+/// The blobs missing below the tree `id`, read straight into an [`Ids`], since a large
+/// repository lacks hundreds of thousands. `None` when git can't say, or once `cancel`
+/// is set, which kills the walk.
+fn walk_missing(repo: &Path, id: &str, hash_len: usize, cancel: &AtomicBool) -> Option<Ids> {
     let mut command = git(repo);
-    command.args(["rev-list", "--objects", "--missing=print"]);
-    if !recursive {
-        command.arg("--filter=tree:1");
-    }
-    let mut child = command.arg(id).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let mut missing = Vec::new();
+    command.args(["rev-list", "--objects", "--missing=print", id]).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let mut ids: Vec<[u8; 32]> = Vec::new();
     for line in BufReader::new(child.stdout.take()?).lines() {
         let Ok(line) = line else { break };
-        if let Some(object) = line.strip_prefix('?') {
-            missing.push(object.to_owned());
-            if missing.len() > limit {
-                break;
-            }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let mut blob = [0; 32];
+        if line.strip_prefix('?').is_some_and(|hex| unhex(hex, &mut blob[..hash_len])) {
+            ids.push(blob);
         }
     }
-    let over = missing.len() > limit;
-    if over {
-        let _ = child.kill();
-    }
-    let status = child.wait().ok()?;
-    (!over && status.success()).then_some(missing)
+    child.wait().ok()?.success().then_some(())?;
+    ids.sort_unstable();
+    ids.dedup();
+    Some(Ids { sorted: ids.iter().flat_map(|blob| blob[..hash_len].iter().copied()).collect(), len: hash_len })
 }
 
 /// A set of object ids kept as sorted raw bytes: a large repository lacks hundreds of
@@ -306,19 +350,16 @@ struct Ids {
 }
 
 impl Ids {
-    fn new(hex_ids: &[String], len: usize) -> Self {
-        let mut ids: Vec<Vec<u8>> = hex_ids.iter().filter_map(|id| unhex(id)).filter(|id| id.len() == len).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        Ids { sorted: ids.concat(), len }
-    }
-
     fn contains(&self, hex_id: &str) -> bool {
-        let Some(id) = unhex(hex_id) else { return false };
+        let mut id = [0; 32];
+        if !unhex(hex_id, &mut id[..self.len]) {
+            return false;
+        }
+        let id = &id[..self.len];
         let (mut low, mut high) = (0, self.sorted.len() / self.len);
         while low < high {
             let mid = (low + high) / 2;
-            match self.sorted[mid * self.len..(mid + 1) * self.len].cmp(&id[..]) {
+            match self.sorted[mid * self.len..(mid + 1) * self.len].cmp(id) {
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Greater => high = mid,
                 std::cmp::Ordering::Equal => return true,
@@ -328,11 +369,18 @@ impl Ids {
     }
 }
 
-fn unhex(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return None;
+/// Decode `hex` into `out`, which must be exactly half its length.
+fn unhex(hex: &str, out: &mut [u8]) -> bool {
+    if hex.len() != out.len() * 2 {
+        return false;
     }
-    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect()
+    for (i, byte) in out.iter_mut().enumerate() {
+        match hex.get(2 * i..2 * i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()) {
+            Some(value) => *byte = value,
+            None => return false,
+        }
+    }
+    true
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -547,8 +595,18 @@ mod tests {
         let listing = source.read_dir(&root).unwrap();
         assert_eq!((size(&listing, "a.txt"), size(&listing, "b.txt")), (Some(5), None));
         let dir = listing["dir"].key.clone();
+        // One file fetched by something else, which the walk's answer doesn't know about,
+        // then the rest of the folder by a prefetch.
+        let c = source.read_dir(&dir).unwrap()["c.txt"].key.clone();
+        run(clone.path(), &["cat-file", "-p", &c]);
         source.prefetch(&dir, false);
         let listing = source.read_dir(&dir).unwrap();
         assert_eq!((size(&listing, "c.txt"), size(&listing, "d.txt")), (Some(9), Some(9)));
+
+        // A walk stops when its source is dropped.
+        let cancelled = AtomicBool::new(true);
+        assert!(walk_missing(clone.path(), &root, source.hash_len, &cancelled).is_none());
+        let found = walk_missing(clone.path(), &root, source.hash_len, &AtomicBool::new(false)).unwrap();
+        assert_eq!(found.sorted.len() / found.len, 1, "b.txt is the one file left on the server");
     }
 }
