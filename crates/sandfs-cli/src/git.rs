@@ -167,9 +167,12 @@ impl GitDir {
             shell_quote(home.to_str().context("non-UTF-8 home directory")?),
             shell_quote(exe.to_str().context("non-UTF-8 path to the sandfs binary")?)
         );
+        // Newer git turns its file monitor off on network and FUSE file systems, a
+        // mount among them, unless `fsmonitor.allowRemote` says otherwise.
         let mut config = format!(
             "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\
              \tfsmonitor = {}\n\tfsmonitorHookVersion = 2\n\tuntrackedCache = true\n\
+             [fsmonitor]\n\tallowRemote = true\n\
              [remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
             config_value(&format!("{hook} git-fsmonitor")),
             config_value(&origin),
@@ -806,8 +809,10 @@ mod tests {
         assert_eq!(alternates.canonicalize().unwrap(), repo.join("objects").canonicalize().unwrap());
         assert!(read("shallow").contains(&commit), "the mounted commit has no parents here");
         let config = read("config");
-        assert!(config.contains(&format!("url = \"{url}\"")) && config.contains("partialClone = origin"), "{config}");
-        assert!(config.contains("git-fsmonitor") && config.contains(home.to_str().unwrap()), "{config}");
+        assert!(config.contains(&format!("url = {}", config_value(&url))), "{config}");
+        assert!(config.contains("partialClone = origin"), "{config}");
+        let quoted_home = config_value(&shell_quote(home.to_str().unwrap()));
+        assert!(config.contains("git-fsmonitor") && config.contains(quoted_home.trim_matches('"')), "{config}");
         assert!(config.contains("[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main"), "{config}");
         let names: Vec<String> = dir.read_dir("").unwrap().into_keys().collect();
         assert_eq!(names, ["HEAD", "config", "index", "objects", "refs", "shallow"]);

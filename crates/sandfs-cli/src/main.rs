@@ -160,7 +160,13 @@ fn run(cli: Cli) -> Result<()> {
             sync(&home, &name)?;
             let opened = home.open(&name)?;
             let root = VPath::parse(ROOT)?;
+            // What git keeps in a git mount's `.git` would drown out the files themselves.
+            let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| VPath::parse(&format!("{ROOT}/.git")));
+            let git_dir = git_dir.transpose()?;
             for change in opened.ws.changes()? {
+                if git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)) {
+                    continue;
+                }
                 let marker = match change.kind {
                     ChangeKind::Added => 'A',
                     ChangeKind::Modified => 'M',

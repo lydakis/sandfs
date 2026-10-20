@@ -272,6 +272,7 @@ fn git_works_inside_a_remote_git_mount() {
     git_out(&work, &["commit", "-q", "-m", "change"]);
     assert_eq!(git_out(&work, &["status", "--porcelain", "-b"]), "## main...origin/main [ahead 1]\n");
     assert_eq!(git_out(&work, &["log", "--format=%s"]), "change\nfirst\n");
+    assert_eq!(sandfs.stdout(&["changes", "work"]), "M README.md\nA docs/scratch.tmp\nA notes.txt\n", "not .git");
     git_out(&work, &["push", "-q", "origin", "HEAD:refs/heads/from-mount"]);
     assert_eq!(git_out(remote, &["show", "from-mount:README.md"]), "hello, sandfs\n");
     assert_eq!(git_out(remote, &["log", "--format=%s", "main"]), "first\n", "only the push reached the remote");
