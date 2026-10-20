@@ -217,10 +217,20 @@ impl Drafts {
             if data.is_empty() {
                 break;
             }
-            draft.write_all_at(offset, &data)?;
+            // Zeros are left as a hole, so a sparse file stays sparse on disk.
+            if data.iter().any(|byte| *byte != 0) {
+                draft.write_all_at(offset, &data)?;
+            }
             offset += data.len() as u64;
         }
+        draft.set_len(offset)?;
         Ok(draft)
+    }
+
+    /// The directory drafts are written in.
+    #[cfg(fuse)]
+    pub fn dir(&self) -> &Path {
+        &self.0.dir
     }
 
     fn track(&self, file: std::fs::File, key: SourceKey) -> Draft {
@@ -1153,6 +1163,25 @@ mod tests {
         // In chunks, every chunk would read the whole file again.
         drafts.copy(&ws, "/mnt/big", true).unwrap();
         assert_eq!(source.1.load(Ordering::SeqCst), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_of_a_sparse_file_stays_sparse() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let sparse = std::fs::File::create(data.path().join("sparse")).unwrap();
+        sparse.set_len(4 * CHUNK).unwrap();
+        drop(sparse);
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(sandfs_core::DirSource::new(data.path()).unwrap())).unwrap();
+        let drafts = Saved::new(state.path()).drafts();
+
+        let draft = drafts.copy(&ws, "/mnt/sparse", true).unwrap();
+        let meta = draft.file.metadata().unwrap();
+        assert_eq!(meta.len(), 4 * CHUNK);
+        assert!(meta.blocks() * 512 < CHUNK, "{} bytes on disk", meta.blocks() * 512);
     }
 
     #[test]

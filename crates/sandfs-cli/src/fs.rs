@@ -1329,9 +1329,28 @@ impl Filesystem for SandFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        // Writes live in memory, so report plenty of room rather than a real disk.
-        let blocks = 1 << 28;
-        reply.statfs(blocks, blocks, blocks, 1 << 24, 1 << 24, 4096, 255, 4096);
+        // Files are written on the disk that holds the drafts, so report its room. A
+        // mount without drafts writes into memory and reports plenty.
+        // The workspace's state directory, which holds the drafts' directory and always
+        // exists.
+        let dir = self.0.lock().drafts.as_ref().and_then(|drafts| drafts.dir().parent().map(|dir| dir.to_path_buf()));
+        let disk = dir.and_then(|dir| nix::sys::statvfs::statvfs(&dir).ok());
+        match disk {
+            Some(disk) => reply.statfs(
+                disk.blocks(),
+                disk.blocks_free(),
+                disk.blocks_available(),
+                disk.files(),
+                disk.files_free(),
+                u32::try_from(disk.block_size()).unwrap_or(4096),
+                255,
+                u32::try_from(disk.fragment_size()).unwrap_or(4096),
+            ),
+            None => {
+                let blocks = 1 << 28;
+                reply.statfs(blocks, blocks, blocks, 1 << 24, 1 << 24, 4096, 255, 4096);
+            }
+        }
     }
 
     fn create(
