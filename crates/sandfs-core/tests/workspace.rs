@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use sandfs_core::{
-    Change, ChangeKind, DirSource, Error, Kind, Listing, MemorySource, Source, SourceKey, Stored, VPath, Workspace,
+    COMPARE_LIMIT, Change, ChangeKind, DirSource, Error, Kind, Listing, MemorySource, Source, SourceKey, Stored, VPath,
+    Workspace,
 };
 
 /// A source whose listing of one directory key always fails.
@@ -726,4 +727,22 @@ fn storing_a_file_keeps_its_version_unless_it_changed_since() {
     let version = ws.set_executable("/data/run.sh", true).unwrap().max(version);
     assert!(ws.store("/data/run.sh", version, stored(&saved, "2", 9)).unwrap());
     assert_eq!(ws.stat("/data/run.sh").unwrap().kind, Kind::File { executable: true });
+}
+
+#[test]
+fn large_files_written_back_unchanged_count_as_modified_without_being_read() {
+    let big = vec![7u8; COMPARE_LIMIT as usize];
+    let source =
+        Counting::new(MemorySource::from_files([("big.bin", big.clone()), ("small.txt", b"hi".to_vec())]).unwrap());
+    let mut ws = Workspace::new();
+    ws.mount("/data", source.clone()).unwrap();
+    ws.write("/data/big.bin", big).unwrap();
+    ws.write("/data/small.txt", "hi").unwrap();
+    let files_before = source.reads().1;
+    assert_eq!(
+        ws.changes().unwrap(),
+        [Change { path: VPath::parse("/data/big.bin").unwrap(), kind: ChangeKind::Modified }],
+        "the small file is compared and unchanged; the large one is not compared"
+    );
+    assert_eq!(source.reads().1 - files_before, 1, "only small.txt was read");
 }

@@ -397,6 +397,7 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     let mut inner =
         Inner::new(opened.ws, &root, opened.restored.times, opened.restored.dirs, base_time, (owner, group));
     inner.ranged_reads = matches!(opened.record.base, Base::Dir { .. });
+    inner.drafts = Some(opened.saved.drafts());
     // NFS has no close to flush a file's writes, and macOS's NFS client adds files of
     // its own next to the ones people write.
     inner.keep_removed = !cfg!(nfs);
