@@ -857,8 +857,11 @@ fn linked_name(snap: &Snapshot, root: &VPath, changed: &HashSet<&VPath>, path: &
         return Ok(None);
     }
     let names = snap.ws.hard_links(path.as_str())?;
-    let first = names.into_iter().find(|other| other != path && (other < path || !changed.contains(other)));
-    Ok(first.and_then(|first| relative(root, &first).ok()))
+    // A name saved earlier comes first: an unchanged one may be gone from a host folder
+    // by the next load, and then only the first name saved relinks to it.
+    let saved = names.iter().find(|other| *other < path && changed.contains(other));
+    let first = saved.or_else(|| names.iter().find(|other| *other != path && !changed.contains(other)));
+    Ok(first.and_then(|first| relative(root, first).ok()))
 }
 
 fn relative(root: &VPath, path: &VPath) -> Result<String> {
@@ -968,20 +971,23 @@ mod tests {
         ws.hard_link("/mnt/out/lib.rlib", "/mnt/cache/lib.rlib").unwrap();
         ws.hard_link("/mnt/out/lib.rlib", "/mnt/out/lib2.rlib").unwrap();
         ws.hard_link("/mnt/a.txt", "/mnt/a-link.txt").unwrap();
+        ws.hard_link("/mnt/a.txt", "/mnt/z-link.txt").unwrap();
         ws.symlink("/mnt/sym", "a.txt").unwrap();
         ws.hard_link("/mnt/sym", "/mnt/sym2").unwrap();
         let dirs = ["/mnt/cache", "/mnt/out"].map(str::to_owned).into();
 
         let mut saved = Saved::new(state.path());
         saved.save(&Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs }, &root(), false).unwrap();
-        assert_eq!(saved.objects.len(), 4);
+        assert_eq!(saved.objects.len(), 5);
         let objects: HashSet<&SourceKey> = saved.objects.values().map(|(_, object)| object).collect();
-        assert_eq!(objects.len(), 2, "the three names of one file share an object");
+        // The second new name of a.txt links to the first, which a load can relink even
+        // if a.txt is gone from the source by then.
+        assert_eq!(objects.len(), 2, "the names of one file share an object");
         let mut written: Vec<String> = saved.take_written().iter().map(|(path, ..)| path.to_string()).collect();
         written.sort();
         assert_eq!(
             written,
-            ["/mnt/a-link.txt", "/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib"],
+            ["/mnt/a-link.txt", "/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib", "/mnt/z-link.txt"],
             "any name can move the file out of memory"
         );
 
@@ -989,7 +995,7 @@ mod tests {
         Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
         let names = |path: &str| loaded.hard_links(path).unwrap().iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(names("/mnt/out/lib.rlib"), ["/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib"]);
-        assert_eq!(names("/mnt/a-link.txt"), ["/mnt/a-link.txt", "/mnt/a.txt"]);
+        assert_eq!(names("/mnt/a-link.txt"), ["/mnt/a-link.txt", "/mnt/a.txt", "/mnt/z-link.txt"]);
         assert_eq!(names("/mnt/sym2"), ["/mnt/sym", "/mnt/sym2"], "a link's names stay one link");
         assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
         loaded.write("/mnt/cache/lib.rlib", "rebuilt").unwrap();

@@ -1190,8 +1190,12 @@ impl Workspace {
             if let Some(Overlay::Linked { id }) = self.overlay.remove(key) {
                 if let Some(linked) = self.links.get_mut(&id) {
                     linked.names.remove(key);
-                    if linked.names.is_empty() {
-                        self.links.remove(&id);
+                    // A file left with one name is an ordinary file again.
+                    if linked.names.len() <= 1 {
+                        let Some(Linked { content, kind, version, names }) = self.links.remove(&id) else { continue };
+                        for name in names {
+                            self.overlay.insert(name, Overlay::File { content: content.clone(), kind, version });
+                        }
                     }
                 }
             }

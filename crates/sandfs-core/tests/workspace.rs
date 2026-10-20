@@ -579,10 +579,12 @@ fn hard_links_share_one_file_until_every_name_is_gone() {
     assert_eq!(ws.read_text("/repo/build/out.o").unwrap(), "v3");
     ws.remove("/repo/build", true).unwrap();
     assert_eq!(names(&ws, "/repo/kept/out.o"), ["/repo/kept/out.o"]);
+    assert!(!ws.has_hard_links(), "a file left with one name is an ordinary file");
     assert_eq!(ws.read_text("/repo/kept/out.o").unwrap(), "v3");
 
     // A base file can be linked without being read; only the new name is a change.
     ws.hard_link("/repo/docs/guide.md", "/repo/guide.md").unwrap();
+    assert!(ws.has_hard_links());
     assert_eq!(source.files.load(Ordering::SeqCst), 0);
     assert_eq!(
         changes(&ws),
