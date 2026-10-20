@@ -292,10 +292,12 @@ mod tests {
     fn the_process_closes_only_after_lingering_idle() {
         let state = Arc::new(State::default());
         let ticket = state.enter().unwrap();
+        // Timed from here, not from inside the thread, which may start late on a busy
+        // machine and so see less than the 100 ms the ticket is held.
+        let started = Instant::now();
         let waiter = {
             let state = state.clone();
             std::thread::spawn(move || {
-                let started = Instant::now();
                 state.wait_until_idle(Duration::from_millis(50));
                 started.elapsed()
             })
