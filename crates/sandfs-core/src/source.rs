@@ -263,6 +263,7 @@ impl DirSource {
     fn link_target(&self, key: &str) -> Result<Bytes> {
         let path = self.host_path(key);
         let target = std::fs::read_link(&path).map_err(io_error)?;
+        let raw = target.clone().into_os_string();
         let reached = resolve(&path.parent().unwrap_or(&self.root).join(&target));
         // A `..` left over follows a folder that isn't there, so the link dangles on the
         // host. Made relative, it would come alive once the folder is made in the
@@ -277,7 +278,10 @@ impl DirSource {
             None if target.has_root() => target,
             None => reached,
         };
+        // A trailing `/` or `/.` means the target must be a folder; resolving drops it.
+        let folder_only = matches!(raw.as_encoded_bytes(), [.., b'/'] | [.., b'/', b'.']);
         match target.into_os_string().into_string() {
+            Ok(target) if folder_only && !target.ends_with('/') => Ok(Bytes::from(target + "/")),
             Ok(target) => Ok(Bytes::from(target)),
             Err(_) => Err(Error::Source(format!("{}: link target is not UTF-8", path.display()))),
         }

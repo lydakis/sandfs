@@ -584,6 +584,10 @@ fn dir_source_lists_symlinks_without_following_them() {
     // A missing folder before `..` leaves a link dangling, so it must not reach anything.
     std::os::unix::fs::symlink("../../missing/../outside/secret", root.join("lib/dangling")).unwrap();
     std::os::unix::fs::symlink("missing/../../data.csv", root.join("lib/dangling-in")).unwrap();
+    // A trailing `/` asks for a folder, so a link to a file that way dangles too.
+    std::os::unix::fs::symlink("../../outside/secret/", root.join("lib/not-a-folder")).unwrap();
+    std::os::unix::fs::symlink("../data.csv/.", root.join("lib/not-a-folder-in")).unwrap();
+    std::os::unix::fs::symlink(".././lib/", root.join("lib/self")).unwrap();
 
     let mut ws = Workspace::new();
     ws.mount("/host", Arc::new(DirSource::new(&root).unwrap())).unwrap();
@@ -600,6 +604,10 @@ fn dir_source_lists_symlinks_without_following_them() {
     assert_eq!(ws.read_link("/host/lib/dangling").unwrap(), dangling.to_str().unwrap());
     let dangling_in = root.canonicalize().unwrap().join("lib/missing/../../data.csv");
     assert_eq!(ws.read_link("/host/lib/dangling-in").unwrap(), dangling_in.to_str().unwrap(), "anchored to the host");
+    let not_a_folder = outside.canonicalize().unwrap().join("secret/");
+    assert_eq!(ws.read_link("/host/lib/not-a-folder").unwrap(), not_a_folder.to_str().unwrap());
+    assert_eq!(ws.read_link("/host/lib/not-a-folder-in").unwrap(), "../data.csv/");
+    assert_eq!(ws.read_link("/host/lib/self").unwrap(), "./");
     assert_eq!(ws.read_link("/host/lib/data.csv").unwrap(), "../data.csv");
     assert_eq!(ws.read_link("/host/lib/x-abs").unwrap(), "x", "a target that doesn't exist yet");
     assert_eq!(ws.read_link("/host/lib/top").unwrap(), "..");
