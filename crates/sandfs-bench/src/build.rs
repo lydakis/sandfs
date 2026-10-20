@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -84,8 +84,12 @@ pub fn run(
         Job::Command { dir, change, .. } => {
             let dir = dir.canonicalize().with_context(|| format!("--build-dir {}", dir.display()))?;
             if let Some(change) = change {
+                // The runs change copies of this file, so it must be one inside the
+                // folder: not an absolute path, and not a link out of it.
+                let file = dir.join(change).canonicalize().ok();
                 ensure!(
-                    dir.join(change).is_file(),
+                    change.components().all(|part| matches!(part, Component::Normal(_)))
+                        && file.is_some_and(|file| file.starts_with(&dir) && file.is_file()),
                     "--build-change {} is no file in {}",
                     change.display(),
                     dir.display()
@@ -107,16 +111,25 @@ pub fn run(
         }
         Ok(dir)
     };
+    // Each column has its own empty cache folder, so a tool that caches there (Go's
+    // build cache, pip) can't reuse what the other column computed.
+    let cache = |name: &str| -> Result<PathBuf> {
+        let dir = base.join(format!("cache-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    };
     let mut columns = Vec::new();
     if host {
-        columns.push(run_in("host folder", &copy("host")?, job, change.as_deref(), iters, None)?);
+        columns.push(run_in("host folder", &copy("host")?, &cache("host")?, job, change.as_deref(), iters, None)?);
     }
     if mount {
         match Fuse::new(copy("mounted")?, base.clone(), bin.to_owned()) {
             Ok(fuse) => {
                 let view = fuse.open(true)?;
                 let root = view.root_dir().context("a mount has a folder")?.to_owned();
-                columns.push(run_in("sandfs mount", &root, job, change.as_deref(), iters, Some(&fuse))?);
+                let cache = cache("mounted")?;
+                columns.push(run_in("sandfs mount", &root, &cache, job, change.as_deref(), iters, Some(&fuse))?);
             }
             Err(err) if mount_named || !host => return Err(err),
             Err(err) => eprintln!("build: no mount column ({err:#})"),
@@ -133,6 +146,7 @@ fn fetch(dir: &Path) -> Result<()> {
 fn run_in(
     name: &'static str,
     dir: &Path,
+    cache: &Path,
     job: &Job,
     change: Option<&Path>,
     iters: usize,
@@ -149,7 +163,8 @@ fn run_in(
                 cargo(dir, &["build", "--offline", "--quiet", "-p", package, "--target-dir", target])?;
             }
             Job::Command { command, .. } => {
-                let status = Command::new("sh").args(["-c", command]).current_dir(dir).status()?;
+                let status =
+                    Command::new("sh").args(["-c", command]).current_dir(dir).env("XDG_CACHE_HOME", cache).status()?;
                 ensure!(status.success(), "`{command}` failed in {}", dir.display());
             }
         }
@@ -159,12 +174,15 @@ fn run_in(
     let mut rebuilds = Vec::new();
     for round in 0..iters {
         // A real edit, not just a newer timestamp: a comment the compiler has to read,
-        // or for any other file an empty line, which no language minds.
+        // or for any other file a blank line, which no language minds. The columns'
+        // edits differ (the mount's lines hold a space), so a cache the columns share
+        // never holds a result for the other column's bytes.
         if let Some(change) = change {
             let mut file = fs::File::options().append(true).open(dir.join(change))?;
+            let blank = if fuse.is_some() { " " } else { "" };
             match job {
-                Job::Cargo { .. } => writeln!(file, "// edit {round}")?,
-                Job::Command { .. } => writeln!(file)?,
+                Job::Cargo { .. } => writeln!(file, "// edit {round} in a {name}")?,
+                Job::Command { .. } => writeln!(file, "{blank}")?,
             }
         }
         rebuilds.push(once()?);
@@ -216,6 +234,9 @@ fn copy_source(from: &Path, to: &Path, scratch: &Path, skipped: &[&str]) -> Resu
             copy_source(&entry.path(), &to.join(&name), scratch, skipped)?;
         } else if kind.is_file() {
             fs::copy(entry.path(), to.join(&name))?;
+            // Keep the time too: tools such as `make` compare times to decide what is
+            // out of date.
+            fs::File::options().write(true).open(to.join(&name))?.set_modified(entry.metadata()?.modified()?)?;
         } else if kind.is_symlink() {
             // Such as the commands in node_modules/.bin.
             std::os::unix::fs::symlink(fs::read_link(entry.path())?, to.join(&name))?;

@@ -101,7 +101,8 @@ struct Args {
     #[arg(long, requires = "build_command")]
     build_dir: Option<PathBuf>,
     /// The shell command the build table runs in each copy of `--build-dir`, such as
-    /// `go test ./...` or `npm test`.
+    /// `go test ./...` or `npm test`. Each column runs it with its own empty
+    /// `XDG_CACHE_HOME`; give a tool that keeps its cache elsewhere one inside the folder.
     #[arg(long, requires = "build_dir")]
     build_command: Option<String>,
     /// A file inside `--build-dir` the build table changes (adding an empty line) before
