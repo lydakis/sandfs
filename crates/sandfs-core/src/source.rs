@@ -390,7 +390,9 @@ impl Source for DirSource {
 }
 
 /// Where the OS would find the absolute `path`: the longest part of it that exists,
-/// resolved through every link, plus the rest, with its `..` taken lexically.
+/// resolved through every link, plus the rest as written. The OS can't take `..` back
+/// out of a folder that isn't there, so a missing folder before one keeps the link
+/// dangling here too.
 fn resolve(path: &Path) -> PathBuf {
     let parts: Vec<Component> = path.components().collect();
     (0..=parts.len())
@@ -398,15 +400,7 @@ fn resolve(path: &Path) -> PathBuf {
         .find_map(|cut| {
             let existing: PathBuf = parts[..cut].iter().collect();
             let mut path = if cut == 0 { PathBuf::new() } else { existing.canonicalize().ok()? };
-            for part in &parts[cut..] {
-                match part {
-                    Component::ParentDir => {
-                        path.pop();
-                    }
-                    Component::CurDir => {}
-                    part => path.push(part),
-                }
-            }
+            path.extend(&parts[cut..]);
             Some(path)
         })
         .unwrap_or_default()
