@@ -229,7 +229,7 @@ impl GitSource {
     /// Fetch these blobs from `remote` in one request. Best effort: whatever this
     /// misses, git still fetches one blob at a time on first read.
     fn fetch(&self, remote: &str, blobs: &[String]) -> bool {
-        fetch(&self.repo, remote, blobs)
+        fetch(&self.repo, remote, blobs, &self.cancel)
     }
 
     /// Fetch everything missing below the tree `id` in the background, a request at a
@@ -449,7 +449,7 @@ fn fetch_in_order(
         if request.is_empty() {
             return true;
         }
-        let ok = !cancel.load(Ordering::Relaxed) && fetch(repo, remote, request.iter().map(|(blob, _)| blob));
+        let ok = !cancel.load(Ordering::Relaxed) && fetch(repo, remote, request.iter().map(|(blob, _)| blob), cancel);
         settle(&request.iter().map(|&(_, index)| index).collect::<Vec<_>>(), ok);
         request.clear();
         ok
@@ -486,7 +486,7 @@ fn fetch_in_order(
 }
 
 /// See [`GitSource::fetch`].
-fn fetch<'a>(repo: &Path, remote: &str, blobs: impl IntoIterator<Item = &'a String>) -> bool {
+fn fetch<'a>(repo: &Path, remote: &str, blobs: impl IntoIterator<Item = &'a String>, cancel: &AtomicBool) -> bool {
     // The same request git makes for a single missing object, with every id at once.
     let fetch = git(repo)
         .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", remote, "--no-tags", "--no-write-fetch-head"])
@@ -504,7 +504,23 @@ fn fetch<'a>(repo: &Path, remote: &str, blobs: impl IntoIterator<Item = &'a Stri
         }
         let _ = stdin.write_all(&ids);
     }
-    fetch.wait().is_ok_and(|status| status.success())
+    // A slow or stalled remote mustn't outlive the source. Checks start often, so a
+    // quick fetch isn't kept waiting.
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        match fetch.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if !cancel.load(Ordering::Relaxed) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = fetch.kill();
+                let _ = fetch.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// Parse a raw tree object: repeated `<octal mode> <name>\0<binary id>` records.
