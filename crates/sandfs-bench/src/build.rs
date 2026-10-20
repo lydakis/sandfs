@@ -117,13 +117,17 @@ pub fn run(
         }
         Ok(dir)
     };
-    // Each column has its own empty cache folder, so a tool that caches there (Go's
-    // build cache, pip) can't reuse what the other column computed.
-    let cache = |name: &str| -> Result<PathBuf> {
-        let dir = base.join(format!("cache-{name}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir)?;
-        Ok(dir)
+    // Each copy has its own empty cache folder, so a tool that caches there (Go's
+    // build cache, pip) can't reuse what another copy or the other column computed.
+    let caches = |column: &str| -> Result<Vec<PathBuf>> {
+        (0..parallel)
+            .map(|i| {
+                let dir = base.join(format!("cache-{column}-{i}"));
+                let _ = fs::remove_dir_all(&dir);
+                fs::create_dir_all(&dir)?;
+                Ok(dir)
+            })
+            .collect()
     };
     let mut columns = Vec::new();
     if host {
@@ -131,7 +135,7 @@ pub fn run(
             1 => ("host folder", vec![copy("host")?]),
             _ => ("host folders", (0..parallel).map(|i| copy(&format!("host-{i}"))).collect::<Result<_>>()?),
         };
-        columns.push(run_in(name, &dirs, &cache("host")?, job, change.as_deref(), iters, None)?);
+        columns.push(run_in(name, &dirs, &caches("host")?, job, change.as_deref(), iters, None)?);
     }
     if mount {
         match Fuse::new(copy("mounted")?, base.clone(), bin.to_owned()) {
@@ -146,8 +150,8 @@ pub fn run(
                     .iter()
                     .map(|view| view.root_dir().context("a mount has a folder").map(Path::to_owned))
                     .collect::<Result<_>>()?;
-                let cache = cache("mounted")?;
-                columns.push(run_in(name, &dirs, &cache, job, change.as_deref(), iters, Some(&fuse))?);
+                let caches = caches("mounted")?;
+                columns.push(run_in(name, &dirs, &caches, job, change.as_deref(), iters, Some(&fuse))?);
             }
             Err(err) if mount_named || !host => return Err(err),
             Err(err) => eprintln!("build: no mount column ({err:#})"),
@@ -161,18 +165,19 @@ fn fetch(dir: &Path) -> Result<()> {
     cargo(dir, &["fetch", "--quiet"]).context("cargo fetch (the build table needs the network once)")
 }
 
-/// Run `job` in every one of `dirs` at once, timing until the last one finishes.
+/// Run `job` in every one of `dirs` at once, each with its cache folder from `caches`,
+/// timing until the last one finishes.
 fn run_in(
     name: &'static str,
     dirs: &[PathBuf],
-    cache: &Path,
+    caches: &[PathBuf],
     job: &Job,
     change: Option<&Path>,
     iters: usize,
     fuse: Option<&Fuse>,
 ) -> Result<Column> {
     eprintln!("{NAME}: in {} {name}", dirs.len());
-    let run_one = |dir: &Path| -> Result<()> {
+    let run_one = |dir: &Path, cache: &Path| -> Result<()> {
         match job {
             Job::Cargo { package } => {
                 // The output goes inside the folder, whatever a cargo config says.
@@ -191,7 +196,8 @@ fn run_in(
     let once = || -> Result<Duration> {
         let start = Instant::now();
         std::thread::scope(|scope| {
-            let runs: Vec<_> = dirs.iter().map(|dir| scope.spawn(move || run_one(dir))).collect();
+            let runs: Vec<_> =
+                dirs.iter().zip(caches).map(|(dir, cache)| scope.spawn(move || run_one(dir, cache))).collect();
             runs.into_iter().try_for_each(|run| run.join().expect("a run panicked"))
         })?;
         Ok(start.elapsed())

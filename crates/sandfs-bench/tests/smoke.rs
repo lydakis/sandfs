@@ -62,7 +62,7 @@ fn a_command_runs_in_copies_of_a_folder() {
         .collect();
     let lines: Vec<&str> = runs.iter().map(|run| run[0].as_str()).collect();
     assert_eq!(lines, ["1", "2", "3"], "a blank line before each run after the first");
-    assert!(runs.iter().all(|run| run[1] == "1600000000" && run[2] == "cache-host"), "{runs:?}");
+    assert!(runs.iter().all(|run| run[1] == "1600000000" && run[2] == "cache-host-0"), "{runs:?}");
     assert!(runs.iter().all(|run| !run[3].starts_with(dir.path().to_str().unwrap())), "{runs:?}");
     assert_eq!(std::fs::read_to_string(dir.path().join("change.txt")).unwrap(), "x\n", "the folder is never changed");
 
@@ -73,10 +73,16 @@ fn a_command_runs_in_copies_of_a_folder() {
     assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("| | host folders |") && stdout.contains("2 at once"), "{stdout}");
     let mut copies: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut caches: std::collections::BTreeSet<(String, String)> = Default::default();
     for line in std::fs::read_to_string(log.path()).unwrap().lines() {
         let run: Vec<&str> = line.split(' ').collect();
         copies.entry(run[3].to_owned()).or_default().push(run[0].to_owned());
+        caches.insert((run[3].to_owned(), run[2].to_owned()));
     }
+    // A cache folder of its own per copy, from the first run on.
+    let names: std::collections::BTreeSet<&str> = caches.iter().map(|(_, cache)| cache.as_str()).collect();
+    assert_eq!(names, ["cache-host-0", "cache-host-1"].into(), "{caches:?}");
+    assert_eq!(caches.len(), 2, "{caches:?}");
     let mut lines: Vec<Vec<String>> = copies.into_values().collect();
     lines.sort();
     assert_eq!(lines, [["1", "2", "4"], ["1", "3", "5"]]);
