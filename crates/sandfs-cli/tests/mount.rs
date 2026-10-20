@@ -412,7 +412,9 @@ fn symlinks_work_in_a_mount_and_survive_a_remount() {
     let venv = Command::new("python3").args(["-m", "venv", "--without-pip"]).arg(ws.join(".venv")).output().unwrap();
     assert!(venv.status.success(), "venv: {}", String::from_utf8_lossy(&venv.stderr));
     let python = Command::new(ws.join(".venv/bin/python")).args(["-c", "import sys; print(sys.prefix)"]).output();
-    assert_eq!(String::from_utf8(python.unwrap().stdout).unwrap().trim(), ws.join(".venv").to_str().unwrap());
+    // macOS reports temporary folders through their real path (/private/var).
+    let prefix = std::fs::canonicalize(String::from_utf8(python.unwrap().stdout).unwrap().trim()).unwrap();
+    assert_eq!(prefix, std::fs::canonicalize(ws.join(".venv")).unwrap());
 
     let changes = sandfs.stdout(&["changes", "env"]);
     assert!(changes.contains("A .venv/bin/python\n"), "{changes}");
