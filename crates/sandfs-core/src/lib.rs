@@ -17,7 +17,7 @@ pub use change::{Change, ChangeKind};
 pub use error::{Error, Result};
 pub use path::VPath;
 pub use source::{DirSource, Kind, Listing, MemorySource, Source, SourceEntry, SourceKey};
-pub use workspace::{DirEntry, Metadata, Stored, Workspace};
+pub use workspace::{COMPARE_LIMIT, DirEntry, Metadata, Stored, Workspace};
 
 // Keeps the README example compiling.
 #[cfg(doctest)]

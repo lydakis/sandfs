@@ -6,7 +6,10 @@
 //! which saves two round trips per file, so reads and writes name only the inode.
 //! Writes land in a per-inode buffer that reaches the workspace once the file has gone
 //! [`SETTLE`] without a write, or on `fsync`, so a file written in many small chunks is
-//! copied once, not once per chunk. [`Shared`] adds a background thread that does that
+//! copied once, not once per chunk. A mount with saved state writes that buffer to disk,
+//! as a new object of the workspace (a [`Draft`]), so a file being written takes no
+//! memory however large it is, and a write in the middle of a large file copies it on
+//! disk rather than reading it into memory. [`Shared`] adds a background thread that does that
 //! and saves the workspace's changes, and the [`fuser::Filesystem`] impl at the bottom
 //! only locks, calls into [`Inner`] and replies. The NFS server on macOS (`nfs`) calls
 //! the same [`Inner`], which has no opens or closes either; fuser lends it the types
@@ -30,7 +33,7 @@ use fuser::{
 };
 use sandfs_core::{ChangeKind, Error, Kind, VPath, Workspace};
 
-use crate::persist::{Saved, Snapshot};
+use crate::persist::{Draft, Drafts, Saved, Snapshot};
 use crate::store::subtree_keys;
 
 /// How long the kernel may cache attributes and names. Every change goes through this
@@ -39,8 +42,11 @@ use crate::store::subtree_keys;
 #[cfg(any(fuse, test))]
 const TTL: Duration = Duration::from_secs(60);
 pub const ROOT_INO: u64 = 1;
-/// Files live in memory, so refuse sizes that could only be a mistake.
-pub const MAX_FILE_SIZE: usize = 4 << 30;
+/// The largest file a mount takes: what a file offset can address. A file being
+/// written is a file on disk, so the disk is the real limit.
+pub const MAX_FILE_SIZE: usize = i64::MAX as usize;
+/// The largest file kept in memory while it is written, where there are no drafts.
+const MAX_MEMORY_FILE: u64 = 4 << 30;
 /// How many whole files, and bytes of them, [`Inner::read`] keeps for sources that
 /// can't read a range on its own. The kernel asks for a file in chunks and caches
 /// what it gets, so only the few files being read right now are worth keeping.
@@ -132,8 +138,86 @@ struct DirHandle {
 
 /// A file's contents with writes the workspace hasn't seen yet.
 struct Buffer {
-    data: Vec<u8>,
+    body: Body,
+    size: u64,
     written: Instant,
+}
+
+/// Where a buffer's bytes are: a draft on disk, or memory for a mount with no saved
+/// state to keep drafts in.
+enum Body {
+    Memory(Vec<u8>),
+    Draft(Draft),
+}
+
+impl Buffer {
+    fn new(body: Body, size: u64) -> Self {
+        Buffer { body, size, written: Instant::now() }
+    }
+
+    fn read(&self, offset: u64, len: u64) -> FsResult<Bytes> {
+        match &self.body {
+            Body::Memory(data) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+                let end = start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX)).min(data.len());
+                Ok(Bytes::copy_from_slice(&data[start..end]))
+            }
+            Body::Draft(draft) => draft.read_at(offset, len).map_err(io_errno),
+        }
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) -> FsResult<()> {
+        let end = offset.checked_add(data.len() as u64).ok_or(Errno::EFBIG)?;
+        match &mut self.body {
+            Body::Memory(buffer) => {
+                let end = usize::try_from(end).ok().filter(|end| *end as u64 <= MAX_MEMORY_FILE).ok_or(Errno::EFBIG)?;
+                if buffer.len() < end {
+                    buffer.resize(end, 0);
+                }
+                buffer[end - data.len()..end].copy_from_slice(data);
+            }
+            Body::Draft(draft) => draft.write_at(offset, data).map_err(io_errno)?,
+        }
+        self.size = self.size.max(end);
+        Ok(())
+    }
+
+    fn set_len(&mut self, size: u64) -> FsResult<()> {
+        match &mut self.body {
+            Body::Memory(data) => {
+                let size = usize::try_from(size).ok().filter(|size| *size as u64 <= MAX_MEMORY_FILE);
+                data.resize(size.ok_or(Errno::EFBIG)?, 0);
+            }
+            Body::Draft(draft) => draft.set_len(size).map_err(io_errno)?,
+        }
+        self.size = size;
+        Ok(())
+    }
+
+    /// Hand the contents to `ws` at `path`.
+    fn commit(self, ws: &mut Workspace, path: &str) -> FsResult<u64> {
+        match self.body {
+            Body::Memory(data) => ws.write(path, Bytes::from(data)).fs(),
+            Body::Draft(draft) => ws.write_stored(path, draft.finish().map_err(io_errno)?).fs(),
+        }
+    }
+}
+
+/// A failed write to a draft, as the error the disk gave (a full disk is `ENOSPC`).
+fn io_errno(err: std::io::Error) -> Errno {
+    eprintln!("sandfs: writing a file failed: {err}");
+    Errno::from(err)
+}
+
+/// A draft that couldn't be made, as [`io_errno`].
+fn draft_errno(err: anyhow::Error) -> Errno {
+    match err.downcast::<std::io::Error>() {
+        Ok(err) => io_errno(err),
+        Err(err) => {
+            eprintln!("sandfs: writing a file failed: {err:#}");
+            Errno::EIO
+        }
+    }
 }
 
 /// The filesystem state, behind one lock.
@@ -149,6 +233,8 @@ pub struct Inner {
     open: HashMap<u64, u32>,
     /// File contents written but not yet committed to the workspace.
     buffers: HashMap<u64, Buffer>,
+    /// Where buffers are written; without it (no saved state) they stay in memory.
+    pub drafts: Option<Drafts>,
     /// Modification times of touched paths; others report `base_time`.
     times: BTreeMap<String, SystemTime>,
     /// Directories created or removed here, which a save must record.
@@ -205,6 +291,7 @@ impl Inner {
             next_fh: 1,
             open: HashMap::new(),
             buffers: HashMap::new(),
+            drafts: None,
             times,
             dirs,
             base_time,
@@ -319,7 +406,7 @@ impl Inner {
         if !node.linked {
             // A removed file the kernel may still have open.
             let size = match (self.buffers.get(&ino), &node.removed_from) {
-                (Some(buffer), _) => buffer.data.len() as u64,
+                (Some(buffer), _) => buffer.size,
                 (None, Some(before)) => before.stat(node.path.as_str()).fs()?.size,
                 (None, None) => return Err(Errno::ENOENT),
             };
@@ -330,7 +417,7 @@ impl Inner {
         let meta = self.ws.stat(path).fs()?;
         node.sized.set(true);
         let size = match self.buffers.get(&ino) {
-            Some(buffer) => buffer.data.len() as u64,
+            Some(buffer) => buffer.size,
             None if meta.kind.is_dir() => 0,
             None => meta.size,
         };
@@ -452,14 +539,17 @@ impl Inner {
         mtime: Option<TimeOrNow>,
     ) -> FsResult<FileAttr> {
         if let Some(size) = size {
-            let size = usize::try_from(size).ok().filter(|size| *size <= MAX_FILE_SIZE).ok_or(Errno::EFBIG)?;
+            if size > MAX_FILE_SIZE as u64 {
+                return Err(Errno::EFBIG);
+            }
             if size == 0 {
                 // Emptying a file (O_TRUNC arrives this way) needn't read it first.
                 self.contents(ino)?;
-                self.buffers.insert(ino, Buffer { data: Vec::new(), written: Instant::now() });
+                let empty = self.empty_buffer()?;
+                self.buffers.insert(ino, empty);
                 self.writing = true;
             } else {
-                self.buffer(ino)?.resize(size, 0);
+                self.buffer(ino)?.set_len(size)?;
             }
             // ftruncate on a removed file that is still open changes only its buffer.
             if !self.nodes.get(&ino).is_some_and(|node| node.linked) {
@@ -640,7 +730,8 @@ impl Inner {
             Ok(_) => {
                 if truncate {
                     let ino = self.ino_for(&path);
-                    self.buffers.insert(ino, Buffer { data: Vec::new(), written: Instant::now() });
+                    let empty = self.empty_buffer()?;
+                    self.buffers.insert(ino, empty);
                     self.writing = true;
                     self.touch(&path);
                 }
@@ -673,7 +764,7 @@ impl Inner {
             start..start.saturating_add(size as usize).min(len)
         };
         if let Some(buffer) = self.buffers.get(&ino) {
-            return Ok(Bytes::copy_from_slice(&buffer.data[range(buffer.data.len())]));
+            return buffer.read(offset, size.into());
         }
         let (ws, path) = self.contents(ino)?;
         // Saved files are on disk, where reading a range is cheap.
@@ -716,33 +807,42 @@ impl Inner {
         }
     }
 
+    /// A new, empty buffer.
+    fn empty_buffer(&self) -> FsResult<Buffer> {
+        let body = match &self.drafts {
+            Some(drafts) => Body::Draft(drafts.empty().map_err(draft_errno)?),
+            None => Body::Memory(Vec::new()),
+        };
+        Ok(Buffer::new(body, 0))
+    }
+
     /// The write buffer for `ino`, filled from the workspace on first use.
-    fn buffer(&mut self, ino: u64) -> FsResult<&mut Vec<u8>> {
+    fn buffer(&mut self, ino: u64) -> FsResult<&mut Buffer> {
         if !self.buffers.contains_key(&ino) {
             let (ws, path) = self.contents(ino)?;
-            // Check before reading: a large source file would otherwise be read whole.
             let size = ws.stat(path.as_str()).fs()?.size;
-            if size > MAX_FILE_SIZE as u64 {
-                return Err(Errno::EFBIG);
-            }
-            // A ranged read keeps no copy of a base file in the workspace's cache.
-            let data = ws.read_range(path.as_str(), 0, size).fs()?.to_vec();
-            self.buffers.insert(ino, Buffer { data, written: Instant::now() });
+            let body = match &self.drafts {
+                // On disk: a saved file is copied there, which the disk may do without
+                // copying a byte, and anything else is read in chunks.
+                Some(drafts) => Body::Draft(drafts.copy(ws, path.as_str()).map_err(draft_errno)?),
+                // Check before reading: a large source file would otherwise be read whole.
+                None if size > MAX_MEMORY_FILE => return Err(Errno::EFBIG),
+                // A ranged read keeps no copy of a base file in the workspace's cache.
+                None => Body::Memory(ws.read_range(path.as_str(), 0, size).fs()?.to_vec()),
+            };
+            self.buffers.insert(ino, Buffer::new(body, size));
         }
         self.writing = true;
         let buffer = self.buffers.get_mut(&ino).ok_or(Errno::EIO)?;
         buffer.written = Instant::now();
-        Ok(&mut buffer.data)
+        Ok(buffer)
     }
 
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
-        let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-        let end = start.checked_add(data.len()).filter(|end| *end <= MAX_FILE_SIZE).ok_or(Errno::EFBIG)?;
-        let buffer = self.buffer(ino)?;
-        if buffer.len() < end {
-            buffer.resize(end, 0);
+        if offset.checked_add(data.len() as u64).is_none_or(|end| end > MAX_FILE_SIZE as u64) {
+            return Err(Errno::EFBIG);
         }
-        buffer[start..end].copy_from_slice(data);
+        self.buffer(ino)?.write(offset, data)?;
         if let Ok(path) = self.path(ino) {
             self.times.insert(path.to_string(), SystemTime::now());
         }
@@ -766,7 +866,7 @@ impl Inner {
             let Some(buffer) = self.buffers.remove(&ino) else { continue };
             // A failure is logged by `errno`; the write is lost either way, as it
             // would be if a commit at close had failed.
-            let _ = self.ws.write(path.as_str(), Bytes::from(buffer.data)).fs();
+            let _ = buffer.commit(&mut self.ws, path.as_str());
             self.unsaved = true;
         }
         self.writing = waiting;
@@ -1320,6 +1420,36 @@ mod tests {
         assert!(!fs.writing && fs.unsaved);
         fs.write(ino, 12, b"!\n").unwrap();
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"hello\nworld\n!\n", "writes go on after a commit");
+    }
+
+    #[test]
+    fn files_are_written_on_disk_where_there_are_drafts() {
+        let state = tempfile::tempdir().unwrap();
+        let mut saved = Saved::new(state.path());
+        let mut fs = fs();
+        fs.drafts = Some(saved.drafts());
+        let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        fs.write(ino, 0, b"HE").unwrap();
+        assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"HEllo\n", "copied from the source, then written");
+        fs.commit_written(Duration::ZERO);
+        let stored = fs.ws.stored("/mnt/README.md").unwrap().expect("committed as the draft on disk");
+        assert_eq!(std::fs::read(state.path().join("objects").join(&*stored.key)).unwrap(), b"HEllo\n");
+        saved.save(&fs.snapshot(Duration::ZERO), &VPath::parse("/mnt").unwrap(), false).unwrap();
+        assert!(saved.take_written().is_empty(), "the save writes nothing new");
+
+        // A saved file written again goes to a new draft; the saved one is never changed.
+        fs.write(ino, 2, b"LLO").unwrap();
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "HELLO\n");
+        assert_eq!(std::fs::read(state.path().join("objects").join(&*stored.key)).unwrap(), b"HEllo\n");
+
+        // Sizes are the disk's to limit, not memory's.
+        let huge = 5 << 30;
+        assert_eq!(fs.setattr(ino, None, Some(huge), None).unwrap().size, huge);
+        assert_eq!(&fs.read(ino, huge - 2, 10).unwrap()[..], b"\0\0");
+        let mut in_memory = super::tests::fs();
+        let ino = in_memory.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        assert_eq!(in_memory.setattr(ino, None, Some(huge), None).unwrap_err(), Errno::EFBIG);
     }
 
     #[test]

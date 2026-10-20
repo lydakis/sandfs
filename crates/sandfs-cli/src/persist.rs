@@ -244,10 +244,10 @@ impl Draft {
     }
 
     /// Up to `len` bytes from `offset`; fewer at the end of the file.
-    pub fn read_at(&mut self, offset: u64, len: u64) -> std::io::Result<Bytes> {
-        let mut data = Vec::new();
-        self.file.seek(SeekFrom::Start(offset))?;
-        (&mut self.file).take(len).read_to_end(&mut data)?;
+    pub fn read_at(&self, offset: u64, len: u64) -> std::io::Result<Bytes> {
+        let (mut file, mut data) = (&self.file, Vec::new());
+        file.seek(SeekFrom::Start(offset))?;
+        file.take(len).read_to_end(&mut data)?;
         Ok(data.into())
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
         assert_eq!(ws.read_text("/mnt/saved.txt").unwrap(), "SAVED bytes");
 
         // A file from the source is read into it.
-        let mut draft = drafts.copy(&ws, "/mnt/dir/b.txt").unwrap();
+        let draft = drafts.copy(&ws, "/mnt/dir/b.txt").unwrap();
         draft.set_len(3).unwrap();
         assert_eq!(draft.read_at(0, 10).unwrap(), &b"b\0\0"[..]);
         assert_eq!(ws.read_text("/mnt/dir/b.txt").unwrap(), "b");
