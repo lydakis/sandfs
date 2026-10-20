@@ -2002,6 +2002,13 @@ mod tests {
         let saved_ino = index_ino();
         shared.save(true).unwrap();
         assert_eq!(index_ino(), saved_ino, "and then nothing is left to do");
+
+        // A draft no save named, such as one written to a removed file, is deleted too.
+        let drafts = shared.lock().drafts.clone().unwrap();
+        drop(drafts.empty().unwrap());
+        assert_eq!(objects(), 3);
+        shared.save(true).unwrap();
+        assert_eq!(objects(), 2);
         let mut restored = fs().ws;
         Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
         assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");

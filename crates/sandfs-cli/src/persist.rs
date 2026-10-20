@@ -924,9 +924,11 @@ impl Saved {
         Ok(())
     }
 
-    /// Whether a replaced object or pack is waiting for a later save to delete it.
+    /// Whether a replaced object or pack, or a draft no save has named yet (such as
+    /// one written to a removed file), is waiting for a later save to delete it.
     pub fn deleting_later(&self) -> bool {
-        !self.doomed.is_empty() || self.packs.values().any(|pack| pack.unnamed)
+        let drafts = !self.store.drafts.lock().unwrap_or_else(PoisonError::into_inner).is_empty();
+        drafts || !self.doomed.is_empty() || self.packs.values().any(|pack| pack.unnamed)
     }
 
     /// Flush to disk what the last save left unflushed: the objects its index names, and
