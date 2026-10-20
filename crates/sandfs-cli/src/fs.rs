@@ -889,19 +889,26 @@ impl Inner {
             if let Some(buffer) = self.buffers.remove(&src) {
                 buffer.commit(&mut self.ws, from.as_str())?;
             }
-            self.buffers.remove(&dst);
             // The copy takes the source's mode; the destination keeps the one it was made with.
             let executable = matches!(self.ws.stat(to.as_str()).fs()?.kind, Kind::File { executable: true });
-            match (&self.drafts, self.ws.stored(from.as_str()).fs()?) {
-                // A file not saved yet (a file of the source) is copied into a draft in
-                // chunks, as a first write would copy it: shared, the next save would
-                // read it whole into memory to write it out.
+            // A file not saved yet (a file of the source) is copied into a draft in
+            // chunks, as a first write would copy it: shared, the next save would read it
+            // whole into memory to write it out.
+            let stored = match (&self.drafts, self.ws.stored(from.as_str()).fs()?) {
                 (Some(drafts), None) => {
                     let draft = drafts.copy(&self.ws, from.as_str(), self.ranged_reads).map_err(draft_errno)?;
-                    let stored = draft.finish().map_err(io_errno)?;
+                    Some(draft.finish().map_err(io_errno)?)
+                }
+                _ => None,
+            };
+            // Only now does the destination's buffer go: until the copy is ready, it
+            // holds a truncation the workspace hasn't seen, which a failed copy keeps.
+            self.buffers.remove(&dst);
+            match stored {
+                Some(stored) => {
                     self.ws.write_stored(to.as_str(), stored).fs()?;
                 }
-                _ => {
+                None => {
                     self.ws.remove(to.as_str(), false).fs()?;
                     self.ws.copy(from.as_str(), to.as_str(), false).fs()?;
                 }
@@ -1767,6 +1774,25 @@ mod tests {
         assert_eq!(fs.copy_range(lib, 0, copied, 0, 1 << 30).unwrap(), 12);
         assert!(fs.ws.stored("/mnt/lib.rs").unwrap().is_some());
         assert_eq!(fs.ws.read_text("/mnt/lib.rs").unwrap(), "fn one() {}\n");
+    }
+
+    #[test]
+    fn a_failed_copy_keeps_the_destination_emptied() {
+        let state = tempfile::tempdir().unwrap();
+        let mut fs = fs();
+        fs.drafts = Some(Saved::new(state.path()).drafts());
+        fs.ws.write("/mnt/out.md", "old\n").unwrap();
+        let out = fs.lookup(ROOT_INO, name("out.md")).unwrap().ino.0;
+        // O_TRUNC, which only the buffer knows about so far.
+        fs.setattr(out, None, Some(0), None).unwrap();
+        // No room for drafts: the objects folder is a file.
+        let objects = state.path().join("objects");
+        let _ = std::fs::remove_dir_all(&objects);
+        std::fs::write(&objects, "").unwrap();
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        assert!(fs.copy_range(readme, 0, out, 0, 1 << 30).is_err());
+        assert_eq!(fs.attr(out).unwrap().size, 0);
+        assert_eq!(fs.read(out, 0, 100).unwrap().len(), 0, "the old bytes stay gone");
     }
 
     #[test]

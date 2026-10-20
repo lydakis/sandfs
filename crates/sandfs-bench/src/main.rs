@@ -203,7 +203,8 @@ fn run(args: Args) -> Result<()> {
     let workloads: Vec<_> = workloads::all(&data).into_iter().filter(|w| selected(w.name)).collect();
     let run_workflow = selected(WORKFLOW);
     let run_everyday = everyday::Op::ALL.iter().any(|op| selected(&format!("everyday/{}", op.name())));
-    let run_build = selected(build::NAME);
+    // The build table has host and FUSE columns only; a run of other targets leaves it out.
+    let run_build = selected(build::NAME) && (wanted(TargetArg::Host) || wanted(TargetArg::Fuse));
     if workloads.is_empty()
         && !lazy::NAMES.iter().any(|name| selected(name))
         && !run_workflow
