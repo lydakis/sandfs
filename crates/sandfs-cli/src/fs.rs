@@ -455,9 +455,14 @@ impl Inner {
     ) -> FsResult<FileAttr> {
         if let Some(size) = size {
             let size = usize::try_from(size).ok().filter(|size| *size <= MAX_FILE_SIZE).ok_or(Errno::EFBIG)?;
+            // Only a regular file has a size to set, as truncate(2) says; the kernel
+            // follows links first, but an NFS client may name one.
+            let (ws, path) = self.contents(ino)?;
+            if ws.read_link(path.as_str()).is_ok() {
+                return Err(Errno::EINVAL);
+            }
             if size == 0 {
                 // Emptying a file (O_TRUNC arrives this way) needn't read it first.
-                self.contents(ino)?;
                 self.buffers.insert(ino, Buffer { data: Vec::new(), written: Instant::now() });
                 self.writing = true;
             } else {
@@ -1564,6 +1569,17 @@ mod tests {
         assert_eq!(errno(&ws.write("/link", "x").unwrap_err()), Errno::ELOOP);
         assert_eq!(errno(&ws.read("/link").unwrap_err()), Errno::ELOOP);
         assert_eq!(errno(&ws.remove("/", true).unwrap_err()), Errno::EPERM, "other refusals stay EPERM");
+    }
+
+    #[test]
+    fn a_link_has_no_size_to_set() {
+        let mut fs = fs();
+        let link = fs.symlink(ROOT_INO, name("link"), OsStr::new("README.md")).unwrap().ino.0;
+        for size in [0, 3] {
+            assert_eq!(fs.setattr(link, None, Some(size), None).unwrap_err(), Errno::EINVAL);
+        }
+        assert_eq!(fs.readlink(link).unwrap(), "README.md");
+        assert!(fs.buffers.is_empty());
     }
 
     #[test]

@@ -570,6 +570,8 @@ fn dir_source_lists_symlinks_without_following_them() {
     std::os::unix::fs::symlink(root.join("lib/../lib/x"), root.join("lib/x-abs")).unwrap();
     std::os::unix::fs::symlink(&root, root.join("lib/top")).unwrap();
     std::os::unix::fs::symlink(base.join("root/lib"), root.join("libs")).unwrap();
+    std::os::unix::fs::symlink(root.join("data.csv"), outside.join("alias")).unwrap();
+    std::os::unix::fs::symlink(outside.join("alias"), root.join("lib/alias")).unwrap();
 
     let mut ws = Workspace::new();
     ws.mount("/host", Arc::new(DirSource::new(&root).unwrap())).unwrap();
@@ -581,6 +583,7 @@ fn dir_source_lists_symlinks_without_following_them() {
     assert_eq!(ws.read_link("/host/lib/x-abs").unwrap(), "x", "a target that doesn't exist yet");
     assert_eq!(ws.read_link("/host/lib/top").unwrap(), "..");
     assert_eq!(ws.read_link("/host/libs").unwrap(), "lib");
+    assert_eq!(ws.read_link("/host/lib/alias").unwrap(), "../data.csv", "through a link outside the folder");
     assert_eq!(ws.stat("/host/lib/data.csv").unwrap().size, 11, "listed with its new length");
     assert!(changes(&ws).is_empty());
 

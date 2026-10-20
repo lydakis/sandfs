@@ -272,7 +272,7 @@ impl DirSource {
     }
 
     /// Where an absolute link target lies inside `root`, relative to it, if it does:
-    /// spelled out from the root, or through a folder that resolves into it.
+    /// spelled out from the root, or reaching it through other links.
     fn inside(&self, target: &Path) -> Option<PathBuf> {
         if !target.is_absolute() {
             return None;
@@ -287,11 +287,17 @@ impl DirSource {
                 part => plain.push(part),
             }
         }
-        let resolved = match (plain.parent(), plain.file_name()) {
-            (Some(dir), Some(name)) => dir.canonicalize().map(|dir| dir.join(name)).unwrap_or_else(|_| plain.clone()),
-            _ => plain.clone(),
+        // As written, through the folders on the way (for a target that doesn't exist
+        // yet), or wherever it finally leads through other links.
+        let through_dirs = match (plain.parent(), plain.file_name()) {
+            (Some(dir), Some(name)) => dir.canonicalize().ok().map(|dir| dir.join(name)),
+            _ => None,
         };
-        [resolved, plain].into_iter().find_map(|path| path.strip_prefix(&self.root).ok().map(Path::to_path_buf))
+        let resolved = plain.canonicalize().ok();
+        [Some(plain), through_dirs, resolved]
+            .into_iter()
+            .flatten()
+            .find_map(|path| path.strip_prefix(&self.root).ok().map(Path::to_path_buf))
     }
 
     fn host_path(&self, key: &str) -> PathBuf {
