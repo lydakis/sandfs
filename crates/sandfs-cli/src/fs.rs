@@ -266,7 +266,7 @@ pub struct Inner {
     buffers: HashMap<u64, Buffer>,
     /// Where buffers are written; without it (no saved state) they stay in memory.
     pub drafts: Option<Drafts>,
-    /// Modification times of touched paths; others report `base_time`.
+    /// Modification times of touched paths; others report their source's, or `base_time`.
     times: BTreeMap<String, SystemTime>,
     /// Directories created or removed here, which a save must record.
     dirs: BTreeSet<String>,
@@ -461,17 +461,17 @@ impl Inner {
         let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
         if !node.linked {
             // A removed file or link the kernel may still have open.
-            let (kind, perm, size) = match (self.buffers.get(&ino), &node.removed_from) {
-                (Some(buffer), _) => (FileType::RegularFile, 0o644, buffer.size),
+            let (kind, perm, size, modified) = match (self.buffers.get(&ino), &node.removed_from) {
+                (Some(buffer), _) => (FileType::RegularFile, 0o644, buffer.size, None),
                 (None, Some(before)) => {
                     let meta = before.stat(node.path.as_str()).fs()?;
                     let (kind, perm) = file_type(meta.kind);
-                    (kind, perm, meta.size)
+                    (kind, perm, meta.size, meta.modified)
                 }
                 (None, None) => return Err(Errno::ENOENT),
             };
             node.sized.set(true);
-            return Ok(self.make_attr(ino, kind, perm, size, self.base_time));
+            return Ok(self.make_attr(ino, kind, perm, size, modified.unwrap_or(self.base_time)));
         }
         let path = node.path.as_str();
         let meta = self.ws.stat(path).fs()?;
@@ -482,7 +482,9 @@ impl Inner {
             None => meta.size,
         };
         let (kind, perm) = file_type(meta.kind);
-        let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
+        // A file nobody wrote keeps its source's time, the same in every mount and fork,
+        // so build and test caches that check times find it unchanged.
+        let mtime = self.times.get(path).copied().or(meta.modified).unwrap_or(self.base_time);
         let mut attr = self.make_attr(ino, kind, perm, size, mtime);
         if kind != FileType::Directory {
             attr.nlink = self.nlink(path);
@@ -505,6 +507,16 @@ impl Inner {
             self.times.insert(other.to_string(), time);
         }
         self.times.insert(path.to_string(), time);
+    }
+
+    /// Note the source's time of a file nobody wrote that just got a new name. Its next
+    /// save keeps it apart from the source, so only `times` can carry that time on.
+    fn keep_source_time(&mut self, path: &VPath) {
+        if !self.times.contains_key(path.as_str())
+            && let Ok(Some(time)) = self.ws.modified(path.as_str())
+        {
+            self.times.insert(path.to_string(), time);
+        }
     }
 
     /// Attributes for a file whose size isn't known without reading it: size 0, for
@@ -662,7 +674,9 @@ impl Inner {
         if let Some(mode) = mode {
             let path = self.path(ino)?;
             if let Kind::File { .. } = self.ws.stat(path.as_str()).fs()?.kind {
-                // Only the executable bit is kept; other mode bits are not stored.
+                // Only the executable bit is kept; other mode bits are not stored. The
+                // bytes stay the same, and so does their time.
+                self.keep_source_time(&path);
                 self.ws.set_executable(path.as_str(), mode & 0o111 != 0).fs()?;
                 self.unsaved = true;
             }
@@ -713,6 +727,7 @@ impl Inner {
         self.ws.hard_link(from.as_str(), to.as_str()).fs()?;
         self.inos.insert(to.to_string(), ino);
         // The file keeps its time; only the directory it gained a name in changes.
+        self.keep_source_time(&from);
         match self.times.get(from.as_str()).copied() {
             Some(time) => self.times.insert(to.to_string(), time),
             None => self.times.remove(to.as_str()),
@@ -815,13 +830,18 @@ impl Inner {
             let mut stack = vec![to.clone()];
             while let Some(dir) = stack.pop() {
                 for entry in self.ws.list(dir.as_str()).fs()? {
+                    let child = dir.join(&entry.name).map_err(|_| Errno::EINVAL)?;
                     if entry.kind.is_dir() {
-                        stack.push(dir.join(&entry.name).map_err(|_| Errno::EINVAL)?);
+                        stack.push(child);
+                    } else {
+                        self.keep_source_time(&child);
                     }
                 }
                 self.dirs.insert(dir.to_string());
             }
             self.dirs.insert(from.to_string());
+        } else {
+            self.keep_source_time(&to);
         }
         self.touch_parent(&from);
         self.touch_parent(&to);
@@ -2137,7 +2157,8 @@ mod tests {
                 Ok("".into())
             }
             fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
-                let entry = sandfs_core::SourceEntry { kind: Kind::Symlink, key: "link".into(), size: Some(4) };
+                let entry =
+                    sandfs_core::SourceEntry { kind: Kind::Symlink, key: "link".into(), size: Some(4), modified: None };
                 Ok([("link".to_owned(), entry)].into())
             }
             fn read_file(&self, _key: &str) -> sandfs_core::Result<Bytes> {

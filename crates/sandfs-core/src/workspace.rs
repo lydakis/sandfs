@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use imbl::ordmap::DiffItem;
@@ -114,7 +114,7 @@ impl Cache {
 #[derive(Clone, Debug)]
 enum Content {
     Bytes(Bytes),
-    Base { mount: Arc<Mount>, key: SourceKey, size: Option<u64> },
+    Base { mount: Arc<Mount>, key: SourceKey, size: Option<u64>, modified: Option<SystemTime> },
     Stored(Stored),
 }
 
@@ -228,6 +228,9 @@ pub struct Metadata {
     /// Optimistic version: 0 for untouched base files. Every change gets a new
     /// version from a per-workspace clock, so versions are never reused.
     pub version: u64,
+    /// When the bytes last changed, as the source reports it, for a file no one has
+    /// written; `None` for everything else. A copy or a move keeps it.
+    pub modified: Option<SystemTime>,
 }
 
 /// What one workspace listed and read lately, to tell a walk reading through
@@ -326,7 +329,7 @@ impl Workspace {
     pub fn stat(&self, path: &str) -> Result<Metadata> {
         let path = VPath::parse(path)?;
         Ok(match self.resolve(&path)? {
-            Resolved::Dir { .. } => Metadata { kind: Kind::Dir, size: 0, version: 0 },
+            Resolved::Dir { .. } => Metadata { kind: Kind::Dir, size: 0, version: 0, modified: None },
             Resolved::File { content, kind, version } => {
                 let size = match content_size(&content) {
                     Some(size) => size,
@@ -342,8 +345,21 @@ impl Workspace {
                         },
                     },
                 };
-                Metadata { kind, size, version }
+                let modified = match content {
+                    Content::Base { modified, .. } => modified,
+                    _ => None,
+                };
+                Metadata { kind, size, version, modified }
             }
+        })
+    }
+
+    /// [`Metadata::modified`] alone: the source's time for a file nobody wrote, found
+    /// without reading the file even when the source left its size out.
+    pub fn modified(&self, path: &str) -> Result<Option<SystemTime>> {
+        Ok(match self.resolve(&VPath::parse(path)?)? {
+            Resolved::File { content: Content::Base { modified, .. }, .. } => modified,
+            _ => None,
         })
     }
 
@@ -832,7 +848,7 @@ impl Workspace {
         match base()? {
             None => Err(Error::NotFound(path.to_string())),
             Some(BaseNode::Entry(mount, entry)) if !entry.kind.is_dir() => Ok(Resolved::File {
-                content: Content::Base { mount, key: entry.key.clone(), size: entry.size },
+                content: Content::Base { mount, key: entry.key.clone(), size: entry.size, modified: entry.modified },
                 kind: entry.kind,
                 version: 0,
             }),

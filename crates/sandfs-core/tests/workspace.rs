@@ -454,6 +454,7 @@ impl Source for Large {
             kind: Kind::File { executable: false },
             key: "large.bin".into(),
             size: self.listed.then_some(self.len),
+            modified: None,
         };
         Ok([("large.bin".to_owned(), entry)].into())
     }
@@ -584,6 +585,38 @@ fn mounting_over_a_deleted_path_makes_the_mount_visible() {
 fn memory_source_rejects_a_file_that_is_also_a_directory() {
     assert!(MemorySource::from_files([("a", "file"), ("a/b", "child")]).is_err());
     assert!(MemorySource::from_files([("a/b", "child"), ("a", "file")]).is_err());
+}
+
+#[test]
+fn files_nobody_wrote_keep_their_source_modification_time() {
+    let dir = std::env::temp_dir().join(format!("sandfs-times-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let then = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::write(dir.join("data.csv"), "a\n").unwrap();
+    std::fs::File::options().write(true).open(dir.join("data.csv")).unwrap().set_modified(then).unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
+    assert_eq!(ws.stat("/host/data.csv").unwrap().modified, Some(then));
+    assert_eq!(ws.fork().stat("/host/data.csv").unwrap().modified, Some(then), "a fork reports the same time");
+
+    // A copy or a move keeps the time; a write drops it, for the caller to decide.
+    ws.copy("/host/data.csv", "/host/copy.csv", false).unwrap();
+    ws.rename("/host/data.csv", "/host/moved.csv").unwrap();
+    assert_eq!(ws.stat("/host/copy.csv").unwrap().modified, Some(then));
+    assert_eq!(ws.stat("/host/moved.csv").unwrap().modified, Some(then));
+    ws.write("/host/moved.csv", "b\n").unwrap();
+    assert_eq!(ws.stat("/host/moved.csv").unwrap().modified, None);
+    assert_eq!(ws.stat("/host").unwrap().modified, None);
+    // A link's own time, not its target's.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("data.csv", dir.join("link")).unwrap();
+        let link_time = std::fs::symlink_metadata(dir.join("link")).unwrap().modified().unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
+        assert_eq!(ws.stat("/host/link").unwrap().modified, Some(link_time));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[cfg(unix)]

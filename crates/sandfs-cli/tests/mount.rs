@@ -393,6 +393,53 @@ fn a_directory_source_is_never_written() {
 }
 
 #[test]
+fn files_keep_their_source_time_in_every_mount_and_fork() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let then = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::create_dir(data.path().join("pkg")).unwrap();
+    for name in ["go.mod", "go.sum", "pkg/a.go"] {
+        std::fs::write(data.path().join(name), "module x\n").unwrap();
+        std::fs::File::options().write(true).open(data.path().join(name)).unwrap().set_modified(then).unwrap();
+    }
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let (ws, fork) = (dirs.path().join("ws"), dirs.path().join("fork"));
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), ws.to_str().unwrap(), "--name", "ws"], &ws);
+    sandfs.mount(&["fork", "ws", fork.to_str().unwrap(), "--name", "fork"], &fork);
+
+    // Build and test caches compare times: a file nobody changed must look unchanged.
+    let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+    assert_eq!(modified(&ws.join("go.mod")), then);
+    assert_eq!(modified(&fork.join("go.mod")), then, "a fork shows the same time");
+    std::fs::write(fork.join("go.mod"), "module y\n").unwrap();
+    assert!(modified(&fork.join("go.mod")) > then, "a write is a change");
+    assert_eq!(modified(&ws.join("go.mod")), then);
+    sandfs.unmount(&fork);
+
+    // A move or a second name keeps the time, after the move is saved and remounted too.
+    std::fs::rename(ws.join("go.sum"), ws.join("go.sum.old")).unwrap();
+    std::fs::rename(ws.join("pkg"), ws.join("lib")).unwrap();
+    let mut moved = vec!["go.sum.old", "lib/a.go", "go.mod"];
+    // The NFS server under the macOS mount has no hard links.
+    if cfg!(target_os = "linux") {
+        std::fs::hard_link(ws.join("go.mod"), ws.join("go.mod.link")).unwrap();
+        moved.push("go.mod.link");
+    }
+    for &name in &moved {
+        assert_eq!(modified(&ws.join(name)), then, "{name}");
+    }
+    sandfs.unmount(&ws);
+    sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
+    for name in moved {
+        assert_eq!(modified(&ws.join(name)), then, "{name} after a remount");
+    }
+    sandfs.unmount(&ws);
+}
+
+#[test]
 fn symlinks_work_in_a_mount_and_survive_a_remount() {
     if !fuse_available() {
         return;

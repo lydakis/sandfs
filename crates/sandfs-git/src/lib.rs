@@ -626,7 +626,7 @@ fn parse_tree(data: &[u8], hash_len: usize) -> Result<Listing> {
             _ => continue,
         };
         let Ok(name) = name else { continue }; // non-UTF-8 names cannot be workspace paths
-        listing.insert(name.to_owned(), SourceEntry { kind, key: id.as_str().into(), size: None });
+        listing.insert(name.to_owned(), SourceEntry { kind, key: id.as_str().into(), size: None, modified: None });
     }
     Ok(listing)
 }

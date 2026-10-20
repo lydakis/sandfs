@@ -307,12 +307,14 @@ impl GitDir {
                 kind: Kind::File { executable: false },
                 key: path.as_str().into(),
                 size: Some(data.len() as u64),
+                modified: None,
             };
             dir.dirs.get_mut(parent).expect("parent added").insert(name.to_owned(), entry);
             dir.files.insert(path, data);
         }
         // Its size is unknown until it is built.
-        let entry = SourceEntry { kind: Kind::File { executable: false }, key: INDEX.into(), size: None };
+        let entry =
+            SourceEntry { kind: Kind::File { executable: false }, key: INDEX.into(), size: None, modified: None };
         dir.dirs.get_mut("").expect("root").insert(INDEX.to_owned(), entry);
         Ok(dir)
     }
@@ -322,7 +324,7 @@ impl GitDir {
         let mut key = String::new();
         for part in path.split('/').filter(|part| !part.is_empty()) {
             let child = if key.is_empty() { part.to_owned() } else { format!("{key}/{part}") };
-            let entry = SourceEntry { kind: Kind::Dir, key: child.as_str().into(), size: None };
+            let entry = SourceEntry { kind: Kind::Dir, key: child.as_str().into(), size: None, modified: None };
             self.dirs.get_mut(&key).expect("parent added").entry(part.to_owned()).or_insert(entry);
             self.dirs.entry(child.clone()).or_default();
             key = child;
@@ -444,7 +446,7 @@ impl GitDir {
             let key = format!("{OBJECTS}/{}/{}", &id[..2], &id[2..]);
             listing.insert(
                 id[2..].to_owned(),
-                SourceEntry { kind: Kind::File { executable: false }, key: key.into(), size: None },
+                SourceEntry { kind: Kind::File { executable: false }, key: key.into(), size: None, modified: None },
             );
         }
         Some(listing)
