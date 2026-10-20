@@ -166,20 +166,23 @@ impl Buffer {
         }
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) -> FsResult<()> {
+    /// Write `data` at `offset` and return how many bytes were written: fewer than
+    /// `data` when the disk filled up partway.
+    fn write(&mut self, offset: u64, data: &[u8]) -> FsResult<usize> {
         let end = offset.checked_add(data.len() as u64).ok_or(Errno::EFBIG)?;
-        match &mut self.body {
+        let written = match &mut self.body {
             Body::Memory(buffer) => {
                 let end = usize::try_from(end).ok().filter(|end| *end as u64 <= MAX_MEMORY_FILE).ok_or(Errno::EFBIG)?;
                 if buffer.len() < end {
                     buffer.resize(end, 0);
                 }
                 buffer[end - data.len()..end].copy_from_slice(data);
+                data.len()
             }
             Body::Draft(draft) => draft.write_at(offset, data).map_err(io_errno)?,
-        }
-        self.size = self.size.max(end);
-        Ok(())
+        };
+        self.size = self.size.max(offset + written as u64);
+        Ok(written)
     }
 
     fn set_len(&mut self, size: u64) -> FsResult<()> {
@@ -824,7 +827,7 @@ impl Inner {
             let body = match &self.drafts {
                 // On disk: a saved file is copied there, which the disk may do without
                 // copying a byte, and anything else is read in chunks.
-                Some(drafts) => Body::Draft(drafts.copy(ws, path.as_str()).map_err(draft_errno)?),
+                Some(drafts) => Body::Draft(drafts.copy(ws, path.as_str(), self.ranged_reads).map_err(draft_errno)?),
                 // Check before reading: a large source file would otherwise be read whole.
                 None if size > MAX_MEMORY_FILE => return Err(Errno::EFBIG),
                 // A ranged read keeps no copy of a base file in the workspace's cache.
@@ -842,11 +845,11 @@ impl Inner {
         if offset.checked_add(data.len() as u64).is_none_or(|end| end > MAX_FILE_SIZE as u64) {
             return Err(Errno::EFBIG);
         }
-        self.buffer(ino)?.write(offset, data)?;
+        let written = self.buffer(ino)?.write(offset, data)?;
         if let Ok(path) = self.path(ino) {
             self.times.insert(path.to_string(), SystemTime::now());
         }
-        Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
+        Ok(u32::try_from(written).unwrap_or(u32::MAX))
     }
 
     /// Move into the workspace every buffer that has gone `settle` without a write. A

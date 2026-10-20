@@ -184,9 +184,11 @@ impl Drafts {
     }
 
     /// A new draft holding what `path` in `ws` holds now. A saved file is copied on
-    /// disk, which shares its blocks where the disk can (APFS, btrfs, XFS); any other
-    /// file is read in chunks, so its size never sits in memory.
-    pub fn copy(&self, ws: &Workspace, path: &str) -> Result<Draft> {
+    /// disk, which shares its blocks where the disk can (APFS, btrfs, XFS). Any other
+    /// file is read in chunks when its source reads ranges cheaply (`ranged`), so its
+    /// size never sits in memory; otherwise it is read once, whole, since each chunk
+    /// would read the whole file again.
+    pub fn copy(&self, ws: &Workspace, path: &str, ranged: bool) -> Result<Draft> {
         if let Some(stored) = ws.stored(path)?
             && std::ptr::addr_eq(Arc::as_ptr(&stored.source), Arc::as_ptr(&self.0))
         {
@@ -207,14 +209,15 @@ impl Drafts {
             return Ok(self.track(file, key));
         }
         let size = ws.stat(path)?.size;
+        let chunk = if ranged { CHUNK } else { size };
         let mut draft = self.empty()?;
         let mut offset = 0;
         while offset < size {
-            let data = ws.read_range(path, offset, CHUNK.min(size - offset))?;
+            let data = ws.read_range(path, offset, chunk.min(size - offset))?;
             if data.is_empty() {
                 break;
             }
-            draft.write_at(offset, &data)?;
+            draft.write_all_at(offset, &data)?;
             offset += data.len() as u64;
         }
         Ok(draft)
@@ -237,8 +240,30 @@ pub struct Draft {
 }
 
 impl Draft {
-    /// Write `data` at `offset`, growing the file if it ends past it.
-    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    /// Write `data` at `offset`, growing the file if it ends past it, and return how
+    /// many bytes were written. An error after some were written (a disk filling up)
+    /// is a short write, as `write(2)` reports it, so the caller knows the file
+    /// changed.
+    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<usize> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut written = 0;
+        while written < data.len() {
+            match self.file.write(&data[written..]) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) if written > 0 => break,
+                Err(err) => return Err(err),
+            }
+        }
+        if written == 0 && !data.is_empty() {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        Ok(written)
+    }
+
+    /// Write all of `data` at `offset`, or fail.
+    fn write_all_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)
     }
@@ -1062,20 +1087,57 @@ mod tests {
         let drafts = saved.drafts();
 
         // A saved file is copied from its object.
-        let mut draft = drafts.copy(&ws, "/mnt/saved.txt").unwrap();
+        let mut draft = drafts.copy(&ws, "/mnt/saved.txt", true).unwrap();
         draft.write_at(0, b"SAVED").unwrap();
         assert_eq!(ws.read_text("/mnt/saved.txt").unwrap(), "saved bytes");
         ws.write_stored("/mnt/saved.txt", draft.finish().unwrap()).unwrap();
         assert_eq!(ws.read_text("/mnt/saved.txt").unwrap(), "SAVED bytes");
 
         // A file from the source is read into it.
-        let draft = drafts.copy(&ws, "/mnt/dir/b.txt").unwrap();
+        let draft = drafts.copy(&ws, "/mnt/dir/b.txt", false).unwrap();
         draft.set_len(3).unwrap();
         assert_eq!(draft.read_at(0, 10).unwrap(), &b"b\0\0"[..]);
         assert_eq!(ws.read_text("/mnt/dir/b.txt").unwrap(), "b");
         save_and_store(&mut saved, &mut ws);
         save_and_store(&mut saved, &mut ws);
         assert_eq!(objects(state.path()), ["2", "3"], "saved.txt's new object and the draft still open");
+    }
+
+    /// A source that can only read whole files, as git's can, counting the reads.
+    #[derive(Debug)]
+    struct WholeFiles(MemorySource, AtomicU64);
+
+    impl Source for WholeFiles {
+        fn root(&self) -> sandfs_core::Result<SourceKey> {
+            self.0.root()
+        }
+
+        fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+            self.0.read_dir(key)
+        }
+
+        fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.read_file(key)
+        }
+    }
+
+    #[test]
+    fn a_draft_reads_a_file_whole_once_from_a_source_without_ranges() {
+        let state = tempfile::tempdir().unwrap();
+        let big = vec![7u8; 2 * CHUNK as usize + 1];
+        let source = Arc::new(WholeFiles(MemorySource::from_files([("big", big.clone())]).unwrap(), AtomicU64::new(0)));
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", source.clone()).unwrap();
+        let drafts = Saved::new(state.path()).drafts();
+
+        let draft = drafts.copy(&ws, "/mnt/big", false).unwrap();
+        assert_eq!(source.1.load(Ordering::SeqCst), 1);
+        assert_eq!(draft.read_at(0, big.len() as u64 + 1).unwrap(), &big[..]);
+
+        // In chunks, every chunk would read the whole file again.
+        drafts.copy(&ws, "/mnt/big", true).unwrap();
+        assert_eq!(source.1.load(Ordering::SeqCst), 4);
     }
 
     #[test]
