@@ -178,13 +178,10 @@ impl GitSource {
         if !self.trees_local {
             return None;
         }
-        if self.absent.get().is_none() {
-            // Walk here rather than wait: a walk the first listing started may still be
-            // running, and two walks cost only time.
-            self.walk.call_once(|| {});
-            let _ = self.absent.set(walk_missing(&self.repo, &self.tree, self.hash_len, &self.cancel));
-        }
-        self.absent.get()?.as_ref()
+        // Waits for a walk already running (every walk fills `absent` through
+        // `get_or_init`), or walks here.
+        self.walk.call_once(|| {});
+        self.absent.get_or_init(|| walk_missing(&self.repo, &self.tree, self.hash_len, &self.cancel)).as_ref()
     }
 
     /// The blobs the whole tree lacked, once the background walk has found them. The
@@ -198,7 +195,7 @@ impl GitSource {
             let (repo, tree, absent) = (self.repo.clone(), self.tree.clone(), Arc::clone(&self.absent));
             let (hash_len, cancel) = (self.hash_len, Arc::clone(&self.cancel));
             let _ = std::thread::Builder::new().name("sandfs-git-walk".into()).spawn(move || {
-                let _ = absent.set(walk_missing(&repo, &tree, hash_len, &cancel));
+                absent.get_or_init(|| walk_missing(&repo, &tree, hash_len, &cancel));
             });
         });
         self.absent.get()?.as_ref()
@@ -251,7 +248,7 @@ impl GitSource {
         let (absent, fetched, cancel) = (Arc::clone(&self.absent), Arc::clone(&self.fetched), Arc::clone(&self.cancel));
         let (local, behind, root) = (Arc::clone(&self.local), Arc::clone(&self.behind), self.tree.clone());
         let _ = std::thread::Builder::new().name("sandfs-git-prefetch".into()).spawn(move || {
-            // Waits for a walk already running; two walks would cost only time.
+            // Waits for a walk already running, such as the one the first listing started.
             if let Some(missing) = absent.get_or_init(|| walk_missing(&repo, &root, hash_len, &cancel)) {
                 // A blob another worker is fetching may not be here yet, so the trees
                 // above it can't be called local.
