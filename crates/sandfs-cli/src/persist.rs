@@ -40,6 +40,14 @@ enum Entry {
     Absent,
 }
 
+/// What a saved path is: a file, a directory, or removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathState {
+    File,
+    Dir,
+    Absent,
+}
+
 /// `changes.json`: entries keyed by path relative to the mount root, so parents sort
 /// before their children and replay can go in order.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -126,6 +134,18 @@ impl Saved {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Changes::default()),
             Err(err) => Err(err).context("reading changes.json"),
         }
+    }
+
+    /// Every changed path in the last save, relative to the mount root, without
+    /// loading the workspace.
+    pub fn paths(&self) -> Result<Vec<(String, PathState)>> {
+        let changes = self.read_index()?;
+        let state = |entry: &Entry| match entry {
+            Entry::File { .. } => PathState::File,
+            Entry::Dir { .. } => PathState::Dir,
+            Entry::Absent => PathState::Absent,
+        };
+        Ok(changes.entries.iter().map(|(rel, entry)| (rel.clone(), state(entry))).collect())
     }
 
     /// Replay the saved changes onto `ws`, whose source is mounted at `root`.

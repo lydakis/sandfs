@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use sandfs_core::{DirSource, Source, VPath, Workspace};
+use sandfs_core::{DirSource, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
 use crate::host::mount_source;
@@ -45,8 +45,14 @@ pub const ROOT: &str = "/mnt";
 pub enum Base {
     /// A host folder, read lazily and never written to.
     Dir { path: PathBuf },
-    /// A commit of a local repository (a partial clone for remote sources).
-    Git { repo: PathBuf, commit: String },
+    /// A commit of a local repository (a partial clone for remote sources), and the
+    /// branch it was mounted as, which the mount's `.git` starts on.
+    Git {
+        repo: PathBuf,
+        commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
 }
 
 /// `workspace.json`.
@@ -308,7 +314,7 @@ impl Home {
     /// newer index.
     pub fn open(&self, name: &str) -> Result<Opened> {
         let record = self.record(name)?;
-        let base = open_base(&record.base)?;
+        let base = open_base(&record.base, &self.root)?;
         self.load(name, record, &base)
     }
 
@@ -317,7 +323,7 @@ impl Home {
     #[cfg(mount)]
     pub fn open_shared(&self, name: &str, bases: &Arc<Bases>) -> Result<(Opened, Lease)> {
         let record = self.record(name)?;
-        let (base, lease) = bases.lease(&record.base)?;
+        let (base, lease) = bases.lease(&record.base, &self.root)?;
         Ok((self.load(name, record, &base)?, lease))
     }
 
@@ -344,8 +350,8 @@ impl Home {
     pub fn resolve(&self, source: &str) -> Result<Record> {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let base = if let Some(spec) = source.strip_prefix("git:") {
-            let (repo, commit) = crate::git::resolve(&self.root.join("repos"), spec)?;
-            Base::Git { repo, commit }
+            let (repo, commit, branch) = crate::git::resolve_branch(&self.root.join("repos"), spec)?;
+            Base::Git { repo, commit, branch }
         } else {
             let path = expand(source).canonicalize().with_context(|| format!("no folder at {source}"))?;
             if !path.is_dir() {
@@ -365,14 +371,17 @@ impl Home {
     }
 }
 
-/// An empty workspace with `base` mounted at [`ROOT`].
-fn open_base(base: &Base) -> Result<Workspace> {
-    let source: Arc<dyn Source> = match base {
-        Base::Dir { path } => Arc::new(DirSource::new(path)?),
-        Base::Git { repo, commit } => crate::git::open(repo, commit)?,
-    };
+/// An empty workspace with `base` mounted at [`ROOT`], for the home at `home`.
+fn open_base(base: &Base, home: &Path) -> Result<Workspace> {
     let mut ws = Workspace::new();
-    ws.mount(ROOT, source)?;
+    match base {
+        Base::Dir { path } => ws.mount(ROOT, Arc::new(DirSource::new(path)?))?,
+        Base::Git { repo, commit, branch } => {
+            let (files, git_dir) = crate::git::open(repo, commit, branch.as_deref(), home)?;
+            ws.mount(ROOT, files)?;
+            ws.mount(&format!("{ROOT}/.git"), git_dir)?;
+        }
+    }
     Ok(ws)
 }
 
@@ -398,9 +407,9 @@ pub struct Lease {
 #[cfg(mount)]
 impl Bases {
     /// An empty workspace over `base` to fork, and the lease that keeps it shared.
-    fn lease(self: &Arc<Self>, base: &Base) -> Result<(Workspace, Lease)> {
+    fn lease(self: &Arc<Self>, base: &Base, home: &Path) -> Result<(Workspace, Lease)> {
         if !matches!(base, Base::Git { .. }) {
-            return Ok((open_base(base)?, Lease { bases: self.clone(), base: None }));
+            return Ok((open_base(base, home)?, Lease { bases: self.clone(), base: None }));
         }
         // A lease is made only once its use is counted, so dropping it never uncounts
         // another mount's.
@@ -411,7 +420,7 @@ impl Bases {
         }
         // Opening a commit starts git, so other mounts aren't kept waiting meanwhile. Of
         // two mounts opening it at once, the second to finish uses the first one's.
-        let opened = open_base(base)?;
+        let opened = open_base(base, home)?;
         let mut open = self.open.lock().expect("bases lock");
         let (ws, uses) = open.entry(base.clone()).or_insert((opened, 0));
         *uses += 1;

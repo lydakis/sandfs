@@ -128,6 +128,8 @@ sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sand
 sandfs mount git:https://github.com/pallets/flask@3.1.0 ~/ws/flask
 ```
 
+The mounted folder has a `.git`, so git itself works in it: `status`, `add`, `commit`, branches and `push`, with commits kept in the workspace and its forks. It holds only the mounted commit, not the history before it. `git status` doesn't read your files, because sandfs tells git which ones changed; on VS Code it takes 0.07 s once the first run (about 10 s on a fresh mount, which lists every folder) is done. The first `commit` fetches the contents of every file in the commit once, as git checks they all exist (VS Code: 16 s and 64 MiB).
+
 `sandfs serve --mcp NAME` hands a saved workspace to an agent as MCP file tools instead of mounting it.
 
 On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there is nothing to install: the mount is served over NFS on localhost and mounted with macOS's own NFS client. On Windows, `changes`, `list`, `rm` and `serve --mcp` work, and `sandfs serve --mcp SOURCE` gives an agent a workspace there; `fork` and `unmount` need a mount. When changes are saved, what a fork on disk costs and how offline git mounts behave are covered in [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md).
