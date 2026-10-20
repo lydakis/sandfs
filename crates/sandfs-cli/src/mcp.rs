@@ -112,7 +112,14 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             // that cannot be saved is undone and reported, so the agent never builds on
             // a change that a restart would lose.
             let snapshot = Snapshot { ws: ws.fork(), times: times.clone(), dirs: dirs.clone() };
-            if let Err(err) = saved.save(&snapshot, &root, true) {
+            let result = saved.save(&snapshot, &root, true);
+            // Saved files are read from disk from now on.
+            if let Ok(written) = &result {
+                for (path, version, stored) in written {
+                    let _ = server.workspace_mut().store(path.as_str(), *version, stored.clone());
+                }
+            }
+            if let Err(err) = result {
                 // Past the point where the new index is in place, the change stays: a
                 // restart would bring it back, so it can't be reported as undone.
                 let message = if err.downcast_ref::<NotDurable>().is_some() {

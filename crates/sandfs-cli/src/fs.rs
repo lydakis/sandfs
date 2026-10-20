@@ -676,7 +676,8 @@ impl Inner {
             return Ok(Bytes::copy_from_slice(&buffer.data[range(buffer.data.len())]));
         }
         let (ws, path) = self.contents(ino)?;
-        if self.ranged_reads {
+        // Saved files are on disk, where reading a range is cheap.
+        if self.ranged_reads || ws.stored(path.as_str()).is_ok_and(|stored| stored.is_some()) {
             return ws.read_range(path.as_str(), offset, size.into()).fs();
         }
         let meta = ws.stat(path.as_str()).fs()?;
@@ -720,10 +721,12 @@ impl Inner {
         if !self.buffers.contains_key(&ino) {
             let (ws, path) = self.contents(ino)?;
             // Check before reading: a large source file would otherwise be read whole.
-            if ws.stat(path.as_str()).fs()?.size > MAX_FILE_SIZE as u64 {
+            let size = ws.stat(path.as_str()).fs()?.size;
+            if size > MAX_FILE_SIZE as u64 {
                 return Err(Errno::EFBIG);
             }
-            let data = ws.read(path.as_str()).fs()?.to_vec();
+            // A ranged read keeps no copy of a base file in the workspace's cache.
+            let data = ws.read_range(path.as_str(), 0, size).fs()?.to_vec();
             self.buffers.insert(ino, Buffer { data, written: Instant::now() });
         }
         self.writing = true;
@@ -923,10 +926,20 @@ impl Shared {
         let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
         let snapshot = self.lock().snapshot(settle);
         let result = saved.save(&snapshot, &self.root, durable);
-        if result.is_err() {
-            self.lock().unsaved = true;
+        let mut inner = self.lock();
+        match result {
+            // Saved files are read from disk from now on, unless written again meanwhile.
+            Ok(written) => {
+                for (path, version, stored) in written {
+                    let _ = inner.ws.store(path.as_str(), version, stored);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                inner.unsaved = true;
+                Err(err)
+            }
         }
-        result
     }
 
     /// Start a thread that commits and saves shortly after each burst of changes,

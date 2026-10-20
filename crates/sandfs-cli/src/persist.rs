@@ -8,14 +8,21 @@
 //!
 //! The entries come from [`Workspace::changes`] (files) plus the directories the mount
 //! created or removed, which `changes` does not report.
+//!
+//! Saved files stay on disk. A loaded workspace reads them from their objects (see
+//! [`Workspace::write_stored`]), and once a save has written a file's object the
+//! serving process reads it from there too ([`Workspace::store`]), so what a mount
+//! has saved costs it no memory; the operating system caches the objects in use.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use sandfs_core::{ChangeKind, Error, Kind, VPath, Workspace};
+use sandfs_core::{ChangeKind, Error, Kind, Listing, Source, SourceKey, Stored, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
 /// A point in time as `(seconds, nanoseconds)` since the Unix epoch.
@@ -84,11 +91,69 @@ pub struct ObjectGone(String);
 
 impl std::fmt::Display for ObjectGone {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "saved object {} is gone; a newer save replaced it", self.0)
+        write!(f, "saved object {} {GONE}", self.0)
     }
 }
 
 impl std::error::Error for ObjectGone {}
+
+const GONE: &str = "is gone; a newer save replaced it";
+
+/// Files a save wrote objects for, by workspace path, with the version saved and where
+/// its bytes are now, so the serving process can read them from there (see
+/// [`Workspace::store`]) instead of keeping them in memory.
+pub type Written = Vec<(VPath, u64, Stored)>;
+
+/// The objects of one workspace, as the source its saved files are read from. It is
+/// never mounted: files point into it by object name.
+#[derive(Debug)]
+struct Objects {
+    dir: PathBuf,
+}
+
+impl Objects {
+    fn open(&self, key: &str) -> sandfs_core::Result<std::fs::File> {
+        check_object(key).map_err(|err| Error::Source(err.to_string()))?;
+        std::fs::File::open(self.dir.join(key)).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => Error::Source(ObjectGone(key.to_owned()).to_string()),
+            _ => Error::Source(format!("reading saved object {key}: {err}")),
+        })
+    }
+}
+
+impl Source for Objects {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        Ok("".into())
+    }
+
+    fn read_dir(&self, _key: &str) -> sandfs_core::Result<Listing> {
+        Err(Error::Source("saved objects are read by name, never listed".into()))
+    }
+
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        let mut data = Vec::new();
+        self.open(key)?.read_to_end(&mut data).map_err(|err| Error::Source(err.to_string()))?;
+        Ok(data.into())
+    }
+
+    fn read_range(&self, key: &str, offset: u64, len: u64) -> sandfs_core::Result<Bytes> {
+        let mut file = self.open(key)?;
+        let mut data = Vec::new();
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.take(len).read_to_end(&mut data))
+            .map_err(|err| Error::Source(err.to_string()))?;
+        Ok(data.into())
+    }
+}
+
+/// Whether `err` is a saved object found missing, by a load or a read of a saved file,
+/// because a newer save replaced it: reading again from the newer index works.
+pub fn is_object_gone(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<ObjectGone>().is_some()
+            || cause.downcast_ref::<Error>().is_some_and(|err| err.to_string().contains(GONE))
+    })
+}
 
 /// A save wrote its new index, so it is what the next load sees, but could not flush
 /// it to disk: a crash could still lose it.
@@ -104,12 +169,17 @@ impl std::fmt::Display for NotDurable {
 /// The saved changes of one workspace, in its state directory.
 pub struct Saved {
     dir: PathBuf,
-    /// For each saved file: the version it had when saved, and its object.
-    objects: HashMap<String, (u64, String)>,
+    /// The objects, as the source saved files are read from.
+    store: Arc<Objects>,
+    /// For each saved file: the version it had when saved, and its object. An object's
+    /// name is shared with every file reading from it, so its count says whether any
+    /// workspace still does.
+    objects: HashMap<String, (u64, SourceKey)>,
     next_object: u64,
-    /// Objects the previous save replaced. They are deleted one save later, so a
-    /// reader that loaded the index just before that save still finds them.
-    doomed: Vec<String>,
+    /// Objects the previous saves replaced. Each is deleted one save later, so a reader
+    /// that loaded the index just before that save still finds it, and only once no
+    /// file here reads from it, such as a removed file a program still has open.
+    doomed: Vec<SourceKey>,
     /// Objects written since the last durable save, not yet flushed to disk.
     unsynced: HashSet<String>,
 }
@@ -117,7 +187,19 @@ pub struct Saved {
 impl Saved {
     /// The saved changes in the state directory `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Saved { dir: dir.into(), objects: HashMap::new(), next_object: 1, doomed: Vec::new(), unsynced: HashSet::new() }
+        let dir = dir.into();
+        let store = Arc::new(Objects { dir: dir.join("objects") });
+        Saved { dir, store, objects: HashMap::new(), next_object: 1, doomed: Vec::new(), unsynced: HashSet::new() }
+    }
+
+    /// Where the bytes of `object`, `size` long, are.
+    fn stored(&self, object: SourceKey, size: u64) -> Stored {
+        Stored { source: self.store.clone(), key: object, size }
+    }
+
+    /// Whether `stored` is one of this workspace's objects.
+    fn is_ours(&self, stored: &Stored) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&stored.source), Arc::as_ptr(&self.store))
     }
 
     fn index_path(&self) -> PathBuf {
@@ -155,9 +237,17 @@ impl Saved {
     pub fn load(&mut self, ws: &mut Workspace, root: &VPath) -> Result<Restored> {
         let changes = self.read_index()?;
         let mut restored = Restored::default();
+        // Files saved as one object share its name.
+        let mut names: HashMap<&str, SourceKey> = HashMap::new();
         for (rel, entry) in &changes.entries {
             let path = under(root, rel)?;
-            self.apply(ws, &path, entry).with_context(|| format!("restoring {rel}"))?;
+            let object = match entry {
+                Entry::File { object, .. } => {
+                    Some(names.entry(object).or_insert_with(|| object.as_str().into()).clone())
+                }
+                _ => None,
+            };
+            self.apply(ws, &path, entry, object.clone()).with_context(|| format!("restoring {rel}"))?;
             let mtime = match entry {
                 Entry::File { mtime, .. } | Entry::Dir { mtime } => *mtime,
                 Entry::Absent => None,
@@ -165,12 +255,12 @@ impl Saved {
             if let Some(mtime) = mtime {
                 restored.times.insert(path.to_string(), from_time(mtime));
             }
-            match entry {
-                Entry::File { object, .. } => {
+            match (entry, object) {
+                (Entry::File { .. }, Some(object)) => {
                     let version = ws.stat(path.as_str())?.version;
-                    self.objects.insert(rel.clone(), (version, object.clone()));
+                    self.objects.insert(rel.clone(), (version, object));
                 }
-                Entry::Dir { .. } | Entry::Absent => {
+                _ => {
                     restored.dirs.insert(path.to_string());
                 }
             }
@@ -186,7 +276,7 @@ impl Saved {
     /// session's delayed deletes. Only the process that serves the workspace, holding
     /// its writer lock, may do this: it alone writes objects.
     pub fn collect_garbage(&mut self) {
-        let live: HashSet<&str> = self.objects.values().map(|(_, object)| object.as_str()).collect();
+        let live: HashSet<&str> = self.objects.values().map(|(_, object)| &**object).collect();
         let mut last = 0;
         if let Ok(files) = std::fs::read_dir(self.objects_dir()) {
             for file in files.flatten() {
@@ -202,7 +292,8 @@ impl Saved {
         self.next_object = self.next_object.max(last + 1);
     }
 
-    fn apply(&self, ws: &mut Workspace, path: &VPath, entry: &Entry) -> Result<()> {
+    /// Replay one entry; a file reads from `object`, its object's shared name.
+    fn apply(&self, ws: &mut Workspace, path: &VPath, entry: &Entry, object: Option<SourceKey>) -> Result<()> {
         let p = path.as_str();
         let current = match ws.stat(p) {
             Ok(meta) => Some(meta.kind),
@@ -225,20 +316,23 @@ impl Saved {
                 }
                 None => ws.mkdir(p, true)?,
             },
-            Entry::File { executable, object, .. } => {
-                check_object(object)?;
+            Entry::File { executable, .. } => {
+                let object = object.context("a saved file without its object")?;
+                check_object(&object)?;
                 // A directory in the way goes first.
                 if current == Some(Kind::Dir) {
                     ws.remove(p, true)?;
                 }
-                let data = match std::fs::read(self.objects_dir().join(object)) {
-                    Ok(data) => data,
+                // The bytes stay on disk; only the size is read now. A missing object
+                // means a newer save replaced it while this index was being loaded.
+                let size = match std::fs::metadata(self.objects_dir().join(&*object)) {
+                    Ok(meta) => meta.len(),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(ObjectGone(object.clone()).into());
+                        return Err(ObjectGone(object.to_string()).into());
                     }
                     Err(err) => return Err(err).with_context(|| format!("reading saved object {object}")),
                 };
-                ws.write(p, data)?;
+                ws.write_stored(p, self.stored(object, size))?;
                 ws.set_executable(p, *executable)?;
             }
         }
@@ -247,14 +341,18 @@ impl Saved {
 
     /// Save `snap`, whose source is mounted at `root`. A `durable` save, which answers
     /// `fsync`, also flushes the index and every object it names to disk before returning.
-    pub fn save(&mut self, snap: &Snapshot, root: &VPath, durable: bool) -> Result<()> {
+    /// Returns the files it wrote objects for.
+    pub fn save(&mut self, snap: &Snapshot, root: &VPath, durable: bool) -> Result<Written> {
         let mut entries = BTreeMap::new();
         let mut kept = HashMap::new();
+        let mut written = Written::new();
         for change in snap.ws.changes()? {
             let rel = relative(root, &change.path)?;
             let entry = match change.kind {
                 ChangeKind::Deleted => Entry::Absent,
-                ChangeKind::Added | ChangeKind::Modified => self.entry(snap, &change.path, &rel, &mut kept)?,
+                ChangeKind::Added | ChangeKind::Modified => {
+                    self.entry(snap, &change.path, &rel, &mut kept, &mut written)?
+                }
             };
             entries.insert(rel, entry);
         }
@@ -265,7 +363,7 @@ impl Saved {
                 // A directory that replaced a deleted base file overrides its deletion.
                 Ok(meta) if meta.kind.is_dir() => Entry::Dir { mtime: snap.times.get(dir).map(|t| to_time(*t)) },
                 _ if entries.contains_key(&rel) => continue,
-                Ok(_) => self.entry(snap, &path, &rel, &mut kept)?,
+                Ok(_) => self.entry(snap, &path, &rel, &mut kept, &mut written)?,
                 // Gone, or below a file that replaced one of its parents.
                 Err(Error::NotFound(_) | Error::NotADirectory(_)) => Entry::Absent,
                 Err(err) => return Err(err.into()),
@@ -277,8 +375,8 @@ impl Saved {
         let tmp = self.dir.join("changes.json.tmp");
         if durable {
             // Objects reach the disk before the index that names them.
-            let live: HashSet<&String> = kept.values().map(|(_, object)| object).collect();
-            for object in self.unsynced.iter().filter(|o| live.contains(o)) {
+            let live: HashSet<&str> = kept.values().map(|(_, object)| &**object).collect();
+            for object in self.unsynced.iter().filter(|o| live.contains(o.as_str())) {
                 sync_path(&self.objects_dir().join(object))?;
             }
             if !self.unsynced.is_empty() {
@@ -293,17 +391,27 @@ impl Saved {
         std::fs::rename(&tmp, self.index_path()).context("writing changes.json")?;
 
         // The new index is in place: objects replaced by the save before this one are
-        // now two indexes old.
+        // now two indexes old. One that a file here still reads from waits until none does.
+        let live: HashSet<&str> = kept.values().map(|(_, object)| &**object).collect();
+        let mut waiting = Vec::new();
         for object in std::mem::take(&mut self.doomed) {
-            let _ = std::fs::remove_file(self.objects_dir().join(object));
+            if live.contains(&*object) {
+                continue;
+            }
+            if Arc::strong_count(&object) == 1 {
+                let _ = std::fs::remove_file(self.objects_dir().join(&*object));
+            } else {
+                waiting.push(object);
+            }
         }
-        let live: HashSet<&String> = kept.values().map(|(_, object)| object).collect();
-        self.doomed = self.objects.values().map(|(_, object)| object).filter(|o| !live.contains(o)).cloned().collect();
+        let replaced = self.objects.values().map(|(_, object)| object).filter(|o| !live.contains(&***o));
+        waiting.extend(replaced.cloned());
+        self.doomed = waiting;
         self.objects = kept;
         if durable {
             sync_path(&self.dir).map_err(|err| err.context(NotDurable))?;
         }
-        Ok(())
+        Ok(written)
     }
 
     /// The entry for a file or directory, writing its bytes to a new object unless the
@@ -313,7 +421,8 @@ impl Saved {
         snap: &Snapshot,
         path: &VPath,
         rel: &str,
-        kept: &mut HashMap<String, (u64, String)>,
+        kept: &mut HashMap<String, (u64, SourceKey)>,
+        written: &mut Written,
     ) -> Result<Entry> {
         let p = path.as_str();
         let meta = snap.ws.stat(p)?;
@@ -323,22 +432,32 @@ impl Saved {
             Kind::File { executable } => {
                 let object = match self.objects.get(rel) {
                     Some((version, object)) if *version == meta.version => object.clone(),
-                    _ => self.write_object(&snap.ws.read(p)?)?,
+                    // A saved file moved, copied or made executable keeps its object.
+                    _ => match snap.ws.stored(p)? {
+                        Some(stored) if self.is_ours(&stored) => stored.key,
+                        _ => {
+                            // A ranged read, which keeps no copy of a base file in memory.
+                            let data = snap.ws.read_range(p, 0, meta.size)?;
+                            let object = self.write_object(&data)?;
+                            written.push((path.clone(), meta.version, self.stored(object.clone(), data.len() as u64)));
+                            object
+                        }
+                    },
                 };
                 kept.insert(rel.to_owned(), (meta.version, object.clone()));
-                Ok(Entry::File { executable, object, mtime })
+                Ok(Entry::File { executable, object: object.to_string(), mtime })
             }
         }
     }
 
-    fn write_object(&mut self, data: &Bytes) -> Result<String> {
+    fn write_object(&mut self, data: &Bytes) -> Result<SourceKey> {
         let dir = self.objects_dir();
         std::fs::create_dir_all(&dir).context("creating the objects directory")?;
         let object = self.next_object.to_string();
         self.next_object += 1;
         std::fs::write(dir.join(&object), data).context("writing a saved file")?;
         self.unsynced.insert(object.clone());
-        Ok(object)
+        Ok(object.into())
     }
 
     /// Copy the saved changes into `to`, the state directory of a fork. Objects are
@@ -361,10 +480,12 @@ impl Saved {
                 let Entry::File { object, .. } = entry else { continue };
                 check_object(object)?;
                 let (from, target) = (self.objects_dir().join(object), objects.join(object));
-                if target.exists() {
-                    continue;
-                }
-                if std::fs::hard_link(&from, &target).is_err() && std::fs::copy(&from, &target).is_err() {
+                // Already linked by an earlier attempt, or for another file saved as it.
+                let linked = match std::fs::hard_link(&from, &target) {
+                    Ok(()) => true,
+                    Err(err) => err.kind() == std::io::ErrorKind::AlreadyExists,
+                };
+                if !linked && std::fs::copy(&from, &target).is_err() {
                     // A failed copy may leave part of the file, which a retry must not reuse.
                     let _ = std::fs::remove_file(&target);
                     complete = false;
@@ -615,6 +736,91 @@ mod tests {
         Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
         assert_eq!(loaded.read_text("/mnt/dir").unwrap(), "a file");
         assert!(loaded.stat("/mnt/a.txt").unwrap().kind.is_dir(), "the directory that replaced a file is kept");
+    }
+
+    fn objects(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("objects"))
+            .map(|files| files.map(|f| f.unwrap().file_name().into_string().unwrap()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn snap(ws: &Workspace) -> Snapshot {
+        Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() }
+    }
+
+    /// Save `ws` and read its saved files from disk from now on, as a mount does.
+    fn save_and_store(saved: &mut Saved, ws: &mut Workspace) {
+        for (path, version, stored) in saved.save(&snap(ws), &root(), false).unwrap() {
+            assert!(ws.store(path.as_str(), version, stored).unwrap());
+        }
+    }
+
+    #[test]
+    fn saved_files_are_read_from_disk_not_memory() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/a.txt", "changed").unwrap();
+        ws.write("/mnt/big.bin", vec![7u8; 1 << 20]).unwrap();
+        let mut saved = Saved::new(state.path());
+        let written = saved.save(&snap(&ws), &root(), false).unwrap();
+        let paths: Vec<&str> = written.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert_eq!(paths, ["/mnt/a.txt", "/mnt/big.bin"], "the save says which files it wrote");
+
+        // A workspace loaded from the save reads each file's object when it is read.
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(&*loaded.stored("/mnt/a.txt").unwrap().unwrap().key, "1");
+        assert_eq!(loaded.stat("/mnt/big.bin").unwrap().size, 1 << 20, "sizes come from the objects");
+        std::fs::write(state.path().join("objects/1"), "on disk").unwrap();
+        assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "on disk", "nothing was read at load");
+    }
+
+    #[test]
+    fn moving_a_saved_file_writes_nothing_new() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/out/app.bin", "built").unwrap();
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["1"]);
+
+        // A program that builds into a folder and renames it, then copies and marks a file.
+        ws.rename("/mnt/out", "/mnt/release").unwrap();
+        ws.copy("/mnt/release/app.bin", "/mnt/app", false).unwrap();
+        ws.set_executable("/mnt/app", true).unwrap();
+        assert!(saved.save(&snap(&ws), &root(), false).unwrap().is_empty(), "every file kept its object");
+        assert_eq!(objects(state.path()), ["1"]);
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/release/app.bin").unwrap(), "built");
+        assert_eq!(loaded.stat("/mnt/app").unwrap().kind, Kind::File { executable: true });
+        assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
+    }
+
+    #[test]
+    fn an_object_a_file_still_reads_from_is_kept() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/log.txt", "first").unwrap();
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        // A program still has the file open after it was replaced: the mount keeps a
+        // fork from before, which reads from object 1.
+        let still_open = ws.fork();
+        ws.write("/mnt/log.txt", "second").unwrap();
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["1", "2"], "object 1 waits for the open file");
+        assert_eq!(still_open.read_text("/mnt/log.txt").unwrap(), "first");
+
+        drop(still_open);
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["2"], "and goes once nothing reads from it");
+        assert_eq!(ws.read_text("/mnt/log.txt").unwrap(), "second");
     }
 
     #[test]
