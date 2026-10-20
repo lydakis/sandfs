@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -157,7 +157,6 @@ pub fn run(home: Home) -> Result<()> {
     let socket = socket_path(&home);
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).context("listening for mounts")?;
-    let bound = identity(&socket);
     let state = Arc::new(State::default());
     let bases = Arc::new(Bases::default());
     let accepting = state.clone();
@@ -174,19 +173,11 @@ pub fn run(home: Home) -> Result<()> {
         }
     });
     state.wait_until_idle(LINGER);
-    // Removed while this process still holds the lock, so it is never a successor's,
-    // unless the home was deleted and made again meanwhile: the lock then went with the
-    // old home, and a successor may already listen at the same path.
-    if bound.is_some() && identity(&socket) == bound {
-        let _ = std::fs::remove_file(&socket);
-    }
+    // The socket stays: connecting to it fails once this process is gone, and the next
+    // process replaces it. Removing it here could remove a successor's instead, when
+    // the home was deleted and made again meanwhile, since the lock went with the old
+    // home.
     Ok(())
-}
-
-/// Which file `path` names (device and inode), to tell this process's socket from a
-/// successor's at the same path.
-fn identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::symlink_metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
 }
 
 /// Read one request from `stream`, start the mount and answer once it is up or failed.
