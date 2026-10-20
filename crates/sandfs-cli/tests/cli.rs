@@ -50,6 +50,16 @@ fn serve_creates_a_workspace_over_a_source() {
     let named = sandfs(home.path(), &["serve", "--mcp", source, "--name", "copy"], "");
     assert!(named.status.success(), "{}", String::from_utf8_lossy(&named.stderr));
     assert_eq!(stdout(home.path(), &["changes", "copy"]), "");
+
+    // Two workspaces over one source compare directly.
+    let write = write.replace("q4.txt", "q5.txt");
+    let other = sandfs(home.path(), &["serve", "--mcp", "copy"], &format!("{write}\n"));
+    assert!(other.status.success(), "{}", String::from_utf8_lossy(&other.stderr));
+    assert_eq!(stdout(home.path(), &["changes", "reports", "--since", "copy"]), "A q4.txt\nD q5.txt\n");
+    let elsewhere = sandfs(home.path(), &["serve", "--mcp", data.path().to_str().unwrap(), "--name", "data"], "");
+    assert!(elsewhere.status.success(), "{}", String::from_utf8_lossy(&elsewhere.stderr));
+    let mismatched = sandfs(home.path(), &["changes", "reports", "--since", "data"], "");
+    assert!(String::from_utf8_lossy(&mismatched.stderr).contains("different sources"));
 }
 
 #[test]

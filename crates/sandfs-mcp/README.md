@@ -11,7 +11,7 @@ Install the binary with `cargo install sandfs-mcp` and point an MCP client at it
 } } }
 ```
 
-A harness that builds its own workspace, with any sources, embeds the server and collects the changes when the session ends:
+A harness that builds its own workspace, with any sources, embeds the server and collects the changes when the session ends. To hand an agent a fork of a checkpoint, `Server::new(checkpoint.fork()).changes_since(checkpoint)` makes its `changes` tool show only its own work:
 
 ```rust,no_run
 use std::io;

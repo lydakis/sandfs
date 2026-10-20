@@ -318,6 +318,17 @@ impl Home {
         self.load(name, record, &base)
     }
 
+    /// Open `name` and `other` over one base, so comparing them skips the source
+    /// files they share. Both must have the same source, as a workspace and its forks do.
+    pub fn open_pair(&self, name: &str, other: &str) -> Result<(Opened, Opened)> {
+        let (record, other_record) = (self.record(name)?, self.record(other)?);
+        if record.base != other_record.base {
+            bail!("{name} and {other} have different sources ({} and {})", record.source, other_record.source);
+        }
+        let base = open_base(&record.base, &self.root)?;
+        Ok((self.load(name, record, &base)?, self.load(other, other_record, &base)?))
+    }
+
     /// Open `name` over a base `bases` shares with the other workspaces this process
     /// serves. The base stays open until the returned [`Lease`] is dropped.
     #[cfg(mount)]

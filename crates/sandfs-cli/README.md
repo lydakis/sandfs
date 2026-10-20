@@ -9,6 +9,7 @@ sandfs mount ~/datasets/survey ~/ws/survey       # a host folder, never written 
 sandfs fork ~/ws/survey ~/ws/cleanup             # survey's changes so far, without copying the folder
 python clean.py ~/ws/cleanup                     # real files, any tool
 sandfs changes ~/ws/cleanup                      # A/M/D against the source
+sandfs changes cleanup --since survey            # A/M/D against another workspace of the same source
 sandfs unmount ~/ws/cleanup                      # changes stay saved
 sandfs mount cleanup ~/ws/cleanup                # and come back
 sandfs fork cleanup --name cleanup-1             # a snapshot, kept but not mounted

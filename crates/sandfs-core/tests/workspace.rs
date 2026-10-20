@@ -338,6 +338,81 @@ fn changes_include_a_directory_replaced_by_a_file() {
     );
 }
 
+fn changes_since(ws: &Workspace, base: &Workspace) -> Vec<(String, ChangeKind)> {
+    ws.changes_since(base).unwrap().into_iter().map(|Change { path, kind }| (path.to_string(), kind)).collect()
+}
+
+#[test]
+fn changes_since_a_checkpoint_show_only_later_work() {
+    let (mut ws, _) = workspace();
+    ws.write("/repo/README.md", "first try\n").unwrap();
+    ws.write("/repo/notes.txt", "kept").unwrap();
+    ws.write("/repo/draft.txt", "dropped later").unwrap();
+    let checkpoint = ws.fork();
+    assert!(changes_since(&ws, &checkpoint).is_empty());
+
+    ws.write("/repo/README.md", "hello\n").unwrap(); // back to the original
+    ws.remove("/repo/draft.txt", false).unwrap();
+    ws.remove("/repo/src", true).unwrap();
+    ws.write("/repo/src", "now a file").unwrap();
+    ws.hard_link("/repo/notes.txt", "/repo/notes-link.txt").unwrap();
+
+    assert_eq!(
+        changes_since(&ws, &checkpoint),
+        [
+            ("/repo/README.md".into(), ChangeKind::Modified),
+            ("/repo/draft.txt".into(), ChangeKind::Deleted),
+            ("/repo/notes-link.txt".into(), ChangeKind::Added),
+            ("/repo/src".into(), ChangeKind::Added),
+            ("/repo/src/lib.rs".into(), ChangeKind::Deleted),
+            ("/repo/src/util/mod.rs".into(), ChangeKind::Deleted),
+        ]
+    );
+    // The other way round, the checkpoint's view of the same difference.
+    assert_eq!(changes_since(&checkpoint, &ws)[0], ("/repo/README.md".into(), ChangeKind::Modified));
+    assert_eq!(changes_since(&checkpoint, &ws)[1], ("/repo/draft.txt".into(), ChangeKind::Added));
+
+    // A write through one name of a linked file changes every name.
+    let linked = ws.fork();
+    ws.write("/repo/notes-link.txt", "edited").unwrap();
+    assert_eq!(
+        changes_since(&ws, &linked),
+        [("/repo/notes-link.txt".into(), ChangeKind::Modified), ("/repo/notes.txt".into(), ChangeKind::Modified)]
+    );
+}
+
+#[test]
+fn two_attempts_from_one_checkpoint_compare_without_reading_the_source() {
+    let (mut checkpoint, source) = workspace();
+    checkpoint.write("/repo/src/lib.rs", "shared work\n").unwrap();
+    let (mut a, mut b) = (checkpoint.fork(), checkpoint.fork());
+    a.write("/repo/src/a.rs", "attempt a").unwrap();
+    b.write("/repo/src/b.rs", "attempt b").unwrap();
+    a.write("/repo/same.txt", "both wrote this").unwrap();
+    b.write("/repo/same.txt", "both wrote this").unwrap();
+    a.set_executable("/repo/src/lib.rs", true).unwrap();
+    let before = source.reads();
+
+    assert_eq!(
+        changes_since(&a, &b),
+        [
+            ("/repo/src/a.rs".into(), ChangeKind::Added),
+            ("/repo/src/b.rs".into(), ChangeKind::Deleted),
+            ("/repo/src/lib.rs".into(), ChangeKind::Modified),
+        ]
+    );
+    assert_eq!(source.reads(), before, "only what the attempts wrote is compared");
+}
+
+#[test]
+fn workspaces_with_their_own_mounts_are_compared_file_by_file() {
+    let (mut ws, _) = workspace();
+    let (other, _) = workspace();
+    assert!(changes_since(&ws, &other).is_empty(), "the same files under separate mounts");
+    ws.write("/repo/docs/guide.md", "rewritten\n").unwrap();
+    assert_eq!(changes_since(&ws, &other), [("/repo/docs/guide.md".into(), ChangeKind::Modified)]);
+}
+
 #[test]
 fn deleting_then_restoring_a_file_is_no_change() {
     let (mut ws, _) = workspace();
@@ -888,6 +963,25 @@ fn stored_files_are_read_from_their_store_every_time() {
     assert!(ws.stored("/data/README.md").unwrap().is_none(), "a base file isn't stored");
     ws.write("/data/final.txt", "rewritten").unwrap();
     assert!(ws.stored("/data/final.txt").unwrap().is_none(), "a new write lives in memory again");
+}
+
+#[test]
+fn stored_files_forks_share_compare_without_reading() {
+    let saved = store(&[("1", "saved report"), ("2", "other text")]);
+    let mut checkpoint = Workspace::new();
+    checkpoint.mount("/data", Arc::new(repo())).unwrap();
+    checkpoint.write_stored("/data/report.txt", stored(&saved, "1", 12)).unwrap();
+    let mut attempt = checkpoint.fork();
+    attempt.copy("/data/report.txt", "/data/copy.txt", false).unwrap();
+    attempt.write_stored("/data/notes.txt", stored(&saved, "2", 10)).unwrap();
+    assert_eq!(
+        changes_since(&attempt, &checkpoint),
+        [("/data/copy.txt".into(), ChangeKind::Added), ("/data/notes.txt".into(), ChangeKind::Added)]
+    );
+    assert!(changes_since(&checkpoint.fork(), &checkpoint).is_empty());
+    attempt.write_stored("/data/report.txt", stored(&saved, "1", 12)).unwrap(); // same file again
+    assert_eq!(changes_since(&attempt, &checkpoint).len(), 2);
+    assert_eq!(saved.reads(), (0, 0), "nothing stored was read");
 }
 
 #[test]

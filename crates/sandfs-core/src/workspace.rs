@@ -6,13 +6,14 @@
 //! exactly the change set. Base content is read through a cache shared by every fork,
 //! so a file fetched once is never fetched again.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use imbl::ordmap::DiffItem;
 use imbl::{OrdMap, OrdSet};
 
 use crate::change::{Change, ChangeKind};
@@ -26,6 +27,13 @@ struct Mount {
     id: u64,
     source: Arc<dyn Source>,
     root: SourceKey,
+}
+
+/// Mounts are equal when they are the same mount: ids are never reused.
+impl PartialEq for Mount {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
 }
 
 impl fmt::Debug for Mount {
@@ -126,7 +134,22 @@ pub struct Stored {
     pub size: u64,
 }
 
-#[derive(Clone, Debug)]
+/// Content is equal when it is the same content: the same written bytes (not just
+/// equal ones), the same source file or the same stored file. That is enough to skip what forks share
+/// when comparing workspaces without reading anything; unequal content may still
+/// hold equal bytes.
+impl PartialEq for Content {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Content::Bytes(a), Content::Bytes(b)) => a.as_ptr() == b.as_ptr() && a.len() == b.len(),
+            (Content::Base { mount: a, key: x, .. }, Content::Base { mount: b, key: y, .. }) => a.id == b.id && x == y,
+            (Content::Stored(a), Content::Stored(b)) => Arc::ptr_eq(&a.source, &b.source) && a.key == b.key,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum Overlay {
     File {
         content: Content,
@@ -150,7 +173,7 @@ enum Overlay {
 }
 
 /// A file with several names, made by [`Workspace::hard_link`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Linked {
     content: Content,
     kind: Kind,
@@ -474,9 +497,16 @@ impl Workspace {
             Resolved::Dir { base } => base,
             Resolved::File { .. } => return Err(Error::NotADirectory(path.to_string())),
         };
-        let mut entries: BTreeMap<String, DirEntry> = BTreeMap::new();
         if let Some(base) = &base {
             self.note_listed(&path, base);
+        }
+        self.entries(&path, base.as_ref())
+    }
+
+    /// The entries of the directory at `path`, whose base node is `base`.
+    fn entries(&self, path: &VPath, base: Option<&BaseNode>) -> Result<Vec<DirEntry>> {
+        let mut entries: BTreeMap<String, DirEntry> = BTreeMap::new();
+        if let Some(base) = base {
             for (name, entry) in self.base_listing(base)?.iter() {
                 let kind = entry.kind;
                 entries.insert(name.clone(), DirEntry { name: name.clone(), kind, size: entry.size });
@@ -484,7 +514,7 @@ impl Workspace {
         }
         // Mount points and the directories leading to them are part of the structure.
         for mount_path in self.mounts.keys() {
-            if let Some(rest) = mount_path.strip_prefix(&path) {
+            if let Some(rest) = mount_path.strip_prefix(path) {
                 if let Some(first) = rest.first() {
                     let name = (*first).to_owned();
                     entries.insert(name.clone(), DirEntry { name, kind: Kind::Dir, size: None });
@@ -492,7 +522,7 @@ impl Workspace {
             }
         }
         let depth = path.depth() + 1;
-        for (child, entry) in self.overlay_descendants(&path) {
+        for (child, entry) in self.overlay_descendants(path) {
             if child.depth() != depth {
                 continue;
             }
@@ -670,39 +700,84 @@ impl Workspace {
     /// plus listing any base directories that were deleted, plus reading written files
     /// under that size that kept their size.
     pub fn changes(&self) -> Result<Vec<Change>> {
-        let mut changes: BTreeMap<VPath, ChangeKind> = BTreeMap::new();
-        // First every base file the overlay hides: below whiteouts, recreated
-        // directories, and files written where a base directory used to be.
-        for (path, entry) in self.overlay.iter() {
-            let hides_base = match entry {
-                Overlay::Deleted { .. } | Overlay::Dir { opaque: true } => true,
-                Overlay::File { .. } | Overlay::Linked { .. } => {
-                    self.base_node(path)?.is_some_and(|node| node.kind().is_dir())
-                }
-                Overlay::Dir { opaque: false } => false,
+        let original =
+            Workspace { overlay: OrdMap::new(), links: OrdMap::new(), walks: Arc::default(), ..self.clone() };
+        self.changes_since(&original)
+    }
+
+    /// Files added, modified or deleted relative to `base`, sorted by path: what
+    /// changed since a checkpoint (a fork kept earlier), or how two forks of one
+    /// checkpoint differ. Reported the way [`Workspace::changes`] reports them.
+    ///
+    /// Everything the two share since a fork is skipped without being looked at, so
+    /// the cost follows what changed after they split, not the size of either.
+    /// Workspaces that share no mounts are compared file by file, reading both.
+    pub fn changes_since(&self, base: &Workspace) -> Result<Vec<Change>> {
+        // Paths whose entries differ, and whether everything below them may differ too.
+        let mut touched: BTreeMap<VPath, bool> = BTreeMap::new();
+        let mut note = |path: &VPath, below: bool| *touched.entry(path.clone()).or_default() |= below;
+        for item in base.overlay.diff(&self.overlay) {
+            let (path, entries) = match item {
+                DiffItem::Add(path, new) => (path, [None, Some(new)]),
+                DiffItem::Update { old: (path, old), new: (_, new) } => (path, [Some(old), Some(new)]),
+                DiffItem::Remove(path, old) => (path, [Some(old), None]),
             };
-            if hides_base {
-                for file in self.base_files_under(path)? {
-                    changes.insert(file, ChangeKind::Deleted);
-                }
+            // A plain directory hides nothing below it; anything else may hide or
+            // replace a whole directory.
+            note(path, entries.into_iter().flatten().any(|entry| !matches!(entry, Overlay::Dir { opaque: false })));
+        }
+        // A write through one name of a linked file changes all of them.
+        for item in base.links.diff(&self.links) {
+            let linked = match item {
+                DiffItem::Add(_, new) => [None, Some(new)],
+                DiffItem::Update { old: (_, old), new: (_, new) } => [Some(old), Some(new)],
+                DiffItem::Remove(_, old) => [Some(old), None],
+            };
+            for name in linked.into_iter().flatten().flat_map(|linked| linked.names.iter()) {
+                note(name, true);
             }
         }
-        for (path, entry) in self.overlay.iter() {
-            let Some((content, kind, _)) = self.overlay_file(entry) else { continue };
-            match self.base_node(path)? {
-                Some(BaseNode::Entry(mount, base)) if !base.kind.is_dir() => {
-                    if self.same_as_base(&content, kind, &mount, &base)? {
-                        changes.remove(path);
-                    } else {
-                        changes.insert(path.clone(), ChangeKind::Modified);
+        for item in base.mounts.diff(&self.mounts) {
+            let (DiffItem::Add(path, _) | DiffItem::Update { new: (path, _), .. } | DiffItem::Remove(path, _)) = item;
+            note(path, true);
+        }
+        let mut changes = BTreeMap::new();
+        let mut below_touched = BTreeSet::new();
+        for (path, below) in &touched {
+            let (old, new) = (base.lookup(path)?, self.lookup(path)?);
+            if *below {
+                for (ws, resolved) in [(base, &old), (self, &new)] {
+                    if let Some(Resolved::Dir { base: node }) = resolved {
+                        below_touched.extend(ws.files_below(path, node.clone())?);
                     }
                 }
-                _ => {
-                    changes.insert(path.clone(), ChangeKind::Added);
-                }
             }
+            self.compare(base, path, file(old), file(new), &mut changes)?;
+        }
+        for path in below_touched.iter().filter(|path| !touched.contains_key(*path)) {
+            self.compare(base, path, file(base.lookup(path)?), file(self.lookup(path)?), &mut changes)?;
         }
         Ok(changes.into_iter().map(|(path, kind)| Change { path, kind }).collect())
+    }
+
+    /// Record how the file at `path` changed from `old` in `base` to `new` here.
+    fn compare(
+        &self,
+        base: &Workspace,
+        path: &VPath,
+        old: Option<(Content, Kind)>,
+        new: Option<(Content, Kind)>,
+        changes: &mut BTreeMap<VPath, ChangeKind>,
+    ) -> Result<()> {
+        let kind = match (old, new) {
+            (None, None) => return Ok(()),
+            (None, Some(_)) => ChangeKind::Added,
+            (Some(_), None) => ChangeKind::Deleted,
+            (Some(old), Some(new)) if self.same_file(&new, base, &old)? => return Ok(()),
+            (Some(_), Some(_)) => ChangeKind::Modified,
+        };
+        changes.insert(path.clone(), kind);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1001,49 +1076,54 @@ impl Workspace {
         }
     }
 
-    fn same_as_base(&self, content: &Content, kind: Kind, mount: &Arc<Mount>, base: &SourceEntry) -> Result<bool> {
-        if kind != base.kind {
+    /// True if a file here has the same kind and bytes as one in `other`. Content
+    /// both share (a fork's, or the same source file) is not read.
+    fn same_file(
+        &self,
+        (content, kind): &(Content, Kind),
+        other: &Workspace,
+        theirs: &(Content, Kind),
+    ) -> Result<bool> {
+        if *kind != theirs.1 {
             return Ok(false);
         }
-        if let Content::Base { mount: from, key, .. } = content {
-            if from.id == mount.id && *key == base.key {
-                return Ok(true);
-            }
+        if *content == theirs.0 {
+            return Ok(true);
         }
-        let original = Content::Base { mount: mount.clone(), key: base.key.clone(), size: base.size };
-        match (content_size(content), content_size(&original)) {
+        match (content_size(content), content_size(&theirs.0)) {
             (Some(a), Some(b)) if a != b => return Ok(false),
             // Comparing would read both files whole, at every call.
             (Some(size), _) if size >= COMPARE_LIMIT => return Ok(false),
             _ => {}
         }
-        Ok(self.content_bytes(content)? == self.content_bytes(&original)?)
+        Ok(self.content_bytes(content)? == other.content_bytes(&theirs.0)?)
     }
 
-    /// Every base file at or below `path`, listing directories but reading no files.
-    fn base_files_under(&self, path: &VPath) -> Result<Vec<VPath>> {
+    /// What `path` is, or `None` if nothing is there.
+    fn lookup(&self, path: &VPath) -> Result<Option<Resolved>> {
+        match self.resolve(path) {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(Error::NotFound(_) | Error::NotADirectory(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Every file and link below the directory at `path`, whose base node is `base`,
+    /// listing directories but reading no files.
+    fn files_below(&self, path: &VPath, base: Option<BaseNode>) -> Result<Vec<VPath>> {
         let mut files = Vec::new();
-        let mut stack = vec![(path.clone(), self.base_node(path)?)];
-        while let Some((current, node)) = stack.pop() {
-            match node {
-                None => {}
-                Some(BaseNode::Entry(_, ref entry)) if !entry.kind.is_dir() => files.push(current),
-                Some(node) => {
-                    for (name, entry) in self.base_listing(&node)?.iter() {
-                        let child = current.join(name)?;
-                        stack.push((child, Some(self.child_node(&node, entry))));
-                    }
+        let mut stack = vec![(path.clone(), base)];
+        while let Some((dir, base)) = stack.pop() {
+            for entry in self.entries(&dir, base.as_ref())? {
+                let child = dir.join(&entry.name)?;
+                if !entry.kind.is_dir() {
+                    files.push(child);
+                } else if let Ok(Resolved::Dir { base }) = self.resolve(&child) {
+                    stack.push((child, base));
                 }
             }
         }
         Ok(files)
-    }
-
-    fn child_node(&self, parent: &BaseNode, entry: &SourceEntry) -> BaseNode {
-        match parent {
-            BaseNode::MountRoot(mount) | BaseNode::Entry(mount, _) => BaseNode::Entry(mount.clone(), entry.clone()),
-            BaseNode::Implicit => BaseNode::Implicit,
-        }
     }
 
     fn overlay_descendants(&self, path: &VPath) -> impl Iterator<Item = (&VPath, &Overlay)> {
@@ -1269,6 +1349,14 @@ fn dir_key(node: &BaseNode) -> Option<(Arc<Mount>, SourceKey)> {
 /// The size from which [`Workspace::changes`] counts a written file as modified
 /// without comparing it to the file it replaced.
 pub const COMPARE_LIMIT: u64 = 64 << 20;
+
+/// The file or link a lookup found, if that is what it found.
+fn file(resolved: Option<Resolved>) -> Option<(Content, Kind)> {
+    match resolved? {
+        Resolved::File { content, kind, .. } => Some((content, kind)),
+        Resolved::Dir { .. } => None,
+    }
+}
 
 fn content_size(content: &Content) -> Option<u64> {
     match content {

@@ -44,7 +44,7 @@ That is the whole model:
 
 - A **source** is read-only data mounted at a path: a folder, a git commit, files held in memory, or your own data.
 - A **workspace** is sources mounted at paths, plus a layer that holds every write and delete. `fork()` copies a workspace in constant time.
-- A **change** is one file that differs from the sources, as listed by `changes()`.
+- A **change** is one file that differs from the sources, as listed by `changes()`. `changes(since=checkpoint)` lists the files that differ from another workspace instead: what an attempt did after a fork you kept, or how two attempts from one fork differ.
 
 ## What you can mount
 
@@ -119,6 +119,7 @@ sandfs mount ~/datasets/survey ~/ws/survey       # the folder underneath is neve
 sandfs fork ~/ws/survey ~/ws/cleanup             # survey's changes so far, without copying the folder
 python clean.py ~/ws/cleanup                     # real files, any tool
 sandfs changes ~/ws/cleanup                      # A/M/D for each changed file
+sandfs changes cleanup --since survey            # how cleanup differs from survey, file by file
 sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sandfs mount cleanup ~/ws/cleanup` brings them back
 ```
 
@@ -153,7 +154,7 @@ On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there
 | `mkdir`, `remove`, `copy`, `move` | File operations; copies share the original's bytes |
 | `symlink(path, target)`, `read_link(path)` | Make a symbolic link, or read where one points |
 | `hard_link(src, dst)`, `hard_links(path)` | Give a file a second name, or list all its names |
-| `changes()` | `Change(path, kind)` for every added, modified or deleted file or link |
+| `changes(since=None)` | `Change(path, kind)` for every added, modified or deleted file or link, against the sources or, with `since`, another workspace such as a checkpoint |
 
 Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`. An exception raised inside a Python source surfaces as `OSError`.
 

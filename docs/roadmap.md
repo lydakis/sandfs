@@ -2,7 +2,7 @@
 
 sandfs is a general-purpose sandbox filesystem for agents. An agent works on files of any kind (documents, spreadsheets, images, data sets, notes, configs, code) in a workspace it can change freely and throw away, and the harness decides which changes to keep. Code is one use case among many.
 
-The core has three primitives: a **source** (a read-only tree read lazily), a **workspace** (sources mounted at paths plus a copy-on-write overlay) and a **change** (one file that differs, from `changes()`). Snapshots and checkpoints are forks, not new concepts. The full design lives in the interface spec linked from the project; this file tracks where the code is.
+The core has three primitives: a **source** (a read-only tree read lazily), a **workspace** (sources mounted at paths plus a copy-on-write overlay) and a **change** (one file that differs, from `changes()`, or from another workspace such as a checkpoint, from `changes_since`). Snapshots and checkpoints are forks, not new concepts. The full design lives in the interface spec linked from the project; this file tracks where the code is.
 
 ## Direction
 
