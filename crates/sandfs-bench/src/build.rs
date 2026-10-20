@@ -236,7 +236,9 @@ fn copy_source(from: &Path, to: &Path, scratch: &Path, skipped: &[&str]) -> Resu
             fs::copy(entry.path(), to.join(&name))?;
             // Keep the time too: tools such as `make` compare times to decide what is
             // out of date.
-            fs::File::options().write(true).open(to.join(&name))?.set_modified(entry.metadata()?.modified()?)?;
+            // Opened for reading only: setting a time needs ownership, not write access,
+            // and a read-only file keeps its mode in the copy.
+            fs::File::open(to.join(&name))?.set_modified(entry.metadata()?.modified()?)?;
         } else if kind.is_symlink() {
             // Such as the commands in node_modules/.bin.
             std::os::unix::fs::symlink(fs::read_link(entry.path())?, to.join(&name))?;

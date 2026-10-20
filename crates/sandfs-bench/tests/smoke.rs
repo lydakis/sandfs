@@ -21,3 +21,56 @@ fn every_workload_runs_on_every_available_target() {
     assert!(stdout.contains("| target | 8 attempts, wall |"), "{stdout}");
     assert!(stdout.contains("\n| sandfs | "), "{stdout}");
 }
+
+/// A command in a copy of a folder: the copy, never the folder, gets the changes, each
+/// column has its own cache folder, and read-only files and file times come across.
+#[test]
+fn a_command_runs_in_copies_of_a_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("change.txt"), "x\n").unwrap();
+    std::fs::write(dir.path().join("fixed.txt"), "y\n").unwrap();
+    let then = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::File::options().write(true).open(dir.path().join("fixed.txt")).unwrap().set_modified(then).unwrap();
+    std::fs::set_permissions(dir.path().join("fixed.txt"), std::fs::Permissions::from_mode(0o444)).unwrap();
+    // Each run notes what it found in its copy, outside the copies.
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let command = format!(
+        "echo \"$(wc -l < change.txt) $(stat -c %Y fixed.txt) $(basename \"$XDG_CACHE_HOME\") $PWD\" >> {}",
+        log.path().display()
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let bench = |change: &str| {
+        Command::new(env!("CARGO_BIN_EXE_sandfs-bench"))
+            .args(["--only", "build", "--targets", "host", "--iters", "2", "--scratch"])
+            .arg(scratch.path())
+            .arg("--build-dir")
+            .arg(dir.path())
+            .args(["--build-command", &command, "--build-change", change])
+            .output()
+            .unwrap()
+    };
+
+    let output = bench("change.txt");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("| run again |"), "{stdout}");
+    let runs: Vec<Vec<String>> = std::fs::read_to_string(log.path())
+        .unwrap()
+        .lines()
+        .map(|line| line.split(' ').map(str::to_owned).collect())
+        .collect();
+    let lines: Vec<&str> = runs.iter().map(|run| run[0].as_str()).collect();
+    assert_eq!(lines, ["1", "2", "3"], "a blank line before each run after the first");
+    assert!(runs.iter().all(|run| run[1] == "1600000000" && run[2] == "cache-host"), "{runs:?}");
+    assert!(runs.iter().all(|run| !run[3].starts_with(dir.path().to_str().unwrap())), "{runs:?}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("change.txt")).unwrap(), "x\n", "the folder is never changed");
+
+    // A file outside the folder is refused before anything runs.
+    let outside = dir.path().join("../outside.txt");
+    std::fs::write(&outside, "z\n").unwrap();
+    let output = bench(outside.to_str().unwrap());
+    let _ = std::fs::remove_file(&outside);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is no file in"));
+}
