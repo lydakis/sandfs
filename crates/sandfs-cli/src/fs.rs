@@ -1720,6 +1720,8 @@ mod tests {
     fn files_are_written_on_disk_where_there_are_drafts() {
         let state = tempfile::tempdir().unwrap();
         let mut saved = Saved::new(state.path());
+        // Files big enough to keep an object of their own; small ones are packed.
+        saved.pack_limit = None;
         let mut fs = fs();
         fs.drafts = Some(saved.drafts());
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
@@ -1911,6 +1913,8 @@ mod tests {
     fn copies_of_saved_files_share_their_object() {
         let state = tempfile::tempdir().unwrap();
         let mut saved = Saved::new(state.path());
+        // One object per file, so the files on disk count the objects.
+        saved.pack_limit = None;
         let mut fs = fs();
         fs.drafts = Some(saved.drafts());
         let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
