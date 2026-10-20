@@ -552,7 +552,7 @@ impl Inner {
                 self.buffers.insert(ino, empty);
                 self.writing = true;
             } else {
-                self.buffer(ino)?.set_len(size)?;
+                self.change_buffer(ino, |buffer| buffer.set_len(size))?;
             }
             // ftruncate on a removed file that is still open changes only its buffer.
             if !self.nodes.get(&ino).is_some_and(|node| node.linked) {
@@ -841,11 +841,22 @@ impl Inner {
         Ok(buffer)
     }
 
+    /// Apply `change` to the write buffer for `ino`. A first change that fails left
+    /// the file as it was, so the buffer it made is dropped rather than committed.
+    fn change_buffer<T>(&mut self, ino: u64, change: impl FnOnce(&mut Buffer) -> FsResult<T>) -> FsResult<T> {
+        let new = !self.buffers.contains_key(&ino);
+        let result = change(self.buffer(ino)?);
+        if result.is_err() && new {
+            self.buffers.remove(&ino);
+        }
+        result
+    }
+
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
         if offset.checked_add(data.len() as u64).is_none_or(|end| end > MAX_FILE_SIZE as u64) {
             return Err(Errno::EFBIG);
         }
-        let written = self.buffer(ino)?.write(offset, data)?;
+        let written = self.change_buffer(ino, |buffer| buffer.write(offset, data))?;
         if let Ok(path) = self.path(ino) {
             self.times.insert(path.to_string(), SystemTime::now());
         }
@@ -1472,6 +1483,10 @@ mod tests {
         let mut in_memory = super::tests::fs();
         let ino = in_memory.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
         assert_eq!(in_memory.setattr(ino, None, Some(huge), None).unwrap_err(), Errno::EFBIG);
+
+        // A first write that fails leaves nothing behind to commit.
+        assert_eq!(in_memory.write(ino, huge, b"x").unwrap_err(), Errno::EFBIG);
+        assert!(!in_memory.buffers.contains_key(&ino));
     }
 
     #[test]
