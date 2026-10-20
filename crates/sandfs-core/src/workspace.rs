@@ -994,7 +994,7 @@ impl Workspace {
 /// The error for reading, writing or changing the mode of a symbolic link, which the
 /// workspace never follows.
 fn is_a_symlink(path: &VPath) -> Error {
-    Error::Unsupported(path.to_string(), "is a symlink, which the workspace does not follow")
+    Error::Unsupported(path.to_string(), "is a symbolic link, which the workspace does not follow")
 }
 
 fn source_is_dir(resolved: &Resolved) -> bool {

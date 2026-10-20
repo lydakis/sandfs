@@ -87,7 +87,8 @@ pub fn errno(err: &Error) -> Errno {
         Error::IsADirectory(_) => Errno::EISDIR,
         Error::DirectoryNotEmpty(_) => Errno::ENOTEMPTY,
         Error::InvalidPath(_) => Errno::EINVAL,
-        Error::Unsupported(_, reason) if reason.contains("symbolic links") => Errno::ELOOP,
+        // An operation that would have to follow a link, as with O_NOFOLLOW.
+        Error::Unsupported(_, reason) if reason.contains("symbolic link") => Errno::ELOOP,
         Error::Unsupported(..) => Errno::EPERM,
         other => {
             eprintln!("sandfs: {other}");
@@ -1546,6 +1547,15 @@ mod tests {
         assert_eq!(&fs.read(util, 0, 100).unwrap()[..], b"", "the old util.rs");
         fs.forget(util, 1);
         assert!(!fs.nodes.contains_key(&util));
+    }
+
+    #[test]
+    fn operations_that_would_follow_a_link_fail_with_eloop() {
+        let mut ws = Workspace::new();
+        ws.symlink("/link", "target").unwrap();
+        assert_eq!(errno(&ws.write("/link", "x").unwrap_err()), Errno::ELOOP);
+        assert_eq!(errno(&ws.read("/link").unwrap_err()), Errno::ELOOP);
+        assert_eq!(errno(&ws.remove("/", true).unwrap_err()), Errno::EPERM, "other refusals stay EPERM");
     }
 
     #[test]

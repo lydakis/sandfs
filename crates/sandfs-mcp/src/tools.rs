@@ -94,7 +94,7 @@ impl Tools {
         let version = meta.version;
         if meta.kind.is_symlink() {
             let target = self.workspace.read_link(&path).map_err(err)?;
-            return Ok(format!("{path}: symlink to {}, version {version}", shown(&target)));
+            return Ok(format!("{}: symlink to {}, version {version}", shown(&path), shown(&target)));
         }
         let bytes = self.workspace.read(&path).map_err(err)?;
         let Some(text) = as_text(&bytes) else {
