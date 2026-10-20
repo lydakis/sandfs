@@ -14,7 +14,8 @@
 //! blob. [`GitSource::with_sizes`] turns them on for files whose blobs are already
 //! local. A [`Source::prefetch`] fetches a folder's missing blobs in one request,
 //! so the workspace's next listing has every size, and a walk of a folder fetches
-//! everything below it in one request rather than one per file.
+//! everything below it in one request rather than one per file, or for a large tree,
+//! in the background a request at a time.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -53,9 +54,10 @@ pub struct GitSource {
     fetched: Mutex<HashSet<SourceKey>>,
 }
 
-/// The most files one prefetch fetches. A folder missing more is left to fetch file by
-/// file as it is read. Git can't tell a blob's size before fetching it, so this can't
-/// be a byte limit: a prefetch fetches at most this many files of any size.
+/// The most files one request fetches. A folder missing more is left to fetch file by
+/// file as it is read; a larger tree below a walk comes this many at a time. Git can't
+/// tell a blob's size before fetching it, so this can't be a byte limit: a request
+/// fetches at most this many files of any size.
 const PREFETCH_FILES: usize = 1000;
 
 impl fmt::Debug for GitSource {
@@ -204,53 +206,37 @@ impl GitSource {
     /// `recursive` every file below it. `None` when git can't say, or when more than
     /// `limit` are missing; git stops looking then.
     fn missing(&self, id: &str, recursive: bool, limit: usize) -> Option<Vec<String>> {
-        // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
-        // `tree:1` stops the walk at the tree's direct children.
-        let mut command = git(&self.repo);
-        command.args(["rev-list", "--objects", "--no-object-names", "--missing=print"]);
-        if !recursive {
-            command.arg("--filter=tree:1");
-        }
-        let mut child = command.arg(id).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-        let mut missing = Vec::new();
-        for line in BufReader::new(child.stdout.take()?).lines() {
-            // A walk cut short would pass for a complete one.
-            let Ok(line) = line else {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            };
-            if let Some(object) = line.strip_prefix('?') {
-                missing.push(object.to_owned());
-                if missing.len() > limit {
-                    break;
-                }
-            }
-        }
-        let over = missing.len() > limit;
-        if over {
-            let _ = child.kill();
-        }
-        let status = child.wait().ok()?;
-        (!over && status.success()).then_some(missing)
+        missing(&self.repo, id, recursive, limit)
     }
 
     /// Fetch these blobs from `remote` in one request. Best effort: whatever this
     /// misses, git still fetches one blob at a time on first read.
     fn fetch(&self, remote: &str, blobs: &[String]) -> bool {
-        // The same request git makes for a single missing object, with every id at once.
-        let fetch = git(&self.repo)
-            .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", remote, "--no-tags", "--no-write-fetch-head"])
-            .args(["--recurse-submodules=no", "--filter=blob:none", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut fetch) = fetch else { return false };
-        if let Some(mut stdin) = fetch.stdin.take() {
-            let _ = stdin.write_all(blobs.join("\n").as_bytes()).and_then(|()| stdin.write_all(b"\n"));
-        }
-        fetch.wait().is_ok_and(|status| status.success())
+        fetch(&self.repo, remote, blobs)
+    }
+
+    /// Fetch everything missing below the tree `id` in the background, a request at a
+    /// time, in the order a walk reads the files, while reads go on: one that gets ahead
+    /// fetches its own file, as without a prefetch, rather than waiting for a whole
+    /// request. Each request first asks git what is still missing, so files fetched
+    /// meanwhile, such as a folder the walk reached first, aren't fetched twice. Sizes
+    /// of files fetched this way show up once their folder is prefetched.
+    fn fetch_behind(&self, remote: &str, id: &str) {
+        let (repo, remote, id) = (self.repo.clone(), remote.to_owned(), id.to_owned());
+        let cancel = Arc::clone(&self.cancel);
+        let _ = std::thread::Builder::new().name("sandfs-git-prefetch".into()).spawn(move || {
+            let Some(order) = missing_in_order(&repo, &id) else { return };
+            let mut order = order.into_iter();
+            while !cancel.load(Ordering::Relaxed) {
+                let Some(missing) = missing(&repo, &id, true, usize::MAX) else { return };
+                let missing: HashSet<String> = missing.into_iter().collect();
+                let request: Vec<String> =
+                    order.by_ref().filter(|blob| missing.contains(blob)).take(PREFETCH_FILES).collect();
+                if request.is_empty() || !fetch(&repo, &remote, &request) {
+                    return;
+                }
+            }
+        });
     }
 
     /// Remember that every file below the tree `id` is local, with every tree below it,
@@ -312,14 +298,21 @@ impl Source for GitSource {
     }
 
     /// Fetch the folder's missing blobs, or with `recursive` everything missing below
-    /// it, in one request, when that is at most 1,000 files. Outside a partial clone
-    /// every blob is local and this does nothing.
+    /// it, in one request, when that is at most 1,000 files. A larger tree comes in the
+    /// background, a request at a time (see [`GitSource::fetch_behind`]); a larger
+    /// folder is left to fetch file by file. Outside a partial clone every blob is
+    /// local and this does nothing.
     fn prefetch(&self, key: &str, recursive: bool) {
         let Some(remote) = &self.promisor else { return };
         if self.local.lock().is_ok_and(|local| local.contains(key)) {
             return;
         }
-        let Some(missing) = self.missing(key, recursive, PREFETCH_FILES) else { return };
+        let Some(missing) = self.missing(key, recursive, PREFETCH_FILES) else {
+            if recursive {
+                self.fetch_behind(remote, key);
+            }
+            return;
+        };
         let fetched = missing.is_empty() || self.fetch(remote, &missing);
         if fetched {
             self.now_local(missing.iter().map(String::as_str));
@@ -333,6 +326,65 @@ impl Source for GitSource {
             self.mark_local(key);
         }
     }
+}
+
+/// See [`GitSource::missing`].
+fn missing(repo: &Path, id: &str, recursive: bool, limit: usize) -> Option<Vec<String>> {
+    // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
+    // `tree:1` stops the walk at the tree's direct children.
+    let mut command = git(repo);
+    command.args(["rev-list", "--objects", "--no-object-names", "--missing=print"]);
+    if !recursive {
+        command.arg("--filter=tree:1");
+    }
+    let mut child = command.arg(id).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut missing = Vec::new();
+    for line in BufReader::new(child.stdout.take()?).lines() {
+        // A walk cut short would pass for a complete one.
+        let Ok(line) = line else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        if let Some(object) = line.strip_prefix('?') {
+            missing.push(object.to_owned());
+            if missing.len() > limit {
+                break;
+            }
+        }
+    }
+    let over = missing.len() > limit;
+    if over {
+        let _ = child.kill();
+    }
+    let status = child.wait().ok()?;
+    (!over && status.success()).then_some(missing)
+}
+
+/// Every blob missing below the tree `id`, once each, in the order a walk reads the
+/// files; git reports missing objects in no useful order.
+fn missing_in_order(repo: &Path, id: &str) -> Option<Vec<String>> {
+    let mut missing: HashSet<String> = missing(repo, id, true, usize::MAX)?.into_iter().collect();
+    // Depth first in name order; trees are local in a clone that leaves out blobs.
+    let listing = git_output(repo, &["ls-tree", "-r", "--format=%(objectname)", id]).ok()?;
+    Some(listing.lines().filter_map(|blob| missing.take(blob)).collect())
+}
+
+/// See [`GitSource::fetch`].
+fn fetch(repo: &Path, remote: &str, blobs: &[String]) -> bool {
+    // The same request git makes for a single missing object, with every id at once.
+    let fetch = git(repo)
+        .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", remote, "--no-tags", "--no-write-fetch-head"])
+        .args(["--recurse-submodules=no", "--filter=blob:none", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut fetch) = fetch else { return false };
+    if let Some(mut stdin) = fetch.stdin.take() {
+        let _ = stdin.write_all(blobs.join("\n").as_bytes()).and_then(|()| stdin.write_all(b"\n"));
+    }
+    fetch.wait().is_ok_and(|status| status.success())
 }
 
 /// Parse a raw tree object: repeated `<octal mode> <name>\0<binary id>` records.
@@ -496,8 +548,12 @@ fn promisor_remote(repo: &Path) -> Option<String> {
 
 fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
-    // Never stop to ask for credentials while fetching blobs of a partial clone.
+    // Never stop to ask for credentials while fetching blobs of a partial clone. Nor
+    // run maintenance after each fetch, which git, and the fetches it starts for a
+    // missing blob, would otherwise do: reading a large tree is a burst of fetches,
+    // and repacking after each costs more than the fetch.
     command.arg("-C").arg(repo).env("GIT_TERMINAL_PROMPT", "0");
+    command.args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"]);
     command
 }
 

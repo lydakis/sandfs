@@ -212,3 +212,34 @@ fn a_walk_fetches_only_once_it_reads() {
     ws.read("/repo/src/lib.rs").unwrap();
     assert_eq!(missing(clone.path()), before - root_blobs - 1);
 }
+
+#[test]
+fn a_tree_too_large_for_one_request_comes_in_the_background() {
+    // 2,500 files in five folders, more than one request fetches.
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "-q"]);
+    for folder in 0..5 {
+        let dir = origin.path().join(format!("d{folder}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..500 {
+            std::fs::write(dir.join(format!("f{file}")), format!("{folder}/{file}\n")).unwrap();
+        }
+    }
+    git(origin.path(), &["add", "-A"]);
+    git(origin.path(), &["commit", "-q", "-m", "many"]);
+    git(origin.path(), &["config", "uploadpack.allowFilter", "true"]);
+    git(origin.path(), &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    let clone = tempfile::tempdir().unwrap();
+    let url = format!("file://{}", origin.path().display());
+    git(clone.path(), &["clone", "-q", "--bare", "--filter=blob:none", &url, "."]);
+    assert_eq!(missing(clone.path()), 2500);
+
+    let source = GitSource::open(clone.path(), "HEAD").unwrap();
+    let root = sandfs_core::Source::root(&source).unwrap();
+    sandfs_core::Source::prefetch(&source, &root, true);
+    let started = std::time::Instant::now();
+    while missing(clone.path()) > 0 {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the files never came");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
