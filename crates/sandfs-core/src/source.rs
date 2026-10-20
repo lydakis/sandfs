@@ -256,35 +256,79 @@ impl DirSource {
     /// The target of the link at `key`, if it is UTF-8 like every workspace path.
     ///
     /// The target keeps the meaning it has on the host, wherever the workspace is
-    /// mounted. One that lands inside the folder is made relative to the link, so a
-    /// mount reaches the workspace's copy of the file instead of the folder itself, which
-    /// a write must never reach. A relative one that lands outside becomes the absolute
-    /// path it reaches on the host; an absolute one outside is kept as written.
+    /// mounted. A relative one that stays inside the folder is kept as written: in a
+    /// mount it stays in the mount, through the workspace's own links. Any other one
+    /// that lands inside is made relative to the link, so a mount reaches the
+    /// workspace's copy of the file instead of the folder itself, which a write must
+    /// never reach. A relative one that lands outside becomes the absolute path it
+    /// reaches on the host; an absolute one outside is kept as written.
     fn link_target(&self, key: &str) -> Result<Bytes> {
         let path = self.host_path(key);
         let target = std::fs::read_link(&path).map_err(io_error)?;
-        let raw = target.clone().into_os_string();
-        let reached = resolve(&path.parent().unwrap_or(&self.root).join(&target));
-        // A `..` left over follows a folder that isn't there, so the link dangles on the
-        // host. Made relative, it would come alive once the folder is made in the
-        // workspace, and could then climb out of the mount; it stays a host path instead.
-        let inside = reached
-            .strip_prefix(&self.root)
-            .ok()
-            .filter(|inside| inside.components().all(|part| part != Component::ParentDir));
-        let target = match inside {
-            Some(inside) => relative_link(Path::new(key).parent().unwrap_or(Path::new("")), inside),
-            // Rooted, even without a drive on Windows: the same path from anywhere.
-            None if target.has_root() => target,
-            None => reached,
+        let parent = Path::new(key).parent().unwrap_or(Path::new(""));
+        let rewritten = match self.named_inside(parent, &target) {
+            Some(_) if !target.has_root() => target.clone(),
+            Some(inside) => relative_link(parent, &inside),
+            None => {
+                let reached = resolve(&path.parent().unwrap_or(&self.root).join(&target));
+                // A `..` left over follows a folder that isn't there, so the link dangles
+                // on the host. Made relative, it would come alive once the folder is made
+                // in the workspace, and could then climb out of the mount; it stays a
+                // host path instead.
+                let inside = reached
+                    .strip_prefix(&self.root)
+                    .ok()
+                    .filter(|inside| inside.components().all(|part| part != Component::ParentDir));
+                match inside {
+                    Some(inside) => relative_link(parent, inside),
+                    // Rooted, even without a drive on Windows: the same path from anywhere.
+                    None if target.has_root() => target.clone(),
+                    None => reached,
+                }
+            }
         };
-        // A trailing `/` or `/.` means the target must be a folder; resolving drops it.
-        let folder_only = matches!(raw.as_encoded_bytes(), [.., b'/'] | [.., b'/', b'.']);
-        match target.into_os_string().into_string() {
-            Ok(target) if folder_only && !target.ends_with('/') => Ok(Bytes::from(target + "/")),
-            Ok(target) => Ok(Bytes::from(target)),
+        // A trailing separator, or one and `.`, means the target must be a folder; the
+        // rewriting drops it.
+        let raw = target.as_os_str().as_encoded_bytes();
+        let separator = |byte: &u8| std::path::is_separator(*byte as char);
+        let folder_only = match raw {
+            [.., last] if separator(last) => true,
+            [.., before, b'.'] => separator(before),
+            _ => false,
+        };
+        match rewritten.into_os_string().into_string() {
+            Ok(rewritten) if folder_only && !rewritten.ends_with(std::path::is_separator) && rewritten != target => {
+                Ok(Bytes::from(rewritten + std::path::MAIN_SEPARATOR_STR))
+            }
+            Ok(rewritten) => Ok(Bytes::from(rewritten)),
             Err(_) => Err(Error::Source(format!("{}: link target is not UTF-8", path.display()))),
         }
+    }
+
+    /// The place in the folder that `target`, written in a link in the folder `parent`,
+    /// names without leaving the folder on the way, if it does. An absolute target with
+    /// `..` in it is left to the OS, since a link before the `..` could lead anywhere.
+    fn named_inside(&self, parent: &Path, target: &Path) -> Option<PathBuf> {
+        let (mut inside, rest): (Vec<Component>, &Path) = if target.has_root() {
+            let rest = target.strip_prefix(&self.root).ok()?;
+            if rest.components().any(|part| part == Component::ParentDir) {
+                return None;
+            }
+            (Vec::new(), rest)
+        } else {
+            (parent.components().collect(), target)
+        };
+        for part in rest.components() {
+            match part {
+                Component::ParentDir => {
+                    inside.pop()?;
+                }
+                Component::Normal(_) => inside.push(part),
+                Component::CurDir => {}
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        Some(inside.into_iter().collect())
     }
 
     fn host_path(&self, key: &str) -> PathBuf {

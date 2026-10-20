@@ -588,6 +588,9 @@ fn dir_source_lists_symlinks_without_following_them() {
     std::os::unix::fs::symlink("../../outside/secret/", root.join("lib/not-a-folder")).unwrap();
     std::os::unix::fs::symlink("../data.csv/.", root.join("lib/not-a-folder-in")).unwrap();
     std::os::unix::fs::symlink(".././lib/", root.join("lib/self")).unwrap();
+    std::os::unix::fs::symlink("alias", root.join("lib/hop")).unwrap();
+    std::os::unix::fs::symlink(root.join("lib/alias"), root.join("lib/hop-abs")).unwrap();
+    std::os::unix::fs::symlink("missing/../../../root/data.csv", root.join("lib/dangling-out")).unwrap();
 
     let mut ws = Workspace::new();
     ws.mount("/host", Arc::new(DirSource::new(&root).unwrap())).unwrap();
@@ -602,12 +605,18 @@ fn dir_source_lists_symlinks_without_following_them() {
     assert_eq!(ws.read_link("/host/lib/escaped").unwrap(), escaped.to_str().unwrap());
     let dangling = base.canonicalize().unwrap().join("missing/../outside/secret");
     assert_eq!(ws.read_link("/host/lib/dangling").unwrap(), dangling.to_str().unwrap());
-    let dangling_in = root.canonicalize().unwrap().join("lib/missing/../../data.csv");
-    assert_eq!(ws.read_link("/host/lib/dangling-in").unwrap(), dangling_in.to_str().unwrap(), "anchored to the host");
+    assert_eq!(ws.read_link("/host/lib/dangling-in").unwrap(), "missing/../../data.csv", "never leaves the folder");
     let not_a_folder = outside.canonicalize().unwrap().join("secret/");
     assert_eq!(ws.read_link("/host/lib/not-a-folder").unwrap(), not_a_folder.to_str().unwrap());
-    assert_eq!(ws.read_link("/host/lib/not-a-folder-in").unwrap(), "../data.csv/");
-    assert_eq!(ws.read_link("/host/lib/self").unwrap(), "./");
+    assert_eq!(ws.read_link("/host/lib/not-a-folder-in").unwrap(), "../data.csv/.");
+    assert_eq!(ws.read_link("/host/lib/self").unwrap(), ".././lib/");
+    // A link through another link inside the folder still goes through it, so it
+    // follows that link if the workspace changes it.
+    assert_eq!(ws.read_link("/host/lib/hop").unwrap(), "alias");
+    assert_eq!(ws.read_link("/host/lib/hop-abs").unwrap(), "alias");
+    // A missing folder before `..` that would leave the folder stays on the host.
+    let escaping = root.canonicalize().unwrap().join("lib/missing/../../../root/data.csv");
+    assert_eq!(ws.read_link("/host/lib/dangling-out").unwrap(), escaping.to_str().unwrap());
     assert_eq!(ws.read_link("/host/lib/data.csv").unwrap(), "../data.csv");
     assert_eq!(ws.read_link("/host/lib/x-abs").unwrap(), "x", "a target that doesn't exist yet");
     assert_eq!(ws.read_link("/host/lib/top").unwrap(), "..");

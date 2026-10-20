@@ -294,7 +294,8 @@ impl Tools {
             unreadable: 0,
             truncated: false,
         };
-        if self.workspace.stat(&root).map_err(err)?.kind.is_dir() {
+        let kind = self.workspace.stat(&root).map_err(err)?.kind;
+        if kind.is_dir() {
             walk(&self.workspace, &root, usize::MAX, &mut |abs, rel, entry| {
                 // Links are never followed, like ripgrep's default.
                 if entry.kind.is_dir() || entry.kind.is_symlink() {
@@ -309,7 +310,7 @@ impl Tools {
                 }
                 search.file(&self.workspace, abs)
             })?;
-        } else {
+        } else if !kind.is_symlink() {
             search.file(&self.workspace, &root);
         }
 

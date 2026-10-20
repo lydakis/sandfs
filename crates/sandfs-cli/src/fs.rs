@@ -318,14 +318,18 @@ impl Inner {
     pub fn attr(&self, ino: u64) -> FsResult<FileAttr> {
         let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
         if !node.linked {
-            // A removed file the kernel may still have open.
-            let size = match (self.buffers.get(&ino), &node.removed_from) {
-                (Some(buffer), _) => buffer.data.len() as u64,
-                (None, Some(before)) => before.stat(node.path.as_str()).fs()?.size,
+            // A removed file or link the kernel may still have open.
+            let (kind, perm, size) = match (self.buffers.get(&ino), &node.removed_from) {
+                (Some(buffer), _) => (FileType::RegularFile, 0o644, buffer.data.len() as u64),
+                (None, Some(before)) => {
+                    let meta = before.stat(node.path.as_str()).fs()?;
+                    let (kind, perm) = file_type(meta.kind);
+                    (kind, perm, meta.size)
+                }
                 (None, None) => return Err(Errno::ENOENT),
             };
             node.sized.set(true);
-            return Ok(self.make_attr(ino, FileType::RegularFile, 0o644, size, self.base_time));
+            return Ok(self.make_attr(ino, kind, perm, size, self.base_time));
         }
         let path = node.path.as_str();
         let meta = self.ws.stat(path).fs()?;
@@ -335,12 +339,7 @@ impl Inner {
             None if meta.kind.is_dir() => 0,
             None => meta.size,
         };
-        let (kind, perm) = match meta.kind {
-            Kind::Dir => (FileType::Directory, 0o755),
-            Kind::File { executable: true } => (FileType::RegularFile, 0o755),
-            Kind::File { executable: false } => (FileType::RegularFile, 0o644),
-            Kind::Symlink => (FileType::Symlink, 0o777),
-        };
+        let (kind, perm) = file_type(meta.kind);
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
         Ok(self.make_attr(ino, kind, perm, size, mtime))
     }
@@ -517,8 +516,8 @@ impl Inner {
 
     /// readlink(2): the target of the link at `ino`.
     pub fn readlink(&self, ino: u64) -> FsResult<String> {
-        let path = self.path(ino)?;
-        self.ws.read_link(path.as_str()).map_err(|err| match err {
+        let (ws, path) = self.contents(ino)?;
+        ws.read_link(path.as_str()).map_err(|err| match err {
             Error::Unsupported(..) => Errno::EINVAL,
             err => errno(&err),
         })
@@ -1296,6 +1295,16 @@ impl Filesystem for SandFs {
     }
 }
 
+/// The file type and permission bits shown for an entry of `kind`.
+fn file_type(kind: Kind) -> (FileType, u16) {
+    match kind {
+        Kind::Dir => (FileType::Directory, 0o755),
+        Kind::File { executable: true } => (FileType::RegularFile, 0o755),
+        Kind::File { executable: false } => (FileType::RegularFile, 0o644),
+        Kind::Symlink => (FileType::Symlink, 0o777),
+    }
+}
+
 #[cfg(fuse)]
 fn log_io(err: &anyhow::Error) -> Errno {
     eprintln!("sandfs: saving changes failed: {err:#}");
@@ -1551,6 +1560,11 @@ mod tests {
         assert!(!fs.ws.exists("/mnt/README.md"), "a removed file's writes go nowhere");
         assert!(!fs.writing, "and keep nothing waiting");
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"HE");
+
+        let link = fs.symlink(ROOT_INO, name("link"), OsStr::new("README.md")).unwrap().ino.0;
+        fs.unlink(ROOT_INO, name("link")).unwrap();
+        assert_eq!(fs.attr(link).unwrap().kind, FileType::Symlink, "a removed link is still a link");
+        assert_eq!(fs.readlink(link).unwrap(), "README.md");
 
         fs.forget(ino, 1);
         assert!(!fs.nodes.contains_key(&ino) && !fs.buffers.contains_key(&ino), "closed once forgotten");
