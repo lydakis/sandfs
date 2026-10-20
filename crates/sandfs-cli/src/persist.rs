@@ -372,8 +372,23 @@ impl Saved {
         self.dir.join("objects")
     }
 
+    /// The index's bytes. On Windows, opening it while a save renames the new index
+    /// over it is refused with "access denied" for a moment; that is retried.
+    fn read_index_bytes(&self) -> std::io::Result<Vec<u8>> {
+        let mut tries = 0;
+        loop {
+            match std::fs::read(self.index_path()) {
+                Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::PermissionDenied && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                read => return read,
+            }
+        }
+    }
+
     fn read_index(&self) -> Result<Changes> {
-        match std::fs::read(self.index_path()) {
+        match self.read_index_bytes() {
             Ok(data) => serde_json::from_slice(&data).context("reading changes.json"),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Changes::default()),
             Err(err) => Err(err).context("reading changes.json"),
@@ -658,7 +673,7 @@ impl Saved {
     pub fn copy_to(&self, to: &Path) -> Result<()> {
         let objects = to.join("objects");
         for _ in 0..10 {
-            let index = match std::fs::read(self.index_path()) {
+            let index = match self.read_index_bytes() {
                 Ok(index) => index,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => return Err(err).context("reading changes.json"),
