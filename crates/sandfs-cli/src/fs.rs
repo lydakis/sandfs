@@ -927,19 +927,14 @@ impl Shared {
         let snapshot = self.lock().snapshot(settle);
         let result = saved.save(&snapshot, &self.root, durable);
         let mut inner = self.lock();
-        match result {
-            // Saved files are read from disk from now on, unless written again meanwhile.
-            Ok(written) => {
-                for (path, version, stored) in written {
-                    let _ = inner.ws.store(path.as_str(), version, stored);
-                }
-                Ok(())
-            }
-            Err(err) => {
-                inner.unsaved = true;
-                Err(err)
-            }
+        // Saved files are read from disk from now on, unless written again meanwhile.
+        for (path, version, stored) in saved.take_written() {
+            let _ = inner.ws.store(path.as_str(), version, stored);
         }
+        if result.is_err() {
+            inner.unsaved = true;
+        }
+        result
     }
 
     /// Start a thread that commits and saves shortly after each burst of changes,

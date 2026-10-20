@@ -182,6 +182,8 @@ pub struct Saved {
     doomed: Vec<SourceKey>,
     /// Objects written since the last durable save, not yet flushed to disk.
     unsynced: HashSet<String>,
+    /// See [`Saved::take_written`].
+    written: Written,
 }
 
 impl Saved {
@@ -189,7 +191,15 @@ impl Saved {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         let store = Arc::new(Objects { dir: dir.join("objects") });
-        Saved { dir, store, objects: HashMap::new(), next_object: 1, doomed: Vec::new(), unsynced: HashSet::new() }
+        Saved {
+            dir,
+            store,
+            objects: HashMap::new(),
+            next_object: 1,
+            doomed: Vec::new(),
+            unsynced: HashSet::new(),
+            written: Written::new(),
+        }
     }
 
     /// Where the bytes of `object`, `size` long, are.
@@ -341,8 +351,8 @@ impl Saved {
 
     /// Save `snap`, whose source is mounted at `root`. A `durable` save, which answers
     /// `fsync`, also flushes the index and every object it names to disk before returning.
-    /// Returns the files it wrote objects for.
-    pub fn save(&mut self, snap: &Snapshot, root: &VPath, durable: bool) -> Result<Written> {
+    /// [`Saved::take_written`] then says which files it wrote objects for.
+    pub fn save(&mut self, snap: &Snapshot, root: &VPath, durable: bool) -> Result<()> {
         let mut entries = BTreeMap::new();
         let mut kept = HashMap::new();
         let mut written = Written::new();
@@ -404,14 +414,30 @@ impl Saved {
                 waiting.push(object);
             }
         }
-        let replaced = self.objects.values().map(|(_, object)| object).filter(|o| !live.contains(&***o));
-        waiting.extend(replaced.cloned());
+        // Files saved as one object (copies) name it once each, but it waits once: a
+        // second entry here would count as a file still reading from it.
+        let mut replaced = HashSet::new();
+        for object in self.objects.values().map(|(_, object)| object) {
+            if !live.contains(&**object) && replaced.insert(object.clone()) {
+                waiting.push(object.clone());
+            }
+        }
         self.doomed = waiting;
         self.objects = kept;
+        // The index names these files' objects now, even if flushing it fails below.
+        self.written = written;
         if durable {
             sync_path(&self.dir).map_err(|err| err.context(NotDurable))?;
         }
-        Ok(written)
+        Ok(())
+    }
+
+    /// The files the last save to put its index in place wrote objects for, by workspace
+    /// path, with the version saved and where its bytes are now: the serving process
+    /// reads them from there from now on (see [`Workspace::store`]). They are kept until
+    /// taken, even when that save then failed to flush the index to disk.
+    pub fn take_written(&mut self) -> Written {
+        std::mem::take(&mut self.written)
     }
 
     /// The entry for a file or directory, writing its bytes to a new object unless the
@@ -752,7 +778,8 @@ mod tests {
 
     /// Save `ws` and read its saved files from disk from now on, as a mount does.
     fn save_and_store(saved: &mut Saved, ws: &mut Workspace) {
-        for (path, version, stored) in saved.save(&snap(ws), &root(), false).unwrap() {
+        saved.save(&snap(ws), &root(), false).unwrap();
+        for (path, version, stored) in saved.take_written() {
             assert!(ws.store(path.as_str(), version, stored).unwrap());
         }
     }
@@ -764,7 +791,8 @@ mod tests {
         ws.write("/mnt/a.txt", "changed").unwrap();
         ws.write("/mnt/big.bin", vec![7u8; 1 << 20]).unwrap();
         let mut saved = Saved::new(state.path());
-        let written = saved.save(&snap(&ws), &root(), false).unwrap();
+        saved.save(&snap(&ws), &root(), false).unwrap();
+        let written = saved.take_written();
         let paths: Vec<&str> = written.iter().map(|(path, _, _)| path.as_str()).collect();
         assert_eq!(paths, ["/mnt/a.txt", "/mnt/big.bin"], "the save says which files it wrote");
 
@@ -790,7 +818,8 @@ mod tests {
         ws.rename("/mnt/out", "/mnt/release").unwrap();
         ws.copy("/mnt/release/app.bin", "/mnt/app", false).unwrap();
         ws.set_executable("/mnt/app", true).unwrap();
-        assert!(saved.save(&snap(&ws), &root(), false).unwrap().is_empty(), "every file kept its object");
+        saved.save(&snap(&ws), &root(), false).unwrap();
+        assert!(saved.take_written().is_empty(), "every file kept its object");
         assert_eq!(objects(state.path()), ["1"]);
 
         let mut loaded = base();
@@ -821,6 +850,25 @@ mod tests {
         save_and_store(&mut saved, &mut ws);
         assert_eq!(objects(state.path()), ["2"], "and goes once nothing reads from it");
         assert_eq!(ws.read_text("/mnt/log.txt").unwrap(), "second");
+    }
+
+    #[test]
+    fn an_object_two_replaced_copies_read_from_still_goes() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/a.txt", "shared").unwrap();
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        // The copy reuses a.txt's object, so both files name object 1.
+        ws.copy("/mnt/a.txt", "/mnt/b.txt", false).unwrap();
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["1"]);
+
+        ws.write("/mnt/a.txt", "new a").unwrap();
+        ws.write("/mnt/b.txt", "new b").unwrap();
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["2", "3"], "object 1 goes once neither file reads it");
     }
 
     #[test]

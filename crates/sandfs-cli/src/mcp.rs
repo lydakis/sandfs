@@ -114,10 +114,8 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             let snapshot = Snapshot { ws: ws.fork(), times: times.clone(), dirs: dirs.clone() };
             let result = saved.save(&snapshot, &root, true);
             // Saved files are read from disk from now on.
-            if let Ok(written) = &result {
-                for (path, version, stored) in written {
-                    let _ = server.workspace_mut().store(path.as_str(), *version, stored.clone());
-                }
+            for (path, version, stored) in saved.take_written() {
+                let _ = server.workspace_mut().store(path.as_str(), version, stored);
             }
             if let Err(err) = result {
                 // Past the point where the new index is in place, the change stays: a
