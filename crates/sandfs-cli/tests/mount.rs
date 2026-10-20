@@ -133,6 +133,7 @@ fn mount_fork_changes_and_remount() {
     std::fs::write(fix.join("fix.txt"), "only in the fork\n").unwrap();
     assert!(!main.join("fix.txt").exists());
     assert!(sandfs.stdout(&["changes", fix.to_str().unwrap()]).contains("A fix.txt\n"));
+    assert_eq!(sandfs.stdout(&["changes", "fix", "--since", "main"]), "A fix.txt\n", "only the fork's own work");
 
     // Changes survive unmounting and mounting again.
     sandfs.unmount(&main);

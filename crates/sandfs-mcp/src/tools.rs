@@ -27,11 +27,13 @@ type ToolResult = Result<String, String>;
 /// The workspace an MCP session works on.
 pub(crate) struct Tools {
     pub(crate) workspace: Workspace,
+    /// What `changes` compares against, when not the mounted sources.
+    pub(crate) since: Option<Workspace>,
 }
 
 impl Tools {
     pub(crate) fn new(workspace: Workspace) -> Self {
-        Tools { workspace }
+        Tools { workspace, since: None }
     }
 
     /// Run a tool; `None` means there is no tool with that name.
@@ -400,7 +402,11 @@ impl Tools {
     fn changes(&self, args: &Args) -> ToolResult {
         let scope = VPath::parse(&args.opt_path("path")?).map_err(err)?;
         let mut lines = Vec::new();
-        for change in self.workspace.changes().map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
+        let changes = match &self.since {
+            Some(base) => self.workspace.changes_since(base),
+            None => self.workspace.changes(),
+        };
+        for change in changes.map_err(err)?.iter().filter(|change| change.path.starts_with(&scope)) {
             let path = change.path.as_str();
             lines.push(match change.kind {
                 ChangeKind::Deleted => format!("D {}", shown(path)),
@@ -817,8 +823,8 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "changes",
-            "description": "List the files changed against the mounted sources: added (A), modified (M) or deleted \
-                (D), with their size. Read a file to see its new contents.",
+            "description": "List the files changed in this workspace: added (A), modified (M) or deleted (D), with \
+                their size. Read a file to see its new contents.",
             "inputSchema": { "type": "object", "properties": {
                 "path": path("Only show changes at or below this path."),
             } },

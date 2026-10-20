@@ -215,6 +215,30 @@ def test_fork_is_isolated_and_changes_lists_changed_files() -> None:
     ]
 
 
+def test_changes_since_a_checkpoint_compare_two_attempts() -> None:
+    ws = Workspace()
+    ws.mount("/data", MemorySource({"rows.csv": "a,b\n1,2\n"}))
+    ws.write("/data/rows.csv", "a,b\n1,2\n3,4\n")
+    checkpoint = ws.fork()
+
+    left, right = checkpoint.fork(), checkpoint.fork()
+    left.write("/data/clean.csv", "a,b\n")
+    right.remove("/data/rows.csv")
+
+    assert [(c.path, c.kind) for c in left.changes(since=checkpoint)] == [
+        ("/data/clean.csv", "added")
+    ]
+    assert [(c.path, c.kind) for c in right.changes(checkpoint)] == [("/data/rows.csv", "deleted")]
+    assert [(c.path, c.kind) for c in left.changes(since=right)] == [
+        ("/data/clean.csv", "added"),
+        ("/data/rows.csv", "added"),
+    ]
+    assert [(c.path, c.kind) for c in left.changes()] == [
+        ("/data/clean.csv", "added"),
+        ("/data/rows.csv", "modified"),
+    ]
+
+
 def test_git_source_reads_any_revision_without_a_checkout(tmp_path: Path) -> None:
     def git(*args: str) -> None:
         subprocess.run(

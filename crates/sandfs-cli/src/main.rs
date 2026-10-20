@@ -86,6 +86,10 @@ enum Cmd {
     Changes {
         /// A workspace name or the directory it is mounted on.
         workspace: String,
+        /// Compare against this workspace instead of the source: a fork kept as a
+        /// checkpoint, or another attempt forked from the same one.
+        #[arg(long, value_name = "WORKSPACE")]
+        since: Option<String>,
     },
     /// List workspaces and where they are mounted.
     List,
@@ -168,15 +172,30 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Changes { workspace } => {
+        Cmd::Changes { workspace, since } => {
             let name = home.find(&workspace)?;
             sync(&home, &name)?;
+            let since = since.map(|since| home.find(&since)).transpose()?;
+            if let Some(since) = &since {
+                sync(&home, since)?;
+            }
             // Saved files are read as needed, and a mount saving meanwhile may replace
             // one; reading again from the newer save works.
             let mut attempts = 0;
             let (opened, changes) = loop {
-                let opened = home.open(&name)?;
-                match opened.ws.changes() {
+                let (opened, changes) = match &since {
+                    Some(since) => {
+                        let (opened, base) = home.open_pair(&name, since)?;
+                        let changes = opened.ws.changes_since(&base.ws);
+                        (opened, changes)
+                    }
+                    None => {
+                        let opened = home.open(&name)?;
+                        let changes = opened.ws.changes();
+                        (opened, changes)
+                    }
+                };
+                match changes {
                     Ok(changes) => break (opened, changes),
                     Err(err) => {
                         let err = anyhow::Error::from(err);

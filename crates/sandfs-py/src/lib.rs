@@ -502,9 +502,17 @@ impl Workspace {
         py.detach(|| inner.rename(src, dst)).or_raise()
     }
 
-    /// The files that differ from the mounts, sorted by path.
-    fn changes(&self, py: Python<'_>) -> PyResult<Vec<Change>> {
-        let changes = py.detach(|| self.inner.changes()).or_raise()?;
+    /// The files that differ from the mounts, sorted by path; with `since`, the files
+    /// that differ from that workspace, such as a fork kept as a checkpoint.
+    #[pyo3(signature = (since=None))]
+    fn changes(&self, py: Python<'_>, since: Option<PyRef<'_, Workspace>>) -> PyResult<Vec<Change>> {
+        let base = since.as_ref().map(|since| &since.inner);
+        let changes = py
+            .detach(|| match base {
+                Some(base) => self.inner.changes_since(base),
+                None => self.inner.changes(),
+            })
+            .or_raise()?;
         Ok(changes
             .into_iter()
             .map(|change| Change {

@@ -211,6 +211,19 @@ fn changes_lists_changed_files_with_sizes() {
 }
 
 #[test]
+fn changes_can_start_from_a_checkpoint() {
+    let mut checkpoint = server().into_workspace();
+    checkpoint.write("/data/plan.md", "shared plan\n").unwrap();
+    let mut s = Server::new(checkpoint.fork()).changes_since(checkpoint);
+    assert_eq!(ok(&mut s, "changes", json!({})), "No changes under /");
+    ok(&mut s, "write", json!({ "path": "/data/plan.md", "content": "my plan\n" }));
+    assert_eq!(
+        ok(&mut s, "changes", json!({})),
+        "M /data/plan.md (8 bytes)\n[A added, M modified, D deleted; read a file to see its contents]"
+    );
+}
+
+#[test]
 fn large_results_are_cut_with_a_note() {
     let mut s = server();
     let line = "x".repeat(99) + "\n";
