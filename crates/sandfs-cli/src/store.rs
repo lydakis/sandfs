@@ -33,7 +33,7 @@ use sandfs_core::{DirSource, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
 use crate::host::mount_source;
-use crate::persist::{ObjectGone, Restored, Saved};
+use crate::persist::{Restored, Saved, is_object_gone};
 
 /// Where a workspace's source is mounted inside the core workspace. The mount
 /// shows this directory as its root.
@@ -335,7 +335,7 @@ impl Home {
             let mut saved = Saved::new(self.workspace_dir(name));
             match saved.load(&mut ws, &VPath::parse(ROOT)?) {
                 Ok(restored) => return Ok(Opened { ws, saved, restored, record }),
-                Err(err) if err.downcast_ref::<ObjectGone>().is_some() && attempts < 10 => attempts += 1,
+                Err(err) if is_object_gone(&err) && attempts < 10 => attempts += 1,
                 Err(err) => return Err(err),
             }
         }
@@ -542,7 +542,8 @@ mod tests {
         writer.saved.save(&snap(&writer.ws), &root, false).unwrap();
 
         // Every save replaces the file's object, and deletes the one before last, so a
-        // reader that loads an index just before two saves finds its object gone.
+        // reader that loads an index just before two saves finds its object gone, at
+        // load or when it reads the file, and loads again.
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for i in 1..=300 {
@@ -551,7 +552,12 @@ mod tests {
                 }
             });
             for _ in 0..300 {
-                let read = home.open("ws").unwrap().ws.read_text("/mnt/count.txt").unwrap();
+                let read = loop {
+                    match home.open("ws").unwrap().ws.read_text("/mnt/count.txt") {
+                        Ok(read) => break read,
+                        Err(err) => assert!(crate::persist::is_object_gone(&err.into())),
+                    }
+                };
                 assert!(read.parse::<u32>().is_ok(), "{read:?}");
             }
         });

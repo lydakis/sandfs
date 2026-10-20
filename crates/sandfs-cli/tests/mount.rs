@@ -652,3 +652,67 @@ fn a_failed_mount_leaves_no_workspace_behind() {
     sandfs.mount(&["mount", "--name", "ws", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
     sandfs.unmount(&ws);
 }
+
+#[test]
+fn a_fork_without_a_directory_is_a_snapshot() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(data.path().join("notes.txt"), "notes\n").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let (work, back) = (dirs.path().join("work"), dirs.path().join("back"));
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), work.to_str().unwrap()], &work);
+    std::fs::write(work.join("draft.txt"), "first draft\n").unwrap();
+
+    // Taken with nothing mounted, so it costs a save and a link per saved file.
+    assert!(!sandfs.try_run(&["fork", "work"]).status.success(), "a snapshot needs a name");
+    assert_eq!(sandfs.stdout(&["fork", "work", "--name", "turn-1"]), "turn-1 forked from work\n");
+    assert!(sandfs.stdout(&["list"]).contains("turn-1\t"));
+    assert_eq!(sandfs.stdout(&["changes", "turn-1"]), "A draft.txt\n");
+
+    // The workspace goes on; the snapshot keeps the files as they were.
+    std::fs::write(work.join("draft.txt"), "second draft, longer\n").unwrap();
+    std::fs::remove_file(work.join("notes.txt")).unwrap();
+    assert_eq!(sandfs.stdout(&["changes", "work"]), "A draft.txt\nD notes.txt\n");
+    sandfs.mount(&["fork", "turn-1", back.to_str().unwrap()], &back);
+    assert_eq!(std::fs::read_to_string(back.join("draft.txt")).unwrap(), "first draft\n");
+    assert_eq!(std::fs::read_to_string(back.join("notes.txt")).unwrap(), "notes\n");
+    sandfs.unmount(&back);
+    sandfs.unmount(&work);
+}
+
+#[test]
+fn saved_files_can_be_changed_moved_and_read_again() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let work = dirs.path().join("work");
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), work.to_str().unwrap()], &work);
+    std::fs::create_dir(work.join("out")).unwrap();
+    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(work.join("out/big.bin"), &big).unwrap();
+    std::fs::write(work.join("out/log.txt"), "one\n").unwrap();
+    // `changes` saves first, so from here on both files are read from the saved copies.
+    assert_eq!(sandfs.stdout(&["changes", "work"]), "A out/big.bin\nA out/log.txt\n");
+
+    let mut log = std::fs::OpenOptions::new().append(true).open(work.join("out/log.txt")).unwrap();
+    std::io::Write::write_all(&mut log, b"two\n").unwrap();
+    drop(log);
+    std::fs::rename(work.join("out"), work.join("done")).unwrap();
+    std::fs::copy(work.join("done/big.bin"), work.join("copy.bin")).unwrap();
+    assert_eq!(std::fs::read(work.join("done/big.bin")).unwrap(), big);
+    assert_eq!(std::fs::read_to_string(work.join("done/log.txt")).unwrap(), "one\ntwo\n");
+
+    sandfs.unmount(&work);
+    sandfs.mount(&["mount", "work", work.to_str().unwrap()], &work);
+    assert_eq!(std::fs::read(work.join("done/big.bin")).unwrap(), big);
+    assert_eq!(std::fs::read(work.join("copy.bin")).unwrap(), big);
+    assert_eq!(std::fs::read_to_string(work.join("done/log.txt")).unwrap(), "one\ntwo\n");
+    assert_eq!(sandfs.stdout(&["changes", "work"]), "A copy.bin\nA done/big.bin\nA done/log.txt\n");
+    sandfs.unmount(&work);
+}

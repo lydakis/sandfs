@@ -100,13 +100,30 @@ impl Cache {
     }
 }
 
-/// File content: bytes written into the overlay, or a reference to a base file that
-/// has not been (or need not be) read. References let copies and renames of base files
-/// stay lazy.
+/// File content: bytes written into the overlay, a reference to a base file that
+/// has not been (or need not be) read, or bytes kept in a store outside memory.
+/// References let copies and renames of base files stay lazy.
 #[derive(Clone, Debug)]
 enum Content {
     Bytes(Bytes),
     Base { mount: Arc<Mount>, key: SourceKey, size: Option<u64> },
+    Stored(Stored),
+}
+
+/// Where a file's bytes are kept outside memory: a file in a source its owner manages,
+/// such as files already saved to disk. See [`Workspace::write_stored`].
+///
+/// The workspace reads a stored file from its source every time and never keeps a
+/// copy, so it costs no memory however large it is; the source (or the operating
+/// system's cache under it) decides what stays in memory.
+#[derive(Clone, Debug)]
+pub struct Stored {
+    /// The source holding the bytes. It needn't be mounted anywhere.
+    pub source: Arc<dyn Source>,
+    /// The file's key in `source`.
+    pub key: SourceKey,
+    /// The file's size in bytes.
+    pub size: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -317,6 +334,9 @@ impl Workspace {
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { content: Content::Bytes(bytes), .. } => Ok(slice(&bytes, offset, len)),
+            Resolved::File { content: Content::Stored(stored), .. } => {
+                stored.source.read_range(&stored.key, offset, len)
+            }
             Resolved::File { content: Content::Base { mount, key, .. }, .. } => {
                 match self.cache.peek_blob(&(mount.id, key.clone())) {
                     Some(bytes) => Ok(slice(&bytes, offset, len)),
@@ -393,7 +413,46 @@ impl Workspace {
         self.write_checked(path, data, Some(expected))
     }
 
+    /// Write a file whose bytes stay in `stored`'s source, read from there whenever the
+    /// file is read and never copied into memory. Returns the new version. The source
+    /// must keep answering for the key while this workspace, or a fork of it, has the
+    /// file.
+    pub fn write_stored(&mut self, path: &str, stored: Stored) -> Result<u64> {
+        self.write_content(path, Content::Stored(stored), None)
+    }
+
+    /// Read the file at `path` from `stored` from now on instead of from memory, if it
+    /// still has `version`, which it keeps: the caller vouches that `stored` holds
+    /// exactly the file's bytes. Returns whether it did. This is how a file already
+    /// saved elsewhere stops taking memory.
+    pub fn store(&mut self, path: &str, version: u64, stored: Stored) -> Result<bool> {
+        let path = VPath::parse(path)?;
+        match self.overlay.get(&path) {
+            Some(Overlay::File { version: current, kind, .. }) if *current == version => {
+                let kind = *kind;
+                self.overlay.insert(path, Overlay::File { content: Content::Stored(stored), kind, version });
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Where the file at `path` is stored outside memory, if it is: written with
+    /// [`Workspace::write_stored`] or moved there with [`Workspace::store`], or a copy
+    /// or move of such a file.
+    pub fn stored(&self, path: &str) -> Result<Option<Stored>> {
+        let path = VPath::parse(path)?;
+        Ok(match self.resolve(&path)? {
+            Resolved::File { content: Content::Stored(stored), .. } => Some(stored),
+            _ => None,
+        })
+    }
+
     fn write_checked(&mut self, path: &str, data: impl Into<Bytes>, expected: Option<u64>) -> Result<u64> {
+        self.write_content(path, Content::Bytes(data.into()), expected)
+    }
+
+    fn write_content(&mut self, path: &str, content: Content, expected: Option<u64>) -> Result<u64> {
         let path = VPath::parse(path)?;
         let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
         let (kind, version) = match self.resolve(&path) {
@@ -408,7 +467,6 @@ impl Workspace {
             }
         }
         self.ensure_dir(&parent)?;
-        let content = Content::Bytes(data.into());
         let version = self.tick();
         self.overlay.insert(path, Overlay::File { content, kind, version });
         Ok(version)
@@ -816,6 +874,7 @@ impl Workspace {
             Content::Base { mount, key, .. } => {
                 Cache::get_or_load(&self.cache.blobs, (mount.id, key.clone()), || mount.source.read_file(key))
             }
+            Content::Stored(stored) => stored.source.read_file(&stored.key),
         }
     }
 
@@ -1030,5 +1089,6 @@ fn content_size(content: &Content) -> Option<u64> {
     match content {
         Content::Bytes(bytes) => Some(bytes.len() as u64),
         Content::Base { size, .. } => *size,
+        Content::Stored(stored) => Some(stored.size),
     }
 }
