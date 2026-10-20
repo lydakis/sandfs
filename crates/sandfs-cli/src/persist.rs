@@ -835,12 +835,15 @@ impl Saved {
         }
 
         let Saving { kept, written, pack, .. } = saving;
-        if let Some(PackWriter { file, name, size, objects, unfinished }) = pack {
-            file.into_inner().map_err(|err| err.into_error()).context("writing a saved file")?;
-            unfinished.finished();
-            self.unsynced.insert(name.to_string());
-            self.packs.insert(name.to_string(), Pack { size, objects, unnamed: false });
-        }
+        // The pack stays the save's to delete until the index naming it is in place.
+        let pack = match pack {
+            Some(PackWriter { file, name, size, objects, unfinished }) => {
+                file.into_inner().map_err(|err| err.into_error()).context("writing a saved file")?;
+                self.unsynced.insert(name.to_string());
+                Some((name, Pack { size, objects, unnamed: false }, unfinished))
+            }
+            None => None,
+        };
         let index = serde_json::to_vec(&Changes { entries, next: self.store.next.load(Ordering::SeqCst) })?;
         let tmp = self.dir.join("changes.json.tmp");
         if durable {
@@ -865,6 +868,10 @@ impl Saved {
             sync_path(&tmp)?;
         }
         std::fs::rename(&tmp, self.index_path()).context("writing changes.json")?;
+        if let Some((name, pack, unfinished)) = pack {
+            unfinished.finished();
+            self.packs.insert(name.to_string(), pack);
+        }
 
         // The new index is in place: objects replaced by the save before this one are
         // now two indexes old. One that a file here still reads from waits until none does.
@@ -1917,6 +1924,15 @@ mod tests {
         let mut saved = Saved::new(state.path());
         assert!(saved.save(&snap(&ws), &root(), false).is_err());
         assert!(objects(state.path()).is_empty(), "{:?}", objects(state.path()));
+
+        // Nor one whose index could not be written.
+        ws.remove("/mnt/b.txt", false).unwrap();
+        std::fs::create_dir(state.path().join("changes.json.tmp")).unwrap();
+        assert!(saved.save(&snap(&ws), &root(), false).is_err());
+        assert!(objects(state.path()).is_empty(), "{:?}", objects(state.path()));
+        std::fs::remove_dir(state.path().join("changes.json.tmp")).unwrap();
+        saved.save(&snap(&ws), &root(), false).unwrap();
+        assert_eq!(objects(state.path()).len(), 1);
     }
 
     #[test]
