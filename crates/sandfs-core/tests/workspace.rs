@@ -547,6 +547,62 @@ fn symlinks_are_stored_and_never_followed() {
 }
 
 #[test]
+fn hard_links_share_one_file_until_every_name_is_gone() {
+    let (mut ws, source) = workspace();
+    ws.write("/repo/build/out.o", "v1").unwrap();
+    ws.hard_link("/repo/build/out.o", "/repo/cache/out.o").unwrap();
+    let names = |ws: &Workspace, path: &str| -> Vec<String> {
+        ws.hard_links(path).unwrap().iter().map(ToString::to_string).collect()
+    };
+    assert_eq!(names(&ws, "/repo/cache/out.o"), ["/repo/build/out.o", "/repo/cache/out.o"]);
+    assert_eq!(names(&ws, "/repo/README.md"), ["/repo/README.md"]);
+
+    // A write through one name is seen through the other, with one version.
+    let version = ws.write("/repo/cache/out.o", "v2").unwrap();
+    assert_eq!(ws.read_text("/repo/build/out.o").unwrap(), "v2");
+    assert_eq!(ws.stat("/repo/build/out.o").unwrap().version, version);
+    ws.set_executable("/repo/build/out.o", true).unwrap();
+    assert_eq!(ws.stat("/repo/cache/out.o").unwrap().kind, Kind::File { executable: true });
+
+    // A fork changes its own copy, and a plain copy is a new file.
+    let mut attempt = ws.fork();
+    attempt.write("/repo/build/out.o", "fork").unwrap();
+    assert_eq!(ws.read_text("/repo/cache/out.o").unwrap(), "v2");
+    assert_eq!(attempt.read_text("/repo/cache/out.o").unwrap(), "fork");
+    ws.copy("/repo/build/out.o", "/repo/copy.o", false).unwrap();
+    ws.write("/repo/copy.o", "copy").unwrap();
+    assert_eq!(ws.read_text("/repo/build/out.o").unwrap(), "v2");
+
+    // Moving a name, or its folder, keeps the link; removing one keeps the other.
+    ws.rename("/repo/cache", "/repo/kept").unwrap();
+    ws.write("/repo/kept/out.o", "v3").unwrap();
+    assert_eq!(ws.read_text("/repo/build/out.o").unwrap(), "v3");
+    ws.remove("/repo/build", true).unwrap();
+    assert_eq!(names(&ws, "/repo/kept/out.o"), ["/repo/kept/out.o"]);
+    assert!(!ws.has_hard_links(), "a file left with one name is an ordinary file");
+    assert_eq!(ws.read_text("/repo/kept/out.o").unwrap(), "v3");
+
+    // A base file can be linked without being read; only the new name is a change.
+    ws.hard_link("/repo/docs/guide.md", "/repo/guide.md").unwrap();
+    assert!(ws.has_hard_links());
+    assert_eq!(source.files.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        changes(&ws),
+        [
+            ("/repo/copy.o".into(), ChangeKind::Added),
+            ("/repo/guide.md".into(), ChangeKind::Added),
+            ("/repo/kept/out.o".into(), ChangeKind::Added),
+        ]
+    );
+    ws.write("/repo/guide.md", "edited").unwrap();
+    assert!(changes(&ws).contains(&("/repo/docs/guide.md".into(), ChangeKind::Modified)), "the base name changed too");
+
+    assert!(matches!(ws.hard_link("/repo/src", "/repo/src2"), Err(Error::IsADirectory(_))));
+    assert!(matches!(ws.hard_link("/repo/README.md", "/repo/copy.o"), Err(Error::AlreadyExists(_))));
+    assert!(matches!(ws.hard_link("/repo/missing", "/repo/x"), Err(Error::NotFound(_))));
+}
+
+#[test]
 fn a_link_replacing_a_base_file_is_a_modification() {
     let (mut ws, _) = workspace();
     ws.remove("/repo/README.md", false).unwrap();
@@ -863,6 +919,13 @@ fn storing_a_file_keeps_its_version_unless_it_changed_since() {
     let version = ws.set_executable("/data/run.sh", true).unwrap().max(version);
     assert!(ws.store("/data/run.sh", version, stored(&saved, "2", 9)).unwrap());
     assert_eq!(ws.stat("/data/run.sh").unwrap().kind, Kind::File { executable: true });
+
+    // Storing one name of a linked file stores the file every name shares.
+    ws.hard_link("/data/run.sh", "/data/run-link.sh").unwrap();
+    let version = ws.write("/data/run-link.sh", "draft one").unwrap();
+    assert!(ws.store("/data/run.sh", version, stored(&saved, "1", 9)).unwrap());
+    assert_eq!(&*ws.stored("/data/run-link.sh").unwrap().unwrap().key, "1");
+    assert_eq!(ws.hard_links("/data/run.sh").unwrap().len(), 2, "still one file");
 }
 
 #[test]

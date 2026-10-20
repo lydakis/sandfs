@@ -425,6 +425,20 @@ impl Workspace {
         py.detach(|| inner.symlink(path, target)).or_raise()
     }
 
+    /// Give the file at `src` a second name, `dst`, like a hard link: a write through
+    /// either name is seen through both, and removing one leaves the other. A copy or
+    /// a fork doesn't share the file.
+    fn hard_link(&mut self, py: Python<'_>, src: &str, dst: &str) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.hard_link(src, dst)).or_raise()
+    }
+
+    /// Every path naming the file at `path`, itself included, sorted.
+    fn hard_links(&self, py: Python<'_>, path: &str) -> PyResult<Vec<String>> {
+        let names = py.detach(|| self.inner.hard_links(path)).or_raise()?;
+        Ok(names.iter().map(ToString::to_string).collect())
+    }
+
     /// The contents of the file at `path` as UTF-8 text; raises `ValueError` if it is not text.
     fn read_text(&self, py: Python<'_>, path: &str) -> PyResult<String> {
         py.detach(|| self.inner.read_text(path)).or_raise()

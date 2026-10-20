@@ -45,6 +45,10 @@ enum Entry {
         object: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<Time>,
+        /// Another name of the same file (a hard link), earlier in the index or
+        /// unchanged in the source. Loading links the two instead of reading the object.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     Dir {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +59,9 @@ enum Entry {
         target: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<Time>,
+        /// Another name of the same link, as for a file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     /// Removed: a deleted base file or directory.
     Absent,
@@ -493,7 +500,7 @@ impl Saved {
                 }
                 _ => None,
             };
-            self.apply(ws, &path, entry, object.clone()).with_context(|| format!("restoring {rel}"))?;
+            self.apply(ws, root, &path, entry, object.clone()).with_context(|| format!("restoring {rel}"))?;
             let mtime = match entry {
                 Entry::File { mtime, .. } | Entry::Dir { mtime } | Entry::Symlink { mtime, .. } => *mtime,
                 Entry::Absent => None,
@@ -542,8 +549,16 @@ impl Saved {
         self.store.next.fetch_max(last + 1, Ordering::SeqCst);
     }
 
-    /// Replay one entry; a file reads from `object`, its object's shared name.
-    fn apply(&self, ws: &mut Workspace, path: &VPath, entry: &Entry, object: Option<SourceKey>) -> Result<()> {
+    /// Replay one entry; a file reads from `object`, its object's shared name, unless
+    /// it is another name of a file already restored.
+    fn apply(
+        &self,
+        ws: &mut Workspace,
+        root: &VPath,
+        path: &VPath,
+        entry: &Entry,
+        object: Option<SourceKey>,
+    ) -> Result<()> {
         let p = path.as_str();
         let current = match ws.stat(p) {
             Ok(meta) => Some(meta.kind),
@@ -566,6 +581,8 @@ impl Saved {
                 }
                 None => ws.mkdir(p, true)?,
             },
+            Entry::File { link: Some(other), .. } | Entry::Symlink { link: Some(other), .. }
+                if self.relink(ws, root, path, other, current)? => {}
             Entry::Symlink { target, .. } => {
                 if current.is_some() {
                     ws.remove(p, true)?;
@@ -595,6 +612,28 @@ impl Saved {
         Ok(())
     }
 
+    /// Make `path` another name of the file at `other` (relative to `root`), if that
+    /// is still a file. False when it isn't, so the file is read from its object.
+    fn relink(
+        &self,
+        ws: &mut Workspace,
+        root: &VPath,
+        path: &VPath,
+        other: &str,
+        current: Option<Kind>,
+    ) -> Result<bool> {
+        let other = under(root, other)?;
+        match ws.stat(other.as_str()) {
+            Ok(meta) if !meta.kind.is_dir() => {}
+            _ => return Ok(false),
+        }
+        if current.is_some() {
+            ws.remove(path.as_str(), true)?;
+        }
+        ws.hard_link(other.as_str(), path.as_str())?;
+        Ok(true)
+    }
+
     /// Save `snap`, whose source is mounted at `root`. A `durable` save, which answers
     /// `fsync`, also flushes the index and every object it names to disk before returning.
     /// [`Saved::take_written`] then says which files it wrote objects for.
@@ -607,12 +646,15 @@ impl Saved {
         let mut entries = BTreeMap::new();
         let mut kept = HashMap::new();
         let mut written = Written::new();
-        for change in snap.ws.changes()? {
+        let changes = snap.ws.changes()?;
+        let changed: HashSet<&VPath> = changes.iter().map(|change| &change.path).collect();
+        for change in &changes {
             let rel = relative(root, &change.path)?;
             let entry = match change.kind {
                 ChangeKind::Deleted => Entry::Absent,
                 ChangeKind::Added | ChangeKind::Modified => {
-                    self.entry(snap, &change.path, &rel, &mut kept, &mut written)?
+                    let link = linked_name(snap, root, &changed, &change.path)?;
+                    self.entry(snap, &change.path, &rel, link, &mut kept, &mut written)?
                 }
             };
             entries.insert(rel, entry);
@@ -624,7 +666,10 @@ impl Saved {
                 // A directory that replaced a deleted base file overrides its deletion.
                 Ok(meta) if meta.kind.is_dir() => Entry::Dir { mtime: snap.times.get(dir).map(|t| to_time(*t)) },
                 _ if entries.contains_key(&rel) => continue,
-                Ok(_) => self.entry(snap, &path, &rel, &mut kept, &mut written)?,
+                Ok(_) => {
+                    let link = linked_name(snap, root, &changed, &path)?;
+                    self.entry(snap, &path, &rel, link, &mut kept, &mut written)?
+                }
                 // Gone, or below a file that replaced one of its parents.
                 Err(Error::NotFound(_) | Error::NotADirectory(_)) => Entry::Absent,
                 Err(err) => return Err(err.into()),
@@ -705,6 +750,7 @@ impl Saved {
         snap: &Snapshot,
         path: &VPath,
         rel: &str,
+        link: Option<String>,
         kept: &mut HashMap<String, (u64, SourceKey)>,
         written: &mut Written,
     ) -> Result<Entry> {
@@ -713,10 +759,20 @@ impl Saved {
         let mtime = snap.times.get(p).map(|t| to_time(*t));
         match meta.kind {
             Kind::Dir => Ok(Entry::Dir { mtime }),
-            Kind::Symlink => Ok(Entry::Symlink { target: snap.ws.read_link(p)?, mtime }),
+            Kind::Symlink => Ok(Entry::Symlink { target: snap.ws.read_link(p)?, mtime, link }),
             Kind::File { executable } => {
-                let object = match self.objects.get(rel) {
-                    Some((version, object)) if *version == meta.version => object.clone(),
+                // A hard-linked file shares the object of the name it links to.
+                let shared = link.as_ref().and_then(|first| kept.get(first)).filter(|(v, _)| *v == meta.version);
+                let object = match (shared, self.objects.get(rel)) {
+                    (Some((_, object)), _) => {
+                        // If this save wrote it, every name may move it out of memory, so
+                        // removing the first name meanwhile doesn't keep it there.
+                        if let Some((_, _, stored)) = written.iter().rev().find(|(.., stored)| stored.key == *object) {
+                            written.push((path.clone(), meta.version, stored.clone()));
+                        }
+                        object.clone()
+                    }
+                    (None, Some((version, object))) if *version == meta.version => object.clone(),
                     // A saved file moved, copied or made executable keeps its object.
                     _ => match snap.ws.stored(p)? {
                         Some(stored) if self.is_ours(&stored) => stored.key,
@@ -730,7 +786,7 @@ impl Saved {
                     },
                 };
                 kept.insert(rel.to_owned(), (meta.version, object.clone()));
-                Ok(Entry::File { executable, object: object.to_string(), mtime })
+                Ok(Entry::File { executable, object: object.to_string(), mtime, link })
             }
         }
     }
@@ -794,6 +850,20 @@ fn check_object(object: &str) -> Result<()> {
 }
 
 /// `path` relative to `root`, as stored in the index.
+/// For a file with other names (hard links), the one loading restores first, relative
+/// to `root`: a name saved before `path`, or one unchanged in the source.
+fn linked_name(snap: &Snapshot, root: &VPath, changed: &HashSet<&VPath>, path: &VPath) -> Result<Option<String>> {
+    if !snap.ws.has_hard_links() {
+        return Ok(None);
+    }
+    let names = snap.ws.hard_links(path.as_str())?;
+    // A name saved earlier comes first: an unchanged one may be gone from a host folder
+    // by the next load, and then only the first name saved relinks to it.
+    let saved = names.iter().find(|other| *other < path && changed.contains(other));
+    let first = saved.or_else(|| names.iter().find(|other| *other != path && !changed.contains(other)));
+    Ok(first.and_then(|first| relative(root, first).ok()))
+}
+
 fn relative(root: &VPath, path: &VPath) -> Result<String> {
     match path.strip_prefix(root) {
         Some(parts) if !parts.is_empty() => Ok(parts.join("/")),
@@ -891,6 +961,45 @@ mod tests {
         assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
         assert_eq!(restored.times["/mnt/a.txt"], mtime);
         assert!(restored.dirs.contains("/mnt/empty"));
+    }
+
+    #[test]
+    fn hard_links_survive_a_save_and_load() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/out/lib.rlib", "built").unwrap();
+        ws.hard_link("/mnt/out/lib.rlib", "/mnt/cache/lib.rlib").unwrap();
+        ws.hard_link("/mnt/out/lib.rlib", "/mnt/out/lib2.rlib").unwrap();
+        ws.hard_link("/mnt/a.txt", "/mnt/a-link.txt").unwrap();
+        ws.hard_link("/mnt/a.txt", "/mnt/z-link.txt").unwrap();
+        ws.symlink("/mnt/sym", "a.txt").unwrap();
+        ws.hard_link("/mnt/sym", "/mnt/sym2").unwrap();
+        let dirs = ["/mnt/cache", "/mnt/out"].map(str::to_owned).into();
+
+        let mut saved = Saved::new(state.path());
+        saved.save(&Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs }, &root(), false).unwrap();
+        assert_eq!(saved.objects.len(), 5);
+        let objects: HashSet<&SourceKey> = saved.objects.values().map(|(_, object)| object).collect();
+        // The second new name of a.txt links to the first, which a load can relink even
+        // if a.txt is gone from the source by then.
+        assert_eq!(objects.len(), 2, "the names of one file share an object");
+        let mut written: Vec<String> = saved.take_written().iter().map(|(path, ..)| path.to_string()).collect();
+        written.sort();
+        assert_eq!(
+            written,
+            ["/mnt/a-link.txt", "/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib", "/mnt/z-link.txt"],
+            "any name can move the file out of memory"
+        );
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        let names = |path: &str| loaded.hard_links(path).unwrap().iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(names("/mnt/out/lib.rlib"), ["/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib"]);
+        assert_eq!(names("/mnt/a-link.txt"), ["/mnt/a-link.txt", "/mnt/a.txt", "/mnt/z-link.txt"]);
+        assert_eq!(names("/mnt/sym2"), ["/mnt/sym", "/mnt/sym2"], "a link's names stay one link");
+        assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
+        loaded.write("/mnt/cache/lib.rlib", "rebuilt").unwrap();
+        assert_eq!(loaded.read_text("/mnt/out/lib2.rlib").unwrap(), "rebuilt");
     }
 
     #[test]

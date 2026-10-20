@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use imbl::OrdMap;
+use imbl::{OrdMap, OrdSet};
 
 use crate::change::{Change, ChangeKind};
 use crate::error::{Error, Result};
@@ -133,6 +133,11 @@ enum Overlay {
         kind: Kind,
         version: u64,
     },
+    /// One name of a file with several (hard links). The file itself is in
+    /// [`Workspace`]'s `links`, so a write through any name is seen through all of them.
+    Linked {
+        id: u64,
+    },
     /// `opaque` directories were deleted and recreated: base entries below are hidden.
     Dir {
         opaque: bool,
@@ -142,6 +147,16 @@ enum Overlay {
     Deleted {
         version: u64,
     },
+}
+
+/// A file with several names, made by [`Workspace::hard_link`].
+#[derive(Clone, Debug)]
+struct Linked {
+    content: Content,
+    kind: Kind,
+    version: u64,
+    /// Every path naming it.
+    names: OrdSet<VPath>,
 }
 
 /// Where a path's base (pre-overlay) node comes from.
@@ -220,6 +235,8 @@ struct Reading {
 pub struct Workspace {
     mounts: OrdMap<VPath, Arc<Mount>>,
     overlay: OrdMap<VPath, Overlay>,
+    /// Files with several names, by the id their [`Overlay::Linked`] entries share.
+    links: OrdMap<u64, Linked>,
     cache: Arc<Cache>,
     walks: Arc<Mutex<Walks>>,
     /// The last version handed out.
@@ -390,6 +407,60 @@ impl Workspace {
         Ok(version)
     }
 
+    /// Give the file at `from` a second name, `to`, creating missing parent
+    /// directories, like a hard link: a write through either name is seen through
+    /// both, and removing one leaves the other. `to` must not exist yet.
+    ///
+    /// Copies and forks don't share the file: a copy is a new file, and each fork
+    /// changes its own.
+    pub fn hard_link(&mut self, from: &str, to: &str) -> Result<()> {
+        let from = VPath::parse(from)?;
+        let to = VPath::parse(to)?;
+        let (content, kind, version) = match self.resolve(&from)? {
+            Resolved::Dir { .. } => return Err(Error::IsADirectory(from.to_string())),
+            Resolved::File { content, kind, version } => (content, kind, version),
+        };
+        match self.resolve(&to) {
+            Err(Error::NotFound(_)) => {}
+            Ok(_) => return Err(Error::AlreadyExists(to.to_string())),
+            Err(err) => return Err(err),
+        }
+        let parent = to.parent().ok_or_else(|| Error::AlreadyExists(to.to_string()))?;
+        self.ensure_dir(&parent)?;
+        let id = match self.overlay.get(&from) {
+            Some(Overlay::Linked { id }) => *id,
+            _ => {
+                let id = self.tick();
+                let names = OrdSet::unit(from.clone());
+                self.links.insert(id, Linked { content, kind, version, names });
+                self.overlay.insert(from, Overlay::Linked { id });
+                id
+            }
+        };
+        self.link_name(id, to);
+        Ok(())
+    }
+
+    /// Every path naming the file at `path`, itself included, sorted: more than one
+    /// after a [`Workspace::hard_link`].
+    pub fn hard_links(&self, path: &str) -> Result<Vec<VPath>> {
+        let path = VPath::parse(path)?;
+        if let Resolved::Dir { .. } = self.resolve(&path)? {
+            return Err(Error::IsADirectory(path.to_string()));
+        }
+        Ok(match self.overlay.get(&path) {
+            Some(Overlay::Linked { id }) => self.links.get(id).map(|linked| linked.names.iter().cloned().collect()),
+            _ => None,
+        }
+        .unwrap_or_else(|| vec![path]))
+    }
+
+    /// Whether any file has several names, so callers that track files by path (a
+    /// mount handing out inode numbers) know when [`Workspace::hard_links`] matters.
+    pub fn has_hard_links(&self) -> bool {
+        !self.links.is_empty()
+    }
+
     /// Read a file as UTF-8 text.
     pub fn read_text(&self, path: &str) -> Result<String> {
         let bytes = self.read(path)?;
@@ -433,9 +504,10 @@ impl Workspace {
                 Overlay::Dir { .. } => {
                     entries.insert(name.clone(), DirEntry { name, kind: Kind::Dir, size: None });
                 }
-                Overlay::File { content, kind, .. } => {
-                    let size = content_size(content);
-                    entries.insert(name.clone(), DirEntry { name, kind: *kind, size });
+                Overlay::File { .. } | Overlay::Linked { .. } => {
+                    let (content, kind, _) = self.overlay_file(entry).expect("a file entry");
+                    let size = content_size(&content);
+                    entries.insert(name.clone(), DirEntry { name, kind, size });
                 }
             }
         }
@@ -466,10 +538,10 @@ impl Workspace {
     /// saved elsewhere stops taking memory.
     pub fn store(&mut self, path: &str, version: u64, stored: Stored) -> Result<bool> {
         let path = VPath::parse(path)?;
-        match self.overlay.get(&path) {
-            Some(Overlay::File { version: current, kind, .. }) if *current == version => {
-                let kind = *kind;
-                self.overlay.insert(path, Overlay::File { content: Content::Stored(stored), kind, version });
+        // Through a hard link, every name of the file reads from `stored`.
+        match self.overlay.get(&path).and_then(|entry| self.overlay_file(entry)) {
+            Some((_, kind, current)) if current == version => {
+                self.put_file(path, Content::Stored(stored), kind, version);
                 Ok(true)
             }
             _ => Ok(false),
@@ -508,7 +580,7 @@ impl Workspace {
         }
         self.ensure_dir(&parent)?;
         let version = self.tick();
-        self.overlay.insert(path, Overlay::File { content, kind, version });
+        self.put_file(path, content, kind, version);
         Ok(version)
     }
 
@@ -522,7 +594,7 @@ impl Workspace {
             Resolved::File { kind, version, .. } if kind == (Kind::File { executable }) => Ok(version),
             Resolved::File { content, .. } => {
                 let version = self.tick();
-                self.overlay.insert(path, Overlay::File { content, kind: Kind::File { executable }, version });
+                self.put_file(path, content, Kind::File { executable }, version);
                 Ok(version)
             }
         }
@@ -571,7 +643,7 @@ impl Workspace {
             return Err(Error::IsADirectory(from.to_string()));
         }
         self.check_destination(&from, &to)?;
-        self.atomically(|ws| ws.copy_tree(&from, &to))
+        self.atomically(|ws| ws.copy_tree(&from, &to, false))
     }
 
     /// Move or rename a file or directory tree. The destination must not exist.
@@ -582,7 +654,7 @@ impl Workspace {
         self.resolve(&from_path)?;
         self.check_destination(&from_path, &to_path)?;
         self.atomically(|ws| {
-            ws.copy_tree(&from_path, &to_path)?;
+            ws.copy_tree(&from_path, &to_path, true)?;
             ws.remove_unchecked(&from_path);
             Ok(())
         })
@@ -593,8 +665,10 @@ impl Workspace {
     /// Only files and symbolic links are reported; an empty directory is not a change.
     /// A file written back with the bytes it had is not a change either, except one of
     /// [`COMPARE_LIMIT`] bytes or more, which counts as modified without being read.
-    /// The cost is proportional to the overlay, plus listing any base directories
-    /// that were deleted, plus reading written files under that size that kept their size.
+    /// Each name of a file with several (hard links) is reported on its own, the way
+    /// it differs from the base at that path. The cost is proportional to the overlay,
+    /// plus listing any base directories that were deleted, plus reading written files
+    /// under that size that kept their size.
     pub fn changes(&self) -> Result<Vec<Change>> {
         let mut changes: BTreeMap<VPath, ChangeKind> = BTreeMap::new();
         // First every base file the overlay hides: below whiteouts, recreated
@@ -602,7 +676,9 @@ impl Workspace {
         for (path, entry) in self.overlay.iter() {
             let hides_base = match entry {
                 Overlay::Deleted { .. } | Overlay::Dir { opaque: true } => true,
-                Overlay::File { .. } => self.base_node(path)?.is_some_and(|node| node.kind().is_dir()),
+                Overlay::File { .. } | Overlay::Linked { .. } => {
+                    self.base_node(path)?.is_some_and(|node| node.kind().is_dir())
+                }
                 Overlay::Dir { opaque: false } => false,
             };
             if hides_base {
@@ -612,10 +688,10 @@ impl Workspace {
             }
         }
         for (path, entry) in self.overlay.iter() {
-            let Overlay::File { content, kind, .. } = entry else { continue };
+            let Some((content, kind, _)) = self.overlay_file(entry) else { continue };
             match self.base_node(path)? {
                 Some(BaseNode::Entry(mount, base)) if !base.kind.is_dir() => {
-                    if self.same_as_base(content, *kind, &mount, &base)? {
+                    if self.same_as_base(&content, kind, &mount, &base)? {
                         changes.remove(path);
                     } else {
                         changes.insert(path.clone(), ChangeKind::Modified);
@@ -640,7 +716,9 @@ impl Workspace {
         for ancestor in ancestors {
             match self.overlay.get(ancestor) {
                 Some(Overlay::Deleted { .. }) => return Err(Error::NotFound(path.to_string())),
-                Some(Overlay::File { .. }) => return Err(Error::NotADirectory(ancestor.to_owned())),
+                Some(Overlay::File { .. } | Overlay::Linked { .. }) => {
+                    return Err(Error::NotADirectory(ancestor.to_owned()));
+                }
                 Some(Overlay::Dir { opaque: true }) => base_hidden = true,
                 Some(Overlay::Dir { opaque: false }) | None => {}
             }
@@ -650,8 +728,9 @@ impl Workspace {
         };
         match self.overlay.get(path) {
             Some(Overlay::Deleted { .. }) => Err(Error::NotFound(path.to_string())),
-            Some(Overlay::File { content, kind, version }) => {
-                Ok(Resolved::File { content: content.clone(), kind: *kind, version: *version })
+            Some(entry @ (Overlay::File { .. } | Overlay::Linked { .. })) => {
+                let (content, kind, version) = self.overlay_file(entry).expect("a file entry");
+                Ok(Resolved::File { content, kind, version })
             }
             Some(Overlay::Dir { opaque: true }) => Ok(Resolved::Dir { base: self.structural_node(path) }),
             Some(Overlay::Dir { opaque: false }) => {
@@ -991,12 +1070,44 @@ impl Workspace {
     /// Run a multi-step change, restoring the overlay if any step fails. Saving the
     /// overlay is O(1) because it is a persistent map.
     fn atomically(&mut self, change: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        let saved = self.overlay.clone();
+        let saved = (self.overlay.clone(), self.links.clone());
         let result = change(self);
         if result.is_err() {
-            self.overlay = saved;
+            (self.overlay, self.links) = saved;
         }
         result
+    }
+
+    /// The contents, kind and version of a file entry, following a hard link to the
+    /// file it names.
+    fn overlay_file(&self, entry: &Overlay) -> Option<(Content, Kind, u64)> {
+        match entry {
+            Overlay::File { content, kind, version } => Some((content.clone(), *kind, *version)),
+            Overlay::Linked { id } => {
+                let linked = self.links.get(id)?;
+                Some((linked.content.clone(), linked.kind, linked.version))
+            }
+            Overlay::Dir { .. } | Overlay::Deleted { .. } => None,
+        }
+    }
+
+    /// Put a file at `path`: through a hard link, into the file every name shares.
+    fn put_file(&mut self, path: VPath, content: Content, kind: Kind, version: u64) {
+        if let Some(Overlay::Linked { id }) = self.overlay.get(&path) {
+            if let Some(linked) = self.links.get_mut(id) {
+                (linked.content, linked.kind, linked.version) = (content, kind, version);
+                return;
+            }
+        }
+        self.overlay.insert(path, Overlay::File { content, kind, version });
+    }
+
+    /// Add `name` to the names of the linked file `id`.
+    fn link_name(&mut self, id: u64, name: VPath) {
+        if let Some(linked) = self.links.get_mut(&id) {
+            linked.names.insert(name.clone());
+        }
+        self.overlay.insert(name, Overlay::Linked { id });
     }
 
     fn ensure_dir(&mut self, path: &VPath) -> Result<()> {
@@ -1049,7 +1160,14 @@ impl Workspace {
         }
     }
 
-    fn copy_tree(&mut self, from: &VPath, to: &VPath) -> Result<()> {
+    /// Copy `from` to `to`. A move keeps hard links: the new name joins the file's
+    /// names (the old one leaves them when it is removed). A copy is a new file.
+    fn copy_tree(&mut self, from: &VPath, to: &VPath, moving: bool) -> Result<()> {
+        if let (true, Some(Overlay::Linked { id })) = (moving, self.overlay.get(from)) {
+            let id = *id;
+            self.link_name(id, to.clone());
+            return Ok(());
+        }
         match self.resolve(from)? {
             Resolved::File { content, kind, .. } => {
                 let version = self.tick();
@@ -1058,7 +1176,7 @@ impl Workspace {
             Resolved::Dir { .. } => {
                 self.insert_dir(to.clone());
                 for entry in self.list(from.as_str())? {
-                    self.copy_tree(&from.join(&entry.name)?, &to.join(&entry.name)?)?;
+                    self.copy_tree(&from.join(&entry.name)?, &to.join(&entry.name)?, moving)?;
                 }
             }
         }
@@ -1067,8 +1185,20 @@ impl Workspace {
 
     fn remove_unchecked(&mut self, path: &VPath) {
         let doomed: Vec<VPath> = self.overlay_descendants(path).map(|(key, _)| key.clone()).collect();
-        for key in doomed {
-            self.overlay.remove(&key);
+        for key in doomed.iter().chain([path]) {
+            // A file with other names lives on under them.
+            if let Some(Overlay::Linked { id }) = self.overlay.remove(key) {
+                if let Some(linked) = self.links.get_mut(&id) {
+                    linked.names.remove(key);
+                    // A file left with one name is an ordinary file again.
+                    if linked.names.len() <= 1 {
+                        let Some(Linked { content, kind, version, names }) = self.links.remove(&id) else { continue };
+                        for name in names {
+                            self.overlay.insert(name, Overlay::File { content: content.clone(), kind, version });
+                        }
+                    }
+                }
+            }
         }
         // A whiteout is only needed when the base still has something to hide.
         let in_base = !self.base_hidden(path) && matches!(self.base_node(path), Ok(Some(_)));
