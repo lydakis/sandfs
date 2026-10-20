@@ -96,6 +96,19 @@ struct Args {
     /// The package of this repository the build table builds.
     #[arg(long, default_value = "sandfs-cli")]
     build_package: String,
+    /// Run `--build-command` in copies of this folder instead of building a package of
+    /// this repository.
+    #[arg(long, requires = "build_command")]
+    build_dir: Option<PathBuf>,
+    /// The shell command the build table runs in each copy of `--build-dir`, such as
+    /// `go test ./...` or `npm test`. Each column runs it with its own empty
+    /// `XDG_CACHE_HOME`; give a tool that keeps its cache elsewhere one inside the folder.
+    #[arg(long, requires = "build_dir")]
+    build_command: Option<String>,
+    /// A file inside `--build-dir` the build table changes (adding an empty line) before
+    /// each run after the first.
+    #[arg(long, requires = "build_dir")]
+    build_change: Option<PathBuf>,
     /// Run one remote method against listings already fetched to this directory and
     /// report it as JSON, so its memory peak is its own.
     #[arg(long, hide = true, requires = "remote_child_method")]
@@ -150,11 +163,17 @@ fn run(args: Args) -> Result<()> {
         return Ok(());
     }
     let wanted = |target: TargetArg| args.targets.as_ref().is_none_or(|list| list.contains(&target));
+    let job = match (&args.build_dir, &args.build_command) {
+        (Some(dir), Some(command)) => {
+            build::Job::Command { dir: dir.clone(), command: command.clone(), change: args.build_change.clone() }
+        }
+        _ => build::Job::Cargo { package: args.build_package.clone() },
+    };
     // The build table needs no data set, so it runs on its own.
     if args.only.as_deref() == Some(build::NAME) {
         let named = args.targets.as_ref().is_some_and(|list| list.contains(&TargetArg::Fuse));
         let (host, mount) = (wanted(TargetArg::Host), (wanted(TargetArg::Fuse), named));
-        let built = build::run(&args.build_package, &scratch, &bin, scale.iters, host, mount)?;
+        let built = build::run(&job, &scratch, &bin, scale.iters, host, mount)?;
         build::print(&built);
         if let Some(path) = &args.json {
             std::fs::write(path, serde_json::to_string_pretty(&json!({ "build": build::json(&built) }))?)?;
@@ -256,7 +275,7 @@ fn run(args: Args) -> Result<()> {
     };
     let built = if run_build {
         let (host, mount) = (wanted(TargetArg::Host), (wanted(TargetArg::Fuse), explicit(TargetArg::Fuse)));
-        Some(build::run(&args.build_package, &scratch, &bin, scale.iters, host, mount)?)
+        Some(build::run(&job, &scratch, &bin, scale.iters, host, mount)?)
     } else {
         None
     };
