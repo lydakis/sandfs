@@ -596,7 +596,10 @@ fn dir_source_lists_symlinks_without_following_them() {
     // Out through one link and back in through another, outside the folder.
     std::os::unix::fs::symlink("../escape/alias", root.join("lib/round-trip")).unwrap();
     std::os::unix::fs::symlink(root.join("escape/alias"), root.join("lib/round-trip-abs")).unwrap();
-    std::os::unix::fs::symlink(root.join("lib/alias"), root.join("lib/hop-abs")).unwrap();
+    // Spelled from the folder's real path: on macOS the temporary folder is reached
+    // through a link, and a target through one is resolved instead.
+    let real = root.canonicalize().unwrap();
+    std::os::unix::fs::symlink(real.join("lib/alias"), root.join("lib/hop-abs")).unwrap();
     std::os::unix::fs::symlink("missing/../../../root/data.csv", root.join("lib/dangling-out")).unwrap();
 
     let mut ws = Workspace::new();
