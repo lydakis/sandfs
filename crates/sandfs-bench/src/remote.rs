@@ -6,7 +6,13 @@
 //! 1. reads one file (the first moment the files are usable),
 //! 2. reads a sample of files spread across the whole tree,
 //! 3. searches one folder: reads every file in it and counts those holding a needle,
-//! 4. makes a second independent copy to work in (a fork).
+//!    as a build or a test run reads the folder it works on,
+//! 4. runs `git status` for the first time,
+//! 5. changes one file in that folder and commits it with `git commit -a`,
+//! 6. runs `git status` again,
+//! 7. makes a second independent copy to work in (a fork),
+//! 8. searches the whole copy with `grep -r`, as a person looking for a name does
+//!    (not the sparse checkout, which holds only the files it was told about).
 //!
 //! The git methods are a full clone, a shallow clone (depth 1), a blobless partial
 //! clone (all history but no file contents until checkout) and a sparse checkout of a
@@ -31,6 +37,10 @@ pub const SAMPLES: usize = 20;
 /// The folder searched by default is the largest one with at most this many files.
 const SUBTREE_FILES: usize = 1000;
 const NEEDLE: &[u8] = b"the ";
+/// What `grep -r` looks for across the whole copy: rare, so it reads every file.
+const RARE: &str = "sandfs-bench-needle";
+/// How long that search may take before it is stopped and reported as slower.
+pub const GREP_LIMIT: Duration = Duration::from_secs(600);
 
 /// How to get the repository's files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -192,7 +202,14 @@ pub struct RemoteResult {
     pub first: Duration,
     pub samples: Duration,
     pub search: Duration,
+    /// The first `git status`, the commit of one changed file, and `git status` after.
+    pub status: Duration,
+    pub commit: Duration,
+    pub status_again: Duration,
     pub fork: Duration,
+    /// `grep -r` over the whole copy, which the sparse checkout doesn't hold; `None`
+    /// inside when it was stopped at [`GREP_LIMIT`].
+    pub grep: Option<Option<Duration>>,
     /// Files in the searched folder holding the needle, and the bytes read in all;
     /// every method must agree.
     pub matches: usize,
@@ -281,6 +298,39 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     }
     let search = start.elapsed();
 
+    // Git in the copy, as a person or a CI job uses it. In the mount, git's file
+    // monitor is sandfs, which the mount's `.git` names.
+    let in_copy = |args: &[&str]| git_output(Some(&dir), args);
+    let start = Instant::now();
+    let listed = in_copy(&["status", "--porcelain"])?;
+    let status = start.elapsed();
+    warn_unless_clean(method, "the first git status", &listed);
+    let changed = dir.join(&plan.subtree_files[0]);
+    let start = Instant::now();
+    let mut file = std::fs::OpenOptions::new().append(true).open(&changed)?;
+    std::io::Write::write_all(&mut file, b"\nchanged by sandfs-bench\n")?;
+    drop(file);
+    in_copy(&[
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.com",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-q",
+        "--no-gpg-sign",
+        "-a",
+        "-m",
+        "change",
+    ])?;
+    let commit = start.elapsed();
+    ensure!(in_copy(&["rev-parse", "HEAD^"])? == plan.commit, "the commit isn't on top of {}", plan.commit);
+    let start = Instant::now();
+    let listed = in_copy(&["status", "--porcelain"])?;
+    let status_again = start.elapsed();
+    warn_unless_clean(method, "git status after the commit", &listed);
+
     let start = Instant::now();
     match method {
         Method::Sandfs => {
@@ -289,11 +339,39 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         }
         _ => {
             let fork_str = fork_dir.to_str().context("scratch path is not UTF-8")?;
-            git(Some(&copy), &["worktree", "add", "-q", "--detach", fork_str, &plan.commit])?;
+            // From the day's commit, as a fork carries it.
+            git(Some(&copy), &["worktree", "add", "-q", "--detach", fork_str, "HEAD"])?;
         }
     }
     let fork = start.elapsed();
     ensure!(fork_dir.join(&plan.samples[0]).is_file(), "the fork has no {}", plan.samples[0]);
+    // What the day's work left on disk, before the whole-copy search brings in the rest.
+    let disk = disk_usage(root)?;
+
+    let grep = (method != Method::Sparse)
+        .then(|| -> Result<Option<Duration>> {
+            let start = Instant::now();
+            let mut grep = Command::new("grep")
+                .args(["-r", "-l", "-F", "--exclude-dir=.git", "-e", RARE, "."])
+                .current_dir(&dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            loop {
+                if let Some(status) = grep.try_wait()? {
+                    // 0: something matched, 1: nothing did; 2: an error.
+                    ensure!(matches!(status.code(), Some(0 | 1)), "grep -r over the copy failed ({status})");
+                    return Ok(Some(start.elapsed()));
+                }
+                if start.elapsed() > GREP_LIMIT {
+                    grep.kill()?;
+                    grep.wait()?;
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .transpose()?;
 
     // The serving processes' peaks, with the git helpers they keep running, read
     // before they exit.
@@ -316,8 +394,32 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     drop(mounts);
     // Every command this process ran has exited; the largest one's peak counts.
     let commands = u64::try_from(getrusage(UsageWho::RUSAGE_CHILDREN)?.max_rss())? * 1024;
-    let disk = disk_usage(root)?;
-    Ok(RemoteResult { method, ready, first, samples, search, fork, matches, bytes, peak_rss: commands + serving, disk })
+    Ok(RemoteResult {
+        method,
+        ready,
+        first,
+        samples,
+        search,
+        status,
+        commit,
+        status_again,
+        fork,
+        grep,
+        matches,
+        bytes,
+        peak_rss: commands + serving,
+        disk,
+    })
+}
+
+/// Report a `git status` that lists files when nothing (else) has changed, which means
+/// the copy isn't a faithful checkout, without stopping the run.
+fn warn_unless_clean(method: Method, what: &str, listed: &str) {
+    if !listed.is_empty() {
+        let lines = listed.lines().count();
+        let first = listed.lines().next().unwrap_or_default();
+        eprintln!("{}: {what} listed {lines} files, starting with {first:?}", method.name());
+    }
 }
 
 /// Check out `commit` in the clone at `dir` byte for byte, as sandfs serves it. The
