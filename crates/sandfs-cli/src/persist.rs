@@ -211,19 +211,27 @@ impl Drafts {
         let size = ws.stat(path)?.size;
         let chunk = if ranged { CHUNK } else { size };
         let mut draft = self.empty()?;
-        let mut offset = 0;
-        while offset < size {
-            let data = ws.read_range(path, offset, chunk.min(size - offset))?;
-            if data.is_empty() {
-                break;
+        let fill = |draft: &mut Draft| -> Result<()> {
+            let mut offset = 0;
+            while offset < size {
+                let data = ws.read_range(path, offset, chunk.min(size - offset))?;
+                if data.is_empty() {
+                    break;
+                }
+                // Zeros are left as a hole, so a sparse file stays sparse on disk.
+                if data.iter().any(|byte| *byte != 0) {
+                    draft.write_all_at(offset, &data)?;
+                }
+                offset += data.len() as u64;
             }
-            // Zeros are left as a hole, so a sparse file stays sparse on disk.
-            if data.iter().any(|byte| *byte != 0) {
-                draft.write_all_at(offset, &data)?;
-            }
-            offset += data.len() as u64;
+            Ok(draft.set_len(offset)?)
+        };
+        // A copy cut short (a full disk) is deleted now: no save may come to collect
+        // it, and it would hold the room a retry needs.
+        if let Err(err) = fill(&mut draft) {
+            let _ = std::fs::remove_file(self.0.dir.join(&*draft.key));
+            return Err(err);
         }
-        draft.set_len(offset)?;
         Ok(draft)
     }
 
