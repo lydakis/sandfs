@@ -10,13 +10,14 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use nix::sys::signal::kill;
+use nix::unistd::{Pid, setsid};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{Bases, Home};
@@ -71,7 +72,7 @@ fn run_dir(home: &Home) -> Result<PathBuf> {
 pub fn mount(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let request = serde_json::to_string(&Request { name: name.to_owned(), dir: dir.as_os_str().as_bytes().to_vec() })?;
     let started = Instant::now();
-    let mut server: Option<Child> = None;
+    let mut server: Option<Pid> = None;
     // A running process answers at once, and a new one within a few milliseconds.
     let mut wait = Duration::from_millis(1);
     loop {
@@ -83,7 +84,7 @@ pub fn mount(home: &Home, name: &str, dir: &Path) -> Result<()> {
             return reply.error.map_or(Ok(()), |err| Err(anyhow!(err)));
         }
         // Start a process, unless the one started before may still be coming up.
-        if !server.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None))) {
+        if !server.is_some_and(|pid| kill(pid, None).is_ok()) {
             server = Some(start(home)?);
         }
         if started.elapsed() > START {
@@ -112,11 +113,20 @@ fn ask(mut stream: UnixStream, request: &str) -> Result<Option<Reply>> {
     }
 }
 
-/// Start the background process, detached from this one's terminal.
-fn start(home: &Home) -> Result<Child> {
+/// Start the background process and return its pid.
+///
+/// The process serves every mount of the home, whoever asked for it, so it shares
+/// nothing with the command that happens to start it: it runs in a session of its own
+/// (no terminal, no process group to be signalled with), its parent exits at once so it
+/// is adopted by init or launchd, and it gets only the environment it needs. A job
+/// runner that ends a job by killing its process group, its descendants or every
+/// process carrying the job's environment marker then leaves the other jobs' mounts
+/// alone.
+fn start(home: &Home) -> Result<Pid> {
     run_dir(home)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path(home))?;
     let mut command = Command::new(std::env::current_exe()?);
+    command.env_clear().envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(inherited)));
     // glibc's allocator raises the size it maps directly once a large block is freed,
     // so after the first mount ends, each new mount's 16 MiB request buffer comes
     // zeroed from memory the process keeps, and a process outliving its mounts grew by
@@ -127,17 +137,73 @@ fn start(home: &Home) -> Result<Child> {
     if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
         command.env("MALLOC_MMAP_THRESHOLD_", "4194304");
     }
-    command
+    // `daemon` starts the server in a new session, prints its pid and exits.
+    let output = command
         .arg("daemon")
         // Started from inside a mount, it would otherwise keep that mount busy.
         .current_dir("/")
         .env("SANDFS_HOME", home.root())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(log)
-        .process_group(0) // keep running when the terminal goes away
+        .output()
+        .context("starting the mount process")?;
+    let pid = String::from_utf8_lossy(&output.stdout).trim().parse::<i32>().ok();
+    match pid {
+        Some(pid) if output.status.success() => Ok(Pid::from_raw(pid)),
+        _ => bail!("the mount process did not start; see {}", log_path(home).display()),
+    }
+}
+
+/// Whether the background process keeps the environment variable `name`: what git
+/// needs to reach a remote (where it is, how to connect and authenticate, its global
+/// settings), the locale, and sandfs's own settings. Anything else, such as a caller's
+/// `GIT_DIR` or a job's marker, would leak one caller's setup into every mount.
+fn inherited(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "TZ",
+        "LANG",
+        "LANGUAGE",
+        "SSH_AUTH_SOCK",
+        "SSH_ASKPASS",
+        "GIT_ASKPASS",
+        "GIT_EXEC_PATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "CURL_CA_BUNDLE",
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+    ];
+    const PREFIXES: &[&str] =
+        &["LC_", "XDG_", "GIT_SSH", "GIT_SSL_", "GIT_CONFIG", "GIT_TRACE", "SANDFS_", "RUST_", "MALLOC_"];
+    NAMES.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// Start the server in a session of its own, print its pid and return, leaving it to
+/// init or launchd: `sandfs daemon`, run by [`start`].
+pub fn detach() -> Result<()> {
+    // Not a process group leader, since `start` gives this process none of its own,
+    // so this cannot fail with EPERM.
+    setsid().context("leaving the caller's session")?;
+    let server = Command::new(std::env::current_exe()?)
+        .args(["daemon", "--serve"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .spawn()
-        .context("starting the mount process")
+        .context("starting the mount process")?;
+    println!("{}", server.id());
+    Ok(())
 }
 
 /// Serve mounts until none is left: the background process itself.
