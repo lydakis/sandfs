@@ -422,9 +422,13 @@ fn files_keep_their_source_time_in_every_mount_and_fork() {
     // A move or a second name keeps the time, after the move is saved and remounted too.
     std::fs::rename(ws.join("go.sum"), ws.join("go.sum.old")).unwrap();
     std::fs::rename(ws.join("pkg"), ws.join("lib")).unwrap();
-    std::fs::hard_link(ws.join("go.mod"), ws.join("go.mod.link")).unwrap();
-    let moved = ["go.sum.old", "lib/a.go", "go.mod", "go.mod.link"];
-    for name in moved {
+    let mut moved = vec!["go.sum.old", "lib/a.go", "go.mod"];
+    // The NFS server under the macOS mount has no hard links.
+    if cfg!(target_os = "linux") {
+        std::fs::hard_link(ws.join("go.mod"), ws.join("go.mod.link")).unwrap();
+        moved.push("go.mod.link");
+    }
+    for &name in &moved {
         assert_eq!(modified(&ws.join(name)), then, "{name}");
     }
     sandfs.unmount(&ws);
