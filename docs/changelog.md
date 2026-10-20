@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.4.1
+## 0.5.0 (unreleased)
+
+The next release is 0.5.0 rather than 0.4.1 because two changes break custom sources and code that matches on kinds. `Kind` has a new variant, `Kind::Symlink`, so a `match` over it needs an arm for links. `SourceEntry` has a new field, `modified`, so a source that builds entries field by field must set it (`None` is fine).
 
 - **Changes since a checkpoint**: `Workspace::changes_since(base)` lists the files that differ from another workspace, reported like `changes()`: what an attempt did after a fork kept as a checkpoint, or how two attempts forked from one checkpoint differ. It skips everything the two still share, so the cost follows what changed after they split. Python: `changes(since=other)`. MCP: `Server::changes_since(checkpoint)` makes the `changes` tool compare against a checkpoint. CLI: `sandfs changes NAME --since OTHER` for two workspaces of the same source.
 - **Hard links**: a file can have several names (`Workspace::hard_link`, `hard_links` and `has_hard_links`; `hard_link(src, dst)` and `hard_links(path)` in Python). A write through any name is seen through all of them, removing one leaves the others, and a move keeps the link while a copy or a fork gets its own file. `changes()` reports each name on its own. The Linux mount supports `link(2)` with one inode per file, and saved workspaces keep links, so rustc's incremental cache and cargo, which link their files, no longer copy them through the mount. The macOS mount can't make hard links yet.

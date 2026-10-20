@@ -11,7 +11,7 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 - **Changes are files, not patches.** The harness walks `changes()` and writes each changed file back to wherever its data lives.
 - **Execution stays out of scope.** Real tools run in a container or on the host against a FUSE mount.
 
-0.2.2 was the last published release of the original design, and 0.4.0 is the first of this one. The original design's shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are core text edits, which only code needed. Symbolic links came back in 0.4.1, stored but never followed by the workspace, because ordinary tools in a mounted folder (Python virtual environments, npm installs) make them.
+0.2.2 was the last published release of the original design, and 0.4.0 is the first of this one. The original design's shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are core text edits, which only code needed. Symbolic links came back in 0.5.0, stored but never followed by the workspace, because ordinary tools in a mounted folder (Python virtual environments, npm installs) make them.
 
 ## Build order
 
