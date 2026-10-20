@@ -214,6 +214,41 @@ fn one_process_serves_every_mount_until_the_last_is_gone() {
     sandfs.unmount(&one);
 }
 
+#[test]
+fn a_process_on_its_way_out_leaves_a_new_home_at_the_same_path_alone() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(data.path().join("rows.csv"), "id\n").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let [one, two] = ["one", "two"].map(|name| dirs.path().join(name));
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), one.to_str().unwrap()], &one);
+    let old = server_pid(&sandfs, "one");
+
+    // A script that cleans up by deleting the whole home, then starts over at the same
+    // path, while the last process still lingers after its last unmount.
+    sandfs.unmount(&one);
+    std::fs::remove_dir_all(sandfs.home.path()).unwrap();
+    std::fs::create_dir(sandfs.home.path()).unwrap();
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), one.to_str().unwrap()], &one);
+    let new = server_pid(&sandfs, "one");
+    assert_ne!(new, old);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while alive(&old) {
+        assert!(std::time::Instant::now() < deadline, "the old process stayed");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // The new process still answers once the old one has gone.
+    sandfs.mount(&["fork", "one", two.to_str().unwrap()], &two);
+    assert_eq!(server_pid(&sandfs, "two"), new);
+    assert_eq!(std::fs::read_to_string(two.join("rows.csv")).unwrap(), "id\n");
+    sandfs.unmount(&two);
+    sandfs.unmount(&one);
+}
+
 /// Runs git in `dir` and returns what it printed.
 fn git_out(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

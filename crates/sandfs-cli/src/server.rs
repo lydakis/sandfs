@@ -173,8 +173,10 @@ pub fn run(home: Home) -> Result<()> {
         }
     });
     state.wait_until_idle(LINGER);
-    // Removed while this process still holds the lock, so it is never a successor's.
-    let _ = std::fs::remove_file(&socket);
+    // The socket stays: connecting to it fails once this process is gone, and the next
+    // process replaces it. Removing it here could remove a successor's instead, when
+    // the home was deleted and made again meanwhile, since the lock went with the old
+    // home.
     Ok(())
 }
 
