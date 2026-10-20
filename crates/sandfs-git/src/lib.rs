@@ -14,14 +14,15 @@
 //! blob. [`GitSource::with_sizes`] turns them on for files whose blobs are already
 //! local. A [`Source::prefetch`] fetches a folder's missing blobs in one request,
 //! so the workspace's next listing has every size, and a walk of a folder fetches
-//! everything below it in one request rather than one per file.
+//! everything below it in one request rather than one per file, or for a large tree,
+//! in the background a request at a time.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 
 use bytes::Bytes;
@@ -41,7 +42,9 @@ pub struct GitSource {
     /// does, so one walk of the whole tree finds every missing file.
     trees_local: bool,
     /// Trees with every file below them local, so prefetching them does nothing.
-    local: Mutex<HashSet<SourceKey>>,
+    local: Arc<Mutex<HashSet<SourceKey>>>,
+    /// What background fetches are doing (see [`GitSource::fetch_behind`]).
+    behind: Arc<Mutex<Behind>>,
     /// The blobs of the whole tree a partial clone lacked, found by one walk started in
     /// the background by the first listing, so later listings don't each start git.
     /// `None` inside when git couldn't say.
@@ -50,12 +53,43 @@ pub struct GitSource {
     /// Set when the source is dropped, which stops a walk still running.
     cancel: Arc<AtomicBool>,
     /// Blobs read or fetched since, which [`GitSource::absent`] may still list.
-    fetched: Mutex<HashSet<SourceKey>>,
+    fetched: Arc<Mutex<HashSet<SourceKey>>>,
+    /// Files read so far, which background fetches watch to keep going.
+    reads: Arc<AtomicU64>,
 }
 
-/// The most files one prefetch fetches. A folder missing more is left to fetch file by
-/// file as it is read. Git can't tell a blob's size before fetching it, so this can't
-/// be a byte limit: a prefetch fetches at most this many files of any size.
+/// Background fetches of large trees, shared by every tree's worker.
+#[derive(Default)]
+struct Behind {
+    /// Trees being fetched now.
+    trees: HashSet<SourceKey>,
+    /// A state per blob of the whole tree's walk ([`GitSource::absent`]), by index:
+    /// [`CLAIMED`] while a request for it runs, [`BROUGHT`] once one brought it. Empty
+    /// until the first worker starts.
+    blobs: Vec<u8>,
+}
+
+const CLAIMED: u8 = 1;
+const BROUGHT: u8 = 2;
+
+/// Mark claimed blobs brought, or give the claims back when their request failed.
+fn settle(behind: &Mutex<Behind>, indexes: &[usize], brought: bool) {
+    if let Ok(mut behind) = behind.lock() {
+        for &index in indexes {
+            behind.blobs[index] = if brought { BROUGHT } else { 0 };
+        }
+    }
+}
+
+/// How long a background fetch waits for the next read before its next request: one
+/// whose reader stopped, such as a search that found what it looked for, stops too, so
+/// a short look at a large tree doesn't fetch all of it.
+const READ_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most files one request fetches. A folder missing more is left to fetch file by
+/// file as it is read; a larger tree below a walk comes this many at a time. Git can't
+/// tell a blob's size before fetching it, so this can't be a byte limit: a request
+/// fetches at most this many files of any size.
 const PREFETCH_FILES: usize = 1000;
 
 impl fmt::Debug for GitSource {
@@ -94,11 +128,13 @@ impl GitSource {
             sizes: None,
             promisor,
             trees_local,
-            local: Mutex::default(),
+            local: Arc::default(),
+            behind: Arc::default(),
             absent: Arc::default(),
             walk: Once::new(),
             cancel: Arc::default(),
-            fetched: Mutex::default(),
+            fetched: Arc::default(),
+            reads: Arc::default(),
         })
     }
 
@@ -129,9 +165,12 @@ impl GitSource {
             // tree is done its answer serves every folder.
             (Some(_), Some(absent)) => {
                 let fetched = self.fetched.lock().map_err(|_| Error::Source("git reader poisoned".into()))?;
+                let behind = self.behind.lock().map_err(|_| Error::Source("git reader poisoned".into()))?;
+                let brought = |index: usize| behind.blobs.get(index) == Some(&BROUGHT);
                 let files = listing.values().filter(|entry| !entry.kind.is_dir());
                 files
-                    .filter(|e| absent.contains(&e.key) && !fetched.contains(&e.key))
+                    .filter(|e| absent.index_of(&e.key).is_some_and(|index| !brought(index)))
+                    .filter(|e| !fetched.contains(&e.key))
                     .map(|e| e.key.to_string())
                     .collect()
             }
@@ -156,13 +195,10 @@ impl GitSource {
         if !self.trees_local {
             return None;
         }
-        if self.absent.get().is_none() {
-            // Walk here rather than wait: a walk the first listing started may still be
-            // running, and two walks cost only time.
-            self.walk.call_once(|| {});
-            let _ = self.absent.set(walk_missing(&self.repo, &self.tree, self.hash_len, &self.cancel));
-        }
-        self.absent.get()?.as_ref()
+        // Waits for a walk already running (every walk fills `absent` through
+        // `get_or_init`), or walks here.
+        self.walk.call_once(|| {});
+        self.absent.get_or_init(|| walk_missing(&self.repo, &self.tree, self.hash_len, &self.cancel)).as_ref()
     }
 
     /// The blobs the whole tree lacked, once the background walk has found them. The
@@ -176,7 +212,7 @@ impl GitSource {
             let (repo, tree, absent) = (self.repo.clone(), self.tree.clone(), Arc::clone(&self.absent));
             let (hash_len, cancel) = (self.hash_len, Arc::clone(&self.cancel));
             let _ = std::thread::Builder::new().name("sandfs-git-walk".into()).spawn(move || {
-                let _ = absent.set(walk_missing(&repo, &tree, hash_len, &cancel));
+                absent.get_or_init(|| walk_missing(&repo, &tree, hash_len, &cancel));
             });
         });
         self.absent.get()?.as_ref()
@@ -204,53 +240,124 @@ impl GitSource {
     /// `recursive` every file below it. `None` when git can't say, or when more than
     /// `limit` are missing; git stops looking then.
     fn missing(&self, id: &str, recursive: bool, limit: usize) -> Option<Vec<String>> {
-        // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
-        // `tree:1` stops the walk at the tree's direct children.
-        let mut command = git(&self.repo);
-        command.args(["rev-list", "--objects", "--no-object-names", "--missing=print"]);
-        if !recursive {
-            command.arg("--filter=tree:1");
-        }
-        let mut child = command.arg(id).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-        let mut missing = Vec::new();
-        for line in BufReader::new(child.stdout.take()?).lines() {
-            // A walk cut short would pass for a complete one.
-            let Ok(line) = line else {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            };
-            if let Some(object) = line.strip_prefix('?') {
-                missing.push(object.to_owned());
-                if missing.len() > limit {
-                    break;
-                }
-            }
-        }
-        let over = missing.len() > limit;
-        if over {
-            let _ = child.kill();
-        }
-        let status = child.wait().ok()?;
-        (!over && status.success()).then_some(missing)
+        missing(&self.repo, id, recursive, limit)
     }
 
     /// Fetch these blobs from `remote` in one request. Best effort: whatever this
     /// misses, git still fetches one blob at a time on first read.
     fn fetch(&self, remote: &str, blobs: &[String]) -> bool {
-        // The same request git makes for a single missing object, with every id at once.
-        let fetch = git(&self.repo)
-            .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", remote, "--no-tags", "--no-write-fetch-head"])
-            .args(["--recurse-submodules=no", "--filter=blob:none", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut fetch) = fetch else { return false };
-        if let Some(mut stdin) = fetch.stdin.take() {
-            let _ = stdin.write_all(blobs.join("\n").as_bytes()).and_then(|()| stdin.write_all(b"\n"));
+        fetch(&self.repo, remote, blobs, &self.cancel)
+    }
+
+    /// Fetch everything missing below the tree `id` in the background, a request at a
+    /// time, in the order a walk reads the files, while reads go on: one that gets ahead
+    /// fetches its own file, as without a prefetch, rather than waiting for a whole
+    /// request. Workers for different trees, such as a folder and then its parent, share
+    /// which blobs are asked for, so none is fetched twice by them; files read meanwhile
+    /// aren't fetched again when this source keeps track of them (with sizes). Needs
+    /// every tree local, which a clone that leaves out only blobs has, and the whole
+    /// tree's walk, which the worker waits for.
+    fn fetch_behind(&self, remote: &str, id: &str) {
+        if !self.trees_local || !self.behind.lock().is_ok_and(|mut behind| behind.trees.insert(id.into())) {
+            return;
         }
-        fetch.wait().is_ok_and(|status| status.success())
+        let (repo, remote, id, hash_len) = (self.repo.clone(), remote.to_owned(), SourceKey::from(id), self.hash_len);
+        let (absent, fetched, cancel) = (Arc::clone(&self.absent), Arc::clone(&self.fetched), Arc::clone(&self.cancel));
+        let (local, behind, root) = (Arc::clone(&self.local), Arc::clone(&self.behind), self.tree.clone());
+        let (reads, tree) = (Arc::clone(&self.reads), id.clone());
+        let spawned = std::thread::Builder::new().name("sandfs-git-prefetch".into()).spawn(move || {
+            // Waits for a walk already running, such as the one the first listing started.
+            if let Some(missing) = absent.get_or_init(|| walk_missing(&repo, &root, hash_len, &cancel)) {
+                // A blob another worker is fetching may not be here yet, so the trees
+                // above it can't be called local.
+                let others = AtomicBool::new(false);
+                // What this worker claimed: a blob can sit at many paths.
+                let mine = std::cell::RefCell::new(Vec::new());
+                let claim = |blob: &str, index: usize| {
+                    let mut mine = mine.borrow_mut();
+                    if mine.is_empty() {
+                        *mine = vec![false; missing.len()];
+                    }
+                    if mine[index] {
+                        return false;
+                    }
+                    // Not under the lock of `behind`: listings take the two the other way.
+                    let read = fetched.lock().is_ok_and(|fetched| fetched.contains(blob));
+                    let Ok(mut behind) = behind.lock() else { return false };
+                    if behind.blobs.is_empty() {
+                        behind.blobs = vec![0; missing.len()];
+                    }
+                    match behind.blobs[index] {
+                        0 if !read => {
+                            behind.blobs[index] = CLAIMED;
+                            mine[index] = true;
+                            true
+                        }
+                        CLAIMED => {
+                            others.store(true, Ordering::Relaxed);
+                            false
+                        }
+                        _ => false,
+                    }
+                };
+                let settle = |indexes: &[usize], brought: bool| settle(&behind, indexes, brought);
+                // Reads must keep coming for the fetch to go on.
+                let seen = std::cell::Cell::new(reads.load(Ordering::Relaxed));
+                let go_on = || {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < READ_GAP && !cancel.load(Ordering::Relaxed) {
+                        let now = reads.load(Ordering::Relaxed);
+                        if now != seen.replace(now) {
+                            return true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    false
+                };
+                let trees = fetch_in_order(&repo, &remote, &id, hash_len, missing, &claim, &settle, &go_on, &cancel);
+                if let (Some(trees), false) = (trees, others.load(Ordering::Relaxed)) {
+                    if let Ok(mut local) = local.lock() {
+                        local.extend(trees);
+                    }
+                }
+            }
+            if let Ok(mut behind) = behind.lock() {
+                behind.trees.remove(&id);
+            }
+        });
+        if spawned.is_err() {
+            if let Ok(mut behind) = self.behind.lock() {
+                behind.trees.remove(&tree);
+            }
+        }
+    }
+
+    /// Claim `blobs` for a request in the table background fetches share. The blobs to
+    /// ask for, the indexes claimed, and whether a background fetch holds some of the
+    /// rest, which may not have arrived yet.
+    fn claim(&self, blobs: Vec<String>) -> (Vec<String>, Vec<usize>, bool) {
+        let (Some(Some(absent)), Ok(mut behind)) = (self.absent.get(), self.behind.lock()) else {
+            return (blobs, Vec::new(), false);
+        };
+        if behind.blobs.is_empty() {
+            return (blobs, Vec::new(), false);
+        }
+        let (mut request, mut claimed, mut held) = (Vec::new(), Vec::new(), false);
+        for blob in blobs {
+            match absent.index_of(&blob) {
+                None => request.push(blob),
+                Some(index) => match behind.blobs[index] {
+                    0 => {
+                        behind.blobs[index] = CLAIMED;
+                        claimed.push(index);
+                        request.push(blob);
+                    }
+                    CLAIMED => held = true,
+                    _ => {}
+                },
+            }
+        }
+        (request, claimed, held)
     }
 
     /// Remember that every file below the tree `id` is local, with every tree below it,
@@ -307,30 +414,189 @@ impl Source for GitSource {
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
         let data = self.object(key, "blob")?;
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.now_local([key]);
         Ok(data)
     }
 
     /// Fetch the folder's missing blobs, or with `recursive` everything missing below
-    /// it, in one request, when that is at most 1,000 files. Outside a partial clone
-    /// every blob is local and this does nothing.
+    /// it, in one request, when that is at most 1,000 files. A larger tree comes in the
+    /// background, a request at a time (see [`GitSource::fetch_behind`]); a larger
+    /// folder is left to fetch file by file. Outside a partial clone every blob is
+    /// local and this does nothing.
     fn prefetch(&self, key: &str, recursive: bool) {
         let Some(remote) = &self.promisor else { return };
         if self.local.lock().is_ok_and(|local| local.contains(key)) {
             return;
         }
-        let Some(missing) = self.missing(key, recursive, PREFETCH_FILES) else { return };
-        let fetched = missing.is_empty() || self.fetch(remote, &missing);
+        let Some(missing) = self.missing(key, recursive, PREFETCH_FILES) else {
+            if recursive {
+                self.fetch_behind(remote, key);
+            }
+            return;
+        };
+        let (request, claimed, held) = self.claim(missing);
+        let fetched = request.is_empty() || self.fetch(remote, &request);
+        settle(&self.behind, &claimed, fetched);
         if fetched {
-            self.now_local(missing.iter().map(String::as_str));
-            // The folder's files are all local now, including any fetched some other way
-            // since the walk, which its answer would otherwise still count as missing.
+            self.now_local(request.iter().map(String::as_str));
+        }
+        // Unless a background fetch still holds some, the folder's files are all local
+        // now, including any fetched some other way since the walk, which its answer
+        // would otherwise still count as missing.
+        if fetched && !held {
             if let Ok(listing) = self.object(key, "tree").and_then(|tree| parse_tree(&tree, self.hash_len)) {
                 self.now_local(listing.values().filter(|entry| !entry.kind.is_dir()).map(|entry| &*entry.key));
             }
+            if recursive {
+                self.mark_local(key);
+            }
         }
-        if fetched && recursive {
-            self.mark_local(key);
+    }
+}
+
+/// See [`GitSource::missing`].
+fn missing(repo: &Path, id: &str, recursive: bool, limit: usize) -> Option<Vec<String>> {
+    // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
+    // `tree:1` stops the walk at the tree's direct children.
+    let mut command = git(repo);
+    command.args(["rev-list", "--objects", "--no-object-names", "--missing=print"]);
+    if !recursive {
+        command.arg("--filter=tree:1");
+    }
+    let mut child = command.arg(id).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut missing = Vec::new();
+    for line in BufReader::new(child.stdout.take()?).lines() {
+        // A walk cut short would pass for a complete one.
+        let Ok(line) = line else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        if let Some(object) = line.strip_prefix('?') {
+            missing.push(object.to_owned());
+            if missing.len() > limit {
+                break;
+            }
+        }
+    }
+    let over = missing.len() > limit;
+    if over {
+        let _ = child.kill();
+    }
+    let status = child.wait().ok()?;
+    (!over && status.success()).then_some(missing)
+}
+
+/// Fetch the blobs of `missing` below the tree `id` a request at a time, in the order a
+/// workspace walks the tree: depth first, each folder's entries in name order, with a
+/// subfolder read where its name falls. A blob is asked for when `claim` takes it (by id
+/// and index in `missing`); `settle` hears whether each request brought its blobs.
+/// Each request after the first goes only once `go_on` says so. Trees must be local.
+/// Every tree walked, once every request was sent and succeeded.
+#[allow(clippy::too_many_arguments)]
+fn fetch_in_order(
+    repo: &Path,
+    remote: &str,
+    id: &str,
+    hash_len: usize,
+    missing: &ObjectIds,
+    claim: &dyn Fn(&str, usize) -> bool,
+    settle: &dyn Fn(&[usize], bool),
+    go_on: &dyn Fn() -> bool,
+    cancel: &AtomicBool,
+) -> Option<Vec<SourceKey>> {
+    let mut trees = Batch::spawn(repo, "--batch").ok()?;
+    let mut listing = |id: &str| -> Option<std::collections::btree_map::IntoIter<String, SourceEntry>> {
+        let (kind, data) = trees.read(id).ok()?;
+        (kind == "tree").then(|| parse_tree(&data, hash_len).ok()).flatten().map(IntoIterator::into_iter)
+    };
+    // Sends the request, or with `go` false gives its claims back.
+    let send = |request: &mut Vec<(String, usize)>, go: bool| {
+        if request.is_empty() {
+            return true;
+        }
+        let ok =
+            go && !cancel.load(Ordering::Relaxed) && fetch(repo, remote, request.iter().map(|(blob, _)| blob), cancel);
+        settle(&request.iter().map(|&(_, index)| index).collect::<Vec<_>>(), ok);
+        request.clear();
+        ok
+    };
+    let mut walked = vec![SourceKey::from(id)];
+    let (mut request, mut sent, mut asked) = (Vec::new(), false, false);
+    let mut stack = vec![listing(id)?];
+    while let Some(entries) = stack.last_mut() {
+        if cancel.load(Ordering::Relaxed) {
+            send(&mut request, false);
+            return None;
+        }
+        let Some((_, entry)) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        if entry.kind.is_dir() {
+            let Some(entries) = listing(&entry.key) else {
+                send(&mut request, false);
+                return None;
+            };
+            stack.push(entries);
+            walked.push(entry.key);
+        } else if let Some(index) = missing.index_of(&entry.key) {
+            // Asked once a request, before claiming, so nothing waits claimed meanwhile.
+            if request.is_empty() && sent && !asked {
+                if !go_on() {
+                    return None;
+                }
+                asked = true;
+            }
+            if claim(&entry.key, index) {
+                request.push((entry.key.to_string(), index));
+            }
+        }
+        if request.len() == PREFETCH_FILES {
+            if !send(&mut request, true) {
+                return None;
+            }
+            (sent, asked) = (true, false);
+        }
+    }
+    send(&mut request, true).then_some(walked)
+}
+
+/// See [`GitSource::fetch`].
+fn fetch<'a>(repo: &Path, remote: &str, blobs: impl IntoIterator<Item = &'a String>, cancel: &AtomicBool) -> bool {
+    // The same request git makes for a single missing object, with every id at once.
+    let fetch = git(repo)
+        .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", remote, "--no-tags", "--no-write-fetch-head"])
+        .args(["--recurse-submodules=no", "--filter=blob:none", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut fetch) = fetch else { return false };
+    if let Some(mut stdin) = fetch.stdin.take() {
+        let mut ids = Vec::new();
+        for blob in blobs {
+            ids.extend_from_slice(blob.as_bytes());
+            ids.push(b'\n');
+        }
+        let _ = stdin.write_all(&ids);
+    }
+    // A slow or stalled remote mustn't outlive the source. Checks start often, so a
+    // quick fetch isn't kept waiting.
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        match fetch.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if !cancel.load(Ordering::Relaxed) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = fetch.kill();
+                let _ = fetch.wait();
+                return false;
+            }
         }
     }
 }
@@ -496,8 +762,12 @@ fn promisor_remote(repo: &Path) -> Option<String> {
 
 fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
-    // Never stop to ask for credentials while fetching blobs of a partial clone.
+    // Never stop to ask for credentials while fetching blobs of a partial clone. Nor
+    // run maintenance after each fetch, which git, and the fetches it starts for a
+    // missing blob, would otherwise do: reading a large tree is a burst of fetches,
+    // and repacking after each costs more than the fetch.
     command.arg("-C").arg(repo).env("GIT_TERMINAL_PROMPT", "0");
+    command.args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"]);
     command
 }
 
@@ -647,6 +917,58 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn background_fetches_follow_the_walk_order() {
+        // `foo.bar` comes after the folder `foo` in a walk, though git sorts it before
+        // `foo/`.
+        let repo = tempfile::tempdir().unwrap();
+        run(repo.path(), &["init", "-q"]);
+        std::fs::create_dir_all(repo.path().join("foo")).unwrap();
+        for (name, data) in [("foo/a", "a"), ("foo/b", "b"), ("foo.bar", "c"), ("twin", "a"), ("z", "z")] {
+            std::fs::write(repo.path().join(name), data).unwrap();
+        }
+        run(repo.path(), &["add", "-A"]);
+        run(repo.path(), &["commit", "-q", "-m", "files"]);
+        let blob = |path: &str| run(repo.path(), &["rev-parse", &format!("HEAD:{path}")]).trim().to_owned();
+        let tree = run(repo.path(), &["rev-parse", "HEAD^{tree}"]).trim().to_owned();
+        // Every blob counts as missing; claims record the order, and refusing them keeps
+        // the fetch from running.
+        let mut ids: Vec<[u8; 20]> = ["foo/a", "foo/b", "foo.bar", "z"]
+            .map(|path| {
+                let mut id = [0; 20];
+                assert!(unhex(&blob(path), &mut id));
+                id
+            })
+            .to_vec();
+        ids.sort_unstable();
+        let missing = ObjectIds { sorted: ids.concat(), len: 20 };
+        let asked = Mutex::new(Vec::new());
+        let claim = |id: &str, _| {
+            asked.lock().unwrap().push(id.to_owned());
+            false
+        };
+        let walked = fetch_in_order(
+            repo.path(),
+            "origin",
+            &tree,
+            20,
+            &missing,
+            &claim,
+            &|_, _| {},
+            &|| true,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(asked.into_inner().unwrap(), ["foo/a", "foo/b", "foo.bar", "twin", "z"].map(blob));
+        let foo = blob("foo");
+        assert_eq!(walked.unwrap(), [tree.as_str(), foo.as_str()].map(SourceKey::from));
+        // Cancelled, it stops.
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            fetch_in_order(repo.path(), "origin", &tree, 20, &missing, &|_, _| false, &|_, _| {}, &|| true, &cancelled)
+                .is_none()
+        );
     }
 
     #[test]
