@@ -44,7 +44,7 @@ That is the whole model:
 
 - A **source** is read-only data mounted at a path: a folder, a git commit, files held in memory, or your own data.
 - A **workspace** is sources mounted at paths, plus a layer that holds every write and delete. `fork()` copies a workspace in constant time.
-- A **change** is one file that differs from the sources, as listed by `changes()`.
+- A **change** is one file that differs from the sources, as listed by `changes()`. `changes(since=checkpoint)` lists the files that differ from another workspace instead: what an attempt did after a fork you kept, or how two attempts from one fork differ.
 
 ## What you can mount
 
@@ -119,6 +119,7 @@ sandfs mount ~/datasets/survey ~/ws/survey       # the folder underneath is neve
 sandfs fork ~/ws/survey ~/ws/cleanup             # survey's changes so far, without copying the folder
 python clean.py ~/ws/cleanup                     # real files, any tool
 sandfs changes ~/ws/cleanup                      # A/M/D for each changed file
+sandfs changes cleanup --since survey            # how cleanup differs from survey, file by file
 sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sandfs mount cleanup ~/ws/cleanup` brings them back
 ```
 
@@ -152,7 +153,8 @@ On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there
 | `write(path, data, *, expected_version=None)` | Write str or bytes, creating parents, and return the new version |
 | `mkdir`, `remove`, `copy`, `move` | File operations; copies share the original's bytes |
 | `symlink(path, target)`, `read_link(path)` | Make a symbolic link, or read where one points |
-| `changes()` | `Change(path, kind)` for every added, modified or deleted file or link |
+| `hard_link(src, dst)`, `hard_links(path)` | Give a file a second name, or list all its names |
+| `changes(since=None)` | `Change(path, kind)` for every added, modified or deleted file or link, against the sources or, with `since`, another workspace such as a checkpoint |
 
 Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`. An exception raised inside a Python source surfaces as `OSError`.
 
@@ -192,7 +194,8 @@ A second copy of the mount (`sandfs fork`) takes 20 ms, against 0.2 to 4.4 s for
 - **sandfs is not an execution sandbox.** It never runs commands, and it doesn't contain the programs that use it. It keeps their writes out of your sources, but a program working in a mounted folder can still read or change anything else its user can. Run untrusted programs in a container or microVM pointed at the mount.
 - **Git runs what a mount's `.git` settings name.** Git settings can name programs for git to run, and anything that can write to a mounted folder can change its `.git`. Don't run git yourself in a mounted folder that a program you don't trust can write to, just as with any folder someone else can change. Over MCP, sandfs refuses changes to a `git:` mount's `.git`; a host folder that holds its own `.git` gets no such protection, so treat an agent's changes there the same way.
 - **A mounted folder isn't frozen.** Folders are read lazily, so if one changes while it's mounted, a workspace can show a mix of old and new. Mount a folder nothing else writes to, copy it first, or mount a git commit when the view must not change.
-- **Symbolic links are kept, never followed.** A link is stored as its target, and a host folder's links are listed as links. In a mounted folder the system resolves them, as on any filesystem; the library and the MCP tools never do, so `read` refuses a link and `read_link` gives its target. In a mount, a host folder's link into the folder reaches the workspace's copy, and one out of it reaches the host itself, where a link of the host's own can still lead back into the folder. A git commit's links aren't shown yet, and hard links, sockets, devices and fifos aren't supported.
+- **Symbolic links are kept, never followed.** A link is stored as its target, and a host folder's links are listed as links. In a mounted folder the system resolves them, as on any filesystem; the library and the MCP tools never do, so `read` refuses a link and `read_link` gives its target. In a mount, a host folder's link into the folder reaches the workspace's copy, and one out of it reaches the host itself, where a link of the host's own can still lead back into the folder. A git commit's links aren't shown yet.
+- **Hard links work in the library and in a Linux mount**, where every name of a file is one inode; the macOS mount can't make them yet, so tools there fall back to copying. `changes()` lists each name of a linked file on its own. Sockets, devices and fifos aren't supported.
 
 ## Contributing
 

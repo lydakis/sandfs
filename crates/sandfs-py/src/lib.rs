@@ -425,6 +425,20 @@ impl Workspace {
         py.detach(|| inner.symlink(path, target)).or_raise()
     }
 
+    /// Give the file at `src` a second name, `dst`, like a hard link: a write through
+    /// either name is seen through both, and removing one leaves the other. A copy or
+    /// a fork doesn't share the file.
+    fn hard_link(&mut self, py: Python<'_>, src: &str, dst: &str) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.hard_link(src, dst)).or_raise()
+    }
+
+    /// Every path naming the file at `path`, itself included, sorted.
+    fn hard_links(&self, py: Python<'_>, path: &str) -> PyResult<Vec<String>> {
+        let names = py.detach(|| self.inner.hard_links(path)).or_raise()?;
+        Ok(names.iter().map(ToString::to_string).collect())
+    }
+
     /// The contents of the file at `path` as UTF-8 text; raises `ValueError` if it is not text.
     fn read_text(&self, py: Python<'_>, path: &str) -> PyResult<String> {
         py.detach(|| self.inner.read_text(path)).or_raise()
@@ -488,9 +502,17 @@ impl Workspace {
         py.detach(|| inner.rename(src, dst)).or_raise()
     }
 
-    /// The files that differ from the mounts, sorted by path.
-    fn changes(&self, py: Python<'_>) -> PyResult<Vec<Change>> {
-        let changes = py.detach(|| self.inner.changes()).or_raise()?;
+    /// The files that differ from the mounts, sorted by path; with `since`, the files
+    /// that differ from that workspace, such as a fork kept as a checkpoint.
+    #[pyo3(signature = (since=None))]
+    fn changes(&self, py: Python<'_>, since: Option<PyRef<'_, Workspace>>) -> PyResult<Vec<Change>> {
+        let base = since.as_ref().map(|since| &since.inner);
+        let changes = py
+            .detach(|| match base {
+                Some(base) => self.inner.changes_since(base),
+                None => self.inner.changes(),
+            })
+            .or_raise()?;
         Ok(changes
             .into_iter()
             .map(|change| Change {

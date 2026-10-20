@@ -2,7 +2,7 @@
 
 sandfs is a general-purpose sandbox filesystem for agents. An agent works on files of any kind (documents, spreadsheets, images, data sets, notes, configs, code) in a workspace it can change freely and throw away, and the harness decides which changes to keep. Code is one use case among many.
 
-The core has three primitives: a **source** (a read-only tree read lazily), a **workspace** (sources mounted at paths plus a copy-on-write overlay) and a **change** (one file that differs, from `changes()`). Snapshots and checkpoints are forks, not new concepts. The full design lives in the interface spec linked from the project; this file tracks where the code is.
+The core has three primitives: a **source** (a read-only tree read lazily), a **workspace** (sources mounted at paths plus a copy-on-write overlay) and a **change** (one file that differs, from `changes()`, or from another workspace such as a checkpoint, from `changes_since`). Snapshots and checkpoints are forks, not new concepts. The full design lives in the interface spec linked from the project; this file tracks where the code is.
 
 ## Direction
 
@@ -32,5 +32,5 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 
 - A mounted workspace holds a file in memory from its first write until it is saved (a quarter of a second after its last write), so a program writing many large files at once costs memory until they settle.
 - Only the executable bit of a file's mode is kept; owners, other mode bits and extended attributes are not.
-- No hard links or special files, matching the core. Symbolic links work; the git source doesn't show a commit's links yet.
+- No special files, matching the core. Symbolic links work; the git source doesn't show a commit's links yet. Hard links work on Linux; the macOS mount can't make them, since its NFS server has no LINK call.
 - macOS mounts over NFS on localhost, answering only the user who mounted it (and root). New `._name`, `.DS_Store` and `.nfs.*` files that macOS creates in a mount are kept out of saves. Windows has no mount.

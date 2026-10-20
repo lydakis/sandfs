@@ -19,6 +19,13 @@
 //! next save names that object as it is. From then on the object is never written
 //! again: a later write copies it into a new draft, which the disk can often do
 //! without copying any bytes.
+//!
+//! Small files are the exception: a save writes them, drafts included, into one pack,
+//! an object holding many files back to back, and names each by its range of the
+//! pack. A fork then links one file per pack rather than one per small file, which
+//! after `npm install` or a build is the difference between thousands of links and a
+//! handful. A pack goes once no file reads from it, and a save writes the files of a
+//! mostly unused pack, or of many small packs, into its own pack again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -45,6 +52,10 @@ enum Entry {
         object: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<Time>,
+        /// Another name of the same file (a hard link), earlier in the index or
+        /// unchanged in the source. Loading links the two instead of reading the object.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     Dir {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +66,9 @@ enum Entry {
         target: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<Time>,
+        /// Another name of the same link, as for a file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     /// Removed: a deleted base file or directory.
     Absent,
@@ -134,12 +148,14 @@ impl Objects {
         self.next.fetch_add(1, Ordering::SeqCst).to_string().into()
     }
 
-    fn open(&self, key: &str) -> sandfs_core::Result<std::fs::File> {
-        check_object(key).map_err(|err| Error::Source(err.to_string()))?;
-        std::fs::File::open(self.dir.join(key)).map_err(|err| match err.kind() {
+    /// The file holding `key` and the range of it that is `key`'s bytes, if not all.
+    fn open(&self, key: &str) -> sandfs_core::Result<(std::fs::File, Option<(u64, u64)>)> {
+        let place = place(key).map_err(|err| Error::Source(err.to_string()))?;
+        let file = std::fs::File::open(self.dir.join(place.file)).map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => Error::Source(ObjectGone(key.to_owned()).to_string()),
             _ => Error::Source(format!("reading saved object {key}: {err}")),
-        })
+        })?;
+        Ok((file, place.range))
     }
 }
 
@@ -153,15 +169,19 @@ impl Source for Objects {
     }
 
     fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
-        let mut data = Vec::new();
-        self.open(key)?.read_to_end(&mut data).map_err(|err| Error::Source(err.to_string()))?;
-        Ok(data.into())
+        self.read_range(key, 0, u64::MAX)
     }
 
     fn read_range(&self, key: &str, offset: u64, len: u64) -> sandfs_core::Result<Bytes> {
-        let mut file = self.open(key)?;
+        let (mut file, range) = self.open(key)?;
+        // A packed object is a range of its pack, read through the page cache like
+        // any other file.
+        let (start, len) = match range {
+            None => (offset, len),
+            Some((at, size)) => (at.saturating_add(offset.min(size)), len.min(size.saturating_sub(offset))),
+        };
         let mut data = Vec::new();
-        file.seek(SeekFrom::Start(offset))
+        file.seek(SeekFrom::Start(start))
             .and_then(|_| file.take(len).read_to_end(&mut data))
             .map_err(|err| Error::Source(err.to_string()))?;
         Ok(data.into())
@@ -189,14 +209,16 @@ impl Drafts {
         Ok(self.track(file, key))
     }
 
-    /// A new draft holding what `path` in `ws` holds now. A saved file is copied on
-    /// disk, which shares its blocks where the disk can (APFS, btrfs, XFS). Any other
+    /// A new draft holding what `path` in `ws` holds now. A saved file of its own is
+    /// copied on disk, which shares its blocks where the disk can (APFS, btrfs, XFS);
+    /// a small one in a pack is read like a source file. Any other
     /// file is read in chunks when its source reads ranges cheaply (`ranged`), so its
     /// size never sits in memory; otherwise it is read once, whole, since each chunk
     /// would read the whole file again.
     pub fn copy(&self, ws: &Workspace, path: &str, ranged: bool) -> Result<Draft> {
         if let Some(stored) = ws.stored(path)?
             && std::ptr::addr_eq(Arc::as_ptr(&stored.source), Arc::as_ptr(&self.0))
+            && !stored.key.contains('@')
         {
             let key = self.0.new_name();
             let to = self.0.dir.join(&*key);
@@ -382,6 +404,88 @@ impl std::fmt::Display for NotDurable {
     }
 }
 
+/// Files of at most this size are saved into the save's pack, one file holding many,
+/// so that a fork links one file per pack instead of one per file. Bigger files keep
+/// a file each, which a write into them can clone.
+const PACK_LIMIT: u64 = 64 << 10;
+
+/// A pack: one file in `objects/` holding the bytes of many small saved files.
+#[derive(Debug, Default)]
+struct Pack {
+    /// Its size on disk.
+    size: u64,
+    /// Every object name handed out for a range of it. Files reading from the pack
+    /// share these, so their counts say whether any still does.
+    objects: Vec<SourceKey>,
+    /// No index named it at the last save. It is deleted at the next save that finds
+    /// nothing reading from it, so a reader of the index before still finds it.
+    unnamed: bool,
+}
+
+/// Packs at most this big are small: a save repacks small packs once there are more
+/// than [`SMALL_PACKS`], so their number stays bounded however many saves there are.
+const SMALL_PACK: u64 = 1 << 20;
+const SMALL_PACKS: usize = 16;
+
+/// The pack a save is writing, opened at its first packed file.
+struct PackWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    name: SourceKey,
+    size: u64,
+    /// The object names handed out for it.
+    objects: Vec<SourceKey>,
+    unfinished: Unfinished,
+}
+
+/// A file a failed save leaves behind, deleted when dropped unless the save finished it.
+struct Unfinished(Option<PathBuf>);
+
+impl Unfinished {
+    fn finished(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// What a save has done so far.
+struct Saving {
+    /// Each saved file's version and object.
+    kept: HashMap<String, (u64, SourceKey)>,
+    written: Written,
+    pack: Option<PackWriter>,
+    /// The objects the last index named.
+    before: HashSet<String>,
+    /// Packs whose files this save writes again; see [`Saved::packs_to_repack`].
+    repack: HashSet<String>,
+    /// Objects this save wrote again into its pack, with their new names.
+    packed: HashMap<String, SourceKey>,
+    /// See [`Saved::pack_limit`].
+    pack_limit: Option<u64>,
+}
+
+impl Saving {
+    /// Whether this save writes the stored file `stored` into its pack: a small draft
+    /// no index has named yet, or a file of a pack being repacked.
+    fn packs(&self, stored: &Stored) -> bool {
+        match stored.key.contains('@') {
+            true => self.repack.contains(file_of(&stored.key)),
+            false => self.small(stored.size) && !self.before.contains(&*stored.key),
+        }
+    }
+
+    /// Whether a file of `size` bytes is packed.
+    fn small(&self, size: u64) -> bool {
+        self.pack_limit.is_some_and(|limit| size <= limit)
+    }
+}
+
 /// The saved changes of one workspace, in its state directory.
 pub struct Saved {
     dir: PathBuf,
@@ -396,10 +500,27 @@ pub struct Saved {
     /// file here reads from it, such as a removed file a program still has open.
     doomed: Vec<SourceKey>,
     /// Objects written since the last durable save that names them, not yet flushed to
-    /// disk.
+    /// disk, by file: a pack is flushed once for all the objects in it.
     unsynced: HashSet<String>,
+    /// The packs, by file, with the objects handed out from each.
+    packs: HashMap<String, Pack>,
+    /// Files of at most this size are packed: [`PACK_LIMIT`], or none in tests of
+    /// files saved one per object.
+    pub(crate) pack_limit: Option<u64>,
     /// See [`Saved::take_written`].
     written: Written,
+    /// The objects being deleted in the background, if any; see [`Saved::delete`].
+    deleting: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Saved {
+    /// Finish deleting first, so no delete outlives the workspace: one recreated
+    /// under the same name reuses the same object names.
+    fn drop(&mut self) {
+        if let Some(deleting) = self.deleting.take() {
+            let _ = deleting.join();
+        }
+    }
 }
 
 impl Saved {
@@ -414,7 +535,10 @@ impl Saved {
             objects: HashMap::new(),
             doomed: Vec::new(),
             unsynced: HashSet::new(),
+            packs: HashMap::new(),
+            pack_limit: Some(PACK_LIMIT),
             written: Written::new(),
+            deleting: None,
         }
     }
 
@@ -485,15 +609,26 @@ impl Saved {
         let mut restored = Restored::default();
         // Files saved as one object share its name.
         let mut names: HashMap<&str, SourceKey> = HashMap::new();
+        // The size of each file in `objects/` looked at so far: one look per pack.
+        let mut files: HashMap<String, u64> = HashMap::new();
         for (rel, entry) in &changes.entries {
             let path = under(root, rel)?;
             let object = match entry {
                 Entry::File { object, .. } => {
-                    Some(names.entry(object).or_insert_with(|| object.as_str().into()).clone())
+                    let size = self.object_size(object, &mut files).with_context(|| format!("restoring {rel}"))?;
+                    let key = names.entry(object).or_insert_with(|| {
+                        let key: SourceKey = object.as_str().into();
+                        if object.contains('@') {
+                            self.packs.entry(file_of(object).to_owned()).or_default().objects.push(key.clone());
+                        }
+                        key
+                    });
+                    Some((key.clone(), size))
                 }
                 _ => None,
             };
-            self.apply(ws, &path, entry, object.clone()).with_context(|| format!("restoring {rel}"))?;
+            self.apply(ws, root, &path, entry, object.clone()).with_context(|| format!("restoring {rel}"))?;
+            let object = object.map(|(object, _)| object);
             let mtime = match entry {
                 Entry::File { mtime, .. } | Entry::Dir { mtime } | Entry::Symlink { mtime, .. } => *mtime,
                 Entry::Absent => None,
@@ -506,7 +641,7 @@ impl Saved {
                     let version = ws.stat(path.as_str())?.version;
                     // A save that wasn't durable may have left it unflushed before the
                     // process that wrote it went away, so the next durable save flushes it.
-                    self.unsynced.insert(object.to_string());
+                    self.unsynced.insert(file_of(&object).to_owned());
                     self.objects.insert(rel.clone(), (version, object));
                 }
                 (Entry::Symlink { .. }, _) => {}
@@ -517,16 +652,47 @@ impl Saved {
         }
         // New objects must never reuse the name of one the index still names, nor of any
         // object an earlier save used.
-        let last = self.objects.values().filter_map(|(_, object)| object.parse::<u64>().ok()).max();
+        let last = self.objects.values().filter_map(|(_, object)| file_of(object).parse::<u64>().ok()).max();
         self.store.next.fetch_max((last.unwrap_or(0) + 1).max(changes.next), Ordering::SeqCst);
+        for (file, size) in files {
+            if let Some(pack) = self.packs.get_mut(&file) {
+                pack.size = size;
+            }
+        }
         Ok(restored)
+    }
+
+    /// The size of the saved object `object`. Only its file's size is read, once per
+    /// file in `files`; a missing file means a newer save replaced the object while
+    /// this index was being loaded.
+    fn object_size(&self, object: &str, files: &mut HashMap<String, u64>) -> Result<u64> {
+        let place = place(object)?;
+        let size = match files.get(place.file) {
+            Some(size) => *size,
+            None => {
+                let size = match std::fs::metadata(self.objects_dir().join(place.file)) {
+                    Ok(meta) => meta.len(),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(ObjectGone(object.to_owned()).into());
+                    }
+                    Err(err) => return Err(err).with_context(|| format!("reading saved object {object}")),
+                };
+                files.insert(place.file.to_owned(), size);
+                size
+            }
+        };
+        match place.range {
+            None => Ok(size),
+            Some((offset, len)) if offset.checked_add(len).is_some_and(|end| end <= size) => Ok(len),
+            Some(_) => bail!("saved object {object} reaches past the end of its pack"),
+        }
     }
 
     /// Delete objects the loaded index does not use, left by a crash or by the last
     /// session's delayed deletes. Only the process that serves the workspace, holding
     /// its writer lock, may do this: it alone writes objects.
     pub fn collect_garbage(&mut self) {
-        let live: HashSet<&str> = self.objects.values().map(|(_, object)| &**object).collect();
+        let live: HashSet<&str> = self.objects.values().map(|(_, object)| file_of(object)).collect();
         let mut last = 0;
         if let Ok(files) = std::fs::read_dir(self.objects_dir()) {
             for file in files.flatten() {
@@ -542,8 +708,16 @@ impl Saved {
         self.store.next.fetch_max(last + 1, Ordering::SeqCst);
     }
 
-    /// Replay one entry; a file reads from `object`, its object's shared name.
-    fn apply(&self, ws: &mut Workspace, path: &VPath, entry: &Entry, object: Option<SourceKey>) -> Result<()> {
+    /// Replay one entry; a file reads from `object`, its object's shared name, and size,
+    /// unless it is another name of a file already restored.
+    fn apply(
+        &self,
+        ws: &mut Workspace,
+        root: &VPath,
+        path: &VPath,
+        entry: &Entry,
+        object: Option<(SourceKey, u64)>,
+    ) -> Result<()> {
         let p = path.as_str();
         let current = match ws.stat(p) {
             Ok(meta) => Some(meta.kind),
@@ -566,6 +740,8 @@ impl Saved {
                 }
                 None => ws.mkdir(p, true)?,
             },
+            Entry::File { link: Some(other), .. } | Entry::Symlink { link: Some(other), .. }
+                if self.relink(ws, root, path, other, current)? => {}
             Entry::Symlink { target, .. } => {
                 if current.is_some() {
                     ws.remove(p, true)?;
@@ -573,26 +749,39 @@ impl Saved {
                 ws.symlink(p, target)?;
             }
             Entry::File { executable, .. } => {
-                let object = object.context("a saved file without its object")?;
-                check_object(&object)?;
+                // The bytes stay on disk; only the size was read.
+                let (object, size) = object.context("a saved file without its object")?;
                 // A directory or a link in the way goes first: a write never follows a link.
                 if matches!(current, Some(Kind::Dir | Kind::Symlink)) {
                     ws.remove(p, true)?;
                 }
-                // The bytes stay on disk; only the size is read now. A missing object
-                // means a newer save replaced it while this index was being loaded.
-                let size = match std::fs::metadata(self.objects_dir().join(&*object)) {
-                    Ok(meta) => meta.len(),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(ObjectGone(object.to_string()).into());
-                    }
-                    Err(err) => return Err(err).with_context(|| format!("reading saved object {object}")),
-                };
                 ws.write_stored(p, self.stored(object, size))?;
                 ws.set_executable(p, *executable)?;
             }
         }
         Ok(())
+    }
+
+    /// Make `path` another name of the file at `other` (relative to `root`), if that
+    /// is still a file. False when it isn't, so the file is read from its object.
+    fn relink(
+        &self,
+        ws: &mut Workspace,
+        root: &VPath,
+        path: &VPath,
+        other: &str,
+        current: Option<Kind>,
+    ) -> Result<bool> {
+        let other = under(root, other)?;
+        match ws.stat(other.as_str()) {
+            Ok(meta) if !meta.kind.is_dir() => {}
+            _ => return Ok(false),
+        }
+        if current.is_some() {
+            ws.remove(path.as_str(), true)?;
+        }
+        ws.hard_link(other.as_str(), path.as_str())?;
+        Ok(true)
     }
 
     /// Save `snap`, whose source is mounted at `root`. A `durable` save, which answers
@@ -605,14 +794,24 @@ impl Saved {
         self.unsynced.extend(drafts.iter().map(|draft| draft.to_string()));
         self.doomed.extend(drafts);
         let mut entries = BTreeMap::new();
-        let mut kept = HashMap::new();
-        let mut written = Written::new();
-        for change in snap.ws.changes()? {
+        let mut saving = Saving {
+            kept: HashMap::new(),
+            written: Written::new(),
+            pack: None,
+            before: self.objects.values().map(|(_, object)| object.to_string()).collect(),
+            repack: self.packs_to_repack(),
+            packed: HashMap::new(),
+            pack_limit: self.pack_limit,
+        };
+        let changes = snap.ws.changes()?;
+        let changed: HashSet<&VPath> = changes.iter().map(|change| &change.path).collect();
+        for change in &changes {
             let rel = relative(root, &change.path)?;
             let entry = match change.kind {
                 ChangeKind::Deleted => Entry::Absent,
                 ChangeKind::Added | ChangeKind::Modified => {
-                    self.entry(snap, &change.path, &rel, &mut kept, &mut written)?
+                    let link = linked_name(snap, root, &changed, &change.path)?;
+                    self.entry(snap, &change.path, &rel, link, &mut saving)?
                 }
             };
             entries.insert(rel, entry);
@@ -624,7 +823,10 @@ impl Saved {
                 // A directory that replaced a deleted base file overrides its deletion.
                 Ok(meta) if meta.kind.is_dir() => Entry::Dir { mtime: snap.times.get(dir).map(|t| to_time(*t)) },
                 _ if entries.contains_key(&rel) => continue,
-                Ok(_) => self.entry(snap, &path, &rel, &mut kept, &mut written)?,
+                Ok(_) => {
+                    let link = linked_name(snap, root, &changed, &path)?;
+                    self.entry(snap, &path, &rel, link, &mut saving)?
+                }
                 // Gone, or below a file that replaced one of its parents.
                 Err(Error::NotFound(_) | Error::NotADirectory(_)) => Entry::Absent,
                 Err(err) => return Err(err.into()),
@@ -632,11 +834,21 @@ impl Saved {
             entries.insert(rel, entry);
         }
 
+        let Saving { kept, written, pack, .. } = saving;
+        // The pack stays the save's to delete until the index naming it is in place.
+        let pack = match pack {
+            Some(PackWriter { file, name, size, objects, unfinished }) => {
+                file.into_inner().map_err(|err| err.into_error()).context("writing a saved file")?;
+                self.unsynced.insert(name.to_string());
+                Some((name, Pack { size, objects, unnamed: false }, unfinished))
+            }
+            None => None,
+        };
         let index = serde_json::to_vec(&Changes { entries, next: self.store.next.load(Ordering::SeqCst) })?;
         let tmp = self.dir.join("changes.json.tmp");
         if durable {
             // Objects reach the disk before the index that names them.
-            let live: HashSet<&str> = kept.values().map(|(_, object)| &**object).collect();
+            let live: HashSet<&str> = kept.values().map(|(_, object)| file_of(object)).collect();
             let named: Vec<String> = self.unsynced.iter().filter(|o| live.contains(o.as_str())).cloned().collect();
             if !sync_disk(&self.objects_dir(), named.len())? {
                 for object in &named {
@@ -656,27 +868,33 @@ impl Saved {
             sync_path(&tmp)?;
         }
         std::fs::rename(&tmp, self.index_path()).context("writing changes.json")?;
+        if let Some((name, pack, unfinished)) = pack {
+            unfinished.finished();
+            self.packs.insert(name.to_string(), pack);
+        }
 
         // The new index is in place: objects replaced by the save before this one are
         // now two indexes old. One that a file here still reads from waits until none does.
         let live: HashSet<&str> = kept.values().map(|(_, object)| &**object).collect();
         let mut waiting = Vec::new();
+        let mut deleted = Vec::new();
         for object in std::mem::take(&mut self.doomed) {
             if live.contains(&*object) {
                 continue;
             }
             if Arc::strong_count(&object) == 1 {
-                let _ = std::fs::remove_file(self.objects_dir().join(&*object));
                 self.unsynced.remove(&*object);
+                deleted.push(object.to_string());
             } else {
                 waiting.push(object);
             }
         }
         // Files saved as one object (copies) name it once each, but it waits once: a
-        // second entry here would count as a file still reading from it.
+        // second entry here would count as a file still reading from it. A packed
+        // object goes with its pack, below.
         let mut replaced = HashSet::new();
         for object in self.objects.values().map(|(_, object)| object) {
-            if !live.contains(&**object) && replaced.insert(object.clone()) {
+            if !live.contains(&**object) && !object.contains('@') && replaced.insert(object.clone()) {
                 waiting.push(object.clone());
             }
         }
@@ -684,6 +902,8 @@ impl Saved {
         self.objects = kept;
         // The index names these files' objects now, even if flushing it fails below.
         self.written = written;
+        deleted.extend(self.collect_packs());
+        self.delete(deleted);
         if durable {
             sync_path(&self.dir).map_err(|err| err.context(NotDurable))?;
         }
@@ -699,40 +919,156 @@ impl Saved {
     }
 
     /// The entry for a file or directory, writing its bytes to a new object unless the
-    /// last save already holds this version.
+    /// last save already holds this version. A small file goes into the save's pack.
     fn entry(
         &mut self,
         snap: &Snapshot,
         path: &VPath,
         rel: &str,
-        kept: &mut HashMap<String, (u64, SourceKey)>,
-        written: &mut Written,
+        link: Option<String>,
+        saving: &mut Saving,
     ) -> Result<Entry> {
         let p = path.as_str();
         let meta = snap.ws.stat(p)?;
         let mtime = snap.times.get(p).map(|t| to_time(*t));
-        match meta.kind {
-            Kind::Dir => Ok(Entry::Dir { mtime }),
-            Kind::Symlink => Ok(Entry::Symlink { target: snap.ws.read_link(p)?, mtime }),
-            Kind::File { executable } => {
-                let object = match self.objects.get(rel) {
-                    Some((version, object)) if *version == meta.version => object.clone(),
+        let executable = match meta.kind {
+            Kind::Dir => return Ok(Entry::Dir { mtime }),
+            Kind::Symlink => return Ok(Entry::Symlink { target: snap.ws.read_link(p)?, mtime, link }),
+            Kind::File { executable } => executable,
+        };
+        // A hard-linked file shares the object its first name got in this save, even a
+        // new range when that name's pack is written again.
+        let shared = link.as_ref().and_then(|first| saving.kept.get(first)).filter(|(v, _)| *v == meta.version);
+        let shared = shared.map(|(_, object)| object.clone());
+        let saved = match self.objects.get(rel) {
+            Some((version, object)) if *version == meta.version && !saving.repack.contains(file_of(object)) => {
+                Some(object.clone())
+            }
+            _ => None,
+        };
+        let object = match (shared, saved) {
+            (Some(object), _) => {
+                // If this save wrote it, every name may move it out of memory, so
+                // removing the first name meanwhile doesn't keep it there.
+                let written = saving.written.iter().rev().find(|(.., stored)| stored.key == object);
+                if let Some((_, _, stored)) = written {
+                    let stored = stored.clone();
+                    saving.written.push((path.clone(), meta.version, stored));
+                }
+                object
+            }
+            (None, Some(object)) => object,
+            (None, None) => {
+                let stored = snap.ws.stored(p)?.filter(|stored| self.is_ours(stored));
+                match stored {
                     // A saved file moved, copied or made executable keeps its object.
-                    _ => match snap.ws.stored(p)? {
-                        Some(stored) if self.is_ours(&stored) => stored.key,
-                        _ => {
-                            // A ranged read, which keeps no copy of a base file in memory.
-                            let data = snap.ws.read_range(p, 0, meta.size)?;
-                            let object = self.write_object(&data)?;
-                            written.push((path.clone(), meta.version, self.stored(object.clone(), data.len() as u64)));
-                            object
-                        }
-                    },
-                };
-                kept.insert(rel.to_owned(), (meta.version, object.clone()));
-                Ok(Entry::File { executable, object: object.to_string(), mtime })
+                    Some(stored) if !saving.packs(&stored) => stored.key,
+                    _ => {
+                        let earlier = stored.as_ref().and_then(|stored| saving.packed.get(&*stored.key)).cloned();
+                        let object = match earlier {
+                            // A copy of a file this save already packed.
+                            Some(object) => object,
+                            None => {
+                                // A ranged read, which keeps no copy of a base file in memory.
+                                let data = snap.ws.read_range(p, 0, meta.size)?;
+                                let object = match saving.small(data.len() as u64) {
+                                    true => self.pack_object(&data, &mut saving.pack)?,
+                                    false => self.write_object(&data)?,
+                                };
+                                if let Some(stored) = &stored {
+                                    saving.packed.insert(stored.key.to_string(), object.clone());
+                                }
+                                object
+                            }
+                        };
+                        let size = place(&object).ok().and_then(|place| place.range).map_or(meta.size, |(_, len)| len);
+                        saving.written.push((path.clone(), meta.version, self.stored(object.clone(), size)));
+                        object
+                    }
+                }
+            }
+        };
+        saving.kept.insert(rel.to_owned(), (meta.version, object.clone()));
+        Ok(Entry::File { executable, object: object.to_string(), mtime, link })
+    }
+
+    /// Append `data` to the pack this save writes, opening it first if need be, and
+    /// return the object name of its range.
+    fn pack_object(&mut self, data: &[u8], pack: &mut Option<PackWriter>) -> Result<SourceKey> {
+        let pack = match pack {
+            Some(pack) => pack,
+            None => {
+                let dir = self.objects_dir();
+                std::fs::create_dir_all(&dir).context("creating the objects directory")?;
+                let name = self.store.new_name();
+                let path = dir.join(&*name);
+                let file = std::fs::File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .context("writing a saved file")?;
+                let file = std::io::BufWriter::with_capacity(1 << 20, file);
+                let unfinished = Unfinished(Some(path));
+                pack.insert(PackWriter { file, name, size: 0, objects: Vec::new(), unfinished })
+            }
+        };
+        pack.file.write_all(data).context("writing a saved file")?;
+        let object: SourceKey = format!("{}@{}+{}", pack.name, pack.size, data.len()).into();
+        pack.size += data.len() as u64;
+        pack.objects.push(object.clone());
+        Ok(object)
+    }
+
+    /// The packs whose files the next save writes again into its own pack: those mostly
+    /// holding files the last index no longer names, and every small one once there
+    /// are many, so that neither wasted space nor the number of packs keeps growing.
+    fn packs_to_repack(&self) -> HashSet<String> {
+        // Copies of a file share its range, which holds its bytes once.
+        let objects: HashSet<&str> = self.objects.values().map(|(_, object)| &**object).collect();
+        let mut named: HashMap<&str, u64> = HashMap::new();
+        for object in objects {
+            if let Ok(Place { file, range: Some((_, len)) }) = place(object) {
+                *named.entry(file).or_default() += len;
             }
         }
+        let mut repack = HashSet::new();
+        let mut small = Vec::new();
+        for (file, bytes) in named {
+            let Some(pack) = self.packs.get(file) else { continue };
+            if bytes * 2 < pack.size {
+                repack.insert(file.to_owned());
+            } else if pack.size <= SMALL_PACK {
+                small.push(file.to_owned());
+            }
+        }
+        if small.len() > SMALL_PACKS {
+            repack.extend(small);
+        }
+        repack
+    }
+
+    /// Forget the objects of each pack that nothing reads from any more, and return the
+    /// packs to delete: those the last two indexes name none of the objects of, and
+    /// that nothing reads from.
+    fn collect_packs(&mut self) -> Vec<String> {
+        let named: HashSet<&str> = self.objects.values().map(|(_, object)| file_of(object)).collect();
+        let mut deleted = Vec::new();
+        let unsynced = &mut self.unsynced;
+        self.packs.retain(|file, pack| {
+            pack.objects.retain(|object| Arc::strong_count(object) > 1);
+            if named.contains(file.as_str()) {
+                pack.unnamed = false;
+                return true;
+            }
+            if pack.unnamed && pack.objects.is_empty() {
+                unsynced.remove(file);
+                deleted.push(file.clone());
+                return false;
+            }
+            pack.unnamed = true;
+            true
+        });
+        deleted
     }
 
     fn write_object(&mut self, data: &Bytes) -> Result<SourceKey> {
@@ -760,10 +1096,15 @@ impl Saved {
             let changes: Changes = serde_json::from_slice(&index).context("reading changes.json")?;
             std::fs::create_dir_all(&objects)?;
             let mut complete = true;
+            let mut files = HashSet::new();
             for entry in changes.entries.values() {
                 let Entry::File { object, .. } = entry else { continue };
-                check_object(object)?;
-                let (from, target) = (self.objects_dir().join(object), objects.join(object));
+                // A pack is linked once for all the files in it.
+                let file = place(object)?.file;
+                if !files.insert(file) {
+                    continue;
+                }
+                let (from, target) = (self.objects_dir().join(file), objects.join(file));
                 // Already linked by an earlier attempt, or for another file saved as it.
                 let linked = match std::fs::hard_link(&from, &target) {
                     Ok(()) => true,
@@ -785,15 +1126,80 @@ impl Saved {
     }
 }
 
-/// Object names are numbers; refuse anything else rather than follow it on disk.
-fn check_object(object: &str) -> Result<()> {
-    if object.is_empty() || !object.bytes().all(|b| b.is_ascii_digit()) {
+/// Objects a save deletes itself; more are deleted in the background, so that a save
+/// after many files were packed doesn't wait for one delete each.
+const DELETE_IN_PLACE: usize = 64;
+
+impl Saved {
+    /// Delete the objects `files`. This workspace never uses their names again, so a
+    /// delete finishing late changes nothing, and one the process ending cuts short is
+    /// finished by the next mount's [`Saved::collect_garbage`].
+    fn delete(&mut self, files: Vec<String>) {
+        let many = files.len() > DELETE_IN_PLACE;
+        let dir = self.objects_dir();
+        let remove = move || {
+            for file in files {
+                let _ = std::fs::remove_file(dir.join(file));
+            }
+        };
+        if !many {
+            return remove();
+        }
+        // One batch at a time, so they don't pile up.
+        if let Some(deleting) = self.deleting.take() {
+            let _ = deleting.join();
+        }
+        self.deleting = Some(std::thread::spawn(remove));
+    }
+}
+
+/// Where an object's bytes are: a whole file in `objects/`, named by a number, or a
+/// range of a pack, a file holding many small objects, named `FILE@OFFSET+LEN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Place<'a> {
+    file: &'a str,
+    range: Option<(u64, u64)>,
+}
+
+/// The place an object name points at. Names are numbers, or a pack range; refuse
+/// anything else rather than follow it on disk.
+fn place(object: &str) -> Result<Place<'_>> {
+    let number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let (file, range) = match object.split_once('@') {
+        None => (object, None),
+        Some((file, range)) => {
+            let parsed = range.split_once('+').and_then(|(offset, len)| {
+                (number(offset) && number(len)).then(|| Some((offset.parse().ok()?, len.parse().ok()?)))?
+            });
+            (file, Some(parsed.with_context(|| format!("invalid object name {object:?} in changes.json"))?))
+        }
+    };
+    if !number(file) {
         bail!("invalid object name {object:?} in changes.json");
     }
-    Ok(())
+    Ok(Place { file, range })
+}
+
+/// The file in `objects/` holding `object`'s bytes. Only for names [`place`] accepted.
+fn file_of(object: &str) -> &str {
+    object.split_once('@').map_or(object, |(file, _)| file)
 }
 
 /// `path` relative to `root`, as stored in the index.
+/// For a file with other names (hard links), the one loading restores first, relative
+/// to `root`: a name saved before `path`, or one unchanged in the source.
+fn linked_name(snap: &Snapshot, root: &VPath, changed: &HashSet<&VPath>, path: &VPath) -> Result<Option<String>> {
+    if !snap.ws.has_hard_links() {
+        return Ok(None);
+    }
+    let names = snap.ws.hard_links(path.as_str())?;
+    // A name saved earlier comes first: an unchanged one may be gone from a host folder
+    // by the next load, and then only the first name saved relinks to it.
+    let saved = names.iter().find(|other| *other < path && changed.contains(other));
+    let first = saved.or_else(|| names.iter().find(|other| *other != path && !changed.contains(other)));
+    Ok(first.and_then(|first| relative(root, first).ok()))
+}
+
 fn relative(root: &VPath, path: &VPath) -> Result<String> {
     match path.strip_prefix(root) {
         Some(parts) if !parts.is_empty() => Ok(parts.join("/")),
@@ -880,7 +1286,7 @@ mod tests {
         let mut loaded = base();
         let mut reloaded = Saved::new(state.path());
         let restored = reloaded.load(&mut loaded, &root()).unwrap();
-        assert_eq!(reloaded.unsynced.len(), 2, "a new process flushes what it loaded at its first durable save");
+        assert_eq!(reloaded.unsynced.len(), 1, "a new process flushes what it loaded at its first durable save");
         assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "changed");
         assert_eq!(loaded.stat("/mnt/new/run.sh").unwrap().kind, Kind::File { executable: true });
         assert_eq!(listing(&loaded, "/mnt/dir"), ["b.txt"], "the removed directory stays removed");
@@ -894,12 +1300,80 @@ mod tests {
     }
 
     #[test]
+    fn hard_links_survive_a_save_and_load() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/out/lib.rlib", "built").unwrap();
+        ws.hard_link("/mnt/out/lib.rlib", "/mnt/cache/lib.rlib").unwrap();
+        ws.hard_link("/mnt/out/lib.rlib", "/mnt/out/lib2.rlib").unwrap();
+        ws.hard_link("/mnt/a.txt", "/mnt/a-link.txt").unwrap();
+        ws.hard_link("/mnt/a.txt", "/mnt/z-link.txt").unwrap();
+        ws.symlink("/mnt/sym", "a.txt").unwrap();
+        ws.hard_link("/mnt/sym", "/mnt/sym2").unwrap();
+        let dirs = ["/mnt/cache", "/mnt/out"].map(str::to_owned).into();
+
+        let mut saved = Saved::new(state.path());
+        saved.save(&Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs }, &root(), false).unwrap();
+        assert_eq!(saved.objects.len(), 5);
+        let objects: HashSet<&SourceKey> = saved.objects.values().map(|(_, object)| object).collect();
+        // The second new name of a.txt links to the first, which a load can relink even
+        // if a.txt is gone from the source by then.
+        assert_eq!(objects.len(), 2, "the names of one file share an object");
+        assert!(objects.iter().all(|object| object.contains('@')), "small files are packed: {objects:?}");
+        let mut written: Vec<String> = saved.take_written().iter().map(|(path, ..)| path.to_string()).collect();
+        written.sort();
+        assert_eq!(
+            written,
+            ["/mnt/a-link.txt", "/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib", "/mnt/z-link.txt"],
+            "any name can move the file out of memory"
+        );
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        let names = |path: &str| loaded.hard_links(path).unwrap().iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(names("/mnt/out/lib.rlib"), ["/mnt/cache/lib.rlib", "/mnt/out/lib.rlib", "/mnt/out/lib2.rlib"]);
+        assert_eq!(names("/mnt/a-link.txt"), ["/mnt/a-link.txt", "/mnt/a.txt", "/mnt/z-link.txt"]);
+        assert_eq!(names("/mnt/sym2"), ["/mnt/sym", "/mnt/sym2"], "a link's names stay one link");
+        assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
+        loaded.write("/mnt/cache/lib.rlib", "rebuilt").unwrap();
+        assert_eq!(loaded.read_text("/mnt/out/lib2.rlib").unwrap(), "rebuilt");
+    }
+
+    #[test]
+    fn hard_links_share_a_new_range_when_their_pack_is_written_again() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        for i in 0..10 {
+            ws.write(&format!("/mnt/{i}.txt"), "0123456789").unwrap();
+        }
+        ws.hard_link("/mnt/0.txt", "/mnt/link.txt").unwrap();
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        // Most of the pack replaced: the next save writes 0.txt again, into its own pack.
+        for i in 1..10 {
+            ws.write(&format!("/mnt/{i}.txt"), "changed").unwrap();
+        }
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        let (first, link) = (&saved.objects["0.txt"].1, &saved.objects["link.txt"].1);
+        assert_eq!(first, link, "both names name the new range");
+        assert_eq!(file_of(first), "3");
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.hard_links("/mnt/link.txt").unwrap().len(), 2);
+        assert_eq!(loaded.read_text("/mnt/link.txt").unwrap(), "0123456789");
+        assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
+    }
+
+    #[test]
     fn saves_write_only_files_that_changed_and_drop_stale_objects() {
         let state = tempfile::tempdir().unwrap();
         let mut ws = base();
         ws.write("/mnt/one.txt", "1").unwrap();
         ws.write("/mnt/two.txt", "2").unwrap();
         let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
         let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
         saved.save(&snap(&ws), &root(), false).unwrap();
         let objects = |dir: &Path| {
@@ -935,6 +1409,7 @@ mod tests {
         ws.write("/mnt/one.txt", "1").unwrap();
         ws.write("/mnt/two.txt", "2").unwrap();
         let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
         saved.save(&snap(&ws), &root(), false).unwrap();
         ws.remove("/mnt/two.txt", false).unwrap();
         saved.save(&snap(&ws), &root(), false).unwrap();
@@ -943,6 +1418,7 @@ mod tests {
         // still be about to open, so it must never name a new object 2.
         let mut next = base();
         let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
         saved.load(&mut next, &root()).unwrap();
         saved.collect_garbage();
         assert!(!state.path().join("objects/2").exists());
@@ -973,6 +1449,8 @@ mod tests {
             ws.write(&format!("/mnt/many/{i}.txt"), i.to_string()).unwrap();
         }
         let mut saved = Saved::new(state.path());
+        // One object per file, so there are many to flush.
+        saved.pack_limit = None;
         saved.save(&snap(&ws), &root(), true).unwrap();
         assert!(saved.unsynced.is_empty());
 
@@ -1086,6 +1564,7 @@ mod tests {
         ws.write("/mnt/a.txt", "changed").unwrap();
         ws.write("/mnt/big.bin", vec![7u8; 1 << 20]).unwrap();
         let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
         saved.save(&snap(&ws), &root(), false).unwrap();
         let written = saved.take_written();
         let paths: Vec<&str> = written.iter().map(|(path, _, _)| path.as_str()).collect();
@@ -1153,6 +1632,7 @@ mod tests {
         let mut ws = base();
         ws.write("/mnt/a.txt", "shared").unwrap();
         let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
         save_and_store(&mut saved, &mut ws);
         // The copy reuses a.txt's object, so both files name object 1.
         ws.copy("/mnt/a.txt", "/mnt/b.txt", false).unwrap();
@@ -1171,6 +1651,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut ws = base();
         let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
         let mut draft = saved.drafts().empty().unwrap();
         draft.write_at(0, b"hello world").unwrap();
         draft.write_at(6, b"there").unwrap();
@@ -1212,6 +1693,7 @@ mod tests {
         let mut ws = base();
         ws.write("/mnt/saved.txt", "saved bytes").unwrap();
         let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
         save_and_store(&mut saved, &mut ws);
         let drafts = saved.drafts();
 
@@ -1286,6 +1768,197 @@ mod tests {
         let meta = draft.file.metadata().unwrap();
         assert_eq!(meta.len(), 4 * CHUNK);
         assert!(meta.blocks() * 512 < CHUNK, "{} bytes on disk", meta.blocks() * 512);
+    }
+
+    #[test]
+    fn small_files_are_saved_into_one_pack_and_forked_as_one_link() {
+        let (state, fork) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut ws = base();
+        for i in 0..100 {
+            ws.write(&format!("/mnt/many/{i}.txt"), format!("file {i}")).unwrap();
+        }
+        ws.write("/mnt/big.bin", vec![7u8; PACK_LIMIT as usize + 1]).unwrap();
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["1", "2"], "one object for the big file, one pack for the small ones");
+        let key = ws.stored("/mnt/many/7.txt").unwrap().unwrap().key;
+        assert!(key.starts_with("2@") && key.ends_with("+6"), "{key}");
+        assert_eq!(ws.read_text("/mnt/many/42.txt").unwrap(), "file 42");
+        assert_eq!(ws.read_range("/mnt/many/42.txt", 5, 100).unwrap(), "42", "ranges stop at the file's end");
+
+        // A load reads the pack's size once and each file's bytes when it is read.
+        let mut loaded = base();
+        let mut reloaded = Saved::new(state.path());
+        reloaded.load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/many/99.txt").unwrap(), "file 99");
+        assert_eq!(loaded.stat("/mnt/big.bin").unwrap().size, PACK_LIMIT + 1);
+        assert_eq!(reloaded.packs["2"].objects.len(), 100);
+
+        saved.copy_to(fork.path()).unwrap();
+        assert_eq!(objects(fork.path()), ["1", "2"], "a fork links the pack once");
+        let mut forked = base();
+        Saved::new(fork.path()).load(&mut forked, &root()).unwrap();
+        assert_eq!(forked.read_text("/mnt/many/0.txt").unwrap(), "file 0");
+        assert_eq!(forked.changes().unwrap(), ws.changes().unwrap());
+    }
+
+    #[test]
+    fn a_small_draft_is_packed_and_a_big_one_kept_as_it_is() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        let mut saved = Saved::new(state.path());
+        let drafts = saved.drafts();
+        let mut small = drafts.empty().unwrap();
+        small.write_at(0, b"small").unwrap();
+        ws.write_stored("/mnt/small.txt", small.finish().unwrap()).unwrap();
+        let big = drafts.empty().unwrap();
+        big.set_len(PACK_LIMIT + 1).unwrap();
+        ws.write_stored("/mnt/big.bin", big.finish().unwrap()).unwrap();
+        // A copy shares the draft, and the save packs it once.
+        ws.copy("/mnt/small.txt", "/mnt/copy.txt", false).unwrap();
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(&*ws.stored("/mnt/small.txt").unwrap().unwrap().key, "3@0+5");
+        assert_eq!(objects(state.path()), ["1", "2", "3"], "the small draft waits a save");
+        assert_eq!(&*ws.stored("/mnt/big.bin").unwrap().unwrap().key, "2", "the big draft is the saved object");
+        assert_eq!(ws.read_text("/mnt/copy.txt").unwrap(), "small");
+
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["2", "3"], "then goes, since nothing reads it any more");
+        assert_eq!(saved.packs["3"].objects.len(), 1, "the copy shares the small file's object");
+
+        // Writing into a packed file copies its range into a new draft.
+        let mut draft = drafts.copy(&ws, "/mnt/small.txt", true).unwrap();
+        draft.write_at(5, b"er").unwrap();
+        assert_eq!(draft.read_at(0, 100).unwrap(), "smaller");
+    }
+
+    #[test]
+    fn a_pack_goes_once_nothing_reads_it() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/a.txt", "a").unwrap();
+        ws.write("/mnt/b.txt", "b").unwrap();
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["1"]);
+
+        let still_open = ws.fork();
+        ws.write("/mnt/a.txt", "a again").unwrap();
+        ws.write("/mnt/b.txt", "b again").unwrap();
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["1", "2"], "pack 1 waits for the open files");
+        assert_eq!(still_open.read_text("/mnt/a.txt").unwrap(), "a");
+
+        drop(still_open);
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["2"]);
+        assert!(!saved.packs.contains_key("1"));
+    }
+
+    #[test]
+    fn packs_mostly_replaced_or_many_and_small_are_written_again() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        for i in 0..10 {
+            ws.write(&format!("/mnt/{i}.txt"), "0123456789").unwrap();
+        }
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        // Six of the ten files replaced: pack 1 is mostly unused, so the next save
+        // writes its four other files again, into its own pack.
+        for i in 0..6 {
+            ws.write(&format!("/mnt/{i}.txt"), "changed").unwrap();
+        }
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(&*ws.stored("/mnt/9.txt").unwrap().unwrap().key, "3@30+10", "after 6, 7 and 8");
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["2", "3"]);
+
+        // Each save of one small file makes a small pack; once there are more than
+        // SMALL_PACKS, a save writes them all into one.
+        for i in 0..2 * SMALL_PACKS {
+            ws.write(&format!("/mnt/one/{i}.txt"), "1").unwrap();
+            save_and_store(&mut saved, &mut ws);
+        }
+        save_and_store(&mut saved, &mut ws);
+        assert!(saved.packs.len() <= SMALL_PACKS + 2, "{} packs", saved.packs.len());
+        assert_eq!(ws.read_text("/mnt/one/0.txt").unwrap(), "1");
+        assert_eq!(ws.read_text("/mnt/9.txt").unwrap(), "0123456789");
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
+    }
+
+    #[test]
+    fn copies_of_a_packed_file_count_its_bytes_once() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        for i in 0..10 {
+            ws.write(&format!("/mnt/{i}.txt"), "0123456789").unwrap();
+        }
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        // Ten copies of one file and the nine others replaced: the pack holds 10 live
+        // bytes of 100, however many paths name them.
+        for i in 0..10 {
+            ws.copy("/mnt/0.txt", &format!("/mnt/copy{i}.txt"), false).unwrap();
+        }
+        for i in 1..10 {
+            ws.write(&format!("/mnt/{i}.txt"), "changed").unwrap();
+        }
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(saved.packs_to_repack(), HashSet::from(["1".to_owned()]));
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_pack_behind() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/a.txt", "packed first").unwrap();
+        // Saved after a.txt, and unreadable: its source holds no such file.
+        let gone = Stored { source: Arc::new(MemorySource::default()), key: "gone".into(), size: 4 };
+        ws.write_stored("/mnt/b.txt", gone).unwrap();
+        let mut saved = Saved::new(state.path());
+        assert!(saved.save(&snap(&ws), &root(), false).is_err());
+        assert!(objects(state.path()).is_empty(), "{:?}", objects(state.path()));
+
+        // Nor one whose index could not be written.
+        ws.remove("/mnt/b.txt", false).unwrap();
+        std::fs::create_dir(state.path().join("changes.json.tmp")).unwrap();
+        assert!(saved.save(&snap(&ws), &root(), false).is_err());
+        assert!(objects(state.path()).is_empty(), "{:?}", objects(state.path()));
+        std::fs::remove_dir(state.path().join("changes.json.tmp")).unwrap();
+        saved.save(&snap(&ws), &root(), false).unwrap();
+        assert_eq!(objects(state.path()).len(), 1);
+    }
+
+    #[test]
+    fn deletes_in_the_background_are_done_once_the_workspace_is_let_go() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
+        for round in 0..3 {
+            // More files replaced than are deleted in place.
+            for i in 0..2 * DELETE_IN_PLACE {
+                ws.write(&format!("/mnt/{i}.txt"), round.to_string()).unwrap();
+            }
+            save_and_store(&mut saved, &mut ws);
+        }
+        drop(saved);
+        assert_eq!(objects(state.path()).len(), 2 * DELETE_IN_PLACE * 2, "the last two saves' objects");
+    }
+
+    #[test]
+    fn object_names_outside_the_objects_folder_are_refused() {
+        assert_eq!(place("12").unwrap(), Place { file: "12", range: None });
+        assert_eq!(place("12@4096+5").unwrap(), Place { file: "12", range: Some((4096, 5)) });
+        for name in ["", "../x", "1@", "1@2", "1@+3", "1@2+", "a@1+2", "1@2+3+4", "1@99999999999999999999+1"] {
+            assert!(place(name).is_err(), "{name:?}");
+        }
     }
 
     #[test]

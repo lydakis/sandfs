@@ -412,6 +412,12 @@ impl Inner {
         if let Some(&ino) = self.inos.get(path.as_str()) {
             return ino;
         }
+        // Every name of a hard-linked file is one inode, so the kernel caches its
+        // pages once and a write through one name is read through the others.
+        if let Some(ino) = self.linked_ino(path) {
+            self.inos.insert(path.to_string(), ino);
+            return ino;
+        }
         let ino = self.next_ino;
         self.next_ino += 1;
         self.inos.insert(path.to_string(), ino);
@@ -420,6 +426,25 @@ impl Inner {
             Node { path: path.clone(), lookups: 0, linked: true, sized: Cell::new(false), removed_from: None },
         );
         ino
+    }
+
+    /// The inode another name of the file at `path` already has.
+    fn linked_ino(&self, path: &VPath) -> Option<u64> {
+        if !self.ws.has_hard_links() {
+            return None;
+        }
+        let names = self.ws.hard_links(path.as_str()).ok()?;
+        names.iter().find_map(|name| self.inos.get(name.as_str()).copied())
+    }
+
+    /// The other names of the file at `path`, if it has any.
+    fn other_names(&self, path: &VPath) -> Vec<VPath> {
+        if !self.ws.has_hard_links() {
+            return Vec::new();
+        }
+        let mut names = self.ws.hard_links(path.as_str()).unwrap_or_default();
+        names.retain(|name| name != path);
+        names
     }
 
     /// Reply data for a name the kernel will now hold: counts as one lookup.
@@ -458,7 +483,28 @@ impl Inner {
         };
         let (kind, perm) = file_type(meta.kind);
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
-        Ok(self.make_attr(ino, kind, perm, size, mtime))
+        let mut attr = self.make_attr(ino, kind, perm, size, mtime);
+        if kind != FileType::Directory {
+            attr.nlink = self.nlink(path);
+        }
+        Ok(attr)
+    }
+
+    /// How many names the file at `path` has: more than one through hard links.
+    fn nlink(&self, path: &str) -> u32 {
+        if !self.ws.has_hard_links() {
+            return 1;
+        }
+        self.ws.hard_links(path).map_or(1, |names| names.len() as u32)
+    }
+
+    /// Set the modification time of the file at `path` and of its other names, since
+    /// they are one inode and any of them may be the one asked about.
+    fn set_time(&mut self, path: &VPath, time: SystemTime) {
+        for other in self.other_names(path) {
+            self.times.insert(other.to_string(), time);
+        }
+        self.times.insert(path.to_string(), time);
     }
 
     /// Attributes for a file whose size isn't known without reading it: size 0, for
@@ -471,7 +517,9 @@ impl Inner {
             return Err(Errno::ENOENT);
         }
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
-        Ok(self.make_attr(ino, FileType::RegularFile, if executable { 0o755 } else { 0o644 }, 0, mtime))
+        let mut attr = self.make_attr(ino, FileType::RegularFile, if executable { 0o755 } else { 0o644 }, 0, mtime);
+        attr.nlink = self.nlink(path);
+        Ok(attr)
     }
 
     fn make_attr(&self, ino: u64, kind: FileType, perm: u16, size: u64, mtime: SystemTime) -> FileAttr {
@@ -520,10 +568,13 @@ impl Inner {
     fn maybe_drop(&mut self, ino: u64) {
         let unused = self.nodes.get(&ino).is_some_and(|node| node.lookups == 0) && !self.is_open(ino);
         if unused && ino != ROOT_INO {
-            if let Some(node) = self.nodes.remove(&ino)
-                && self.inos.get(node.path.as_str()) == Some(&ino)
-            {
-                self.inos.remove(node.path.as_str());
+            if let Some(node) = self.nodes.remove(&ino) {
+                let others = if node.linked { self.other_names(&node.path) } else { Vec::new() };
+                for name in others.iter().chain([&node.path]) {
+                    if self.inos.get(name.as_str()) == Some(&ino) {
+                        self.inos.remove(name.as_str());
+                    }
+                }
             }
             self.buffers.remove(&ino);
         }
@@ -532,8 +583,19 @@ impl Inner {
     /// Mark the inode at `path` as removed. A removed file keeps `before`, the
     /// workspace from before the removal, until the kernel forgets it, so reads and
     /// writes through handles still open on it keep working. Forking is O(1).
-    fn unlink_path(&mut self, path: &VPath, before: Option<Workspace>) {
+    ///
+    /// `others` are the file's other names (hard links), which keep the inode alive.
+    fn unlink_path(&mut self, path: &VPath, before: Option<Workspace>, others: &[VPath]) {
         let Some(ino) = self.inos.remove(path.as_str()) else { return };
+        if let Some(other) = others.first() {
+            if let Some(node) = self.nodes.get_mut(&ino)
+                && node.path == *path
+            {
+                node.path = other.clone();
+            }
+            self.inos.entry(other.to_string()).or_insert(ino);
+            return;
+        }
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.linked = false;
             node.removed_from = before.filter(|_| self.keep_removed);
@@ -611,7 +673,7 @@ impl Inner {
                 TimeOrNow::Now => SystemTime::now(),
                 TimeOrNow::SpecificTime(time) => time,
             };
-            self.times.insert(path.to_string(), time);
+            self.set_time(&path, time);
             self.unsaved = true;
         }
         self.attr(ino)
@@ -643,14 +705,31 @@ impl Inner {
         })
     }
 
+    /// link(2): a second name for the file at `ino`, which stays one inode.
+    #[cfg(any(fuse, test))]
+    pub fn link(&mut self, ino: u64, new_parent: u64, new_name: &OsStr) -> FsResult<FileAttr> {
+        let from = self.path(ino)?;
+        let to = self.child(new_parent, new_name)?;
+        self.ws.hard_link(from.as_str(), to.as_str()).fs()?;
+        self.inos.insert(to.to_string(), ino);
+        // The file keeps its time; only the directory it gained a name in changes.
+        match self.times.get(from.as_str()).copied() {
+            Some(time) => self.times.insert(to.to_string(), time),
+            None => self.times.remove(to.as_str()),
+        };
+        self.touch_parent(&to);
+        self.entry(&to)
+    }
+
     pub fn unlink(&mut self, parent: u64, name: &OsStr) -> FsResult<()> {
         let path = self.child(parent, name)?;
         if self.ws.stat(path.as_str()).fs()?.kind.is_dir() {
             return Err(Errno::EISDIR);
         }
         let before = self.ws.fork();
+        let others = self.other_names(&path);
         self.ws.remove(path.as_str(), false).fs()?;
-        self.unlink_path(&path, Some(before));
+        self.unlink_path(&path, Some(before), &others);
         self.times.remove(path.as_str());
         self.touch_parent(&path);
         Ok(())
@@ -662,7 +741,7 @@ impl Inner {
             return Err(Errno::ENOTDIR);
         }
         self.ws.remove(path.as_str(), false).fs()?;
-        self.unlink_path(&path, None);
+        self.unlink_path(&path, None, &[]);
         self.times.remove(path.as_str());
         self.dirs.insert(path.to_string());
         self.touch_parent(&path);
@@ -702,6 +781,10 @@ impl Inner {
                 if rename_noreplace(flags) {
                     return Err(Errno::EEXIST);
                 }
+                // Two names of one file: rename(2) leaves both.
+                if !moving_dir && self.other_names(&to).contains(&from) {
+                    return Ok(());
+                }
                 match (moving_dir, meta.kind.is_dir()) {
                     (true, false) => return Err(Errno::ENOTDIR),
                     (false, true) => return Err(Errno::EISDIR),
@@ -714,13 +797,14 @@ impl Inner {
         };
         // Work on a fork so a failure halfway leaves the workspace as it was.
         let mut next = self.ws.fork();
+        let others = if replacing && !moving_dir { self.other_names(&to) } else { Vec::new() };
         if replacing {
             next.remove(to.as_str(), true).fs()?;
         }
         next.rename(from.as_str(), to.as_str()).fs()?;
         if replacing {
             let before = (!moving_dir).then(|| self.ws.fork());
-            self.unlink_path(&to, before);
+            self.unlink_path(&to, before, &others);
             self.times.remove(to.as_str());
         }
         self.ws = next;
@@ -914,7 +998,7 @@ impl Inner {
         }
         let written = self.change_buffer(ino, |buffer| buffer.write(offset, data))?;
         if let Ok(path) = self.path(ino) {
-            self.times.insert(path.to_string(), SystemTime::now());
+            self.set_time(&path, SystemTime::now());
         }
         Ok(u32::try_from(written).unwrap_or(u32::MAX))
     }
@@ -1334,6 +1418,11 @@ impl Filesystem for SandFs {
         }
     }
 
+    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+        let result = self.0.lock().link(ino.0, newparent.0, newname);
+        self.reply_entry(reply, result);
+    }
+
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let result = self.0.lock().unlink(parent.0, name);
         self.reply_empty(reply, result);
@@ -1631,6 +1720,8 @@ mod tests {
     fn files_are_written_on_disk_where_there_are_drafts() {
         let state = tempfile::tempdir().unwrap();
         let mut saved = Saved::new(state.path());
+        // Files big enough to keep an object of their own; small ones are packed.
+        saved.pack_limit = None;
         let mut fs = fs();
         fs.drafts = Some(saved.drafts());
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
@@ -1822,6 +1913,8 @@ mod tests {
     fn copies_of_saved_files_share_their_object() {
         let state = tempfile::tempdir().unwrap();
         let mut saved = Saved::new(state.path());
+        // One object per file, so the files on disk count the objects.
+        saved.pack_limit = None;
         let mut fs = fs();
         fs.drafts = Some(saved.drafts());
         let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
@@ -2001,6 +2094,36 @@ mod tests {
     }
 
     #[test]
+    fn hard_links_are_one_inode_until_the_last_name_goes() {
+        let mut fs = fs();
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let attr = fs.link(readme, src, name("readme")).unwrap();
+        assert_eq!((attr.ino.0, attr.nlink), (readme, 2));
+        assert_eq!(attr.mtime, SystemTime::UNIX_EPOCH, "a new name leaves the file's time alone");
+        assert_ne!(fs.attr(src).unwrap().mtime, SystemTime::UNIX_EPOCH, "its folder changed");
+        assert_eq!(fs.lookup(src, name("readme")).unwrap().ino.0, readme);
+
+        fs.write(readme, 0, b"HELLO").unwrap();
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read_text("/mnt/src/readme").unwrap(), "HELLO\n");
+        let written = fs.times["/mnt/README.md"];
+        assert_eq!(fs.times["/mnt/src/readme"], written, "every name has the time of the write");
+
+        // Renaming one name onto the other changes nothing.
+        fs.rename(ROOT_INO, name("README.md"), src, name("readme"), RenameFlags::empty()).unwrap();
+        assert_eq!(fs.attr(readme).unwrap().nlink, 2);
+
+        // The first name goes; the inode lives on under the second.
+        fs.unlink(ROOT_INO, name("README.md")).unwrap();
+        let attr = fs.attr(readme).unwrap();
+        assert_eq!((attr.nlink, attr.size), (1, 6));
+        assert_eq!(fs.read(readme, 0, 100).unwrap(), "HELLO\n");
+        assert_eq!(fs.lookup(src, name("readme")).unwrap().ino.0, readme);
+        assert!(matches!(fs.link(src, ROOT_INO, name("dir")), Err(Errno::EISDIR)));
+    }
+
+    #[test]
     fn directories_are_created_and_removed() {
         let mut fs = fs();
         let dir = fs.mkdir(ROOT_INO, name("new")).unwrap();
@@ -2070,16 +2193,19 @@ mod tests {
         ws.mount("/mnt", source.clone()).unwrap();
         let root = VPath::parse("/mnt").unwrap();
         let mut fs = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), SystemTime::UNIX_EPOCH, (1000, 1000));
+        fs.ws.hard_link("/mnt/README.md", "/mnt/README.txt").unwrap();
         let fh = fs.opendir(ROOT_INO).unwrap();
         let mut seen = Vec::new();
         fs.readdirplus(fh, 2, |ino, _, name, attr, ttl| {
-            seen.push((name.to_owned(), ino, attr.size, ttl));
+            seen.push((name.to_owned(), ino, attr.size, ttl, attr.nlink));
             false
         })
         .unwrap();
         fs.releasedir(fh);
         let readme = seen.iter().find(|(name, ..)| name == "README.md").unwrap();
         assert_eq!((readme.2, readme.3), (0, Duration::ZERO), "no size yet, and nothing to keep");
+        let other = seen.iter().find(|(name, ..)| name == "README.txt").unwrap();
+        assert_eq!((readme.4, other.1, other.4), (2, readme.1, 2), "one inode with two names: {seen:?}");
         let src = seen.iter().find(|(name, ..)| name == "src").unwrap();
         assert_eq!(src.3, TTL);
         assert_eq!(source.1.load(Ordering::SeqCst), 0, "listing read no file");

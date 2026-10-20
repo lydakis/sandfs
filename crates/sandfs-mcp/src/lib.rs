@@ -5,7 +5,8 @@
 //! Every call works on one copy-on-write [`Workspace`]: mounts stay read-only, writes
 //! land in the overlay, and the harness collects the result with
 //! [`Server::into_workspace`] and [`Workspace::changes`]. Forking, checkpoints and commits
-//! stay with the harness, so there are no tools for them.
+//! stay with the harness, so there are no tools for them; [`Server::changes_since`] makes
+//! `changes` show only what was done after a checkpoint.
 //!
 //! The `sandfs-mcp` binary serves a workspace built from command-line mounts. For an
 //! MCP client such as Claude Code:
@@ -60,6 +61,14 @@ impl Server {
     /// Serve `workspace`. Fork it first if the caller wants to keep the original.
     pub fn new(workspace: Workspace) -> Self {
         Server { tools: Tools::new(workspace) }
+    }
+
+    /// Make the `changes` tool compare against `base` instead of the mounted sources.
+    /// For an agent handed a fork of a checkpoint, pass the checkpoint, so `changes`
+    /// shows only the agent's own work.
+    pub fn changes_since(mut self, base: Workspace) -> Self {
+        self.tools.since = Some(base);
+        self
     }
 
     /// The workspace as the agent has left it so far.

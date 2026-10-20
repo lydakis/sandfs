@@ -338,6 +338,155 @@ fn changes_include_a_directory_replaced_by_a_file() {
     );
 }
 
+fn changes_since(ws: &Workspace, base: &Workspace) -> Vec<(String, ChangeKind)> {
+    ws.changes_since(base).unwrap().into_iter().map(|Change { path, kind }| (path.to_string(), kind)).collect()
+}
+
+#[test]
+fn changes_since_a_checkpoint_show_only_later_work() {
+    let (mut ws, _) = workspace();
+    ws.write("/repo/README.md", "first try\n").unwrap();
+    ws.write("/repo/notes.txt", "kept").unwrap();
+    ws.write("/repo/draft.txt", "dropped later").unwrap();
+    let checkpoint = ws.fork();
+    assert!(changes_since(&ws, &checkpoint).is_empty());
+
+    ws.write("/repo/README.md", "hello\n").unwrap(); // back to the original
+    ws.remove("/repo/draft.txt", false).unwrap();
+    ws.remove("/repo/src", true).unwrap();
+    ws.write("/repo/src", "now a file").unwrap();
+    ws.hard_link("/repo/notes.txt", "/repo/notes-link.txt").unwrap();
+
+    assert_eq!(
+        changes_since(&ws, &checkpoint),
+        [
+            ("/repo/README.md".into(), ChangeKind::Modified),
+            ("/repo/draft.txt".into(), ChangeKind::Deleted),
+            ("/repo/notes-link.txt".into(), ChangeKind::Added),
+            ("/repo/src".into(), ChangeKind::Added),
+            ("/repo/src/lib.rs".into(), ChangeKind::Deleted),
+            ("/repo/src/util/mod.rs".into(), ChangeKind::Deleted),
+        ]
+    );
+    // The other way round, the checkpoint's view of the same difference.
+    assert_eq!(changes_since(&checkpoint, &ws)[0], ("/repo/README.md".into(), ChangeKind::Modified));
+    assert_eq!(changes_since(&checkpoint, &ws)[1], ("/repo/draft.txt".into(), ChangeKind::Added));
+
+    // A write through one name of a linked file changes every name.
+    let linked = ws.fork();
+    ws.write("/repo/notes-link.txt", "edited").unwrap();
+    assert_eq!(
+        changes_since(&ws, &linked),
+        [("/repo/notes-link.txt".into(), ChangeKind::Modified), ("/repo/notes.txt".into(), ChangeKind::Modified)]
+    );
+}
+
+#[test]
+fn two_attempts_from_one_checkpoint_compare_without_reading_the_source() {
+    let (mut checkpoint, source) = workspace();
+    checkpoint.write("/repo/src/lib.rs", "shared work\n").unwrap();
+    let (mut a, mut b) = (checkpoint.fork(), checkpoint.fork());
+    a.write("/repo/src/a.rs", "attempt a").unwrap();
+    b.write("/repo/src/b.rs", "attempt b").unwrap();
+    a.write("/repo/same.txt", "both wrote this").unwrap();
+    b.write("/repo/same.txt", "both wrote this").unwrap();
+    a.set_executable("/repo/src/lib.rs", true).unwrap();
+    let before = source.reads();
+
+    assert_eq!(
+        changes_since(&a, &b),
+        [
+            ("/repo/src/a.rs".into(), ChangeKind::Added),
+            ("/repo/src/b.rs".into(), ChangeKind::Deleted),
+            ("/repo/src/lib.rs".into(), ChangeKind::Modified),
+        ]
+    );
+    assert_eq!(source.reads(), before, "only what the attempts wrote is compared");
+}
+
+/// One file of `len` zero bytes but the last, counting whole reads of it.
+#[derive(Debug)]
+struct Large {
+    len: u64,
+    last: u8,
+    listed: bool,
+    whole_reads: AtomicUsize,
+}
+
+impl Large {
+    fn new(last: u8) -> Self {
+        Large { len: COMPARE_LIMIT, last, listed: true, whole_reads: AtomicUsize::new(0) }
+    }
+}
+
+impl Source for Large {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        Ok("".into())
+    }
+
+    fn read_dir(&self, _key: &str) -> sandfs_core::Result<Listing> {
+        let entry = sandfs_core::SourceEntry {
+            kind: Kind::File { executable: false },
+            key: "large.bin".into(),
+            size: self.listed.then_some(self.len),
+        };
+        Ok([("large.bin".to_owned(), entry)].into())
+    }
+
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        self.whole_reads.fetch_add(1, Ordering::SeqCst);
+        self.read_range(key, 0, self.len)
+    }
+
+    fn read_range(&self, _key: &str, offset: u64, len: u64) -> sandfs_core::Result<Bytes> {
+        let end = (offset + len).min(self.len);
+        let mut bytes = vec![0; end.saturating_sub(offset) as usize];
+        if end == self.len && !bytes.is_empty() {
+            *bytes.last_mut().unwrap() = self.last;
+        }
+        Ok(bytes.into())
+    }
+}
+
+#[test]
+fn large_files_mounted_separately_are_compared_in_pieces() {
+    let mounted = |source: &Arc<Large>| {
+        let mut ws = Workspace::new();
+        ws.mount("/data", source.clone()).unwrap();
+        ws
+    };
+    let (zero, one) = (Arc::new(Large::new(0)), Arc::new(Large::new(1)));
+    assert!(changes_since(&mounted(&zero), &mounted(&Arc::new(Large::new(0)))).is_empty(), "same bytes");
+    assert_eq!(changes_since(&mounted(&one), &mounted(&zero)), [("/data/large.bin".into(), ChangeKind::Modified)]);
+    assert_eq!(zero.whole_reads.load(Ordering::SeqCst) + one.whole_reads.load(Ordering::SeqCst), 0);
+    // A source that doesn't list sizes may hold more than the other's listed size.
+    let longer = Arc::new(Large { len: COMPARE_LIMIT + 1, listed: false, ..Large::new(0) });
+    assert_eq!(changes_since(&mounted(&zero), &mounted(&longer)), [("/data/large.bin".into(), ChangeKind::Modified)]);
+}
+
+#[test]
+fn large_written_files_from_separate_stores_are_compared_in_pieces() {
+    // Saved workspaces loaded separately keep their files in stores of their own.
+    let written = |last| {
+        let mut ws = Workspace::new();
+        ws.mount("/data", Arc::new(MemorySource::from_files([("a.txt", "a")]).unwrap())).unwrap();
+        let source: Arc<dyn Source> = Arc::new(Large::new(last));
+        ws.write_stored("/data/large.bin", Stored { source, key: "large.bin".into(), size: COMPARE_LIMIT }).unwrap();
+        ws
+    };
+    assert!(changes_since(&written(0), &written(0)).is_empty());
+    assert_eq!(changes_since(&written(1), &written(0)), [("/data/large.bin".into(), ChangeKind::Modified)]);
+}
+
+#[test]
+fn workspaces_with_their_own_mounts_are_compared_file_by_file() {
+    let (mut ws, _) = workspace();
+    let (other, _) = workspace();
+    assert!(changes_since(&ws, &other).is_empty(), "the same files under separate mounts");
+    ws.write("/repo/docs/guide.md", "rewritten\n").unwrap();
+    assert_eq!(changes_since(&ws, &other), [("/repo/docs/guide.md".into(), ChangeKind::Modified)]);
+}
+
 #[test]
 fn deleting_then_restoring_a_file_is_no_change() {
     let (mut ws, _) = workspace();
@@ -544,6 +693,62 @@ fn symlinks_are_stored_and_never_followed() {
         changes(&ws),
         [("/repo/.venv/lib64".into(), ChangeKind::Added), ("/repo/docs/readme".into(), ChangeKind::Added)]
     );
+}
+
+#[test]
+fn hard_links_share_one_file_until_every_name_is_gone() {
+    let (mut ws, source) = workspace();
+    ws.write("/repo/build/out.o", "v1").unwrap();
+    ws.hard_link("/repo/build/out.o", "/repo/cache/out.o").unwrap();
+    let names = |ws: &Workspace, path: &str| -> Vec<String> {
+        ws.hard_links(path).unwrap().iter().map(ToString::to_string).collect()
+    };
+    assert_eq!(names(&ws, "/repo/cache/out.o"), ["/repo/build/out.o", "/repo/cache/out.o"]);
+    assert_eq!(names(&ws, "/repo/README.md"), ["/repo/README.md"]);
+
+    // A write through one name is seen through the other, with one version.
+    let version = ws.write("/repo/cache/out.o", "v2").unwrap();
+    assert_eq!(ws.read_text("/repo/build/out.o").unwrap(), "v2");
+    assert_eq!(ws.stat("/repo/build/out.o").unwrap().version, version);
+    ws.set_executable("/repo/build/out.o", true).unwrap();
+    assert_eq!(ws.stat("/repo/cache/out.o").unwrap().kind, Kind::File { executable: true });
+
+    // A fork changes its own copy, and a plain copy is a new file.
+    let mut attempt = ws.fork();
+    attempt.write("/repo/build/out.o", "fork").unwrap();
+    assert_eq!(ws.read_text("/repo/cache/out.o").unwrap(), "v2");
+    assert_eq!(attempt.read_text("/repo/cache/out.o").unwrap(), "fork");
+    ws.copy("/repo/build/out.o", "/repo/copy.o", false).unwrap();
+    ws.write("/repo/copy.o", "copy").unwrap();
+    assert_eq!(ws.read_text("/repo/build/out.o").unwrap(), "v2");
+
+    // Moving a name, or its folder, keeps the link; removing one keeps the other.
+    ws.rename("/repo/cache", "/repo/kept").unwrap();
+    ws.write("/repo/kept/out.o", "v3").unwrap();
+    assert_eq!(ws.read_text("/repo/build/out.o").unwrap(), "v3");
+    ws.remove("/repo/build", true).unwrap();
+    assert_eq!(names(&ws, "/repo/kept/out.o"), ["/repo/kept/out.o"]);
+    assert!(!ws.has_hard_links(), "a file left with one name is an ordinary file");
+    assert_eq!(ws.read_text("/repo/kept/out.o").unwrap(), "v3");
+
+    // A base file can be linked without being read; only the new name is a change.
+    ws.hard_link("/repo/docs/guide.md", "/repo/guide.md").unwrap();
+    assert!(ws.has_hard_links());
+    assert_eq!(source.files.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        changes(&ws),
+        [
+            ("/repo/copy.o".into(), ChangeKind::Added),
+            ("/repo/guide.md".into(), ChangeKind::Added),
+            ("/repo/kept/out.o".into(), ChangeKind::Added),
+        ]
+    );
+    ws.write("/repo/guide.md", "edited").unwrap();
+    assert!(changes(&ws).contains(&("/repo/docs/guide.md".into(), ChangeKind::Modified)), "the base name changed too");
+
+    assert!(matches!(ws.hard_link("/repo/src", "/repo/src2"), Err(Error::IsADirectory(_))));
+    assert!(matches!(ws.hard_link("/repo/README.md", "/repo/copy.o"), Err(Error::AlreadyExists(_))));
+    assert!(matches!(ws.hard_link("/repo/missing", "/repo/x"), Err(Error::NotFound(_))));
 }
 
 #[test]
@@ -835,6 +1040,25 @@ fn stored_files_are_read_from_their_store_every_time() {
 }
 
 #[test]
+fn stored_files_forks_share_compare_without_reading() {
+    let saved = store(&[("1", "saved report"), ("2", "other text")]);
+    let mut checkpoint = Workspace::new();
+    checkpoint.mount("/data", Arc::new(repo())).unwrap();
+    checkpoint.write_stored("/data/report.txt", stored(&saved, "1", 12)).unwrap();
+    let mut attempt = checkpoint.fork();
+    attempt.copy("/data/report.txt", "/data/copy.txt", false).unwrap();
+    attempt.write_stored("/data/notes.txt", stored(&saved, "2", 10)).unwrap();
+    assert_eq!(
+        changes_since(&attempt, &checkpoint),
+        [("/data/copy.txt".into(), ChangeKind::Added), ("/data/notes.txt".into(), ChangeKind::Added)]
+    );
+    assert!(changes_since(&checkpoint.fork(), &checkpoint).is_empty());
+    attempt.write_stored("/data/report.txt", stored(&saved, "1", 12)).unwrap(); // same file again
+    assert_eq!(changes_since(&attempt, &checkpoint).len(), 2);
+    assert_eq!(saved.reads(), (0, 0), "nothing stored was read");
+}
+
+#[test]
 fn storing_a_file_keeps_its_version_unless_it_changed_since() {
     let saved = store(&[("1", "draft one"), ("2", "draft two")]);
     let mut ws = Workspace::new();
@@ -863,6 +1087,13 @@ fn storing_a_file_keeps_its_version_unless_it_changed_since() {
     let version = ws.set_executable("/data/run.sh", true).unwrap().max(version);
     assert!(ws.store("/data/run.sh", version, stored(&saved, "2", 9)).unwrap());
     assert_eq!(ws.stat("/data/run.sh").unwrap().kind, Kind::File { executable: true });
+
+    // Storing one name of a linked file stores the file every name shares.
+    ws.hard_link("/data/run.sh", "/data/run-link.sh").unwrap();
+    let version = ws.write("/data/run-link.sh", "draft one").unwrap();
+    assert!(ws.store("/data/run.sh", version, stored(&saved, "1", 9)).unwrap());
+    assert_eq!(&*ws.stored("/data/run-link.sh").unwrap().unwrap().key, "1");
+    assert_eq!(ws.hard_links("/data/run.sh").unwrap().len(), 2, "still one file");
 }
 
 #[test]

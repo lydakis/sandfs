@@ -133,6 +133,7 @@ fn mount_fork_changes_and_remount() {
     std::fs::write(fix.join("fix.txt"), "only in the fork\n").unwrap();
     assert!(!main.join("fix.txt").exists());
     assert!(sandfs.stdout(&["changes", fix.to_str().unwrap()]).contains("A fix.txt\n"));
+    assert_eq!(sandfs.stdout(&["changes", "fix", "--since", "main"]), "A fix.txt\n", "only the fork's own work");
 
     // Changes survive unmounting and mounting again.
     sandfs.unmount(&main);
@@ -435,6 +436,45 @@ fn symlinks_work_in_a_mount_and_survive_a_remount() {
     assert_eq!(std::fs::read_link(ws.join("site")).unwrap(), Path::new("lib/site.txt"));
     assert_eq!(std::fs::read_link(ws.join("lib/dangling")).unwrap(), Path::new("missing"));
     assert!(Command::new(ws.join(".venv/bin/python")).arg("-c").arg("pass").status().unwrap().success());
+    sandfs.unmount(&ws);
+}
+
+/// Hard links need the FUSE mount; the NFS server under the macOS mount has no LINK.
+#[cfg(target_os = "linux")]
+#[test]
+fn hard_links_work_in_a_mount_and_survive_a_remount() {
+    use std::os::unix::fs::MetadataExt;
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(data.path().join("base.txt"), "base\n").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("build");
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+
+    std::fs::create_dir(ws.join("deps")).unwrap();
+    std::fs::write(ws.join("deps/lib-1a2b.rlib"), "v1").unwrap();
+    std::fs::hard_link(ws.join("deps/lib-1a2b.rlib"), ws.join("lib.rlib")).unwrap();
+    std::fs::hard_link(ws.join("base.txt"), ws.join("base-link.txt")).unwrap();
+    let (a, b) =
+        (std::fs::metadata(ws.join("deps/lib-1a2b.rlib")).unwrap(), std::fs::metadata(ws.join("lib.rlib")).unwrap());
+    assert_eq!((a.ino(), a.nlink()), (b.ino(), 2));
+    std::fs::write(ws.join("lib.rlib"), "v2").unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("deps/lib-1a2b.rlib")).unwrap(), "v2");
+    std::fs::remove_file(ws.join("deps/lib-1a2b.rlib")).unwrap();
+    assert_eq!(std::fs::metadata(ws.join("lib.rlib")).unwrap().nlink(), 1);
+    std::fs::hard_link(ws.join("lib.rlib"), ws.join("deps/lib-1a2b.rlib")).unwrap();
+
+    assert_eq!(sandfs.stdout(&["changes", "build"]), "A base-link.txt\nA deps/lib-1a2b.rlib\nA lib.rlib\n");
+    assert!(!data.path().join("lib.rlib").exists(), "the folder underneath is untouched");
+
+    sandfs.unmount(&ws);
+    sandfs.mount(&["mount", "build", ws.to_str().unwrap()], &ws);
+    std::fs::write(ws.join("deps/lib-1a2b.rlib"), "v3").unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("lib.rlib")).unwrap(), "v3", "still one file after a remount");
+    assert_eq!(std::fs::metadata(ws.join("base-link.txt")).unwrap().nlink(), 2);
     sandfs.unmount(&ws);
 }
 
