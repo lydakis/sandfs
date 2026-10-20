@@ -60,18 +60,23 @@ pub struct Column {
 
 pub struct BuildResult {
     pub job: String,
+    /// How many copies or forks ran the job at once.
+    pub parallel: usize,
     pub columns: Vec<Column>,
 }
 
 /// Run `job` in a copy of its folder on the host (`host`) and, when asked (`mount`) and
-/// `bin` can mount here, in a mount of another copy; run it again `iters` times. A
-/// mount column that was asked for by name (`mount_named`) and can't run is an error,
-/// not a missing column.
+/// `bin` can mount here, in a mount of another copy; run it again `iters` times. With
+/// `parallel` above one, the job runs that many times at once: in as many copies on the
+/// host, and in as many forks of one mount. A mount column that was asked for by name
+/// (`mount_named`) and can't run is an error, not a missing column.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     job: &Job,
     scratch: &Path,
     bin: &Path,
     iters: usize,
+    parallel: usize,
     host: bool,
     (mount, mount_named): (bool, bool),
 ) -> Result<BuildResult> {
@@ -99,6 +104,7 @@ pub fn run(
         }
     };
     ensure!(host || mount, "the build table runs on the host and fuse targets only");
+    ensure!(parallel > 0, "--build-parallel must be at least 1");
     // A scratch folder inside the copied folder is left out of its copies, with the data
     // set and anything else the run put there.
     let scratch = scratch.canonicalize()?;
@@ -121,21 +127,33 @@ pub fn run(
     };
     let mut columns = Vec::new();
     if host {
-        columns.push(run_in("host folder", &copy("host")?, &cache("host")?, job, change.as_deref(), iters, None)?);
+        let (name, dirs) = match parallel {
+            1 => ("host folder", vec![copy("host")?]),
+            _ => ("host folders", (0..parallel).map(|i| copy(&format!("host-{i}"))).collect::<Result<_>>()?),
+        };
+        columns.push(run_in(name, &dirs, &cache("host")?, job, change.as_deref(), iters, None)?);
     }
     if mount {
         match Fuse::new(copy("mounted")?, base.clone(), bin.to_owned()) {
             Ok(fuse) => {
-                let view = fuse.open(true)?;
-                let root = view.root_dir().context("a mount has a folder")?.to_owned();
+                let mut view = fuse.open(true)?;
+                // Forks of one mount, as attempts branching from one prepared folder are.
+                let (name, views) = match parallel {
+                    1 => ("sandfs mount", vec![view]),
+                    _ => ("sandfs forks", (0..parallel).map(|_| view.fork()).collect::<Result<_>>()?),
+                };
+                let dirs: Vec<PathBuf> = views
+                    .iter()
+                    .map(|view| view.root_dir().context("a mount has a folder").map(Path::to_owned))
+                    .collect::<Result<_>>()?;
                 let cache = cache("mounted")?;
-                columns.push(run_in("sandfs mount", &root, &cache, job, change.as_deref(), iters, Some(&fuse))?);
+                columns.push(run_in(name, &dirs, &cache, job, change.as_deref(), iters, Some(&fuse))?);
             }
             Err(err) if mount_named || !host => return Err(err),
             Err(err) => eprintln!("build: no mount column ({err:#})"),
         }
     }
-    Ok(BuildResult { job: job.describe(), columns })
+    Ok(BuildResult { job: job.describe(), parallel, columns })
 }
 
 /// Fetch the dependencies once, so no build waits on the network.
@@ -143,46 +161,60 @@ fn fetch(dir: &Path) -> Result<()> {
     cargo(dir, &["fetch", "--quiet"]).context("cargo fetch (the build table needs the network once)")
 }
 
+/// Run `job` in every one of `dirs` at once, timing until the last one finishes.
 fn run_in(
     name: &'static str,
-    dir: &Path,
+    dirs: &[PathBuf],
     cache: &Path,
     job: &Job,
     change: Option<&Path>,
     iters: usize,
     fuse: Option<&Fuse>,
 ) -> Result<Column> {
-    eprintln!("{NAME}: in a {name}");
-    let once = || -> Result<Duration> {
-        let start = Instant::now();
+    eprintln!("{NAME}: in {} {name}", dirs.len());
+    let run_one = |dir: &Path| -> Result<()> {
         match job {
             Job::Cargo { package } => {
                 // The output goes inside the folder, whatever a cargo config says.
                 let target = dir.join("target");
                 let target = target.to_str().context("a non-UTF-8 folder")?;
-                cargo(dir, &["build", "--offline", "--quiet", "-p", package, "--target-dir", target])?;
+                cargo(dir, &["build", "--offline", "--quiet", "-p", package, "--target-dir", target])
             }
             Job::Command { command, .. } => {
                 let status =
                     Command::new("sh").args(["-c", command]).current_dir(dir).env("XDG_CACHE_HOME", cache).status()?;
                 ensure!(status.success(), "`{command}` failed in {}", dir.display());
+                Ok(())
             }
         }
+    };
+    let once = || -> Result<Duration> {
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            let runs: Vec<_> = dirs.iter().map(|dir| scope.spawn(move || run_one(dir))).collect();
+            runs.into_iter().try_for_each(|run| run.join().expect("a run panicked"))
+        })?;
         Ok(start.elapsed())
     };
     let cold = once()?;
     let mut rebuilds = Vec::new();
     for round in 0..iters {
         // A real edit, not just a newer timestamp: a comment the compiler has to read,
-        // or for any other file a blank line, which no language minds. The columns'
-        // edits differ (the mount's lines hold a space), so a cache the columns share
-        // never holds a result for the other column's bytes.
+        // or for any other file blank lines, which no language minds. Every copy and
+        // round gets different bytes, and the mount's lines hold a space, so no run
+        // finds another's result in a cache they share.
         if let Some(change) = change {
-            let mut file = fs::File::options().append(true).open(dir.join(change))?;
-            let blank = if fuse.is_some() { " " } else { "" };
-            match job {
-                Job::Cargo { .. } => writeln!(file, "// edit {round} in a {name}")?,
-                Job::Command { .. } => writeln!(file, "{blank}")?,
+            let blank = if fuse.is_some() { " \n" } else { "\n" };
+            for (i, dir) in dirs.iter().enumerate() {
+                let mut file = fs::File::options().append(true).open(dir.join(change))?;
+                match job {
+                    Job::Cargo { .. } => writeln!(file, "// edit {round} in copy {i} of a {name}")?,
+                    // Copy i holds i + 1 + round * dirs.len() lines more than at first.
+                    Job::Command { .. } => {
+                        let lines = if round == 0 { i + 1 } else { dirs.len() };
+                        file.write_all(blank.repeat(lines).as_bytes())?;
+                    }
+                }
             }
         }
         rebuilds.push(once()?);
@@ -260,7 +292,15 @@ fn current_rss(pid: u32) -> Result<u64> {
 
 pub fn print(result: &BuildResult) {
     println!();
-    println!("{}; median of {}.", result.job, result.columns.first().map_or(0, |column| column.rebuilds.len()));
+    let at_once = match result.parallel {
+        1 => String::new(),
+        n => format!(", {n} at once (in copies of the folder on the host, in forks of one mount)"),
+    };
+    println!(
+        "{}{at_once}; median of {}.",
+        result.job,
+        result.columns.first().map_or(0, |column| column.rebuilds.len())
+    );
     println!();
     let names: Vec<&str> = result.columns.iter().map(|column| column.name).collect();
     println!("| | {} |", names.join(" | "));
@@ -291,5 +331,5 @@ pub fn json(result: &BuildResult) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "job": result.job, "columns": columns })
+    serde_json::json!({ "job": result.job, "parallel": result.parallel, "columns": columns })
 }

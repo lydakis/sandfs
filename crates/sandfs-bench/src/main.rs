@@ -109,6 +109,9 @@ struct Args {
     /// each run after the first.
     #[arg(long, requires = "build_dir")]
     build_change: Option<PathBuf>,
+    /// How many copies (or forks of one mount) the build table runs the job in at once.
+    #[arg(long, default_value_t = 1)]
+    build_parallel: usize,
     /// Run one remote method against listings already fetched to this directory and
     /// report it as JSON, so its memory peak is its own.
     #[arg(long, hide = true, requires = "remote_child_method")]
@@ -173,7 +176,7 @@ fn run(args: Args) -> Result<()> {
     if args.only.as_deref() == Some(build::NAME) {
         let named = args.targets.as_ref().is_some_and(|list| list.contains(&TargetArg::Fuse));
         let (host, mount) = (wanted(TargetArg::Host), (wanted(TargetArg::Fuse), named));
-        let built = build::run(&job, &scratch, &bin, scale.iters, host, mount)?;
+        let built = build::run(&job, &scratch, &bin, scale.iters, args.build_parallel, host, mount)?;
         build::print(&built);
         if let Some(path) = &args.json {
             std::fs::write(path, serde_json::to_string_pretty(&json!({ "build": build::json(&built) }))?)?;
@@ -275,7 +278,7 @@ fn run(args: Args) -> Result<()> {
     };
     let built = if run_build {
         let (host, mount) = (wanted(TargetArg::Host), (wanted(TargetArg::Fuse), explicit(TargetArg::Fuse)));
-        Some(build::run(&job, &scratch, &bin, scale.iters, host, mount)?)
+        Some(build::run(&job, &scratch, &bin, scale.iters, args.build_parallel, host, mount)?)
     } else {
         None
     };
