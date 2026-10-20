@@ -225,13 +225,21 @@ impl GitSource {
         fetch.wait().is_ok_and(|status| status.success())
     }
 
-    /// Remember that every file below the tree `id` is local, with every tree below it.
+    /// Remember that every file below the tree `id` is local, with every tree below it,
+    /// including files fetched some other way since the walk.
     fn mark_local(&self, id: &str) {
         // Trees are local in a blobless clone, so listing them fetches nothing.
-        let Ok(trees) = git_output(&self.repo, &["ls-tree", "-r", "-d", "--object-only", id]) else { return };
+        // `<mode> <type> <id>\t<path>`
+        let Ok(listed) = git_output(&self.repo, &["ls-tree", "-r", "-t", "-z", id]) else { return };
+        let entries = listed.split('\0').filter_map(|entry| {
+            let mut fields = entry.split('\t').next()?.split(' ').skip(1);
+            Some((fields.next()?, fields.next()?))
+        });
+        let (trees, files): (Vec<_>, Vec<_>) = entries.partition(|(kind, _)| *kind == "tree");
+        self.now_local(files.into_iter().map(|(_, id)| id));
         let Ok(mut local) = self.local.lock() else { return };
         local.insert(id.into());
-        local.extend(trees.lines().map(SourceKey::from));
+        local.extend(trees.into_iter().map(|(_, id)| SourceKey::from(id)));
     }
 
     fn object(&self, id: &str, expected: &str) -> Result<Bytes> {
@@ -573,8 +581,8 @@ mod tests {
     fn listings_use_one_walk_of_the_tree_once_it_is_done() {
         let origin = tempfile::tempdir().unwrap();
         run(origin.path(), &["init", "-q"]);
-        std::fs::create_dir(origin.path().join("dir")).unwrap();
-        for name in ["a.txt", "b.txt", "dir/c.txt", "dir/d.txt"] {
+        std::fs::create_dir_all(origin.path().join("dir/sub")).unwrap();
+        for name in ["a.txt", "b.txt", "dir/c.txt", "dir/d.txt", "dir/sub/e.txt"] {
             std::fs::write(origin.path().join(name), name).unwrap();
         }
         run(origin.path(), &["add", "-A"]);
@@ -595,7 +603,7 @@ mod tests {
             assert!(start.elapsed().as_secs() < 30, "the walk never finished");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(source.absent.get().unwrap().as_ref().unwrap().sorted.len() / source.hash_len, 4);
+        assert_eq!(source.absent.get().unwrap().as_ref().unwrap().sorted.len() / source.hash_len, 5);
 
         // What is read or fetched afterwards gets its size, though the walk found it missing.
         let listing = source.read_dir(&root).unwrap();
@@ -642,6 +650,14 @@ mod tests {
         let cancelled = AtomicBool::new(true);
         assert!(walk_missing(clone.path(), &root, source.hash_len, &cancelled).is_none());
         let found = walk_missing(clone.path(), &root, source.hash_len, &AtomicBool::new(false)).unwrap();
-        assert_eq!(found.sorted.len() / found.len, 1, "b.txt is the one file left on the server");
+        assert_eq!(found.sorted.len() / found.len, 2, "b.txt and dir/sub/e.txt are left on the server");
+
+        // A prefetch of everything below a folder also notes files deep inside it that
+        // something else fetched.
+        let sub = source.read_dir(&dir).unwrap()["sub"].key.clone();
+        let e = source.read_dir(&sub).unwrap()["e.txt"].key.clone();
+        run(clone.path(), &["cat-file", "-p", &e]);
+        source.prefetch(&root, true);
+        assert_eq!(size(&source.read_dir(&sub).unwrap(), "e.txt"), Some(13));
     }
 }
