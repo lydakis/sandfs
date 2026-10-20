@@ -11,6 +11,7 @@
 //! Every timed run starts from a fresh view: a new workspace or mount, so caches start
 //! empty except the kernel's page cache, which is warm for every target alike.
 
+mod build;
 mod data;
 mod everyday;
 mod lazy;
@@ -92,6 +93,9 @@ struct Args {
     /// shallow, blobless, full. Default: all of them.
     #[arg(long, value_enum, value_delimiter = ',')]
     remote_methods: Option<Vec<remote::Method>>,
+    /// The package of this repository the build table builds.
+    #[arg(long, default_value = "sandfs-cli")]
+    build_package: String,
     /// Run one remote method against listings already fetched to this directory and
     /// report it as JSON, so its memory peak is its own.
     #[arg(long, hide = true, requires = "remote_child_method")]
@@ -145,11 +149,22 @@ fn run(args: Args) -> Result<()> {
         }
         return Ok(());
     }
+    let wanted = |target: TargetArg| args.targets.as_ref().is_none_or(|list| list.contains(&target));
+    // The build table needs no data set, so it runs on its own.
+    if args.only.as_deref() == Some(build::NAME) {
+        let named = args.targets.as_ref().is_some_and(|list| list.contains(&TargetArg::Fuse));
+        let (host, mount) = (wanted(TargetArg::Host), (wanted(TargetArg::Fuse), named));
+        let built = build::run(&args.build_package, &scratch, &bin, scale.iters, host, mount)?;
+        build::print(&built);
+        if let Some(path) = &args.json {
+            std::fs::write(path, serde_json::to_string_pretty(&json!({ "build": build::json(&built) }))?)?;
+        }
+        return Ok(());
+    }
     eprintln!("generating the data set in {}", scratch.display());
     let data = Data::generate(scale, &scratch)?;
     let root = data.root().to_owned();
 
-    let wanted = |target: TargetArg| args.targets.as_ref().is_none_or(|list| list.contains(&target));
     let explicit = |target: TargetArg| args.targets.as_ref().is_some_and(|list| list.contains(&target));
     let mut targets: Vec<Box<dyn Target>> = Vec::new();
     // The kind of each target, in the same order, for running it in a child process.
@@ -188,7 +203,14 @@ fn run(args: Args) -> Result<()> {
     let workloads: Vec<_> = workloads::all(&data).into_iter().filter(|w| selected(w.name)).collect();
     let run_workflow = selected(WORKFLOW);
     let run_everyday = everyday::Op::ALL.iter().any(|op| selected(&format!("everyday/{}", op.name())));
-    if workloads.is_empty() && !lazy::NAMES.iter().any(|name| selected(name)) && !run_workflow && !run_everyday {
+    // The build table has host and FUSE columns only; a run of other targets leaves it out.
+    let run_build = selected(build::NAME) && (wanted(TargetArg::Host) || wanted(TargetArg::Fuse));
+    if workloads.is_empty()
+        && !lazy::NAMES.iter().any(|name| selected(name))
+        && !run_workflow
+        && !run_everyday
+        && !run_build
+    {
         bail!("--only {:?} matches no workload", args.only.as_deref().unwrap_or_default());
     }
     let mut table: Vec<Vec<Option<Vec<Duration>>>> = Vec::new();
@@ -232,6 +254,12 @@ fn run(args: Args) -> Result<()> {
         Some(url) if selected("remote") => Some(run_remote(&args, url, &scratch)?),
         _ => None,
     };
+    let built = if run_build {
+        let (host, mount) = (wanted(TargetArg::Host), (wanted(TargetArg::Fuse), explicit(TargetArg::Fuse)));
+        Some(build::run(&args.build_package, &scratch, &bin, scale.iters, host, mount)?)
+    } else {
+        None
+    };
 
     print_report(&args, &data, &targets, &skipped, &workloads, &table, &lazy);
     print_workflow(&args, &flows);
@@ -240,6 +268,9 @@ fn run(args: Args) -> Result<()> {
     }
     if let Some((plan, results)) = &remote {
         print_remote(plan, results);
+    }
+    if let Some(built) = &built {
+        build::print(built);
     }
     if let Some(path) = &args.json {
         let rows: Vec<_> = workloads
@@ -272,6 +303,7 @@ fn run(args: Args) -> Result<()> {
             "workflow": workflow_json(&flows),
             "everyday": days.iter().map(everyday::json).collect::<Vec<_>>(),
             "remote": remote.iter().flat_map(|(_, results)| results.iter().map(remote_json)).collect::<Vec<_>>(),
+            "build": built.as_ref().map(build::json),
         });
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     }
