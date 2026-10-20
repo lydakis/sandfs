@@ -266,7 +266,7 @@ pub struct Inner {
     buffers: HashMap<u64, Buffer>,
     /// Where buffers are written; without it (no saved state) they stay in memory.
     pub drafts: Option<Drafts>,
-    /// Modification times of touched paths; others report `base_time`.
+    /// Modification times of touched paths; others report their source's, or `base_time`.
     times: BTreeMap<String, SystemTime>,
     /// Directories created or removed here, which a save must record.
     dirs: BTreeSet<String>,
@@ -482,7 +482,9 @@ impl Inner {
             None => meta.size,
         };
         let (kind, perm) = file_type(meta.kind);
-        let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
+        // A file nobody wrote keeps its source's time, the same in every mount and fork,
+        // so build and test caches that check times find it unchanged.
+        let mtime = self.times.get(path).copied().or(meta.modified).unwrap_or(self.base_time);
         let mut attr = self.make_attr(ino, kind, perm, size, mtime);
         if kind != FileType::Directory {
             attr.nlink = self.nlink(path);
@@ -2137,7 +2139,8 @@ mod tests {
                 Ok("".into())
             }
             fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
-                let entry = sandfs_core::SourceEntry { kind: Kind::Symlink, key: "link".into(), size: Some(4) };
+                let entry =
+                    sandfs_core::SourceEntry { kind: Kind::Symlink, key: "link".into(), size: Some(4), modified: None };
                 Ok([("link".to_owned(), entry)].into())
             }
             fn read_file(&self, _key: &str) -> sandfs_core::Result<Bytes> {

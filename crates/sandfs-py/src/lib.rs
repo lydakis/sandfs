@@ -270,7 +270,7 @@ impl Source for PySource {
                 };
                 let child = if key == "/" { format!("/{name}") } else { format!("{key}/{name}") };
                 let size = if kind.is_dir() { None } else { entry.size };
-                listing.insert(name.to_owned(), SourceEntry { kind, key: child.as_str().into(), size });
+                listing.insert(name.to_owned(), SourceEntry { kind, key: child.as_str().into(), size, modified: None });
             }
             Ok(listing)
         })

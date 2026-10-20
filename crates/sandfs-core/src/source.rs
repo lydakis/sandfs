@@ -10,6 +10,7 @@ use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 
@@ -56,6 +57,10 @@ pub struct SourceEntry {
     /// Size in bytes when the source knows it without reading the file. When it is
     /// `None`, [`crate::Workspace::stat`] reads the file once to find it.
     pub size: Option<u64>,
+    /// When the file's bytes last changed, if the source knows. Programs that skip
+    /// work for unchanged files (build and test caches, `make`) compare it, so it
+    /// must stay the same for as long as the file does.
+    pub modified: Option<SystemTime>,
 }
 
 /// A directory listing, sorted by name.
@@ -158,6 +163,7 @@ impl MemorySource {
                 kind: Kind::Dir,
                 key: child_key.as_str().into(),
                 size: None,
+                modified: None,
             });
             if !entry.kind.is_dir() {
                 return Err(Error::NotADirectory(child_key));
@@ -173,7 +179,7 @@ impl MemorySource {
         self.dirs
             .entry(dir_key)
             .or_default()
-            .insert((*name).to_owned(), SourceEntry { kind, key: file_key.as_str().into(), size });
+            .insert((*name).to_owned(), SourceEntry { kind, key: file_key.as_str().into(), size, modified: None });
         self.files.insert(file_key, data);
         Ok(())
     }
@@ -416,21 +422,21 @@ impl Source for DirSource {
             // need a size and a mode, cost a stat (relative to the open directory).
             let file_type = entry.file_type().map_err(io_error)?;
             let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
-            let (kind, size) = if file_type.is_dir() {
-                (Kind::Dir, None)
+            let (kind, size, modified) = if file_type.is_dir() {
+                (Kind::Dir, None, None)
             } else if file_type.is_file() {
                 let meta = entry.metadata().map_err(io_error)?;
-                (Kind::File { executable: is_executable(&meta) }, Some(meta.len()))
+                (Kind::File { executable: is_executable(&meta) }, Some(meta.len()), meta.modified().ok())
             } else if file_type.is_symlink() {
                 match self.link_target(&child_key) {
-                    Ok(target) => (Kind::Symlink, Some(target.len() as u64)),
+                    Ok(target) => (Kind::Symlink, Some(target.len() as u64), None),
                     Err(Error::NotText(_)) => continue, // a target no workspace path could hold
                     Err(err) => return Err(err),
                 }
             } else {
                 continue; // special files are not part of a workspace
             };
-            listing.insert(name, SourceEntry { kind, key: child_key.as_str().into(), size });
+            listing.insert(name, SourceEntry { kind, key: child_key.as_str().into(), size, modified });
         }
         Ok(listing)
     }

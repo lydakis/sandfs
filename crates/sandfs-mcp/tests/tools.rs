@@ -338,7 +338,11 @@ impl sandfs_core::Source for RangeOnly {
     }
     fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
         let file = sandfs_core::Kind::File { executable: false };
-        Ok([("big.log".to_owned(), sandfs_core::SourceEntry { kind: file, key: "big.log".into(), size: None })].into())
+        Ok([(
+            "big.log".to_owned(),
+            sandfs_core::SourceEntry { kind: file, key: "big.log".into(), size: None, modified: None },
+        )]
+        .into())
     }
     fn read_file(&self, _key: &str) -> sandfs_core::Result<bytes::Bytes> {
         panic!("a byte read must not load the whole file");
@@ -450,7 +454,12 @@ impl sandfs_core::Source for DeadLink {
         Ok("".into())
     }
     fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
-        let link = sandfs_core::SourceEntry { kind: sandfs_core::Kind::Symlink, key: "link".into(), size: Some(3) };
+        let link = sandfs_core::SourceEntry {
+            kind: sandfs_core::Kind::Symlink,
+            key: "link".into(),
+            size: Some(3),
+            modified: None,
+        };
         Ok([("link".to_owned(), link)].into())
     }
     fn read_file(&self, _key: &str) -> sandfs_core::Result<bytes::Bytes> {
