@@ -311,6 +311,29 @@ impl Draft {
     }
 }
 
+/// Files a durable save flushes one by one; more are flushed with one call for the
+/// whole disk.
+const SYNC_ONE_BY_ONE: usize = 64;
+
+/// Flush the whole disk holding `dir` in one call when `files` files need flushing
+/// and one call each would cost more, and say whether it did. After `npm install`
+/// wrote 6,200 files, flushing them one by one made a fork take 0.8 s; one call
+/// makes it 0.35 s. The call also flushes what other programs wrote to that disk.
+#[cfg(target_os = "linux")]
+fn sync_disk(dir: &Path, files: usize) -> Result<bool> {
+    if files <= SYNC_ONE_BY_ONE {
+        return Ok(false);
+    }
+    let dir = std::fs::File::open(dir).context("flushing saved files")?;
+    nix::unistd::syncfs(&dir).context("flushing saved files")?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_disk(_dir: &Path, _files: usize) -> Result<bool> {
+    Ok(false)
+}
+
 /// Whether `err` is a saved object found missing, by a load or a read of a saved file,
 /// because a newer save replaced it: reading again from the newer index works.
 pub fn is_object_gone(err: &anyhow::Error) -> bool {
@@ -580,8 +603,10 @@ impl Saved {
             // Objects reach the disk before the index that names them.
             let live: HashSet<&str> = kept.values().map(|(_, object)| &**object).collect();
             let named: Vec<String> = self.unsynced.iter().filter(|o| live.contains(o.as_str())).cloned().collect();
-            for object in &named {
-                sync_path(&self.objects_dir().join(object))?;
+            if !sync_disk(&self.objects_dir(), named.len())? {
+                for object in &named {
+                    sync_path(&self.objects_dir().join(object))?;
+                }
             }
             if !named.is_empty() {
                 sync_path(&self.objects_dir())?;
@@ -883,6 +908,26 @@ mod tests {
         saved.save(&snap(&next), &root(), false).unwrap();
         assert!(!state.path().join("objects/2").exists());
         assert_eq!(std::fs::read_to_string(state.path().join("objects/3")).unwrap(), "3");
+    }
+
+    #[test]
+    fn a_durable_save_of_many_files_flushes_them_all() {
+        let state = tempfile::tempdir().unwrap();
+        let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
+        let mut ws = base();
+        for i in 0..=SYNC_ONE_BY_ONE {
+            ws.write(&format!("/mnt/many/{i}.txt"), i.to_string()).unwrap();
+        }
+        let mut saved = Saved::new(state.path());
+        saved.save(&snap(&ws), &root(), true).unwrap();
+        assert!(saved.unsynced.is_empty());
+
+        let mut reloaded = base();
+        Saved::new(state.path()).load(&mut reloaded, &root()).unwrap();
+        assert_eq!(
+            reloaded.read_text(&format!("/mnt/many/{SYNC_ONE_BY_ONE}.txt")).unwrap(),
+            SYNC_ONE_BY_ONE.to_string()
+        );
     }
 
     #[test]
