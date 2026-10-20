@@ -13,11 +13,18 @@
 //! [`Workspace::write_stored`]), and once a save has written a file's object the
 //! serving process reads it from there too ([`Workspace::store`]), so what a mount
 //! has saved costs it no memory; the operating system caches the objects in use.
+//!
+//! A mount writes a file straight into a new object, a [`Draft`], instead of into
+//! memory, and hands it to the workspace as a stored file once the writes settle. The
+//! next save names that object as it is. From then on the object is never written
+//! again: a later write copies it into a new draft, which the disk can often do
+//! without copying any bytes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -115,9 +122,18 @@ pub type Written = Vec<(VPath, u64, Stored)>;
 #[derive(Debug)]
 struct Objects {
     dir: PathBuf,
+    /// The next object name, shared by saves and drafts.
+    next: AtomicU64,
+    /// Drafts made since the last save, which that save starts tracking.
+    drafts: Mutex<Vec<SourceKey>>,
 }
 
 impl Objects {
+    /// A name no object of this workspace has had.
+    fn new_name(&self) -> SourceKey {
+        self.next.fetch_add(1, Ordering::SeqCst).to_string().into()
+    }
+
     fn open(&self, key: &str) -> sandfs_core::Result<std::fs::File> {
         check_object(key).map_err(|err| Error::Source(err.to_string()))?;
         std::fs::File::open(self.dir.join(key)).map_err(|err| match err.kind() {
@@ -152,6 +168,200 @@ impl Source for Objects {
     }
 }
 
+/// Where a mount writes files: each into a new object of the workspace, a [`Draft`].
+#[derive(Clone, Debug)]
+pub struct Drafts(Arc<Objects>);
+
+/// Bytes read into a draft at a time, from a file that cannot be copied on disk.
+const CHUNK: u64 = 8 << 20;
+
+impl Drafts {
+    /// A new, empty draft.
+    pub fn empty(&self) -> Result<Draft> {
+        let key = self.0.new_name();
+        std::fs::create_dir_all(&self.0.dir).context("creating the objects directory")?;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(self.0.dir.join(&*key))
+            .context("creating a file to write into")?;
+        Ok(self.track(file, key))
+    }
+
+    /// A new draft holding what `path` in `ws` holds now. A saved file is copied on
+    /// disk, which shares its blocks where the disk can (APFS, btrfs, XFS). Any other
+    /// file is read in chunks when its source reads ranges cheaply (`ranged`), so its
+    /// size never sits in memory; otherwise it is read once, whole, since each chunk
+    /// would read the whole file again.
+    pub fn copy(&self, ws: &Workspace, path: &str, ranged: bool) -> Result<Draft> {
+        if let Some(stored) = ws.stored(path)?
+            && std::ptr::addr_eq(Arc::as_ptr(&stored.source), Arc::as_ptr(&self.0))
+        {
+            let key = self.0.new_name();
+            let to = self.0.dir.join(&*key);
+            match std::fs::copy(self.0.dir.join(&*stored.key), &to) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = std::fs::remove_file(&to);
+                    return Err(ObjectGone(stored.key.to_string()).into());
+                }
+                Err(err) => {
+                    let _ = std::fs::remove_file(&to);
+                    return Err(err).context("copying a saved file to write into");
+                }
+            }
+            let file = std::fs::File::options().read(true).write(true).open(&to)?;
+            return Ok(self.track(file, key));
+        }
+        let size = ws.stat(path)?.size;
+        let chunk = if ranged { CHUNK } else { size };
+        let mut draft = self.empty()?;
+        let fill = |draft: &mut Draft| -> Result<()> {
+            let mut offset = 0;
+            while offset < size {
+                let data = ws.read_range(path, offset, chunk.min(size - offset))?;
+                if data.is_empty() {
+                    break;
+                }
+                // Zeros are left as a hole, so a sparse file stays sparse on disk.
+                if data.iter().any(|byte| *byte != 0) {
+                    draft.write_all_at(offset, &data)?;
+                }
+                offset += data.len() as u64;
+            }
+            Ok(draft.set_len(offset)?)
+        };
+        // A copy cut short (a full disk) is deleted now: no save may come to collect
+        // it, and it would hold the room a retry needs.
+        if let Err(err) = fill(&mut draft) {
+            let _ = std::fs::remove_file(self.0.dir.join(&*draft.key));
+            return Err(err);
+        }
+        Ok(draft)
+    }
+
+    /// The directory drafts are written in.
+    #[cfg(fuse)]
+    pub fn dir(&self) -> &Path {
+        &self.0.dir
+    }
+
+    fn track(&self, file: std::fs::File, key: SourceKey) -> Draft {
+        self.0.drafts.lock().unwrap_or_else(PoisonError::into_inner).push(key.clone());
+        Draft { file, key, store: self.0.clone() }
+    }
+}
+
+/// A file being written, as a new object on disk. [`Draft::finish`] turns it into
+/// a stored file for the workspace; a draft dropped unfinished is deleted by a later
+/// save.
+#[derive(Debug)]
+pub struct Draft {
+    file: std::fs::File,
+    key: SourceKey,
+    store: Arc<Objects>,
+}
+
+impl Draft {
+    /// Write `data` at `offset`, growing the file if it ends past it, and return how
+    /// many bytes were written. An error after some were written (a disk filling up)
+    /// is a short write, as `write(2)` reports it, so the caller knows the file
+    /// changed.
+    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<usize> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut written = 0;
+        while written < data.len() {
+            match self.file.write(&data[written..]) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) if written > 0 => break,
+                Err(err) => return Err(err),
+            }
+        }
+        if written == 0 && !data.is_empty() {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        Ok(written)
+    }
+
+    /// Write all of `data` at `offset`, or fail.
+    fn write_all_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)
+    }
+
+    /// Up to `len` bytes from `offset`; fewer at the end of the file.
+    pub fn read_at(&self, offset: u64, len: u64) -> std::io::Result<Bytes> {
+        let (mut file, mut data) = (&self.file, Vec::new());
+        file.seek(SeekFrom::Start(offset))?;
+        file.take(len).read_to_end(&mut data)?;
+        Ok(data.into())
+    }
+
+    /// Cut or extend the file to `size`; an extension reads as zeros.
+    pub fn set_len(&self, size: u64) -> std::io::Result<()> {
+        self.file.set_len(size)
+    }
+
+    pub fn len(&self) -> std::io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    /// The finished file, for [`Workspace::write_stored`]. Its object is never written
+    /// again.
+    pub fn finish(self) -> std::io::Result<Stored> {
+        let size = self.len()?;
+        Ok(Stored { source: self.store, key: self.key, size })
+    }
+}
+
+/// Files a durable save flushes one by one; more are flushed with one call for the
+/// whole disk.
+#[cfg(target_os = "linux")]
+const SYNC_ONE_BY_ONE: usize = 64;
+
+/// Flush the whole disk holding `dir` in one call when `files` files need flushing
+/// and one call each would cost more, and say whether it did. After `npm install`
+/// wrote 6,200 files, flushing them one by one made a fork take 0.8 s; one call
+/// makes it 0.35 s. The call also flushes what other programs wrote to that disk.
+#[cfg(target_os = "linux")]
+fn sync_disk(dir: &Path, files: usize) -> Result<bool> {
+    if files <= SYNC_ONE_BY_ONE || !syncfs_reports_errors() {
+        return Ok(false);
+    }
+    let dir = std::fs::File::open(dir).context("flushing saved files")?;
+    nix::unistd::syncfs(&dir).context("flushing saved files")?;
+    Ok(true)
+}
+
+/// Whether `syncfs` reports a file that failed to reach the disk, as it does from
+/// Linux 5.8. Before that it succeeds anyway, so a save flushes file by file.
+#[cfg(target_os = "linux")]
+fn syncfs_reports_errors() -> bool {
+    static REPORTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REPORTS.get_or_init(|| {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        kernel_at_least(&release, (5, 8))
+    })
+}
+
+/// Whether a kernel release such as `6.1.0-13-amd64` is `want` or newer.
+#[cfg(target_os = "linux")]
+fn kernel_at_least(release: &str, want: (u32, u32)) -> bool {
+    let mut parts = release.trim().split(['.', '-']).map(|part| part.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= want,
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_disk(_dir: &Path, _files: usize) -> Result<bool> {
+    Ok(false)
+}
+
 /// Whether `err` is a saved object found missing, by a load or a read of a saved file,
 /// because a newer save replaced it: reading again from the newer index works.
 pub fn is_object_gone(err: &anyhow::Error) -> bool {
@@ -181,12 +391,12 @@ pub struct Saved {
     /// name is shared with every file reading from it, so its count says whether any
     /// workspace still does.
     objects: HashMap<String, (u64, SourceKey)>,
-    next_object: u64,
     /// Objects the previous saves replaced. Each is deleted one save later, so a reader
     /// that loaded the index just before that save still finds it, and only once no
     /// file here reads from it, such as a removed file a program still has open.
     doomed: Vec<SourceKey>,
-    /// Objects written since the last durable save, not yet flushed to disk.
+    /// Objects written since the last durable save that names them, not yet flushed to
+    /// disk.
     unsynced: HashSet<String>,
     /// See [`Saved::take_written`].
     written: Written,
@@ -196,12 +406,12 @@ impl Saved {
     /// The saved changes in the state directory `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
-        let store = Arc::new(Objects { dir: dir.join("objects") });
+        let store =
+            Arc::new(Objects { dir: dir.join("objects"), next: AtomicU64::new(1), drafts: Mutex::new(Vec::new()) });
         Saved {
             dir,
             store,
             objects: HashMap::new(),
-            next_object: 1,
             doomed: Vec::new(),
             unsynced: HashSet::new(),
             written: Written::new(),
@@ -211,6 +421,11 @@ impl Saved {
     /// Where the bytes of `object`, `size` long, are.
     fn stored(&self, object: SourceKey, size: u64) -> Stored {
         Stored { source: self.store.clone(), key: object, size }
+    }
+
+    /// Where the serving process writes files, as drafts of new objects.
+    pub fn drafts(&self) -> Drafts {
+        Drafts(self.store.clone())
     }
 
     /// Whether `stored` is one of this workspace's objects.
@@ -226,8 +441,23 @@ impl Saved {
         self.dir.join("objects")
     }
 
+    /// The index's bytes. On Windows, opening it while a save renames the new index
+    /// over it is refused with "access denied" for a moment; that is retried.
+    fn read_index_bytes(&self) -> std::io::Result<Vec<u8>> {
+        let mut tries = 0;
+        loop {
+            match std::fs::read(self.index_path()) {
+                Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::PermissionDenied && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                read => return read,
+            }
+        }
+    }
+
     fn read_index(&self) -> Result<Changes> {
-        match std::fs::read(self.index_path()) {
+        match self.read_index_bytes() {
             Ok(data) => serde_json::from_slice(&data).context("reading changes.json"),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Changes::default()),
             Err(err) => Err(err).context("reading changes.json"),
@@ -274,6 +504,9 @@ impl Saved {
             match (entry, object) {
                 (Entry::File { .. }, Some(object)) => {
                     let version = ws.stat(path.as_str())?.version;
+                    // A save that wasn't durable may have left it unflushed before the
+                    // process that wrote it went away, so the next durable save flushes it.
+                    self.unsynced.insert(object.to_string());
                     self.objects.insert(rel.clone(), (version, object));
                 }
                 (Entry::Symlink { .. }, _) => {}
@@ -285,7 +518,7 @@ impl Saved {
         // New objects must never reuse the name of one the index still names, nor of any
         // object an earlier save used.
         let last = self.objects.values().filter_map(|(_, object)| object.parse::<u64>().ok()).max();
-        self.next_object = self.next_object.max(last.unwrap_or(0) + 1).max(changes.next);
+        self.store.next.fetch_max((last.unwrap_or(0) + 1).max(changes.next), Ordering::SeqCst);
         Ok(restored)
     }
 
@@ -306,7 +539,7 @@ impl Saved {
                 }
             }
         }
-        self.next_object = self.next_object.max(last + 1);
+        self.store.next.fetch_max(last + 1, Ordering::SeqCst);
     }
 
     /// Replay one entry; a file reads from `object`, its object's shared name.
@@ -366,6 +599,11 @@ impl Saved {
     /// `fsync`, also flushes the index and every object it names to disk before returning.
     /// [`Saved::take_written`] then says which files it wrote objects for.
     pub fn save(&mut self, snap: &Snapshot, root: &VPath, durable: bool) -> Result<()> {
+        // Drafts made since the last save: each is either named by this save or, once
+        // nothing writes or reads it, deleted like a replaced object.
+        let drafts = std::mem::take(&mut *self.store.drafts.lock().unwrap_or_else(PoisonError::into_inner));
+        self.unsynced.extend(drafts.iter().map(|draft| draft.to_string()));
+        self.doomed.extend(drafts);
         let mut entries = BTreeMap::new();
         let mut kept = HashMap::new();
         let mut written = Written::new();
@@ -394,18 +632,24 @@ impl Saved {
             entries.insert(rel, entry);
         }
 
-        let index = serde_json::to_vec(&Changes { entries, next: self.next_object })?;
+        let index = serde_json::to_vec(&Changes { entries, next: self.store.next.load(Ordering::SeqCst) })?;
         let tmp = self.dir.join("changes.json.tmp");
         if durable {
             // Objects reach the disk before the index that names them.
             let live: HashSet<&str> = kept.values().map(|(_, object)| &**object).collect();
-            for object in self.unsynced.iter().filter(|o| live.contains(o.as_str())) {
-                sync_path(&self.objects_dir().join(object))?;
+            let named: Vec<String> = self.unsynced.iter().filter(|o| live.contains(o.as_str())).cloned().collect();
+            if !sync_disk(&self.objects_dir(), named.len())? {
+                for object in &named {
+                    sync_path(&self.objects_dir().join(object))?;
+                }
             }
-            if !self.unsynced.is_empty() {
+            if !named.is_empty() {
                 sync_path(&self.objects_dir())?;
             }
-            self.unsynced.clear();
+            // A draft still being written is flushed by the durable save that names it.
+            for object in named {
+                self.unsynced.remove(&object);
+            }
         }
         std::fs::write(&tmp, index).context("writing changes.json")?;
         if durable {
@@ -423,6 +667,7 @@ impl Saved {
             }
             if Arc::strong_count(&object) == 1 {
                 let _ = std::fs::remove_file(self.objects_dir().join(&*object));
+                self.unsynced.remove(&*object);
             } else {
                 waiting.push(object);
             }
@@ -493,11 +738,10 @@ impl Saved {
     fn write_object(&mut self, data: &Bytes) -> Result<SourceKey> {
         let dir = self.objects_dir();
         std::fs::create_dir_all(&dir).context("creating the objects directory")?;
-        let object = self.next_object.to_string();
-        self.next_object += 1;
-        std::fs::write(dir.join(&object), data).context("writing a saved file")?;
-        self.unsynced.insert(object.clone());
-        Ok(object.into())
+        let object = self.store.new_name();
+        std::fs::write(dir.join(&*object), data).context("writing a saved file")?;
+        self.unsynced.insert(object.to_string());
+        Ok(object)
     }
 
     /// Copy the saved changes into `to`, the state directory of a fork. Objects are
@@ -508,7 +752,7 @@ impl Saved {
     pub fn copy_to(&self, to: &Path) -> Result<()> {
         let objects = to.join("objects");
         for _ in 0..10 {
-            let index = match std::fs::read(self.index_path()) {
+            let index = match self.read_index_bytes() {
                 Ok(index) => index,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => return Err(err).context("reading changes.json"),
@@ -634,7 +878,9 @@ mod tests {
         assert!(saved.unsynced.is_empty(), "a durable save flushes every object it wrote");
 
         let mut loaded = base();
-        let restored = Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        let mut reloaded = Saved::new(state.path());
+        let restored = reloaded.load(&mut loaded, &root()).unwrap();
+        assert_eq!(reloaded.unsynced.len(), 2, "a new process flushes what it loaded at its first durable save");
         assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "changed");
         assert_eq!(loaded.stat("/mnt/new/run.sh").unwrap().kind, Kind::File { executable: true });
         assert_eq!(listing(&loaded, "/mnt/dir"), ["b.txt"], "the removed directory stays removed");
@@ -678,7 +924,7 @@ mod tests {
         reopened.load(&mut base(), &root()).unwrap();
         reopened.collect_garbage();
         assert_eq!(objects(state.path()), ["3"], "the serving process clears what the index no longer uses");
-        assert_eq!(reopened.next_object, 4);
+        assert_eq!(reopened.store.next.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -704,6 +950,35 @@ mod tests {
         saved.save(&snap(&next), &root(), false).unwrap();
         assert!(!state.path().join("objects/2").exists());
         assert_eq!(std::fs::read_to_string(state.path().join("objects/3")).unwrap(), "3");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn syncfs_is_trusted_from_linux_5_8() {
+        assert!(kernel_at_least("5.8.0", (5, 8)));
+        assert!(kernel_at_least("6.1.0-13-amd64\n", (5, 8)));
+        assert!(kernel_at_least("5.15.0-1050-azure", (5, 8)));
+        assert!(!kernel_at_least("5.4.0-150-generic", (5, 8)));
+        assert!(!kernel_at_least("4.19.0", (5, 8)));
+        assert!(!kernel_at_least("", (5, 8)));
+    }
+
+    #[test]
+    fn a_durable_save_of_many_files_flushes_them_all() {
+        let state = tempfile::tempdir().unwrap();
+        let snap = |ws: &Workspace| Snapshot { ws: ws.fork(), times: BTreeMap::new(), dirs: BTreeSet::new() };
+        let mut ws = base();
+        // More than are flushed one by one on Linux.
+        for i in 0..100 {
+            ws.write(&format!("/mnt/many/{i}.txt"), i.to_string()).unwrap();
+        }
+        let mut saved = Saved::new(state.path());
+        saved.save(&snap(&ws), &root(), true).unwrap();
+        assert!(saved.unsynced.is_empty());
+
+        let mut reloaded = base();
+        Saved::new(state.path()).load(&mut reloaded, &root()).unwrap();
+        assert_eq!(reloaded.read_text("/mnt/many/99.txt").unwrap(), "99");
     }
 
     #[test]
@@ -889,6 +1164,128 @@ mod tests {
         save_and_store(&mut saved, &mut ws);
         save_and_store(&mut saved, &mut ws);
         assert_eq!(objects(state.path()), ["2", "3"], "object 1 goes once neither file reads it");
+    }
+
+    #[test]
+    fn a_file_written_as_a_draft_is_saved_as_it_is() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        let mut saved = Saved::new(state.path());
+        let mut draft = saved.drafts().empty().unwrap();
+        draft.write_at(0, b"hello world").unwrap();
+        draft.write_at(6, b"there").unwrap();
+        assert_eq!(draft.read_at(6, 100).unwrap(), "there");
+        ws.write_stored("/mnt/new.txt", draft.finish().unwrap()).unwrap();
+        saved.save(&snap(&ws), &root(), true).unwrap();
+        assert!(saved.take_written().is_empty(), "the draft is the saved object");
+        assert_eq!(objects(state.path()), ["1"]);
+        assert!(saved.unsynced.is_empty(), "a durable save flushes the drafts it names");
+
+        let mut loaded = base();
+        Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+        assert_eq!(loaded.read_text("/mnt/new.txt").unwrap(), "hello there");
+    }
+
+    #[test]
+    fn a_draft_is_deleted_once_nothing_writes_or_reads_it() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        let mut saved = Saved::new(state.path());
+        let drafts = saved.drafts();
+        let open = drafts.empty().unwrap();
+        drop(drafts.empty().unwrap());
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["1"], "the dropped draft goes, the open one stays");
+        assert!(saved.unsynced.contains("1"), "flushed once a durable save names it");
+
+        // Finished, then replaced before any save named it.
+        ws.write_stored("/mnt/a.txt", open.finish().unwrap()).unwrap();
+        ws.write("/mnt/a.txt", "in memory").unwrap();
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["3"], "only the saved copy of a.txt is left");
+        assert!(saved.unsynced.iter().all(|o| o == "3"));
+    }
+
+    #[test]
+    fn a_draft_copied_from_a_file_leaves_the_file_as_it_was() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/saved.txt", "saved bytes").unwrap();
+        let mut saved = Saved::new(state.path());
+        save_and_store(&mut saved, &mut ws);
+        let drafts = saved.drafts();
+
+        // A saved file is copied from its object.
+        let mut draft = drafts.copy(&ws, "/mnt/saved.txt", true).unwrap();
+        draft.write_at(0, b"SAVED").unwrap();
+        assert_eq!(ws.read_text("/mnt/saved.txt").unwrap(), "saved bytes");
+        ws.write_stored("/mnt/saved.txt", draft.finish().unwrap()).unwrap();
+        assert_eq!(ws.read_text("/mnt/saved.txt").unwrap(), "SAVED bytes");
+
+        // A file from the source is read into it.
+        let draft = drafts.copy(&ws, "/mnt/dir/b.txt", false).unwrap();
+        draft.set_len(3).unwrap();
+        assert_eq!(draft.read_at(0, 10).unwrap(), &b"b\0\0"[..]);
+        assert_eq!(ws.read_text("/mnt/dir/b.txt").unwrap(), "b");
+        save_and_store(&mut saved, &mut ws);
+        save_and_store(&mut saved, &mut ws);
+        assert_eq!(objects(state.path()), ["2", "3"], "saved.txt's new object and the draft still open");
+    }
+
+    /// A source that can only read whole files, as git's can, counting the reads.
+    #[derive(Debug)]
+    struct WholeFiles(MemorySource, AtomicU64);
+
+    impl Source for WholeFiles {
+        fn root(&self) -> sandfs_core::Result<SourceKey> {
+            self.0.root()
+        }
+
+        fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+            self.0.read_dir(key)
+        }
+
+        fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.read_file(key)
+        }
+    }
+
+    #[test]
+    fn a_draft_reads_a_file_whole_once_from_a_source_without_ranges() {
+        let state = tempfile::tempdir().unwrap();
+        let big = vec![7u8; 2 * CHUNK as usize + 1];
+        let source = Arc::new(WholeFiles(MemorySource::from_files([("big", big.clone())]).unwrap(), AtomicU64::new(0)));
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", source.clone()).unwrap();
+        let drafts = Saved::new(state.path()).drafts();
+
+        let draft = drafts.copy(&ws, "/mnt/big", false).unwrap();
+        assert_eq!(source.1.load(Ordering::SeqCst), 1);
+        assert_eq!(draft.read_at(0, big.len() as u64 + 1).unwrap(), &big[..]);
+
+        // In chunks, every chunk would read the whole file again.
+        drafts.copy(&ws, "/mnt/big", true).unwrap();
+        assert_eq!(source.1.load(Ordering::SeqCst), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_of_a_sparse_file_stays_sparse() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let sparse = std::fs::File::create(data.path().join("sparse")).unwrap();
+        sparse.set_len(4 * CHUNK).unwrap();
+        drop(sparse);
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(sandfs_core::DirSource::new(data.path()).unwrap())).unwrap();
+        let drafts = Saved::new(state.path()).drafts();
+
+        let draft = drafts.copy(&ws, "/mnt/sparse", true).unwrap();
+        let meta = draft.file.metadata().unwrap();
+        assert_eq!(meta.len(), 4 * CHUNK);
+        assert!(meta.blocks() * 512 < CHUNK, "{} bytes on disk", meta.blocks() * 512);
     }
 
     #[test]

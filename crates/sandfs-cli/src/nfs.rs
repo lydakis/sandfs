@@ -118,6 +118,7 @@ fn status(err: Errno) -> nfsstat3 {
         Errno::ENOTEMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
         Errno::EINVAL => nfsstat3::NFS3ERR_INVAL,
         Errno::EFBIG => nfsstat3::NFS3ERR_FBIG,
+        Errno::ENOSPC => nfsstat3::NFS3ERR_NOSPC,
         Errno::EPERM => nfsstat3::NFS3ERR_PERM,
         Errno::EACCES => nfsstat3::NFS3ERR_ACCES,
         Errno::ELOOP => nfsstat3::NFS3ERR_NOTSUPP,
@@ -263,7 +264,11 @@ impl NFSFileSystem for SandNfs {
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let attr = self.change(|inner| {
-            inner.write(id, offset, data)?;
+            // A WRITE reply says the whole request was written, so a short write (the
+            // disk filled up partway) is reported as the full disk it is.
+            if (inner.write(id, offset, data)? as usize) < data.len() {
+                return Err(Errno::ENOSPC);
+            }
             inner.attr(id)
         })?;
         Ok(attributes(&attr))

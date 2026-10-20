@@ -590,8 +590,11 @@ impl Workspace {
 
     /// Files added, modified or deleted relative to the mounts, sorted by path.
     ///
-    /// Only files and symbolic links are reported; an empty directory is not a change. The cost is
-    /// proportional to the overlay, plus listing any base directories that were deleted.
+    /// Only files and symbolic links are reported; an empty directory is not a change.
+    /// A file written back with the bytes it had is not a change either, except one of
+    /// [`COMPARE_LIMIT`] bytes or more, which counts as modified without being read.
+    /// The cost is proportional to the overlay, plus listing any base directories
+    /// that were deleted, plus reading written files under that size that kept their size.
     pub fn changes(&self) -> Result<Vec<Change>> {
         let mut changes: BTreeMap<VPath, ChangeKind> = BTreeMap::new();
         // First every base file the overlay hides: below whiteouts, recreated
@@ -929,10 +932,11 @@ impl Workspace {
             }
         }
         let original = Content::Base { mount: mount.clone(), key: base.key.clone(), size: base.size };
-        if let (Some(a), Some(b)) = (content_size(content), content_size(&original)) {
-            if a != b {
-                return Ok(false);
-            }
+        match (content_size(content), content_size(&original)) {
+            (Some(a), Some(b)) if a != b => return Ok(false),
+            // Comparing would read both files whole, at every call.
+            (Some(size), _) if size >= COMPARE_LIMIT => return Ok(false),
+            _ => {}
         }
         Ok(self.content_bytes(content)? == self.content_bytes(&original)?)
     }
@@ -1131,6 +1135,10 @@ fn dir_key(node: &BaseNode) -> Option<(Arc<Mount>, SourceKey)> {
         _ => None,
     }
 }
+
+/// The size from which [`Workspace::changes`] counts a written file as modified
+/// without comparing it to the file it replaced.
+pub const COMPARE_LIMIT: u64 = 64 << 20;
 
 fn content_size(content: &Content) -> Option<u64> {
     match content {
