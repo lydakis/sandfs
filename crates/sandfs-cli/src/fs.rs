@@ -24,13 +24,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
-use fuser::{Errno, FileAttr, FileType, INodeNo, RenameFlags, TimeOrNow};
 #[cfg(fuse)]
 use fuser::{
-    FileHandle, Filesystem, FopenFlags, Generation, InitFlags, KernelConfig, LockOwner, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, Request, WriteFlags,
+    CopyFileRangeFlags, FileHandle, Filesystem, FopenFlags, Generation, InitFlags, KernelConfig, LockOwner, OpenFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, Request, WriteFlags,
 };
+use fuser::{Errno, FileAttr, FileType, INodeNo, RenameFlags, TimeOrNow};
 use sandfs_core::{ChangeKind, Error, Kind, VPath, Workspace};
 
 use crate::persist::{Draft, Drafts, Saved, Snapshot};
@@ -45,6 +45,10 @@ pub const ROOT_INO: u64 = 1;
 /// The largest file a mount takes: what a file offset can address. A file being
 /// written is a file on disk, so the disk is the real limit.
 pub const MAX_FILE_SIZE: usize = i64::MAX as usize;
+/// The most bytes one `copy_file_range` call reads and writes when it can't share a
+/// whole file; the caller asks again for the rest.
+#[cfg_attr(not(fuse), allow(dead_code))] // macOS's NFS has no copy request
+const COPY_PIECE: u64 = 8 << 20;
 /// The largest file kept in memory while it is written, where there are no drafts.
 const MAX_MEMORY_FILE: u64 = 4 << 30;
 /// How many whole files, and bytes of them, [`Inner::read`] keeps for sources that
@@ -863,6 +867,66 @@ impl Inner {
         Ok(u32::try_from(written).unwrap_or(u32::MAX))
     }
 
+    /// Copy up to `len` bytes of `src` from `offset_in` into `dst` at `offset_out`, as
+    /// `copy_file_range` asks (`std::fs::copy`, and programs copying instead of
+    /// hard-linking). A whole file copied into an empty one becomes a copy in the
+    /// workspace, which shares the bytes (a saved file's object on disk, or memory), so
+    /// the copy reads and stores nothing; a file of the source is copied to disk in
+    /// chunks. Any other range is written a piece at a time, as a write would be.
+    #[cfg_attr(not(fuse), allow(dead_code))]
+    pub fn copy_range(&mut self, src: u64, offset_in: u64, dst: u64, offset_out: u64, len: u64) -> FsResult<u32> {
+        let size = match self.buffers.get(&src) {
+            Some(buffer) => buffer.size,
+            None => {
+                let (ws, path) = self.contents(src)?;
+                ws.stat(path.as_str()).fs()?.size
+            }
+        };
+        let linked = |ino| matches!(self.nodes.get(&ino), Some(Node { linked: true, .. }));
+        if offset_in == 0 && offset_out == 0 && len >= size && linked(src) && linked(dst) && self.attr(dst)?.size == 0 {
+            let (from, to) = (self.path(src)?, self.path(dst)?);
+            // A file still being written is committed first, as it would be once settled.
+            if let Some(buffer) = self.buffers.remove(&src) {
+                buffer.commit(&mut self.ws, from.as_str())?;
+            }
+            self.buffers.remove(&dst);
+            // The copy takes the source's mode; the destination keeps the one it was made with.
+            let executable = matches!(self.ws.stat(to.as_str()).fs()?.kind, Kind::File { executable: true });
+            match (&self.drafts, self.ws.stored(from.as_str()).fs()?) {
+                // A file not saved yet (a file of the source) is copied into a draft in
+                // chunks, as a first write would copy it: shared, the next save would
+                // read it whole into memory to write it out.
+                (Some(drafts), None) => {
+                    let draft = drafts.copy(&self.ws, from.as_str(), self.ranged_reads).map_err(draft_errno)?;
+                    let stored = draft.finish().map_err(io_errno)?;
+                    self.ws.write_stored(to.as_str(), stored).fs()?;
+                }
+                _ => {
+                    self.ws.remove(to.as_str(), false).fs()?;
+                    self.ws.copy(from.as_str(), to.as_str(), false).fs()?;
+                }
+            }
+            self.ws.set_executable(to.as_str(), executable).fs()?;
+            self.times.insert(to.to_string(), SystemTime::now());
+            self.unsaved = true;
+            // The reply counts bytes in 32 bits. Past that the caller asks again for the
+            // rest, which then goes piece by piece over the shared copy.
+            return Ok(u32::try_from(size).unwrap_or(u32::MAX));
+        }
+        let len = len.min(COPY_PIECE);
+        let piece = match self.buffers.get(&src) {
+            Some(buffer) => buffer.read(offset_in, len)?,
+            None => {
+                let (ws, path) = self.contents(src)?;
+                ws.read_range(path.as_str(), offset_in, len).fs()?
+            }
+        };
+        if piece.is_empty() {
+            return Ok(0);
+        }
+        self.write(dst, offset_out, &piece)
+    }
+
     /// Move into the workspace every buffer that has gone `settle` without a write. A
     /// file still being written stays buffered: committing it would copy it, and its
     /// next write would copy it back. A removed file's buffer stays where it is: it
@@ -1265,6 +1329,27 @@ impl Filesystem for SandFs {
         }
     }
 
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        _fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        _fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        let result = self.0.lock().copy_range(ino_in.0, offset_in, ino_out.0, offset_out, len);
+        self.0.changed();
+        match result {
+            Ok(copied) => reply.written(copied),
+            Err(err) => reply.error(err),
+        }
+    }
+
     /// A close needs nothing from this filesystem: buffers are committed once they
     /// settle. ENOSYS tells the kernel to stop asking, which saves a round trip per close.
     fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
@@ -1620,6 +1705,68 @@ mod tests {
         assert_eq!(attr.size, 0, "an existing file opened with O_TRUNC");
         fs.commit_written(Duration::ZERO);
         assert_eq!(fs.ws.read_text("/mnt/run.sh").unwrap(), "");
+    }
+
+    #[test]
+    fn copies_share_whole_files_and_write_pieces() {
+        let mut fs = fs();
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let copy = fs.create(ROOT_INO, name("copy.md"), 0o644, true, false).unwrap().ino.0;
+        assert_eq!(fs.copy_range(readme, 0, copy, 0, 1 << 30).unwrap(), 6);
+        assert!(!fs.writing && fs.unsaved, "a whole copy needs no buffer");
+        assert_eq!(fs.ws.read_text("/mnt/copy.md").unwrap(), "hello\n");
+        assert_eq!(fs.attr(copy).unwrap().size, 6);
+
+        // A piece goes through the buffer.
+        assert_eq!(fs.copy_range(readme, 1, copy, 6, 3).unwrap(), 3);
+        assert_eq!(&fs.read(copy, 0, 100).unwrap()[..], b"hello\nell");
+        assert!(fs.writing);
+        // A whole copy of a file still being written commits it and shares it.
+        let again = fs.create(ROOT_INO, name("again.md"), 0o755, true, false).unwrap().ino.0;
+        assert_eq!(fs.copy_range(copy, 0, again, 0, 100).unwrap(), 9);
+        assert_eq!(fs.ws.read_text("/mnt/again.md").unwrap(), "hello\nell");
+        assert_eq!(fs.ws.read_text("/mnt/copy.md").unwrap(), "hello\nell");
+        assert_eq!(fs.attr(again).unwrap().perm, 0o755, "the destination keeps its mode");
+        assert_eq!(fs.copy_range(copy, 100, again, 0, 100).unwrap(), 0, "past the end");
+        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn copies_of_saved_files_share_their_object() {
+        let state = tempfile::tempdir().unwrap();
+        let mut saved = Saved::new(state.path());
+        let mut fs = fs();
+        fs.drafts = Some(saved.drafts());
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        fs.write(readme, 0, b"HE").unwrap();
+        fs.commit_written(Duration::ZERO);
+        saved.save(&fs.snapshot(Duration::ZERO), &VPath::parse("/mnt").unwrap(), false).unwrap();
+        let stored = fs.ws.stored("/mnt/README.md").unwrap().unwrap();
+        let objects = std::fs::read_dir(state.path().join("objects")).unwrap().count();
+
+        let copy = fs.create(ROOT_INO, name("copy.md"), 0o644, true, false).unwrap().ino.0;
+        assert_eq!(fs.copy_range(readme, 0, copy, 0, 1 << 30).unwrap(), 6);
+        assert_eq!(fs.ws.stored("/mnt/copy.md").unwrap().unwrap().key, stored.key, "one object, two files");
+        saved.save(&fs.snapshot(Duration::ZERO), &VPath::parse("/mnt").unwrap(), false).unwrap();
+        assert_eq!(std::fs::read_dir(state.path().join("objects")).unwrap().count(), objects, "nothing new on disk");
+
+        // Writing either one leaves the other as it was.
+        fs.write(copy, 0, b"J").unwrap();
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read_text("/mnt/copy.md").unwrap(), "JEllo\n");
+        assert_eq!(fs.ws.read_text("/mnt/README.md").unwrap(), "HEllo\n");
+        saved.save(&fs.snapshot(Duration::ZERO), &VPath::parse("/mnt").unwrap(), false).unwrap();
+        let mut restored = super::tests::fs().ws;
+        Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
+        assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");
+        assert_eq!(restored.read_text("/mnt/copy.md").unwrap(), "JEllo\n");
+        // A file of the source goes to disk, in chunks, rather than being read whole at the next save.
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let lib = fs.lookup(src, name("lib.rs")).unwrap().ino.0;
+        let copied = fs.create(ROOT_INO, name("lib.rs"), 0o644, true, false).unwrap().ino.0;
+        assert_eq!(fs.copy_range(lib, 0, copied, 0, 1 << 30).unwrap(), 12);
+        assert!(fs.ws.stored("/mnt/lib.rs").unwrap().is_some());
+        assert_eq!(fs.ws.read_text("/mnt/lib.rs").unwrap(), "fn one() {}\n");
     }
 
     #[test]

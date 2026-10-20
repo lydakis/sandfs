@@ -12,6 +12,7 @@ sudo ./target/release/sandfs-bench --scratch /dev/shm  # root lets it mount over
 uv run python crates/sandfs-bench/python/bench.py --scratch /dev/shm   # the Python bindings
 ./target/release/sandfs-bench --only remote --remote https://github.com/microsoft/vscode --scratch /dev/shm
 ./target/release/sandfs-bench --only everyday --remote https://github.com/microsoft/vscode --scratch /dev/shm
+./target/release/sandfs-bench --only build --scratch /dev/shm
 ```
 
 Put the scratch directory on tmpfs (`/dev/shm`) when comparing numbers. sandfs keeps its changes in memory, so a disk under the other targets mostly measures the disk, and writeback makes their write and copy timings swing by several times between runs.
@@ -92,4 +93,10 @@ The Rust API is what the Python package and the MCP server call, so its column s
 | blobless clone | `git clone --filter=blob:none`: all history without file contents, then a checkout of every file | `git worktree add` |
 | full clone | `git clone`, checked out | `git worktree add` |
 
+Each copy then has a day of work done in it: the first `git status`, a commit of one changed file, `git status` again, and `grep -r` over the whole copy (stopped and reported after 10 minutes).
+
 `--remote-folder` picks the folder to search (default: the largest folder of at most 1,000 files) and `--remote-methods` the methods (default: all). Each method runs once, in its own process, so its peak memory is the largest command it ran plus, for sandfs, its serving processes; "on disk" is everything it left in the scratch directory. Every method must read the same bytes and find the same matches. Timings depend on the network, so compare methods within one run rather than across runs.
+
+## Build
+
+`--only build` runs a program that writes a lot: `cargo build` (debug) of one of this repository's packages (`--build-package`, default `sandfs-cli`), with the build output inside the folder, once in a copy of the repository on the host and once in a sandfs mount of another copy. Dependencies are fetched first, so it needs the network once. The first build writes every compiled file; each rebuild changes one source file first and then rereads what the first build wrote and rewrites part of it, the way a person or an agent rebuilds after an edit. The table shows the first build, the median rebuild, and the memory of the process serving the mount afterwards.
