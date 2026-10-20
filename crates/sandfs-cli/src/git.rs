@@ -75,7 +75,9 @@ pub fn resolve_branch(repos: &Path, spec: &str) -> Result<(PathBuf, String, Opti
 /// The branch `rev` names in a local repository, if any.
 fn local_branch(repo: &Path, rev: &str) -> Option<String> {
     if rev == "HEAD" {
-        return git(repo, &["symbolic-ref", "-q", "--short", "HEAD"]).ok();
+        // The full name: `--short` gives `heads/main` when a tag is also called `main`.
+        let head = git(repo, &["symbolic-ref", "-q", "HEAD"]).ok()?;
+        return head.strip_prefix("refs/heads/").map(str::to_owned);
     }
     let name = rev.strip_prefix("refs/heads/").unwrap_or(rev);
     git(repo, &["show-ref", "--verify", "-q", &format!("refs/heads/{name}")]).ok().map(|_| name.to_owned())
@@ -133,6 +135,9 @@ pub struct GitDir {
     files: BTreeMap<String, Bytes>,
     /// The repository the index is built from.
     common: PathBuf,
+    /// Whether that is sandfs's own copy of a remote, which the index build may fetch
+    /// into. A repository of the user's own is never written to.
+    managed: bool,
     commit: String,
     index: OnceLock<std::result::Result<Bytes, String>>,
 }
@@ -220,6 +225,7 @@ impl GitDir {
             dirs: BTreeMap::from([(String::new(), Listing::new())]),
             files: BTreeMap::new(),
             common,
+            managed: repo.starts_with(home.join("repos")),
             commit: commit.to_owned(),
             index: OnceLock::new(),
         };
@@ -323,7 +329,10 @@ impl GitDir {
     /// every `.gitignore` and `.gitattributes` it passes, and would otherwise fetch
     /// each in a request of its own. Best effort: git fetches what this misses.
     fn fetch_missing(&self, blobs: &[&[u8]]) {
-        if blobs.is_empty() || git(&self.common, &["config", "--get", "remote.origin.promisor"]).is_err() {
+        if !self.managed
+            || blobs.is_empty()
+            || git(&self.common, &["config", "--get", "remote.origin.promisor"]).is_err()
+        {
             return;
         }
         // Trees are local, so finding the missing blobs fetches nothing.
@@ -683,6 +692,8 @@ mod tests {
         run(&repo, &["add", "."]);
         run(&repo, &["commit", "-q", "-m", "a"]);
         let commit = run(&repo, &["rev-parse", "HEAD"]);
+        run(&repo, &["tag", "main"]);
+        assert_eq!(local_branch(&repo, "HEAD").as_deref(), Some("main"), "a tag of the same name aside");
         // Settings of the repository's own that would otherwise apply to the build.
         run(&repo, &["config", "core.splitIndex", "true"]);
         let marker = tmp.path().join("hook-ran");
@@ -858,7 +869,7 @@ mod tests {
             assert_eq!(resolve_branch(&repos, remote.to_str().unwrap()).unwrap().2.as_deref(), Some("main"));
         }
 
-        let home = tmp.path().join("home");
+        let home = tmp.path().to_path_buf();
         let dir = GitDir::new(&repo, &commit, Some("main"), &home).unwrap();
         let read = |key: &str| String::from_utf8(dir.read_file(key).unwrap().to_vec()).unwrap();
         assert_eq!(read("HEAD"), "ref: refs/heads/main\n");
@@ -884,6 +895,10 @@ mod tests {
         let missing = || run(&repo, &["rev-list", "--objects", "--missing=print", &commit]);
         let rules = run(&remote, &["rev-parse", "HEAD:docs/.gitignore"]);
         assert!(missing().contains(&format!("?{rules}")), "nothing is fetched before the index is read");
+        // A repository outside sandfs's copies, as `git:/path` mounts, is never fetched into.
+        let elsewhere = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("elsewhere")).unwrap();
+        elsewhere.read_file("index").unwrap();
+        assert!(missing().contains(&format!("?{rules}")), "a repository of the user's own is left alone");
         let index = tmp.path().join("index");
         std::fs::write(&index, dir.read_file("index").unwrap()).unwrap();
         // Git runs a file monitor with `sh`, which Windows may not have.
