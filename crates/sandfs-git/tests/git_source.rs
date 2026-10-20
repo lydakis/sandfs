@@ -58,7 +58,10 @@ fn mounts_a_commit_without_a_checkout() {
     assert!(names.starts_with(&["README.md".to_owned()]) && names.contains(&"src".to_owned()));
     assert_eq!(ws.stat("/head/run.sh").unwrap().kind, Kind::File { executable: true });
     #[cfg(unix)]
-    assert!(!ws.exists("/head/link"), "symlinks are skipped");
+    {
+        assert_eq!(ws.stat("/head/link").unwrap().kind, Kind::Symlink);
+        assert_eq!(ws.read_link("/head/link").unwrap(), "README.md");
+    }
 
     ws.write("/head/src/lib.rs", "changed\n").unwrap();
     let changes = ws.changes().unwrap();
@@ -156,7 +159,7 @@ fn walk(ws: &Workspace, dir: &str, read: bool) -> usize {
         if entry.kind.is_dir() {
             files += walk(ws, &path, read);
         } else {
-            if read {
+            if read && !entry.kind.is_symlink() {
                 ws.read(&path).unwrap();
             }
             files += 1;
@@ -198,7 +201,7 @@ fn a_walk_fetches_only_once_it_reads() {
     let mut ws = Workspace::new();
     ws.mount("/repo", Arc::new(GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap())).unwrap();
     // `find`: every name, no contents.
-    assert_eq!(walk(&ws, "/repo", false), 4);
+    assert_eq!(walk(&ws, "/repo", false), if cfg!(unix) { 5 } else { 4 });
     assert_eq!(missing(clone.path()), before, "a walk that only lists fetches nothing");
 
     // Reading what the walk listed: the first file of a folder comes alone, the second

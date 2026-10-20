@@ -242,6 +242,7 @@ fn git_works_inside_a_remote_git_mount() {
     std::fs::write(remote.join("src/lib.rs"), "fn one() {}\n").unwrap();
     std::fs::write(remote.join("docs/.gitignore"), "*.tmp\n").unwrap();
     std::fs::write(remote.join("LICENSE"), "free\n").unwrap();
+    std::os::unix::fs::symlink("../README.md", remote.join("docs/readme")).unwrap();
     git(remote, &["add", "-A"]);
     git(remote, &["commit", "-q", "-m", "first"]);
 
@@ -261,6 +262,7 @@ fn git_works_inside_a_remote_git_mount() {
         })
     };
     assert_eq!(unread(), [true, true]);
+    assert_eq!(std::fs::read_link(work.join("docs/readme")).unwrap(), Path::new("../README.md"));
     assert_eq!(git_out(&work, &["status", "--porcelain", "-b"]), "## main...origin/main\n");
     // (A Mac mount lists folders over NFS with every file's size, which fetches them; #83.)
     if cfg!(target_os = "linux") {
@@ -271,7 +273,9 @@ fn git_works_inside_a_remote_git_mount() {
     std::fs::write(work.join("README.md"), "hello, sandfs\n").unwrap();
     std::fs::write(work.join("notes.txt"), "notes\n").unwrap();
     std::fs::write(work.join("docs/scratch.tmp"), "ignored\n").unwrap();
-    assert_eq!(git_out(&work, &["status", "--porcelain"]), " M README.md\n?? notes.txt\n");
+    std::fs::remove_file(work.join("docs/readme")).unwrap();
+    std::os::unix::fs::symlink("../LICENSE", work.join("docs/readme")).unwrap();
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), " M README.md\n M docs/readme\n?? notes.txt\n");
     git_out(&work, &["add", "-A"]);
     git_out(&work, &["commit", "-q", "-m", "change"]);
     // Committing compared the files of the folders it changed, and fetched no others,
@@ -283,9 +287,14 @@ fn git_works_inside_a_remote_git_mount() {
     assert_eq!(fetched_here, 0, "the workspace holds no fetched files");
     assert_eq!(git_out(&work, &["status", "--porcelain", "-b"]), "## main...origin/main [ahead 1]\n");
     assert_eq!(git_out(&work, &["log", "--format=%s"]), "change\nfirst\n");
-    assert_eq!(sandfs.stdout(&["changes", "work"]), "M README.md\nA docs/scratch.tmp\nA notes.txt\n", "not .git");
+    assert_eq!(
+        sandfs.stdout(&["changes", "work"]),
+        "M README.md\nM docs/readme\nA docs/scratch.tmp\nA notes.txt\n",
+        "not .git"
+    );
     git_out(&work, &["push", "-q", "origin", "HEAD:refs/heads/from-mount"]);
     assert_eq!(git_out(remote, &["show", "from-mount:README.md"]), "hello, sandfs\n");
+    assert_eq!(git_out(remote, &["show", "from-mount:docs/readme"]), "../LICENSE");
     assert_eq!(git_out(remote, &["log", "--format=%s", "main"]), "first\n", "only the push reached the remote");
 
     // A file changed, staged, then put back by something other than git differs from

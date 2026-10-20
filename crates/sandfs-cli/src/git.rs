@@ -128,8 +128,8 @@ pub fn open(
 /// by reading every file. Instead every entry is marked unchanged for git's file
 /// monitor, which asks `sandfs git-fsmonitor` what changed since; the same answers
 /// keep git's cache of untracked files current, so it lists folders only once.
-/// Symbolic links and submodules, which a mount doesn't show, are marked as outside
-/// the checkout, so git doesn't take them for deleted.
+/// Submodules, which a mount doesn't show, are marked as outside the checkout, so git
+/// doesn't take them for deleted.
 ///
 /// Before every commit, git in a partial clone checks that it has the contents of every
 /// file the index lists, and fetches whichever it lacks: on a fresh mount, all of them.
@@ -362,14 +362,14 @@ impl GitDir {
             };
             run(&["read-tree", &self.commit], None)?;
             let listed = run(&["ls-files", "-s", "-z"], None)?;
-            let (mut all, mut links, mut rules) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut all, mut submodules, mut rules) = (Vec::new(), Vec::new(), Vec::new());
             // `<mode> <id> <stage>\t<path>`
             for record in listed.split(|&b| b == 0).filter(|record| !record.is_empty()) {
                 let Some(tab) = record.iter().position(|&b| b == b'\t') else { continue };
                 let path = &record[tab + 1..];
-                if record.starts_with(b"120000 ") || record.starts_with(b"160000 ") {
-                    links.extend_from_slice(path);
-                    links.push(0);
+                if record.starts_with(b"160000 ") {
+                    submodules.extend_from_slice(path);
+                    submodules.push(0);
                 }
                 let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
                 if name == b".gitignore" || name == b".gitattributes" {
@@ -380,8 +380,8 @@ impl GitDir {
             }
             self.fetch_missing(&rules);
             // Outside the checkout first: a path marked both ways would get only that.
-            if !links.is_empty() {
-                run(&["update-index", "-z", "--skip-worktree", "--stdin"], Some(&links))?;
+            if !submodules.is_empty() {
+                run(&["update-index", "-z", "--skip-worktree", "--stdin"], Some(&submodules))?;
             }
             run(&["update-index", "-z", "--fsmonitor", "--fsmonitor-valid", "--stdin"], Some(&all))?;
             // Marking entries also forgot the folder ids `read-tree` put in the index, so
@@ -1037,7 +1037,7 @@ mod tests {
         std::fs::write(remote.join("a.txt"), "one").unwrap();
         std::fs::write(remote.join("docs/.gitignore"), "*.tmp\n").unwrap();
         run(&remote, &["add", "-A"]);
-        // A symbolic link and a submodule, neither of which a mount shows.
+        // A symbolic link, which a mount shows, and a submodule, which it doesn't.
         let blob = run(&remote, &["hash-object", "-w", "a.txt"]);
         run(&remote, &["update-index", "--add", "--cacheinfo", &format!("120000,{blob},link")]);
         run(&remote, &["commit", "-q", "-m", "first"]);
@@ -1081,8 +1081,8 @@ mod tests {
         assert_eq!(&detached.read_file("HEAD").unwrap()[..], format!("{first}\n").as_bytes());
         assert!(!String::from_utf8_lossy(&detached.read_file("config").unwrap()).contains("[branch"));
 
-        // The index lists every file as unchanged for git's file monitor, and keeps the
-        // link and the submodule out of the checkout.
+        // The index lists every file and link as unchanged for git's file monitor, and
+        // keeps the submodule out of the checkout.
         let missing = || run(&repo, &["rev-list", "--objects", "--missing=print", &commit]);
         let rules = run(&remote, &["rev-parse", "HEAD:docs/.gitignore"]);
         assert!(missing().contains(&format!("?{rules}")), "nothing is fetched before the index is read");
@@ -1186,7 +1186,7 @@ mod tests {
             .filter_map(|line| line.split_once(' '))
             .map(|(tag, path)| (path, tag.chars().next().unwrap().to_ascii_lowercase()))
             .collect();
-        assert_eq!(tags, BTreeMap::from([("a.txt", 'h'), ("docs/.gitignore", 'h'), ("link", 's'), ("sub", 's')]));
+        assert_eq!(tags, BTreeMap::from([("a.txt", 'h'), ("docs/.gitignore", 'h'), ("link", 'h'), ("sub", 's')]));
         assert!(listed.contains("h a.txt"), "files are marked unchanged: {listed}");
     }
 
