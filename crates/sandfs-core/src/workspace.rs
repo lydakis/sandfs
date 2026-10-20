@@ -596,11 +596,11 @@ impl Workspace {
     fn write_content(&mut self, path: &str, content: Content, expected: Option<u64>) -> Result<u64> {
         let path = VPath::parse(path)?;
         let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
-        let (kind, version) = match self.resolve(&path) {
+        let (kind, version, exists) = match self.resolve(&path) {
             Ok(Resolved::Dir { .. }) => return Err(Error::IsADirectory(path.to_string())),
             Ok(Resolved::File { kind: Kind::Symlink, .. }) => return Err(is_a_symlink(&path)),
-            Ok(Resolved::File { kind, version, .. }) => (kind, version),
-            Err(Error::NotFound(_)) => (Kind::File { executable: false }, self.missing_version(&path)),
+            Ok(Resolved::File { kind, version, .. }) => (kind, version, true),
+            Err(Error::NotFound(_)) => (Kind::File { executable: false }, self.missing_version(&path), false),
             Err(err) => return Err(err),
         };
         if let Some(expected) = expected {
@@ -608,7 +608,11 @@ impl Workspace {
                 return Err(Error::VersionMismatch { path: path.to_string(), expected, actual: version });
             }
         }
-        self.ensure_dir(&parent)?;
+        // An existing file's parent is a directory already, and so is a directory
+        // written here (nothing above it can hide it, as in `resolve`).
+        if !exists && !matches!(self.overlay.get(&parent), Some(Overlay::Dir { .. })) {
+            self.ensure_dir(&parent)?;
+        }
         let version = self.tick();
         self.put_file(path, content, kind, version);
         Ok(version)
@@ -788,6 +792,20 @@ impl Workspace {
     // ------------------------------------------------------------------
 
     fn resolve(&self, path: &VPath) -> Result<Resolved> {
+        let entry = self.overlay.get(path);
+        // Nothing is kept below a file or a whiteout: removing a directory removes
+        // everything below it, and nothing can be added below a file. So an entry for
+        // one of those has nothing above it to check, and neither has a directory that
+        // hides the base anyway.
+        match entry {
+            Some(Overlay::Deleted { .. }) => return Err(Error::NotFound(path.to_string())),
+            Some(entry @ (Overlay::File { .. } | Overlay::Linked { .. })) => {
+                let (content, kind, version) = self.overlay_file(entry).expect("a file entry");
+                return Ok(Resolved::File { content, kind, version });
+            }
+            Some(Overlay::Dir { opaque: true }) => return Ok(Resolved::Dir { base: self.structural_node(path) }),
+            Some(Overlay::Dir { opaque: false }) | None => {}
+        }
         let mut base_hidden = false;
         // An untouched workspace has nothing above any path to check.
         let ancestors = (!self.overlay.is_empty()).then(|| path.ancestor_strs()).into_iter().flatten();
@@ -804,28 +822,21 @@ impl Workspace {
         let base = || -> Result<Option<BaseNode>> {
             if base_hidden { Ok(self.structural_node(path)) } else { self.base_node(path) }
         };
-        match self.overlay.get(path) {
-            Some(Overlay::Deleted { .. }) => Err(Error::NotFound(path.to_string())),
-            Some(entry @ (Overlay::File { .. } | Overlay::Linked { .. })) => {
-                let (content, kind, version) = self.overlay_file(entry).expect("a file entry");
-                Ok(Resolved::File { content, kind, version })
-            }
-            Some(Overlay::Dir { opaque: true }) => Ok(Resolved::Dir { base: self.structural_node(path) }),
-            Some(Overlay::Dir { opaque: false }) => {
-                Ok(Resolved::Dir { base: base()?.filter(|node| node.kind().is_dir()) })
-            }
-            None if path.is_root() => Ok(Resolved::Dir { base: Some(BaseNode::Implicit) }),
-            None => match base()? {
-                None => Err(Error::NotFound(path.to_string())),
-                Some(node) => match node {
-                    BaseNode::Entry(mount, entry) if !entry.kind.is_dir() => Ok(Resolved::File {
-                        content: Content::Base { mount, key: entry.key.clone(), size: entry.size },
-                        kind: entry.kind,
-                        version: 0,
-                    }),
-                    node => Ok(Resolved::Dir { base: Some(node) }),
-                },
-            },
+        // What is left is a directory written here, or nothing in the overlay.
+        if entry.is_some() {
+            return Ok(Resolved::Dir { base: base()?.filter(|node| node.kind().is_dir()) });
+        }
+        if path.is_root() {
+            return Ok(Resolved::Dir { base: Some(BaseNode::Implicit) });
+        }
+        match base()? {
+            None => Err(Error::NotFound(path.to_string())),
+            Some(BaseNode::Entry(mount, entry)) if !entry.kind.is_dir() => Ok(Resolved::File {
+                content: Content::Base { mount, key: entry.key.clone(), size: entry.size },
+                kind: entry.kind,
+                version: 0,
+            }),
+            Some(node) => Ok(Resolved::Dir { base: Some(node) }),
         }
     }
 

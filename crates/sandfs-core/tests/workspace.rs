@@ -233,6 +233,31 @@ fn removing_hides_base_entries_and_recreating_starts_empty() {
 }
 
 #[test]
+fn nothing_written_below_a_removed_directory_comes_back() {
+    let (mut ws, _) = workspace();
+    ws.write("/repo/src/new/deep.rs", "deep").unwrap();
+    ws.mkdir("/repo/src/empty", false).unwrap();
+    ws.remove("/repo/src", true).unwrap();
+    for gone in ["/repo/src/new/deep.rs", "/repo/src/new", "/repo/src/empty", "/repo/src/lib.rs"] {
+        assert!(matches!(ws.stat(gone), Err(Error::NotFound(_))), "{gone}");
+    }
+
+    // Replaced by a file, the old paths are below a file now.
+    ws.write("/repo/src", "now a file").unwrap();
+    for below in ["/repo/src/new/deep.rs", "/repo/src/empty", "/repo/src/lib.rs"] {
+        assert!(matches!(ws.stat(below), Err(Error::NotADirectory(_))), "{below}");
+        assert!(matches!(ws.write(below, "x"), Err(Error::NotADirectory(_))), "{below}");
+    }
+
+    // A directory again, it starts empty: neither written nor base entries return.
+    ws.remove("/repo/src", false).unwrap();
+    ws.write("/repo/src/new/other.rs", "other").unwrap();
+    assert_eq!(names(&ws, "/repo/src"), ["new"]);
+    assert_eq!(names(&ws, "/repo/src/new"), ["other.rs"]);
+    assert!(matches!(ws.stat("/repo/src/new/deep.rs"), Err(Error::NotFound(_))));
+}
+
+#[test]
 fn mount_points_cannot_be_removed_or_replaced() {
     let (mut ws, _) = workspace();
     assert!(matches!(ws.remove("/repo", true), Err(Error::Unsupported(..))));
