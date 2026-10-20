@@ -1246,7 +1246,19 @@ impl Shared {
     /// Save, leaving out files written within `settle`.
     fn save_settled(&self, settle: Duration, durable: bool) -> anyhow::Result<()> {
         let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = self.lock().snapshot(settle);
+        let snapshot = {
+            let mut inner = self.lock();
+            inner.commit_written(settle);
+            // Nothing changed since the last save took its snapshot, and that save
+            // succeeded (a failed one sets `unsaved` again): its index still holds.
+            // Rewriting it would cost a pass over every change, at every `fsync` and fork.
+            // Replaced files still waiting to be deleted take a save, as before.
+            if !inner.unsaved && !inner.writing && !saved.deleting_later() {
+                drop(inner);
+                return if durable { saved.flush() } else { Ok(()) };
+            }
+            inner.snapshot(settle)
+        };
         let result = saved.save(&snapshot, &self.root, durable);
         let mut inner = self.lock();
         // Saved files are read from disk from now on, unless written again meanwhile.
@@ -1947,6 +1959,60 @@ mod tests {
         assert_eq!(fs.copy_range(lib, 0, copied, 0, 1 << 30).unwrap(), 12);
         assert!(fs.ws.stored("/mnt/lib.rs").unwrap().is_some());
         assert_eq!(fs.ws.read_text("/mnt/lib.rs").unwrap(), "fn one() {}\n");
+    }
+
+    #[test]
+    fn an_fsync_with_nothing_changed_keeps_the_saved_index() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state = tempfile::tempdir().unwrap();
+        let mut saved = Saved::new(state.path());
+        // One object per file, so the files on disk count the objects.
+        saved.pack_limit = None;
+        let mut inner = fs();
+        inner.drafts = Some(saved.drafts());
+        let shared = Shared::new(inner, saved, VPath::parse("/mnt").unwrap());
+        let index = state.path().join("changes.json");
+        let objects = || std::fs::read_dir(state.path().join("objects")).unwrap().count();
+        let index_ino = || std::fs::metadata(&index).unwrap().ino();
+        shared.save(true).unwrap();
+        assert!(!index.exists(), "nothing to save yet");
+
+        let readme = shared.lock().lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        shared.lock().write(readme, 0, b"HE").unwrap();
+        shared.save(true).unwrap();
+        let saved_ino = index_ino();
+        // Each save puts a new index in place, so an unchanged inode means no save.
+        shared.save(true).unwrap();
+        shared.save(false).unwrap();
+        assert_eq!(index_ino(), saved_ino, "the index is kept as it is");
+
+        let new = shared.lock().create(ROOT_INO, name("new.md"), 0o644, true, false).unwrap().ino.0;
+        shared.lock().write(new, 0, b"new\n").unwrap();
+        shared.save(true).unwrap();
+        assert_ne!(index_ino(), saved_ino, "a change is saved");
+
+        // Writing a saved file again replaces its object, which a later save deletes,
+        // even with nothing else changed by then.
+        shared.lock().write(new, 0, b"NEW\n").unwrap();
+        shared.save(true).unwrap();
+        assert_eq!(objects(), 3, "the replaced object waits one save");
+        shared.save(true).unwrap();
+        assert_eq!(objects(), 2);
+        let saved_ino = index_ino();
+        shared.save(true).unwrap();
+        assert_eq!(index_ino(), saved_ino, "and then nothing is left to do");
+
+        // A draft no save named, such as one written to a removed file, is deleted too.
+        let drafts = shared.lock().drafts.clone().unwrap();
+        drop(drafts.empty().unwrap());
+        assert_eq!(objects(), 3);
+        shared.save(true).unwrap();
+        assert_eq!(objects(), 2);
+        let mut restored = fs().ws;
+        Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
+        assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");
+        assert_eq!(restored.read_text("/mnt/new.md").unwrap(), "NEW\n");
     }
 
     #[test]

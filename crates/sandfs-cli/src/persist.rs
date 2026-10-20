@@ -384,6 +384,17 @@ fn sync_disk(_dir: &Path, _files: usize) -> Result<bool> {
     Ok(false)
 }
 
+/// What is at `path` before `entry` is replayed there.
+fn current_kind(ws: &Workspace, path: &VPath, entry: &Entry) -> Result<Option<Kind>> {
+    match ws.stat(path.as_str()) {
+        Ok(meta) => Ok(Some(meta.kind)),
+        // Below a file that replaced a directory: the file already hides it.
+        Err(Error::NotFound(_) | Error::NotADirectory(_)) if *entry == Entry::Absent => Ok(None),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Whether `err` is a saved object found missing, by a load or a read of a saved file,
 /// because a newer save replaced it: reading again from the newer index works.
 pub fn is_object_gone(err: &anyhow::Error) -> bool {
@@ -611,6 +622,9 @@ impl Saved {
         let mut names: HashMap<&str, SourceKey> = HashMap::new();
         // The size of each file in `objects/` looked at so far: one look per pack.
         let mut files: HashMap<String, u64> = HashMap::new();
+        // Directories this load made where nothing was. Entries are sorted, so one comes
+        // before everything below it, and nothing is there yet to look at.
+        let mut made: HashSet<VPath> = HashSet::new();
         for (rel, entry) in &changes.entries {
             let path = under(root, rel)?;
             let object = match entry {
@@ -627,7 +641,16 @@ impl Saved {
                 }
                 _ => None,
             };
-            self.apply(ws, root, &path, entry, object.clone()).with_context(|| format!("restoring {rel}"))?;
+            let current = match path.parent() {
+                Some(parent) if made.contains(&parent) => None,
+                _ => current_kind(ws, &path, entry).with_context(|| format!("restoring {rel}"))?,
+            };
+            let version = self
+                .apply(ws, root, &path, entry, current, object.clone())
+                .with_context(|| format!("restoring {rel}"))?;
+            if current.is_none() && matches!(entry, Entry::Dir { .. }) {
+                made.insert(path.clone());
+            }
             let object = object.map(|(object, _)| object);
             let mtime = match entry {
                 Entry::File { mtime, .. } | Entry::Dir { mtime } | Entry::Symlink { mtime, .. } => *mtime,
@@ -638,7 +661,10 @@ impl Saved {
             }
             match (entry, object) {
                 (Entry::File { .. }, Some(object)) => {
-                    let version = ws.stat(path.as_str())?.version;
+                    let version = match version {
+                        Some(version) => version,
+                        None => ws.stat(path.as_str())?.version,
+                    };
                     // A save that wasn't durable may have left it unflushed before the
                     // process that wrote it went away, so the next durable save flushes it.
                     self.unsynced.insert(file_of(&object).to_owned());
@@ -708,24 +734,19 @@ impl Saved {
         self.store.next.fetch_max(last + 1, Ordering::SeqCst);
     }
 
-    /// Replay one entry; a file reads from `object`, its object's shared name, and size,
-    /// unless it is another name of a file already restored.
+    /// Replay one entry over `current`, what is at its path now; a file reads from
+    /// `object`, its object's shared name, and size, unless it is another name of a file
+    /// already restored. Returns the version of a file it wrote.
     fn apply(
         &self,
         ws: &mut Workspace,
         root: &VPath,
         path: &VPath,
         entry: &Entry,
+        current: Option<Kind>,
         object: Option<(SourceKey, u64)>,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         let p = path.as_str();
-        let current = match ws.stat(p) {
-            Ok(meta) => Some(meta.kind),
-            // Below a file that replaced a directory: the file already hides it.
-            Err(Error::NotFound(_) | Error::NotADirectory(_)) if *entry == Entry::Absent => None,
-            Err(Error::NotFound(_)) => None,
-            Err(err) => return Err(err.into()),
-        };
         match entry {
             Entry::Absent => {
                 if current.is_some() {
@@ -755,11 +776,17 @@ impl Saved {
                 if matches!(current, Some(Kind::Dir | Kind::Symlink)) {
                     ws.remove(p, true)?;
                 }
-                ws.write_stored(p, self.stored(object, size))?;
-                ws.set_executable(p, *executable)?;
+                let version = ws.write_stored(p, self.stored(object, size))?;
+                // A write keeps the mode of the file it replaces, and a new file starts
+                // without the executable bit, so the bit is set only where it differs.
+                let was_executable = current == Some(Kind::File { executable: true });
+                if *executable != was_executable {
+                    return Ok(Some(ws.set_executable(p, *executable)?));
+                }
+                return Ok(Some(version));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Make `path` another name of the file at `other` (relative to `root`), if that
@@ -848,20 +875,7 @@ impl Saved {
         let tmp = self.dir.join("changes.json.tmp");
         if durable {
             // Objects reach the disk before the index that names them.
-            let live: HashSet<&str> = kept.values().map(|(_, object)| file_of(object)).collect();
-            let named: Vec<String> = self.unsynced.iter().filter(|o| live.contains(o.as_str())).cloned().collect();
-            if !sync_disk(&self.objects_dir(), named.len())? {
-                for object in &named {
-                    sync_path(&self.objects_dir().join(object))?;
-                }
-            }
-            if !named.is_empty() {
-                sync_path(&self.objects_dir())?;
-            }
-            // A draft still being written is flushed by the durable save that names it.
-            for object in named {
-                self.unsynced.remove(&object);
-            }
+            self.sync_objects(&kept)?;
         }
         std::fs::write(&tmp, index).context("writing changes.json")?;
         if durable {
@@ -906,6 +920,50 @@ impl Saved {
         self.delete(deleted);
         if durable {
             sync_path(&self.dir).map_err(|err| err.context(NotDurable))?;
+        }
+        Ok(())
+    }
+
+    /// Whether a replaced object or pack, or a draft no save has named yet (such as
+    /// one written to a removed file), is waiting for a later save to delete it.
+    pub fn deleting_later(&self) -> bool {
+        let drafts = !self.store.drafts.lock().unwrap_or_else(PoisonError::into_inner).is_empty();
+        drafts || !self.doomed.is_empty() || self.packs.values().any(|pack| pack.unnamed)
+    }
+
+    /// Flush to disk what the last save left unflushed: the objects its index names, and
+    /// the index. This is all an `fsync` has to do when nothing changed since that save
+    /// and nothing waits for it to be deleted ([`Saved::deleting_later`]).
+    pub fn flush(&mut self) -> Result<()> {
+        let objects = std::mem::take(&mut self.objects);
+        let synced = self.sync_objects(&objects);
+        self.objects = objects;
+        synced?;
+        let index = self.index_path();
+        // Nothing saved yet, so nothing to flush.
+        if !index.exists() {
+            return Ok(());
+        }
+        sync_path(&index)?;
+        sync_path(&self.dir).map_err(|err| err.context(NotDurable))
+    }
+
+    /// Flush the files holding `objects` that were written since a durable save last
+    /// named them.
+    fn sync_objects(&mut self, objects: &HashMap<String, (u64, SourceKey)>) -> Result<()> {
+        let live: HashSet<&str> = objects.values().map(|(_, object)| file_of(object)).collect();
+        let named: Vec<String> = self.unsynced.iter().filter(|o| live.contains(o.as_str())).cloned().collect();
+        if !sync_disk(&self.objects_dir(), named.len())? {
+            for object in &named {
+                sync_path(&self.objects_dir().join(object))?;
+            }
+        }
+        if !named.is_empty() {
+            sync_path(&self.objects_dir())?;
+        }
+        // A draft still being written is flushed by the durable save that names it.
+        for object in named {
+            self.unsynced.remove(&object);
         }
         Ok(())
     }
