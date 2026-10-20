@@ -587,7 +587,6 @@ fn memory_source_rejects_a_file_that_is_also_a_directory() {
     assert!(MemorySource::from_files([("a/b", "child"), ("a", "file")]).is_err());
 }
 
-#[cfg(unix)]
 #[test]
 fn files_nobody_wrote_keep_their_source_modification_time() {
     let dir = std::env::temp_dir().join(format!("sandfs-times-{}", std::process::id()));
@@ -611,6 +610,7 @@ fn files_nobody_wrote_keep_their_source_modification_time() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn dir_source_refuses_reads_through_a_swapped_in_symlink() {
     let base = std::env::temp_dir().join(format!("sandfs-escape-{}", std::process::id()));
