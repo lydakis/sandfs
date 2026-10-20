@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, Write};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use anyhow::Result;
@@ -88,6 +88,9 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
                         times.insert(format!("{to}{}", &old[from.as_str().len()..]), time);
                     }
                 }
+                // Files nobody wrote keep their source's time, which the save that stores
+                // them apart from the source would otherwise drop.
+                keep_source_times(ws, to, &mut times);
             }
             for path in &touched {
                 for parent in path.ancestors().into_iter().filter(below_root) {
@@ -178,6 +181,24 @@ fn tool_error(request: &Value, message: &str) -> Option<String> {
     let id = request.get("id")?;
     let result = json!({ "content": [{ "type": "text", "text": message }], "isError": true });
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
+}
+
+/// Note the source's time of every file under the moved folder `dir` that has no time
+/// of its own yet.
+fn keep_source_times(ws: &Workspace, dir: &VPath, times: &mut BTreeMap<String, SystemTime>) {
+    let mut stack = vec![dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in ws.list(dir.as_str()).unwrap_or_default() {
+            let Ok(path) = dir.join(&entry.name) else { continue };
+            if entry.kind.is_dir() {
+                stack.push(path);
+            } else if !times.contains_key(path.as_str())
+                && let Ok(Some(time)) = ws.modified(path.as_str())
+            {
+                times.insert(path.to_string(), time);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +349,21 @@ mod tests {
         let times = home.open("ws").unwrap().restored.times;
         assert_eq!(times.get("/mnt/moved/f.txt"), Some(&written));
         assert!(!times.contains_key("/mnt/dir/f.txt"));
+    }
+
+    #[test]
+    fn moved_folders_keep_their_source_files_times() {
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let then = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::create_dir(data.path().join("dir")).unwrap();
+        std::fs::write(data.path().join("dir/old.txt"), "old").unwrap();
+        std::fs::File::options().write(true).open(data.path().join("dir/old.txt")).unwrap().set_modified(then).unwrap();
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(data.path().to_str().unwrap()).unwrap()).unwrap();
+
+        session(&home, &call(1, "move", json!({ "from": "/mnt/dir", "to": "/mnt/moved" })));
+        let times = home.open("ws").unwrap().restored.times;
+        assert_eq!(times.get("/mnt/moved/old.txt"), Some(&then));
     }
 
     #[test]

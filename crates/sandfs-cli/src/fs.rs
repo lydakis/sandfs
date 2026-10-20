@@ -513,7 +513,7 @@ impl Inner {
     /// save keeps it apart from the source, so only `times` can carry that time on.
     fn keep_source_time(&mut self, path: &VPath) {
         if !self.times.contains_key(path.as_str())
-            && let Some(time) = self.ws.stat(path.as_str()).ok().and_then(|meta| meta.modified)
+            && let Ok(Some(time)) = self.ws.modified(path.as_str())
         {
             self.times.insert(path.to_string(), time);
         }
@@ -674,7 +674,9 @@ impl Inner {
         if let Some(mode) = mode {
             let path = self.path(ino)?;
             if let Kind::File { .. } = self.ws.stat(path.as_str()).fs()?.kind {
-                // Only the executable bit is kept; other mode bits are not stored.
+                // Only the executable bit is kept; other mode bits are not stored. The
+                // bytes stay the same, and so does their time.
+                self.keep_source_time(&path);
                 self.ws.set_executable(path.as_str(), mode & 0o111 != 0).fs()?;
                 self.unsaved = true;
             }

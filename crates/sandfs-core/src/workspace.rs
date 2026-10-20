@@ -354,6 +354,15 @@ impl Workspace {
         })
     }
 
+    /// [`Metadata::modified`] alone: the source's time for a file nobody wrote, found
+    /// without reading the file even when the source left its size out.
+    pub fn modified(&self, path: &str) -> Result<Option<SystemTime>> {
+        Ok(match self.resolve(&VPath::parse(path)?)? {
+            Resolved::File { content: Content::Base { modified, .. }, .. } => modified,
+            _ => None,
+        })
+    }
+
     /// Read a file's bytes.
     pub fn read(&self, path: &str) -> Result<Bytes> {
         let path = VPath::parse(path)?;
