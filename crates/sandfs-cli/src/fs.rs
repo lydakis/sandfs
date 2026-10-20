@@ -458,8 +458,11 @@ impl Inner {
             // Only a regular file has a size to set, as truncate(2) says; the kernel
             // follows links first, but an NFS client may name one.
             let (ws, path) = self.contents(ino)?;
-            if ws.read_link(path.as_str()).is_ok() {
-                return Err(Errno::EINVAL);
+            match ws.read_link(path.as_str()) {
+                Ok(_) => return Err(Errno::EINVAL),
+                // Not a link: the one refusal that lets the size be set.
+                Err(Error::Unsupported(..)) => {}
+                Err(err) => return Err(errno(&err)),
             }
             if size == 0 {
                 // Emptying a file (O_TRUNC arrives this way) needn't read it first.
@@ -1579,6 +1582,35 @@ mod tests {
             assert_eq!(fs.setattr(link, None, Some(size), None).unwrap_err(), Errno::EINVAL);
         }
         assert_eq!(fs.readlink(link).unwrap(), "README.md");
+        assert!(fs.buffers.is_empty());
+
+        // A link whose target can't be read now is still not a file to empty.
+        #[derive(Debug)]
+        struct Broken;
+        impl sandfs_core::Source for Broken {
+            fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+                Ok("".into())
+            }
+            fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+                let entry = sandfs_core::SourceEntry { kind: Kind::Symlink, key: "link".into(), size: Some(4) };
+                Ok([("link".to_owned(), entry)].into())
+            }
+            fn read_file(&self, _key: &str) -> sandfs_core::Result<Bytes> {
+                Err(Error::Source("gone".into()))
+            }
+        }
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(Broken)).unwrap();
+        let mut fs = Inner::new(
+            ws,
+            &VPath::parse("/mnt").unwrap(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            SystemTime::UNIX_EPOCH,
+            (1000, 1000),
+        );
+        let link = fs.lookup(ROOT_INO, name("link")).unwrap().ino.0;
+        assert_eq!(fs.setattr(link, None, Some(0), None).unwrap_err(), Errno::EIO);
         assert!(fs.buffers.is_empty());
     }
 

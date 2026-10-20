@@ -277,24 +277,28 @@ impl DirSource {
         if !target.is_absolute() {
             return None;
         }
-        let mut plain = PathBuf::new();
-        for part in target.components() {
-            match part {
-                Component::ParentDir => {
-                    plain.pop();
+        let parts: Vec<Component> = target.components().collect();
+        // The target as written, with `..` taken lexically, and as the OS would find
+        // it: the longest part of it that exists, resolved through every link, plus
+        // the rest. Either landing in the folder makes the link relative.
+        let rest = |mut path: PathBuf, parts: &[Component]| {
+            for part in parts {
+                match part {
+                    Component::ParentDir => {
+                        path.pop();
+                    }
+                    Component::CurDir => {}
+                    part => path.push(part),
                 }
-                Component::CurDir => {}
-                part => plain.push(part),
             }
-        }
-        // As written, through the folders on the way (for a target that doesn't exist
-        // yet), or wherever it finally leads through other links.
-        let through_dirs = match (plain.parent(), plain.file_name()) {
-            (Some(dir), Some(name)) => dir.canonicalize().ok().map(|dir| dir.join(name)),
-            _ => None,
+            path
         };
-        let resolved = plain.canonicalize().ok();
-        [Some(plain), through_dirs, resolved]
+        let plain = rest(PathBuf::new(), &parts);
+        let resolved = (1..=parts.len()).rev().find_map(|cut| {
+            let existing: PathBuf = parts[..cut].iter().collect();
+            existing.canonicalize().ok().map(|path| rest(path, &parts[cut..]))
+        });
+        [Some(plain), resolved]
             .into_iter()
             .flatten()
             .find_map(|path| path.strip_prefix(&self.root).ok().map(Path::to_path_buf))
