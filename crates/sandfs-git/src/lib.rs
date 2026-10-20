@@ -620,8 +620,9 @@ fn parse_tree(data: &[u8], hash_len: usize) -> Result<Listing> {
             b"40000" => Kind::Dir,
             b"100644" | b"100664" => Kind::File { executable: false },
             b"100755" => Kind::File { executable: true },
-            // Symlinks (120000) are not part of a workspace, and submodules (160000)
-            // point at commits in other repositories.
+            // A link's blob is its target, which is what the workspace reads for one.
+            b"120000" => Kind::Symlink,
+            // Submodules (160000) point at commits in other repositories.
             _ => continue,
         };
         let Ok(name) = name else { continue }; // non-UTF-8 names cannot be workspace paths
