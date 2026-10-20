@@ -42,7 +42,9 @@ pub struct GitSource {
     /// does, so one walk of the whole tree finds every missing file.
     trees_local: bool,
     /// Trees with every file below them local, so prefetching them does nothing.
-    local: Mutex<HashSet<SourceKey>>,
+    local: Arc<Mutex<HashSet<SourceKey>>>,
+    /// Trees whose files are coming in the background (see [`GitSource::fetch_behind`]).
+    behind: Arc<Mutex<HashSet<SourceKey>>>,
     /// The blobs of the whole tree a partial clone lacked, found by one walk started in
     /// the background by the first listing, so later listings don't each start git.
     /// `None` inside when git couldn't say.
@@ -51,7 +53,7 @@ pub struct GitSource {
     /// Set when the source is dropped, which stops a walk still running.
     cancel: Arc<AtomicBool>,
     /// Blobs read or fetched since, which [`GitSource::absent`] may still list.
-    fetched: Mutex<HashSet<SourceKey>>,
+    fetched: Arc<Mutex<HashSet<SourceKey>>>,
 }
 
 /// The most files one request fetches. A folder missing more is left to fetch file by
@@ -96,11 +98,12 @@ impl GitSource {
             sizes: None,
             promisor,
             trees_local,
-            local: Mutex::default(),
+            local: Arc::default(),
+            behind: Arc::default(),
             absent: Arc::default(),
             walk: Once::new(),
             cancel: Arc::default(),
-            fetched: Mutex::default(),
+            fetched: Arc::default(),
         })
     }
 
@@ -218,23 +221,45 @@ impl GitSource {
     /// Fetch everything missing below the tree `id` in the background, a request at a
     /// time, in the order a walk reads the files, while reads go on: one that gets ahead
     /// fetches its own file, as without a prefetch, rather than waiting for a whole
-    /// request. Each request first asks git what is still missing, so files fetched
-    /// meanwhile, such as a folder the walk reached first, aren't fetched twice. Sizes
-    /// of files fetched this way show up once their folder is prefetched.
+    /// request. Files read meanwhile aren't fetched again when this source keeps track
+    /// of them (with sizes); otherwise a few may come twice. Sizes of files fetched this
+    /// way show up once their folder is prefetched. Needs every tree local, which a
+    /// clone that leaves out only blobs has; one tree comes once at a time.
     fn fetch_behind(&self, remote: &str, id: &str) {
-        let (repo, remote, id) = (self.repo.clone(), remote.to_owned(), id.to_owned());
-        let cancel = Arc::clone(&self.cancel);
+        if !self.trees_local || !self.behind.lock().is_ok_and(|mut behind| behind.insert(id.into())) {
+            return;
+        }
+        let (repo, remote, id, hash_len) = (self.repo.clone(), remote.to_owned(), SourceKey::from(id), self.hash_len);
+        let (absent, fetched, cancel) = (Arc::clone(&self.absent), Arc::clone(&self.fetched), Arc::clone(&self.cancel));
+        let (local, behind) = (Arc::clone(&self.local), Arc::clone(&self.behind));
         let _ = std::thread::Builder::new().name("sandfs-git-prefetch".into()).spawn(move || {
-            let Some(order) = missing_in_order(&repo, &id) else { return };
-            let mut order = order.into_iter();
-            while !cancel.load(Ordering::Relaxed) {
-                let Some(missing) = missing(&repo, &id, true, usize::MAX) else { return };
-                let missing: HashSet<String> = missing.into_iter().collect();
-                let request: Vec<String> =
-                    order.by_ref().filter(|blob| missing.contains(blob)).take(PREFETCH_FILES).collect();
-                if request.is_empty() || !fetch(&repo, &remote, &request) {
-                    return;
+            // The whole tree's walk lists every blob missing below any of its folders.
+            let walked;
+            let missing = match absent.get() {
+                Some(Some(absent)) => Some(absent),
+                _ => {
+                    walked = walk_missing(&repo, &id, hash_len, &cancel);
+                    walked.as_ref()
                 }
+            };
+            let done = missing.is_some_and(|missing| {
+                fetch_in_order(
+                    &repo,
+                    &remote,
+                    &id,
+                    hash_len,
+                    missing,
+                    &|blob| fetched.lock().is_ok_and(|f| f.contains(blob)),
+                    &cancel,
+                )
+            });
+            if done {
+                if let Ok(mut local) = local.lock() {
+                    local.insert(id.clone());
+                }
+            }
+            if let Ok(mut behind) = behind.lock() {
+                behind.remove(&id);
             }
         });
     }
@@ -361,13 +386,53 @@ fn missing(repo: &Path, id: &str, recursive: bool, limit: usize) -> Option<Vec<S
     (!over && status.success()).then_some(missing)
 }
 
-/// Every blob missing below the tree `id`, once each, in the order a walk reads the
-/// files; git reports missing objects in no useful order.
-fn missing_in_order(repo: &Path, id: &str) -> Option<Vec<String>> {
-    let mut missing: HashSet<String> = missing(repo, id, true, usize::MAX)?.into_iter().collect();
-    // Depth first in name order; trees are local in a clone that leaves out blobs.
-    let listing = git_output(repo, &["ls-tree", "-r", "--format=%(objectname)", id]).ok()?;
-    Some(listing.lines().filter_map(|blob| missing.take(blob)).collect())
+/// Fetch the blobs of `missing` below the tree `id`, once each and a request at a time,
+/// in the order a workspace walks the tree: depth first, each folder's entries in name
+/// order, with a subfolder read where its name falls. Blobs `local` says are present
+/// are left out. Trees must be local. Whether every request succeeded, uncancelled.
+fn fetch_in_order(
+    repo: &Path,
+    remote: &str,
+    id: &str,
+    hash_len: usize,
+    missing: &ObjectIds,
+    local: &dyn Fn(&str) -> bool,
+    cancel: &AtomicBool,
+) -> bool {
+    let Ok(mut trees) = Batch::spawn(repo, "--batch") else { return false };
+    let mut listing = |id: &str| -> Option<std::collections::btree_map::IntoIter<String, SourceEntry>> {
+        let (kind, data) = trees.read(id).ok()?;
+        (kind == "tree").then(|| parse_tree(&data, hash_len).ok()).flatten().map(IntoIterator::into_iter)
+    };
+    // One bit per missing blob, set once requested: a blob can sit at many paths.
+    let mut requested = vec![false; missing.len()];
+    let mut request = Vec::new();
+    let Some(root) = listing(id) else { return false };
+    let mut stack = vec![root];
+    while let Some(entries) = stack.last_mut() {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some((_, entry)) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        if entry.kind.is_dir() {
+            let Some(entries) = listing(&entry.key) else { return false };
+            stack.push(entries);
+        } else if let Some(index) = missing.index_of(&entry.key) {
+            if !std::mem::replace(&mut requested[index], true) && !local(&entry.key) {
+                request.push(entry.key.to_string());
+            }
+        }
+        if request.len() == PREFETCH_FILES {
+            if cancel.load(Ordering::Relaxed) || !fetch(repo, remote, &request) {
+                return false;
+            }
+            request.clear();
+        }
+    }
+    request.is_empty() || (!cancel.load(Ordering::Relaxed) && fetch(repo, remote, &request))
 }
 
 /// See [`GitSource::fetch`].
@@ -703,6 +768,42 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn background_fetches_follow_the_walk_order_once_per_file() {
+        // `foo.bar` comes after the folder `foo` in a walk, though git sorts it before
+        // `foo/`; `twin` holds the same bytes as `foo/a`.
+        let repo = tempfile::tempdir().unwrap();
+        run(repo.path(), &["init", "-q"]);
+        std::fs::create_dir_all(repo.path().join("foo")).unwrap();
+        for (name, data) in [("foo/a", "a"), ("foo/b", "b"), ("foo.bar", "c"), ("twin", "a"), ("z", "z")] {
+            std::fs::write(repo.path().join(name), data).unwrap();
+        }
+        run(repo.path(), &["add", "-A"]);
+        run(repo.path(), &["commit", "-q", "-m", "files"]);
+        let blob = |path: &str| run(repo.path(), &["rev-parse", &format!("HEAD:{path}")]).trim().to_owned();
+        let tree = run(repo.path(), &["rev-parse", "HEAD^{tree}"]).trim().to_owned();
+        // Every blob counts as missing; asking whether one is local records the order,
+        // and saying yes keeps the fetch from running.
+        let mut ids: Vec<[u8; 20]> = ["foo/a", "foo/b", "foo.bar", "z"]
+            .map(|path| {
+                let mut id = [0; 20];
+                assert!(unhex(&blob(path), &mut id));
+                id
+            })
+            .to_vec();
+        ids.sort_unstable();
+        let missing = ObjectIds { sorted: ids.concat(), len: 20 };
+        let asked = Mutex::new(Vec::new());
+        let local = |id: &str| {
+            asked.lock().unwrap().push(id.to_owned());
+            true
+        };
+        assert!(fetch_in_order(repo.path(), "origin", &tree, 20, &missing, &local, &AtomicBool::new(false)));
+        assert_eq!(asked.into_inner().unwrap(), ["foo/a", "foo/b", "foo.bar", "z"].map(blob));
+        // Cancelled, it stops.
+        assert!(!fetch_in_order(repo.path(), "origin", &tree, 20, &missing, &|_| true, &AtomicBool::new(true)));
     }
 
     #[test]
