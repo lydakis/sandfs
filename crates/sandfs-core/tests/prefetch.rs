@@ -147,6 +147,18 @@ fn reading_through_one_part_of_a_tree_prefetches_that_part_too() {
 }
 
 #[test]
+fn a_folder_read_again_counts_as_the_latest() {
+    let source = Arc::new(Remote::new(&["x/a/1", "x/a/2", "x/b/1", "x/c/1", "y/1", "z/1"]));
+    let ws = mounted(&source);
+    // After `y` and `z`, reading in `x/a` again makes it the latest of the last three,
+    // so `x/b` and `x/c` are all in `x`.
+    for path in ["x/a/1", "y/1", "z/1", "x/a/2", "x/b/1", "x/c/1"] {
+        ws.read(&format!("/data/{path}")).unwrap();
+    }
+    assert_eq!(source.prefetches(), vec![(String::new(), true), ("x".to_owned(), true), ("x/a".to_owned(), false)]);
+}
+
+#[test]
 fn a_walk_that_only_lists_prefetches_nothing() {
     let source = Arc::new(Remote::new(TREE));
     let ws = mounted(&source);
@@ -238,6 +250,10 @@ fn looking_around_with_pauses_or_from_forks_prefetches_nothing_below() {
     by_path.read("/data/s/y.txt").unwrap();
     assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
     assert_eq!(other.prefetches(), Vec::<(String, bool)>::new());
+    // The read after the pause starts a new look, so the next file right after it is
+    // the second.
+    by_path.read("/data/s/z.txt").unwrap();
+    assert_eq!(other.prefetches(), vec![("s".to_owned(), false)]);
 }
 
 #[test]

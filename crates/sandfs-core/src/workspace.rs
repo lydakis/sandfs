@@ -666,16 +666,21 @@ impl Workspace {
         let start = self.walks.lock().expect("walks lock").starts.get(path).cloned();
         let walking = start.is_some();
         let steady = self.walk_reads(start, path, mount)?;
+        // A read by path after a pause starts the directory's count again: it is a new
+        // look, and the file read right after it is the second.
+        let fresh = read && !walking && !steady;
         let first = self.cache.touched.lock().expect("cache lock").insert((mount.id, file.clone()));
         let count = {
             let mut touches = self.cache.touches.lock().expect("cache lock");
             let count = touches.entry((mount.id, dir.clone())).or_default();
-            if first {
+            if fresh {
+                *count = u32::from(first);
+            } else if first {
                 *count = count.saturating_add(1);
             }
             *count
         };
-        if read && !walking && !steady {
+        if fresh {
             return Ok(Touch::Cold);
         }
         Ok(match (count, first) {
@@ -706,10 +711,15 @@ impl Workspace {
                 reading.recent.clear();
             }
             reading.last = now;
-            if reading.recent.contains(path) {
-                return Ok(steady);
+            // A directory needed again becomes the latest.
+            let again = reading.recent.iter().position(|dir| dir == path);
+            if let Some(at) = again {
+                reading.recent.remove(at);
             }
             reading.recent.push_back(path.clone());
+            if again.is_some() {
+                return Ok(steady);
+            }
             if reading.recent.len() > WALK_DIRS {
                 reading.recent.pop_front();
             }

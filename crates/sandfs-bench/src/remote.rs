@@ -326,7 +326,8 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         }
         _ => {
             let fork_str = fork_dir.to_str().context("scratch path is not UTF-8")?;
-            git(Some(&copy), &["worktree", "add", "-q", "--detach", fork_str, &plan.commit])?;
+            // From the day's commit, as a fork carries it.
+            git(Some(&copy), &["worktree", "add", "-q", "--detach", fork_str, "HEAD"])?;
         }
     }
     let fork = start.elapsed();
@@ -345,8 +346,8 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
                 .spawn()?;
             loop {
                 if let Some(status) = grep.try_wait()? {
-                    // 1: nothing matched, which is expected; 2: an error.
-                    ensure!(status.code() == Some(1), "grep -r over the copy failed ({status})");
+                    // 0: something matched, 1: nothing did; 2: an error.
+                    ensure!(matches!(status.code(), Some(0 | 1)), "grep -r over the copy failed ({status})");
                     return Ok(Some(start.elapsed()));
                 }
                 if start.elapsed() > GREP_LIMIT {
