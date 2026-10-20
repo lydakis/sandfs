@@ -179,14 +179,19 @@ impl GitSource {
         // `--missing=print` lists absent objects as `?<id>` instead of fetching them, and
         // `tree:1` stops the walk at the tree's direct children.
         let mut command = git(&self.repo);
-        command.args(["rev-list", "--objects", "--missing=print"]);
+        command.args(["rev-list", "--objects", "--no-object-names", "--missing=print"]);
         if !recursive {
             command.arg("--filter=tree:1");
         }
         let mut child = command.arg(id).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
         let mut missing = Vec::new();
         for line in BufReader::new(child.stdout.take()?).lines() {
-            let Ok(line) = line else { break };
+            // A walk cut short would pass for a complete one.
+            let Ok(line) = line else {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            };
             if let Some(object) = line.strip_prefix('?') {
                 missing.push(object.to_owned());
                 if missing.len() > limit {
@@ -321,16 +326,20 @@ fn parse_tree(data: &[u8], hash_len: usize) -> Result<Listing> {
 /// is set, which kills the walk.
 fn walk_missing(repo: &Path, id: &str, hash_len: usize, cancel: &AtomicBool) -> Option<Ids> {
     let mut command = git(repo);
-    command.args(["rev-list", "--objects", "--missing=print", id]).stdout(Stdio::piped()).stderr(Stdio::null());
+    command.args(["rev-list", "--objects", "--no-object-names", "--missing=print", id]);
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
     let mut ids: Vec<[u8; 32]> = Vec::new();
     for line in BufReader::new(child.stdout.take()?).lines() {
-        let Ok(line) = line else { break };
-        if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
+        let line = match line {
+            Ok(line) if !cancel.load(Ordering::Relaxed) => line,
+            // Cancelled, or cut short, which would pass for a complete walk.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
         let mut blob = [0; 32];
         if line.strip_prefix('?').is_some_and(|hex| unhex(hex, &mut blob[..hash_len])) {
             ids.push(blob);
@@ -602,6 +611,32 @@ mod tests {
         source.prefetch(&dir, false);
         let listing = source.read_dir(&dir).unwrap();
         assert_eq!((size(&listing, "c.txt"), size(&listing, "d.txt")), (Some(9), Some(9)));
+
+        // A name git can't print as UTF-8, of a folder that is local, doesn't cut the
+        // walk short before the missing file after it.
+        let mktree = |entries: &[u8]| {
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(origin.path())
+                .arg("mktree")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(entries).unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap().trim().to_owned()
+        };
+        let blob = |path: &str| run(origin.path(), &["rev-parse", &format!("HEAD:{path}")]).trim().to_owned();
+        let folder = mktree(format!("100644 blob {}\ta.txt\n", blob("a.txt")).as_bytes());
+        let mut entries = format!("040000 tree {folder}\t").into_bytes();
+        entries.extend_from_slice(b"\xff\n");
+        entries.extend_from_slice(format!("100644 blob {}\tz\n", blob("b.txt")).as_bytes());
+        let tree = mktree(&entries);
+        run(origin.path(), &["tag", "odd", &tree]);
+        run(clone.path(), &["fetch", "-q", "--filter=blob:none", "origin", "refs/tags/odd:refs/tags/odd"]);
+        run(clone.path(), &["config", "core.quotePath", "false"]);
+        let found = walk_missing(clone.path(), &tree, source.hash_len, &AtomicBool::new(false)).unwrap();
+        assert_eq!(found.sorted.len() / found.len, 1, "b.txt, as z");
 
         // A walk stops when its source is dropped.
         let cancelled = AtomicBool::new(true);
