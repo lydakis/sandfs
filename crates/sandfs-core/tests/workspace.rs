@@ -508,19 +508,91 @@ fn executable_bits_survive_copies() {
     assert_eq!(ws.stat("/m/bin/run2").unwrap().kind, Kind::File { executable: true });
 }
 
+#[test]
+fn symlinks_are_stored_and_never_followed() {
+    let (mut ws, _) = workspace();
+    let version = ws.symlink("/repo/.venv/lib64", "lib").unwrap();
+    assert!(version > 0);
+    assert_eq!(ws.read_link("/repo/.venv/lib64").unwrap(), "lib");
+    let meta = ws.stat("/repo/.venv/lib64").unwrap();
+    assert_eq!((meta.kind, meta.size, meta.version), (Kind::Symlink, 3, version));
+    assert_eq!(ws.list("/repo/.venv").unwrap()[0].kind, Kind::Symlink);
+
+    // The link itself is the entry: reads, writes and modes refuse it rather than
+    // follow it, and the target never has to exist.
+    ws.symlink("/repo/readme", "README.md").unwrap();
+    assert!(matches!(ws.read("/repo/readme"), Err(Error::Unsupported(..))));
+    assert!(matches!(ws.read_range("/repo/readme", 0, 2), Err(Error::Unsupported(..))));
+    assert!(matches!(ws.write("/repo/readme", "x"), Err(Error::Unsupported(..))));
+    assert!(matches!(ws.set_executable("/repo/readme", true), Err(Error::Unsupported(..))));
+    assert!(matches!(ws.read_link("/repo/README.md"), Err(Error::Unsupported(..))));
+    assert!(matches!(ws.symlink("/repo/README.md", "x"), Err(Error::AlreadyExists(_))));
+    assert!(matches!(ws.symlink("/repo/empty", ""), Err(Error::InvalidPath(_))));
+    assert!(matches!(ws.read("/repo/readme/x"), Err(Error::NotADirectory(_))));
+
+    // Copies and moves take the link, not what it points to.
+    ws.copy("/repo/readme", "/repo/readme2", false).unwrap();
+    ws.rename("/repo/readme", "/repo/docs/readme").unwrap();
+    assert_eq!(ws.read_link("/repo/readme2").unwrap(), "README.md");
+    assert_eq!(ws.read_link("/repo/docs/readme").unwrap(), "README.md");
+
+    let attempt = ws.fork();
+    ws.remove("/repo/readme2", false).unwrap();
+    assert_eq!(attempt.read_link("/repo/readme2").unwrap(), "README.md");
+    assert_eq!(
+        changes(&ws),
+        [("/repo/.venv/lib64".into(), ChangeKind::Added), ("/repo/docs/readme".into(), ChangeKind::Added)]
+    );
+}
+
+#[test]
+fn a_link_replacing_a_base_file_is_a_modification() {
+    let (mut ws, _) = workspace();
+    ws.remove("/repo/README.md", false).unwrap();
+    ws.symlink("/repo/README.md", "docs/guide.md").unwrap();
+    assert_eq!(changes(&ws), [("/repo/README.md".into(), ChangeKind::Modified)]);
+}
+
 #[cfg(unix)]
 #[test]
-fn dir_source_skips_symlinks() {
-    let dir = std::env::temp_dir().join(format!("sandfs-links-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("data.csv"), "a,b\n").unwrap();
-    std::os::unix::fs::symlink("/etc/passwd", dir.join("link")).unwrap();
+fn dir_source_lists_symlinks_without_following_them() {
+    let base = std::env::temp_dir().join(format!("sandfs-links-{}", std::process::id()));
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("data.csv"), "a,b\n").unwrap();
+    std::fs::write(outside.join("secret"), "SECRET").unwrap();
+    std::os::unix::fs::symlink(outside.join("secret"), root.join("secret")).unwrap();
+    std::os::unix::fs::symlink("../outside", root.join("away")).unwrap();
+    std::os::unix::fs::symlink("lib", root.join("lib64")).unwrap();
 
     let mut ws = Workspace::new();
-    ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
-    assert_eq!(names(&ws, "/host"), ["data.csv"]);
-    assert!(matches!(ws.read("/host/link"), Err(Error::NotFound(_))));
-    std::fs::remove_dir_all(&dir).unwrap();
+    ws.mount("/host", Arc::new(DirSource::new(&root).unwrap())).unwrap();
+    assert_eq!(names(&ws, "/host"), ["away", "data.csv", "lib", "lib64", "secret"]);
+    assert_eq!(ws.stat("/host/lib64").unwrap().kind, Kind::Symlink);
+    assert_eq!(ws.read_link("/host/lib64").unwrap(), "lib");
+    assert_eq!(ws.read_link("/host/away").unwrap(), "../outside");
+    assert!(changes(&ws).is_empty());
+
+    // Nothing reads through a link out of the folder: the target is all there is.
+    let target = outside.join("secret");
+    assert_eq!(ws.read_link("/host/secret").unwrap(), target.to_str().unwrap());
+    assert_eq!(ws.stat("/host/secret").unwrap().size, target.to_str().unwrap().len() as u64);
+    assert!(matches!(ws.read("/host/secret"), Err(Error::Unsupported(..))));
+    assert!(matches!(ws.read_range("/host/secret", 0, 6), Err(Error::Unsupported(..))));
+    assert!(matches!(ws.list("/host/away"), Err(Error::NotADirectory(_))));
+    assert!(ws.read("/host/away/secret").is_err());
+    let source = DirSource::new(&root).unwrap();
+    assert_eq!(source.read_file("secret").unwrap(), target.to_str().unwrap().as_bytes());
+    assert_eq!(source.read_range("secret", 0, 3).unwrap(), &target.to_str().unwrap().as_bytes()[..3]);
+    assert!(source.read_file("away/secret").is_err());
+    assert!(source.read_dir("away").is_err());
+
+    // A copy of a link is a link, and changes report it like a file.
+    ws.copy("/host/lib64", "/host/lib32", false).unwrap();
+    assert_eq!(ws.read_link("/host/lib32").unwrap(), "lib");
+    assert_eq!(changes(&ws), [("/host/lib32".into(), ChangeKind::Added)]);
+    std::fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]

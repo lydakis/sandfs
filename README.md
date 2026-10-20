@@ -148,10 +148,11 @@ On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there
 | `mount(path, source)` | Mount a `DirSource(root)`, `MemorySource({name: str or bytes})`, `GitSource(repo, rev)`, or any object with `list(path)` and `read(path)` |
 | `fork()` | A new workspace with the same mounts and changes, in constant time |
 | `read(path, *, offset=0, length=None)`, `read_text(path)` | File contents as bytes (all of it, or one range), or as UTF-8 text |
-| `list(path="/")`, `stat(path)`, `exists(path)` | Entries (name, kind, size), and kind, size and version |
+| `list(path="/")`, `stat(path)`, `exists(path)` | Entries (name, kind, size), and kind, size and version; a kind is `"file"`, `"dir"` or `"symlink"` |
 | `write(path, data, *, expected_version=None)` | Write str or bytes, creating parents, and return the new version |
 | `mkdir`, `remove`, `copy`, `move` | File operations; copies share the original's bytes |
-| `changes()` | `Change(path, kind)` for every added, modified or deleted file |
+| `symlink(path, target)`, `read_link(path)` | Make a symbolic link, or read where one points |
+| `changes()` | `Change(path, kind)` for every added, modified or deleted file or link |
 
 Errors are built-in exceptions (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, `ValueError`, `OSError`) plus `sandfs.VersionMismatch`, which carries `path`, `expected` and `actual`. An exception raised inside a Python source surfaces as `OSError`.
 
@@ -190,7 +191,7 @@ A second copy of the mount (`sandfs fork`) takes 20 ms, against 0.2 to 4.4 s for
 
 - **sandfs is not an execution sandbox.** It never runs commands, and it doesn't contain the programs that use it. It keeps their writes out of your sources, but a program working in a mounted folder can still read or change anything else its user can. Run untrusted programs in a container or microVM pointed at the mount.
 - **A mounted folder isn't frozen.** Folders are read lazily, so if one changes while it's mounted, a workspace can show a mix of old and new. Mount a folder nothing else writes to, copy it first, or mount a git commit when the view must not change.
-- **No symlinks.** A folder source skips them, along with sockets and devices.
+- **Symbolic links are kept, never followed.** A link is stored as its target, and a host folder's links are listed as links. In a mounted folder the system resolves them, as on any filesystem; the library and the MCP tools never do, so `read` refuses a link and `read_link` gives its target. A git commit's links aren't shown yet, and hard links, sockets, devices and fifos aren't supported.
 
 ## Contributing
 

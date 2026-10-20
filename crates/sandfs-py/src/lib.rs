@@ -82,6 +82,7 @@ fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Dir => "dir",
         Kind::File { .. } => "file",
+        Kind::Symlink => "symlink",
     }
 }
 
@@ -101,7 +102,7 @@ fn is_executable(kind: Kind) -> bool {
 struct DirEntry {
     /// Entry name, without its directory.
     name: String,
-    /// `"file"` or `"dir"`.
+    /// `"file"`, `"dir"` or `"symlink"`.
     kind: String,
     /// Size in bytes when known without reading the file, else `None`.
     size: Option<u64>,
@@ -114,8 +115,8 @@ impl DirEntry {
     #[new]
     #[pyo3(signature = (name, kind = "file", *, size = None, executable = false))]
     fn new(name: String, kind: &str, size: Option<u64>, executable: bool) -> PyResult<Self> {
-        if kind != "file" && kind != "dir" {
-            return Err(PyValueError::new_err(format!("kind must be \"file\" or \"dir\", not {kind:?}")));
+        if !matches!(kind, "file" | "dir" | "symlink") {
+            return Err(PyValueError::new_err(format!("kind must be \"file\", \"dir\" or \"symlink\", not {kind:?}")));
         }
         Ok(DirEntry { name, kind: kind.to_owned(), size, executable })
     }
@@ -129,9 +130,9 @@ impl DirEntry {
 #[pyclass(module = "sandfs", frozen, get_all, eq)]
 #[derive(Clone, PartialEq)]
 struct Stat {
-    /// `"file"` or `"dir"`.
+    /// `"file"`, `"dir"` or `"symlink"`.
     kind: String,
-    /// Size in bytes; 0 for a directory.
+    /// Size in bytes (a link's is its target's length); 0 for a directory.
     size: u64,
     /// Optimistic version: 0 for an untouched base file, new on every change.
     version: u64,
@@ -164,8 +165,8 @@ impl Change {
 }
 
 /// A read-only view of a host directory, read lazily. It is not a snapshot: a directory
-/// that changes while mounted can show a mix of old and new contents. Symlinks and
-/// special files are skipped.
+/// that changes while mounted can show a mix of old and new contents. Symlinks are
+/// listed as links and never followed; special files are skipped.
 #[pyclass(module = "sandfs", name = "DirSource", frozen)]
 struct PyDirSource {
     inner: Arc<dyn Source>,
@@ -264,6 +265,7 @@ impl Source for PySource {
                 }
                 let kind = match entry.kind.as_str() {
                     "dir" => Kind::Dir,
+                    "symlink" => Kind::Symlink,
                     _ => Kind::File { executable: entry.executable },
                 };
                 let child = if key == "/" { format!("/{name}") } else { format!("{key}/{name}") };
@@ -408,6 +410,19 @@ impl Workspace {
             })
             .or_raise()?;
         Ok(PyBytes::new(py, &data))
+    }
+
+    /// The target of the symbolic link at `path`. The workspace never follows links:
+    /// `read`, `write` and the rest raise `OSError` on one rather than follow it.
+    fn read_link(&self, py: Python<'_>, path: &str) -> PyResult<String> {
+        py.detach(|| self.inner.read_link(path)).or_raise()
+    }
+
+    /// Create a symbolic link at `path` to `target`, creating parent directories, and
+    /// return its version. The target is stored as given and may point anywhere.
+    fn symlink(&mut self, py: Python<'_>, path: &str, target: &str) -> PyResult<u64> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.symlink(path, target)).or_raise()
     }
 
     /// The contents of the file at `path` as UTF-8 text; raises `ValueError` if it is not text.

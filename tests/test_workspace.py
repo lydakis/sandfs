@@ -92,7 +92,7 @@ def test_source_failures_raise_os_error() -> None:
     with pytest.raises(TypeError, match="list"):
         ws.mount("/nope", object())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="kind"):
-        DirEntry("x", "symlink")  # type: ignore[arg-type]
+        DirEntry("x", "fifo")  # type: ignore[arg-type]
 
 
 def test_python_sources_work_from_several_threads() -> None:
@@ -115,7 +115,7 @@ def test_python_sources_work_from_several_threads() -> None:
     assert results == [json.dumps({"title": "x"}).encode()] * 4
 
 
-def test_dir_source_never_writes_to_disk_and_skips_symlinks(tmp_path: Path) -> None:
+def test_dir_source_never_writes_to_disk_and_lists_symlinks(tmp_path: Path) -> None:
     (tmp_path / "sales.csv").write_text("region,total\neu,10\n")
     os.symlink("/etc/passwd", tmp_path / "link")
     ws = Workspace()
@@ -125,7 +125,49 @@ def test_dir_source_never_writes_to_disk_and_skips_symlinks(tmp_path: Path) -> N
 
     assert ws.read_text("/data/sales.csv") == "region,total\neu,12\n"
     assert (tmp_path / "sales.csv").read_text() == "region,total\neu,10\n"
-    assert [e.name for e in ws.list("/data")] == ["sales.csv"]
+    assert [(e.name, e.kind) for e in ws.list("/data")] == [
+        ("link", "symlink"),
+        ("sales.csv", "file"),
+    ]
+    # The link is never followed, so nothing outside the folder is read.
+    assert ws.read_link("/data/link") == "/etc/passwd"
+    with pytest.raises(OSError):
+        ws.read("/data/link")
+
+
+def test_symlinks_are_written_to_the_overlay() -> None:
+    ws = Workspace()
+    ws.mount("/env", MemorySource({"lib/site.py": "x = 1\n"}))
+
+    version = ws.symlink("/env/lib64", "lib")
+
+    assert ws.read_link("/env/lib64") == "lib"
+    stat = ws.stat("/env/lib64")
+    assert (stat.kind, stat.size, stat.version) == ("symlink", 3, version)
+    assert [c.kind for c in ws.changes()] == ["added"]
+    with pytest.raises(FileExistsError):
+        ws.symlink("/env/lib64", "elsewhere")
+    with pytest.raises(OSError):
+        ws.write("/env/lib64", "not through a link")
+    with pytest.raises(OSError):
+        ws.read_link("/env/lib/site.py")
+
+
+def test_python_sources_can_list_symlinks() -> None:
+    class Links:
+        def list(self, path: str) -> Iterable[DirEntry]:
+            return [DirEntry("latest", "symlink"), DirEntry("v2", "dir")]
+
+        def read(self, path: str) -> str:
+            assert path == "/latest"
+            return "v2"
+
+    ws = Workspace()
+    ws.mount("/releases", Links())
+
+    assert ws.stat("/releases/latest").kind == "symlink"
+    assert ws.read_link("/releases/latest") == "v2"
+    assert ws.changes() == []
 
 
 def test_memory_source_and_binary_files() -> None:

@@ -34,8 +34,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use fuser::{Errno, FileAttr, FileType, RenameFlags, TimeOrNow};
 use nfsserve::nfs::{
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3, nfsstat3,
-    nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
+    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3,
+    nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
 };
 #[cfg(nfs)]
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -141,9 +141,12 @@ fn time(time: SystemTime) -> nfstime3 {
 }
 
 fn attributes(attr: &FileAttr) -> fattr3 {
-    let directory = attr.kind == FileType::Directory;
     fattr3 {
-        ftype: if directory { ftype3::NF3DIR } else { ftype3::NF3REG },
+        ftype: match attr.kind {
+            FileType::Directory => ftype3::NF3DIR,
+            FileType::Symlink => ftype3::NF3LNK,
+            _ => ftype3::NF3REG,
+        },
         mode: attr.perm.into(),
         nlink: attr.nlink,
         uid: attr.uid,
@@ -357,7 +360,7 @@ impl NFSFileSystem for SandNfs {
         Ok(ReadDirResult { entries, end })
     }
 
-    /// The server's defaults, but with sandfs's own file size limit, and no symlinks.
+    /// The server's defaults, but with sandfs's own file size limit.
     async fn fsinfo(&self, root_fileid: fileid3) -> Result<fsinfo3, nfsstat3> {
         let attributes = match self.getattr(root_fileid).await {
             Ok(attr) => post_op_attr::attributes(attr),
@@ -374,22 +377,24 @@ impl NFSFileSystem for SandNfs {
             dtpref: 1 << 20,
             maxfilesize: MAX_FILE_SIZE as u64,
             time_delta: nfstime3 { seconds: 0, nseconds: 1_000_000 },
-            properties: FSF_HOMOGENEOUS | FSF_CANSETTIME,
+            properties: FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME,
         })
     }
 
     async fn symlink(
         &self,
-        _dirid: fileid3,
-        _linkname: &filename3,
-        _symlink: &nfspath3,
+        dirid: fileid3,
+        linkname: &filename3,
+        symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+        let attr = self.change(|inner| inner.symlink(dirid, os_name(linkname), OsStr::from_bytes(&symlink.0)))?;
+        Ok((attr.ino.0, attributes(&attr)))
     }
 
-    async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+        let target = self.shared.lock().readlink(id).nfs()?;
+        Ok(target.into_bytes().into())
     }
 }
 
@@ -903,7 +908,30 @@ mod tests {
         let (fs, _dir) = served();
         let info = block(fs.fsinfo(ROOT_INO)).unwrap();
         assert_eq!(info.maxfilesize, MAX_FILE_SIZE as u64);
-        assert_eq!(info.properties & nfsserve::nfs::FSF_SYMLINK, 0, "symlinks are not supported");
+        assert_ne!(info.properties & nfsserve::nfs::FSF_SYMLINK, 0, "symlinks are supported");
+    }
+
+    #[test]
+    fn symlinks_are_created_read_and_removed() {
+        let (fs, _dir) = served();
+        block(async {
+            let target = "in/a.txt".as_bytes().to_vec().into();
+            let (id, attr) = fs.symlink(ROOT_INO, &name("link"), &target, &sattr3::default()).await.unwrap();
+            assert!(matches!(attr.ftype, ftype3::NF3LNK));
+            assert_eq!((attr.size, attr.mode), (8, 0o777));
+            assert_eq!(fs.readlink(id).await.unwrap().0, b"in/a.txt");
+            assert_eq!(fs.lookup(ROOT_INO, &name("link")).await.unwrap(), id);
+            assert!(matches!(
+                fs.symlink(ROOT_INO, &name("link"), &target, &sattr3::default()).await,
+                Err(nfsstat3::NFS3ERR_EXIST)
+            ));
+            let notes = fs.lookup(ROOT_INO, &name("notes.txt")).await.unwrap();
+            assert!(matches!(fs.readlink(notes).await, Err(nfsstat3::NFS3ERR_INVAL)));
+        });
+        let snapshot = fs.shared.lock().snapshot(Duration::ZERO);
+        assert_eq!(snapshot.ws.read_link("/mnt/link").unwrap(), "in/a.txt");
+        block(async { fs.remove(ROOT_INO, &name("link")).await.unwrap() });
+        assert!(!fs.shared.lock().snapshot(Duration::ZERO).ws.exists("/mnt/link"));
     }
 
     #[test]

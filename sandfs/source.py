@@ -33,5 +33,8 @@ class Source(Protocol):
         ...
 
     def read(self, path: str) -> bytes | str:
-        """The contents of the file at ``path``; text is stored as UTF-8."""
+        """The contents of the file at ``path``; text is stored as UTF-8.
+
+        For an entry listed with kind ``"symlink"``, its target.
+        """
         ...

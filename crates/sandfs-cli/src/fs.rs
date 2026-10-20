@@ -338,6 +338,7 @@ impl Inner {
             Kind::Dir => (FileType::Directory, 0o755),
             Kind::File { executable: true } => (FileType::RegularFile, 0o755),
             Kind::File { executable: false } => (FileType::RegularFile, 0o644),
+            Kind::Symlink => (FileType::Symlink, 0o777),
         };
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
         Ok(self.make_attr(ino, kind, perm, size, mtime))
@@ -494,6 +495,24 @@ impl Inner {
         self.dirs.insert(path.to_string());
         self.touch(&path);
         self.entry(&path)
+    }
+
+    /// symlink(2): a link whose target is stored as given and resolved by the system.
+    pub fn symlink(&mut self, parent: u64, name: &OsStr, target: &OsStr) -> FsResult<FileAttr> {
+        let path = self.child(parent, name)?;
+        let target = target.to_str().ok_or(Errno::EINVAL)?;
+        self.ws.symlink(path.as_str(), target).fs()?;
+        self.touch(&path);
+        self.entry(&path)
+    }
+
+    /// readlink(2): the target of the link at `ino`.
+    pub fn readlink(&self, ino: u64) -> FsResult<String> {
+        let path = self.path(ino)?;
+        self.ws.read_link(path.as_str()).map_err(|err| match err {
+            Error::Unsupported(..) => Errno::EINVAL,
+            err => errno(&err),
+        })
     }
 
     pub fn unlink(&mut self, parent: u64, name: &OsStr) -> FsResult<()> {
@@ -792,6 +811,7 @@ impl Inner {
             let kind = match entry.kind {
                 Kind::Dir => FileType::Directory,
                 Kind::File { .. } => FileType::RegularFile,
+                Kind::Symlink => FileType::Symlink,
             };
             entries.push((self.ino_for(&child), kind, entry.name));
         }
@@ -1069,6 +1089,18 @@ impl Filesystem for SandFs {
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let result = self.0.lock().mkdir(parent.0, name);
         self.reply_entry(reply, result);
+    }
+
+    fn symlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
+        let result = self.0.lock().symlink(parent.0, name, target.as_os_str());
+        self.reply_entry(reply, result);
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.0.lock().readlink(ino.0) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(err) => reply.error(err),
+        }
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {

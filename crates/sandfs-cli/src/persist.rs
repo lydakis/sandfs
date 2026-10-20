@@ -36,6 +36,12 @@ enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<Time>,
     },
+    /// A symbolic link, its target kept in the index since it is short.
+    Symlink {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime: Option<Time>,
+    },
     /// Removed: a deleted base file or directory.
     Absent,
 }
@@ -141,7 +147,7 @@ impl Saved {
     pub fn paths(&self) -> Result<Vec<(String, PathState)>> {
         let changes = self.read_index()?;
         let state = |entry: &Entry| match entry {
-            Entry::File { .. } => PathState::File,
+            Entry::File { .. } | Entry::Symlink { .. } => PathState::File,
             Entry::Dir { .. } => PathState::Dir,
             Entry::Absent => PathState::Absent,
         };
@@ -159,7 +165,7 @@ impl Saved {
             let path = under(root, rel)?;
             self.apply(ws, &path, entry).with_context(|| format!("restoring {rel}"))?;
             let mtime = match entry {
-                Entry::File { mtime, .. } | Entry::Dir { mtime } => *mtime,
+                Entry::File { mtime, .. } | Entry::Dir { mtime } | Entry::Symlink { mtime, .. } => *mtime,
                 Entry::Absent => None,
             };
             if let Some(mtime) = mtime {
@@ -173,6 +179,7 @@ impl Saved {
                 Entry::Dir { .. } | Entry::Absent => {
                     restored.dirs.insert(path.to_string());
                 }
+                Entry::Symlink { .. } => {}
             }
         }
         // New objects must never reuse the name of one the index still names, nor of any
@@ -225,10 +232,16 @@ impl Saved {
                 }
                 None => ws.mkdir(p, true)?,
             },
+            Entry::Symlink { target, .. } => {
+                if current.is_some() {
+                    ws.remove(p, true)?;
+                }
+                ws.symlink(p, target)?;
+            }
             Entry::File { executable, object, .. } => {
                 check_object(object)?;
-                // A directory in the way goes first.
-                if current == Some(Kind::Dir) {
+                // A directory or a link in the way goes first: a write never follows a link.
+                if matches!(current, Some(Kind::Dir | Kind::Symlink)) {
                     ws.remove(p, true)?;
                 }
                 let data = match std::fs::read(self.objects_dir().join(object)) {
@@ -320,6 +333,7 @@ impl Saved {
         let mtime = snap.times.get(p).map(|t| to_time(*t));
         match meta.kind {
             Kind::Dir => Ok(Entry::Dir { mtime }),
+            Kind::Symlink => Ok(Entry::Symlink { target: snap.ws.read_link(p)?, mtime }),
             Kind::File { executable } => {
                 let object = match self.objects.get(rel) {
                     Some((version, object)) if *version == meta.version => object.clone(),
@@ -459,6 +473,9 @@ mod tests {
         ws.write("/mnt/a.txt", "changed").unwrap();
         ws.write("/mnt/new/run.sh", "#!/bin/sh").unwrap();
         ws.set_executable("/mnt/new/run.sh", true).unwrap();
+        ws.symlink("/mnt/new/link", "run.sh").unwrap();
+        ws.remove("/mnt/dir/b.txt", false).unwrap();
+        ws.symlink("/mnt/dir/b.txt", "../a.txt").unwrap();
         ws.remove("/mnt/dir/sub", true).unwrap();
         ws.mkdir("/mnt/empty", false).unwrap();
         let dirs = ["/mnt/dir/sub", "/mnt/empty", "/mnt/new"].map(str::to_owned).into();
@@ -474,6 +491,9 @@ mod tests {
         assert_eq!(loaded.read_text("/mnt/a.txt").unwrap(), "changed");
         assert_eq!(loaded.stat("/mnt/new/run.sh").unwrap().kind, Kind::File { executable: true });
         assert_eq!(listing(&loaded, "/mnt/dir"), ["b.txt"], "the removed directory stays removed");
+        assert_eq!(loaded.read_link("/mnt/new/link").unwrap(), "run.sh");
+        assert_eq!(loaded.read_link("/mnt/dir/b.txt").unwrap(), "../a.txt", "a link replaces a base file");
+        assert_eq!(saved.objects.len(), 2, "links need no saved object");
         assert!(loaded.list("/mnt/empty").unwrap().is_empty(), "empty directories are kept");
         assert_eq!(loaded.changes().unwrap(), ws.changes().unwrap());
         assert_eq!(restored.times["/mnt/a.txt"], mtime);

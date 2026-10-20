@@ -28,12 +28,21 @@ pub enum Kind {
         /// Whether the executable bit is set, reported as the mode on a FUSE mount.
         executable: bool,
     },
+    /// A symbolic link. Its target is its contents: what [`Source::read_file`] returns
+    /// for it. sandfs stores links but never follows them; in a mounted folder the
+    /// system resolves them, the same as on any other filesystem.
+    Symlink,
 }
 
 impl Kind {
     /// True for directories.
     pub fn is_dir(self) -> bool {
         matches!(self, Kind::Dir)
+    }
+
+    /// True for symbolic links.
+    pub fn is_symlink(self) -> bool {
+        matches!(self, Kind::Symlink)
     }
 }
 
@@ -63,7 +72,7 @@ pub trait Source: Send + Sync + fmt::Debug {
     fn root(&self) -> Result<SourceKey>;
     /// List the directory with this key.
     fn read_dir(&self, key: &str) -> Result<Listing>;
-    /// Read the file with this key.
+    /// Read the file with this key; for a symbolic link, its target.
     fn read_file(&self, key: &str) -> Result<Bytes>;
 
     /// Read up to `len` bytes of the file with this key, starting at `offset`. Fewer
@@ -185,8 +194,10 @@ impl Source for MemorySource {
 /// read when first touched, and ranged reads go back to the directory every time, so a
 /// directory that changes while mounted can show a mix of old and new contents.
 ///
-/// Symlinks and special files (sockets, devices, fifos) are skipped, so a link cannot
-/// lead the workspace outside `root`. Each read also checks that the resolved host
+/// Symlinks are listed as links, with their targets, and never followed, so a link
+/// cannot lead the workspace outside `root`; in a mounted folder the system resolves
+/// them as it would in `root` itself. Special files (sockets, devices, fifos) and links
+/// whose targets aren't UTF-8 are skipped. Each read also checks that the resolved host
 /// path is still inside `root`, in case a directory was swapped for a symlink after it
 /// was listed. That check is not atomic with the read, so treat the directory as
 /// trusted while it is mounted.
@@ -243,16 +254,23 @@ impl DirSource {
         if key.is_empty() { self.root.clone() } else { self.root.join(key) }
     }
 
-    /// Open the regular file at `key` inside `root`.
-    fn open_file(&self, key: &str) -> Result<std::fs::File> {
+    /// Open the regular file at `key` inside `root`, or read the target of the link there.
+    fn open_file(&self, key: &str) -> Result<Opened> {
         // Keys from listings are plain relative names; an absolute key or `..` would
         // name a file outside the folder that the check below would accept as-is.
         if !Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
             return Err(Error::Source(format!("{key} is outside the mounted directory")));
         }
         let path = self.host_path(key);
-        // Checked before opening, so a special file (a fifo) is never opened.
-        if !path.symlink_metadata().map_err(io_error)?.is_file() {
+        // Checked before opening, so a special file (a fifo) is never opened, and a
+        // link is never followed: its target is read from the folder holding it.
+        let file_type = path.symlink_metadata().map_err(io_error)?.file_type();
+        if file_type.is_symlink() {
+            let parent = Path::new(key).parent().and_then(Path::to_str).unwrap_or_default();
+            self.check_dir(parent, path.parent().unwrap_or(&self.root))?;
+            return Ok(Opened::Link(link_target(&path)?));
+        }
+        if !file_type.is_file() {
             return Err(Error::Source(format!("{} is not a regular file", path.display())));
         }
         let file = std::fs::File::open(&path).map_err(io_error)?;
@@ -264,7 +282,7 @@ impl DirSource {
             use std::os::fd::AsRawFd;
             if let Ok(opened) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
                 return if opened == path {
-                    Ok(file)
+                    Ok(Opened::File(file))
                 } else {
                     Err(Error::Source(format!("{} is outside the mounted directory", path.display())))
                 };
@@ -273,7 +291,23 @@ impl DirSource {
         // Elsewhere, or without /proc, the parent is resolved instead; a symlink in
         // the final component was refused above.
         self.check_inside(path.parent().unwrap_or(&self.root))?;
-        Ok(file)
+        Ok(Opened::File(file))
+    }
+}
+
+/// What [`DirSource::open_file`] found at a key.
+enum Opened {
+    File(std::fs::File),
+    /// A symbolic link's target.
+    Link(Bytes),
+}
+
+/// The target of the link at `path`, if it is UTF-8 like every workspace path.
+fn link_target(path: &Path) -> Result<Bytes> {
+    let target = std::fs::read_link(path).map_err(io_error)?;
+    match target.into_os_string().into_string() {
+        Ok(target) => Ok(Bytes::from(target)),
+        Err(_) => Err(Error::Source(format!("{}: link target is not UTF-8", path.display()))),
     }
 }
 
@@ -300,8 +334,13 @@ impl Source for DirSource {
             } else if file_type.is_file() {
                 let meta = entry.metadata().map_err(io_error)?;
                 (Kind::File { executable: is_executable(&meta) }, Some(meta.len()))
+            } else if file_type.is_symlink() {
+                match link_target(&entry.path()) {
+                    Ok(target) => (Kind::Symlink, Some(target.len() as u64)),
+                    Err(_) => continue, // a target no workspace path could hold
+                }
             } else {
-                continue; // symlinks and special files are not part of a workspace
+                continue; // special files are not part of a workspace
             };
             let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
             listing.insert(name, SourceEntry { kind, key: child_key.as_str().into(), size });
@@ -310,7 +349,10 @@ impl Source for DirSource {
     }
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
-        let mut file = self.open_file(key)?;
+        let mut file = match self.open_file(key)? {
+            Opened::File(file) => file,
+            Opened::Link(target) => return Ok(target),
+        };
         let size = file.metadata().map_err(io_error)?.len();
         let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
         file.read_to_end(&mut data).map_err(io_error)?;
@@ -318,7 +360,10 @@ impl Source for DirSource {
     }
 
     fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
-        let mut file = self.open_file(key)?;
+        let mut file = match self.open_file(key)? {
+            Opened::File(file) => file,
+            Opened::Link(target) => return Ok(slice(&target, offset, len)),
+        };
         let available = file.metadata().map_err(io_error)?.len().saturating_sub(offset);
         file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
         let mut data = Vec::with_capacity(usize::try_from(len.min(available)).unwrap_or(0));

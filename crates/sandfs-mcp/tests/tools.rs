@@ -403,3 +403,18 @@ fn paths_with_control_characters_are_shown_quoted() {
     );
     assert_eq!(ok(&mut s, "changes", json!({ "path": "/d/sub\ndir/x" })), "No changes under \"/d/sub\\ndir/x\"");
 }
+
+#[test]
+fn links_are_shown_with_their_targets_and_never_followed() {
+    let source = MemorySource::from_files([("lib/site.py", "x = 1\n")]).unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/env", Arc::new(source)).unwrap();
+    ws.symlink("/env/lib64", "lib").unwrap();
+    let mut s = Server::new(ws);
+
+    assert_eq!(ok(&mut s, "list", json!({ "path": "/env" })), "lib/\nlib64 -> lib");
+    assert!(ok(&mut s, "read", json!({ "path": "/env/lib64" })).starts_with("/env/lib64: symlink to lib, version "));
+    assert!(ok(&mut s, "grep", json!({ "pattern": "x", "path": "/env" })).contains("1 matches in 1 file"));
+    assert!(ok(&mut s, "changes", json!({})).starts_with("A /env/lib64 -> lib\n"));
+    assert!(fails(&mut s, "write", json!({ "path": "/env/lib64", "content": "y" })).contains("symlink"));
+}
