@@ -439,6 +439,41 @@ fn symlinks_work_in_a_mount_and_survive_a_remount() {
 }
 
 #[test]
+fn names_found_missing_appear_once_created() {
+    if !fuse_available() {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir(folder.path().join("lib")).unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+
+    // A module loader probes names that aren't there; the kernel may remember each
+    // absence, but every way of making the name must still show it at once.
+    let probe = |name: &str| ws.join("lib").join(name);
+    let gone = |name: &str| std::fs::metadata(probe(name)).unwrap_err().kind() == std::io::ErrorKind::NotFound;
+    for name in ["index.js", "index.json", "index", "moved.js", "copy.js"] {
+        assert!(gone(name) && gone(name));
+    }
+    std::fs::write(probe("index.js"), "one\n").unwrap();
+    assert_eq!(std::fs::read_to_string(probe("index.js")).unwrap(), "one\n");
+    std::fs::create_dir(probe("index")).unwrap();
+    assert!(std::fs::metadata(probe("index")).unwrap().is_dir());
+    std::fs::write(probe("first.js"), "two\n").unwrap();
+    std::fs::rename(probe("first.js"), probe("moved.js")).unwrap();
+    assert_eq!(std::fs::read_to_string(probe("moved.js")).unwrap(), "two\n");
+    std::fs::copy(probe("moved.js"), probe("copy.js")).unwrap();
+    assert_eq!(std::fs::read_to_string(probe("copy.js")).unwrap(), "two\n");
+    // And a removed name is missing again.
+    std::fs::remove_file(probe("index.js")).unwrap();
+    assert!(gone("index.js"));
+    assert!(gone("index.json"));
+    sandfs.unmount(&ws);
+}
+
+#[test]
 fn rereading_a_changed_file_never_returns_cached_bytes() {
     if !fuse_available() {
         return;

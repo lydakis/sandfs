@@ -36,6 +36,29 @@ use sandfs_core::{ChangeKind, Error, Kind, VPath, Workspace};
 use crate::persist::{Draft, Drafts, Saved, Snapshot};
 use crate::store::subtree_keys;
 
+/// The entry for a name that doesn't exist, which the kernel caches for [`TTL`].
+#[cfg(fuse)]
+fn missing() -> FileAttr {
+    let never = SystemTime::UNIX_EPOCH;
+    FileAttr {
+        ino: INodeNo(0),
+        size: 0,
+        blocks: 0,
+        atime: never,
+        mtime: never,
+        ctime: never,
+        crtime: never,
+        kind: FileType::RegularFile,
+        perm: 0,
+        nlink: 0,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: 0,
+        flags: 0,
+    }
+}
+
 /// How long the kernel may cache attributes and names. Every change goes through this
 /// filesystem, so the kernel already sees its own updates and nothing goes stale;
 /// a short TTL would only make it ask again (a round trip per path, per second).
@@ -1247,6 +1270,11 @@ impl Filesystem for SandFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.0.lock().lookup(parent.0, name) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            // A name that isn't there is cached too (inode 0 means "no such entry"), so
+            // a program probing for files, like a module loader trying each extension,
+            // asks once. Whatever creates the name goes through the kernel, which drops
+            // the cached absence.
+            Err(Errno::ENOENT) => reply.entry(&TTL, &missing(), Generation(0)),
             Err(err) => reply.error(err),
         }
     }
