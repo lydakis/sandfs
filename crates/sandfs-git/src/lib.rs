@@ -37,6 +37,9 @@ pub struct GitSource {
     sizes: Option<Mutex<Batch>>,
     /// The remote a partial clone fetches missing blobs from.
     promisor: Option<String>,
+    /// Whether the partial clone has every tree, as a clone that leaves out only blobs
+    /// does, so one walk of the whole tree finds every missing file.
+    trees_local: bool,
     /// Trees with every file below them local, so prefetching them does nothing.
     local: Mutex<HashSet<SourceKey>>,
     /// The blobs of the whole tree a partial clone lacked, found by one walk started in
@@ -79,6 +82,10 @@ impl GitSource {
         };
         let readers = Readers::new(&repo)?;
         let promisor = promisor_remote(&repo);
+        let trees_local = promisor.as_ref().is_some_and(|remote| {
+            let key = format!("remote.{remote}.partialclonefilter");
+            git_output(&repo, &["config", "--get", &key]).is_ok_and(|filter| filter.starts_with("blob:"))
+        });
         Ok(GitSource {
             repo,
             tree: tree.as_str().into(),
@@ -86,6 +93,7 @@ impl GitSource {
             readers,
             sizes: None,
             promisor,
+            trees_local,
             local: Mutex::default(),
             absent: Arc::default(),
             walk: Once::new(),
@@ -143,7 +151,10 @@ impl GitSource {
     /// The blobs the whole tree lacked, once the background walk has found them. The
     /// first call in a partial clone starts that walk.
     fn absent(&self) -> Option<&Ids> {
-        self.promisor.as_ref()?;
+        // A walk can't see the files inside trees the clone lacks.
+        if !self.trees_local {
+            return None;
+        }
         self.walk.call_once(|| {
             let (repo, tree, absent) = (self.repo.clone(), self.tree.clone(), Arc::clone(&self.absent));
             let (hash_len, cancel) = (self.hash_len, Arc::clone(&self.cancel));
@@ -157,7 +168,7 @@ impl GitSource {
     /// Note blobs that are local now, which the walk may have found missing. Once its
     /// answer is in, only blobs it lists need remembering.
     fn now_local<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
-        if self.promisor.is_none() || self.sizes.is_none() {
+        if !self.trees_local || self.sizes.is_none() {
             return;
         }
         let absent = self.absent.get();
@@ -228,18 +239,25 @@ impl GitSource {
     /// Remember that every file below the tree `id` is local, with every tree below it,
     /// including files fetched some other way since the walk.
     fn mark_local(&self, id: &str) {
-        // Trees are local in a blobless clone, so listing them fetches nothing.
-        // `<mode> <type> <id>\t<path>`
-        let Ok(listed) = git_output(&self.repo, &["ls-tree", "-r", "-t", "-z", id]) else { return };
-        let entries = listed.split('\0').filter_map(|entry| {
-            let mut fields = entry.split('\t').next()?.split(' ').skip(1);
-            Some((fields.next()?, fields.next()?))
-        });
-        let (trees, files): (Vec<_>, Vec<_>) = entries.partition(|(kind, _)| *kind == "tree");
-        self.now_local(files.into_iter().map(|(_, id)| id));
-        let Ok(mut local) = self.local.lock() else { return };
-        local.insert(id.into());
-        local.extend(trees.into_iter().map(|(_, id)| SourceKey::from(id)));
+        // Trees are local in a blobless clone, so listing them fetches nothing. Read one
+        // entry at a time, without names: below a large folder there are millions.
+        let mut command = git(&self.repo);
+        command.args(["ls-tree", "-r", "-t", "--format=%(objecttype) %(objectname)", id]);
+        let Ok(mut child) = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return };
+        let Some(stdout) = child.stdout.take() else { return };
+        let mut trees = vec![SourceKey::from(id)];
+        for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            match line.split_once(' ') {
+                Some(("tree", tree)) => trees.push(tree.into()),
+                Some((_, file)) => self.now_local([file]),
+                None => {}
+            }
+        }
+        if child.wait().is_ok_and(|status| status.success()) {
+            if let Ok(mut local) = self.local.lock() {
+                local.extend(trees);
+            }
+        }
     }
 
     fn object(&self, id: &str, expected: &str) -> Result<Bytes> {
@@ -659,5 +677,16 @@ mod tests {
         run(clone.path(), &["cat-file", "-p", &e]);
         source.prefetch(&root, true);
         assert_eq!(size(&source.read_dir(&sub).unwrap(), "e.txt"), Some(13));
+
+        // A clone that also leaves out trees lists each folder's missing files when it is
+        // read, since one walk can't see inside trees that aren't there.
+        let trees_too = tempfile::tempdir().unwrap();
+        run(trees_too.path(), &["clone", "-q", "--bare", "--filter=tree:1", &url, "."]);
+        let source = GitSource::open(trees_too.path(), "HEAD").unwrap().with_sizes().unwrap();
+        let root = source.root().unwrap();
+        let dir = source.read_dir(&root).unwrap()["dir"].key.clone();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let listing = source.read_dir(&dir).unwrap();
+        assert_eq!((size(&listing, "c.txt"), size(&listing, "d.txt")), (None, None), "nothing fetched to list");
     }
 }
