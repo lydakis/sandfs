@@ -11,7 +11,7 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 - **Changes are files, not patches.** The harness walks `changes()` and writes each changed file back to wherever its data lives.
 - **Execution stays out of scope.** Real tools run in a container or on the host against a FUSE mount.
 
-0.2.2 was the last published release of the original design, and 0.4.0 is the first of this one. The original design's shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are symlinks and core text edits, which only code needed.
+0.2.2 was the last published release of the original design, and 0.4.0 is the first of this one. The original design's shell, host bridge, Python executor, storage adapters, write hooks and index are gone, and so are core text edits, which only code needed. Symbolic links came back in 0.4.1, stored but never followed by the workspace, because ordinary tools in a mounted folder (Python virtual environments, npm installs) make them.
 
 ## Build order
 
@@ -32,5 +32,5 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 
 - A mounted workspace holds a file in memory from its first write until it is saved (a quarter of a second after its last write), so a program writing many large files at once costs memory until they settle.
 - Only the executable bit of a file's mode is kept; owners, other mode bits and extended attributes are not.
-- No hard links, symlinks or special files, matching the core.
+- No hard links or special files, matching the core. Symbolic links work; the git source doesn't show a commit's links yet.
 - macOS mounts over NFS on localhost, answering only the user who mounted it (and root). New `._name`, `.DS_Store` and `.nfs.*` files that macOS creates in a mount are kept out of saves. Windows has no mount.

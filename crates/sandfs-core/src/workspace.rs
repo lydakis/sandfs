@@ -312,6 +312,7 @@ impl Workspace {
         let path = VPath::parse(path)?;
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
+            Resolved::File { kind: Kind::Symlink, .. } => Err(is_a_symlink(&path)),
             Resolved::File { content, .. } => {
                 let Content::Base { mount, key, .. } = &content else { return self.content_bytes(&content) };
                 let fetching = self.reading(&path, mount, key)?;
@@ -333,6 +334,7 @@ impl Workspace {
         let path = VPath::parse(path)?;
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
+            Resolved::File { kind: Kind::Symlink, .. } => Err(is_a_symlink(&path)),
             Resolved::File { content: Content::Bytes(bytes), .. } => Ok(slice(&bytes, offset, len)),
             Resolved::File { content: Content::Stored(stored), .. } => {
                 stored.source.read_range(&stored.key, offset, len)
@@ -349,6 +351,43 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// The target of the symbolic link at `path`. The workspace never follows links:
+    /// `read`, `write` and the rest act on the link itself or refuse it, and a mounted
+    /// folder leaves resolving links to the system.
+    pub fn read_link(&self, path: &str) -> Result<String> {
+        let path = VPath::parse(path)?;
+        match self.resolve(&path)? {
+            Resolved::File { content, kind: Kind::Symlink, .. } => {
+                let target = self.content_bytes(&content)?;
+                String::from_utf8(target.to_vec()).map_err(|_| Error::NotText(path.to_string()))
+            }
+            _ => Err(Error::Unsupported(path.to_string(), "not a symlink")),
+        }
+    }
+
+    /// Create a symbolic link at `path` to `target`, creating missing parent
+    /// directories. The path must not exist yet. Returns the link's version.
+    ///
+    /// The target is stored as it is and never resolved by the workspace, so it may
+    /// point anywhere, or nowhere.
+    pub fn symlink(&mut self, path: &str, target: &str) -> Result<u64> {
+        let path = VPath::parse(path)?;
+        if target.is_empty() || target.contains('\0') {
+            return Err(Error::InvalidPath(target.to_owned()));
+        }
+        match self.resolve(&path) {
+            Err(Error::NotFound(_)) => {}
+            Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
+            Err(err) => return Err(err),
+        }
+        let parent = path.parent().ok_or_else(|| Error::AlreadyExists(path.to_string()))?;
+        self.ensure_dir(&parent)?;
+        let content = Content::Bytes(Bytes::copy_from_slice(target.as_bytes()));
+        let version = self.tick();
+        self.overlay.insert(path, Overlay::File { content, kind: Kind::Symlink, version });
+        Ok(version)
     }
 
     /// Read a file as UTF-8 text.
@@ -457,6 +496,7 @@ impl Workspace {
         let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
         let (kind, version) = match self.resolve(&path) {
             Ok(Resolved::Dir { .. }) => return Err(Error::IsADirectory(path.to_string())),
+            Ok(Resolved::File { kind: Kind::Symlink, .. }) => return Err(is_a_symlink(&path)),
             Ok(Resolved::File { kind, version, .. }) => (kind, version),
             Err(Error::NotFound(_)) => (Kind::File { executable: false }, self.missing_version(&path)),
             Err(err) => return Err(err),
@@ -478,6 +518,7 @@ impl Workspace {
         let path = VPath::parse(path)?;
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
+            Resolved::File { kind: Kind::Symlink, .. } => Err(is_a_symlink(&path)),
             Resolved::File { kind, version, .. } if kind == (Kind::File { executable }) => Ok(version),
             Resolved::File { content, .. } => {
                 let version = self.tick();
@@ -549,8 +590,8 @@ impl Workspace {
 
     /// Files added, modified or deleted relative to the mounts, sorted by path.
     ///
-    /// Only files are reported; an empty directory is not a change. A file written
-    /// back with the bytes it had is not a change either, except one of
+    /// Only files and symbolic links are reported; an empty directory is not a change.
+    /// A file written back with the bytes it had is not a change either, except one of
     /// [`COMPARE_LIMIT`] bytes or more, which counts as modified without being read.
     /// The cost is proportional to the overlay, plus listing any base directories
     /// that were deleted, plus reading written files under that size that kept their size.
@@ -1042,6 +1083,12 @@ impl Workspace {
     fn base_hidden(&self, path: &VPath) -> bool {
         path.ancestor_strs().any(|ancestor| matches!(self.overlay.get(ancestor), Some(Overlay::Dir { opaque: true })))
     }
+}
+
+/// The error for reading, writing or changing the mode of a symbolic link, which the
+/// workspace never follows.
+fn is_a_symlink(path: &VPath) -> Error {
+    Error::Unsupported(path.to_string(), "is a symbolic link, which the workspace does not follow")
 }
 
 fn source_is_dir(resolved: &Resolved) -> bool {

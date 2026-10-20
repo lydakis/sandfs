@@ -82,10 +82,22 @@ impl Tools {
         let path = args.path("path")?;
         let byte_offset = args.opt_u64("byte_offset")?;
         let byte_length = args.opt_u64("byte_length")?;
-        if byte_offset.is_some() || byte_length.is_some() {
-            if args.has("offset") || args.has("limit") {
-                return Err("use either offset/limit (lines) or byte_offset/byte_length, not both".to_owned());
+        let bytes_wanted = byte_offset.is_some() || byte_length.is_some();
+        if bytes_wanted && (args.has("offset") || args.has("limit")) {
+            return Err("use either offset/limit (lines) or byte_offset/byte_length, not both".to_owned());
+        }
+        // A link has no bytes to page through, however it is read. Asking for its
+        // target first spares a file a stat, which may have to read it whole.
+        match self.workspace.read_link(&path) {
+            Ok(target) => {
+                let version = self.workspace.stat(&path).map_err(err)?.version;
+                return Ok(format!("{}: symlink to {}, version {version}", shown(&path), shown(&target)));
             }
+            // Not a link: the one refusal that lets the read go on.
+            Err(Error::Unsupported(..)) => {}
+            Err(error) => return Err(err(error)),
+        }
+        if bytes_wanted {
             return self.read_bytes(&path, byte_offset.unwrap_or(0), byte_length.unwrap_or(DEFAULT_READ_BYTES));
         }
         let offset = args.opt_u64("offset")?.unwrap_or(1).max(1) as usize;
@@ -201,13 +213,17 @@ impl Tools {
         let depth = depth as usize;
         let mut lines = Vec::new();
         let mut truncated = false;
-        walk(&self.workspace, &path, depth, &mut |_, rel, entry| {
+        walk(&self.workspace, &path, depth, &mut |abs, rel, entry| {
             if lines.len() == MAX_ENTRIES {
                 truncated = true;
                 return false;
             }
             lines.push(match (entry.kind, entry.size) {
                 (Kind::Dir, _) => shown(&format!("{rel}/")).into_owned(),
+                (Kind::Symlink, _) => match self.workspace.read_link(abs) {
+                    Ok(target) => format!("{} -> {}", shown(rel), shown(&target)),
+                    Err(_) => format!("{} -> (target unreadable)", shown(rel)),
+                },
                 (_, Some(size)) => format!("{} ({size} bytes)", shown(rel)),
                 (_, None) => format!("{} (size unknown)", shown(rel)),
             });
@@ -278,9 +294,11 @@ impl Tools {
             unreadable: 0,
             truncated: false,
         };
-        if self.workspace.stat(&root).map_err(err)?.kind.is_dir() {
+        let kind = self.workspace.stat(&root).map_err(err)?.kind;
+        if kind.is_dir() {
             walk(&self.workspace, &root, usize::MAX, &mut |abs, rel, entry| {
-                if entry.kind.is_dir() {
+                // Links are never followed, like ripgrep's default.
+                if entry.kind.is_dir() || entry.kind.is_symlink() {
                     return true;
                 }
                 // Like ripgrep, a glob without a slash matches the file name at any depth.
@@ -292,7 +310,7 @@ impl Tools {
                 }
                 search.file(&self.workspace, abs)
             })?;
-        } else {
+        } else if !kind.is_symlink() {
             search.file(&self.workspace, &root);
         }
 
@@ -388,8 +406,13 @@ impl Tools {
                 ChangeKind::Deleted => format!("D {}", shown(path)),
                 kind => {
                     let mark = if kind == ChangeKind::Added { 'A' } else { 'M' };
-                    let size = self.workspace.stat(path).map_err(err)?.size;
-                    format!("{mark} {} ({size} bytes)", shown(path))
+                    let meta = self.workspace.stat(path).map_err(err)?;
+                    if meta.kind.is_symlink() {
+                        let target = self.workspace.read_link(path).map_err(err)?;
+                        format!("{mark} {} -> {}", shown(path), shown(&target))
+                    } else {
+                        format!("{mark} {} ({} bytes)", shown(path), meta.size)
+                    }
                 }
             });
         }

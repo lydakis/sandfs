@@ -93,7 +93,8 @@ pub fn errno(err: &Error) -> Errno {
         Error::IsADirectory(_) => Errno::EISDIR,
         Error::DirectoryNotEmpty(_) => Errno::ENOTEMPTY,
         Error::InvalidPath(_) => Errno::EINVAL,
-        Error::Unsupported(_, reason) if reason.contains("symbolic links") => Errno::ELOOP,
+        // An operation that would have to follow a link, as with O_NOFOLLOW.
+        Error::Unsupported(_, reason) if reason.contains("symbolic link") => Errno::ELOOP,
         Error::Unsupported(..) => Errno::EPERM,
         other => {
             eprintln!("sandfs: {other}");
@@ -407,14 +408,18 @@ impl Inner {
     pub fn attr(&self, ino: u64) -> FsResult<FileAttr> {
         let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
         if !node.linked {
-            // A removed file the kernel may still have open.
-            let size = match (self.buffers.get(&ino), &node.removed_from) {
-                (Some(buffer), _) => buffer.size,
-                (None, Some(before)) => before.stat(node.path.as_str()).fs()?.size,
+            // A removed file or link the kernel may still have open.
+            let (kind, perm, size) = match (self.buffers.get(&ino), &node.removed_from) {
+                (Some(buffer), _) => (FileType::RegularFile, 0o644, buffer.size),
+                (None, Some(before)) => {
+                    let meta = before.stat(node.path.as_str()).fs()?;
+                    let (kind, perm) = file_type(meta.kind);
+                    (kind, perm, meta.size)
+                }
                 (None, None) => return Err(Errno::ENOENT),
             };
             node.sized.set(true);
-            return Ok(self.make_attr(ino, FileType::RegularFile, 0o644, size, self.base_time));
+            return Ok(self.make_attr(ino, kind, perm, size, self.base_time));
         }
         let path = node.path.as_str();
         let meta = self.ws.stat(path).fs()?;
@@ -424,11 +429,7 @@ impl Inner {
             None if meta.kind.is_dir() => 0,
             None => meta.size,
         };
-        let (kind, perm) = match meta.kind {
-            Kind::Dir => (FileType::Directory, 0o755),
-            Kind::File { executable: true } => (FileType::RegularFile, 0o755),
-            Kind::File { executable: false } => (FileType::RegularFile, 0o644),
-        };
+        let (kind, perm) = file_type(meta.kind);
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
         Ok(self.make_attr(ino, kind, perm, size, mtime))
     }
@@ -545,9 +546,17 @@ impl Inner {
             if size > MAX_FILE_SIZE as u64 {
                 return Err(Errno::EFBIG);
             }
+            // Only a regular file has a size to set, as truncate(2) says; the kernel
+            // follows links first, but an NFS client may name one.
+            let (ws, path) = self.contents(ino)?;
+            match ws.read_link(path.as_str()) {
+                Ok(_) => return Err(Errno::EINVAL),
+                // Not a link: the one refusal that lets the size be set.
+                Err(Error::Unsupported(..)) => {}
+                Err(err) => return Err(errno(&err)),
+            }
             if size == 0 {
                 // Emptying a file (O_TRUNC arrives this way) needn't read it first.
-                self.contents(ino)?;
                 let empty = self.empty_buffer()?;
                 self.buffers.insert(ino, empty);
                 self.writing = true;
@@ -587,6 +596,24 @@ impl Inner {
         self.dirs.insert(path.to_string());
         self.touch(&path);
         self.entry(&path)
+    }
+
+    /// symlink(2): a link whose target is stored as given and resolved by the system.
+    pub fn symlink(&mut self, parent: u64, name: &OsStr, target: &OsStr) -> FsResult<FileAttr> {
+        let path = self.child(parent, name)?;
+        let target = target.to_str().ok_or(Errno::EINVAL)?;
+        self.ws.symlink(path.as_str(), target).fs()?;
+        self.touch(&path);
+        self.entry(&path)
+    }
+
+    /// readlink(2): the target of the link at `ino`.
+    pub fn readlink(&self, ino: u64) -> FsResult<String> {
+        let (ws, path) = self.contents(ino)?;
+        ws.read_link(path.as_str()).map_err(|err| match err {
+            Error::Unsupported(..) => Errno::EINVAL,
+            err => errno(&err),
+        })
     }
 
     pub fn unlink(&mut self, parent: u64, name: &OsStr) -> FsResult<()> {
@@ -730,6 +757,8 @@ impl Inner {
         match self.ws.stat(path.as_str()) {
             Ok(_) if exclusive => return Err(Errno::EEXIST),
             Ok(meta) if meta.kind.is_dir() => return Err(Errno::EISDIR),
+            // Emptying a link would empty what it points to, which sandfs never follows.
+            Ok(meta) if truncate && meta.kind == Kind::Symlink => return Err(Errno::ELOOP),
             Ok(_) => {
                 if truncate {
                     let ino = self.ino_for(&path);
@@ -909,6 +938,7 @@ impl Inner {
             let kind = match entry.kind {
                 Kind::Dir => FileType::Directory,
                 Kind::File { .. } => FileType::RegularFile,
+                Kind::Symlink => FileType::Symlink,
             };
             entries.push((self.ino_for(&child), kind, entry.name));
         }
@@ -1193,6 +1223,18 @@ impl Filesystem for SandFs {
         self.reply_entry(reply, result);
     }
 
+    fn symlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
+        let result = self.0.lock().symlink(parent.0, name, target.as_os_str());
+        self.reply_entry(reply, result);
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.0.lock().readlink(ino.0) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(err) => reply.error(err),
+        }
+    }
+
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let result = self.0.lock().unlink(parent.0, name);
         self.reply_empty(reply, result);
@@ -1383,6 +1425,16 @@ impl Filesystem for SandFs {
             Ok(attr) => reply.created(&TTL, &attr, Generation(0), FileHandle(0), FopenFlags::empty()),
             Err(err) => reply.error(err),
         }
+    }
+}
+
+/// The file type and permission bits shown for an entry of `kind`.
+fn file_type(kind: Kind) -> (FileType, u16) {
+    match kind {
+        Kind::Dir => (FileType::Directory, 0o755),
+        Kind::File { executable: true } => (FileType::RegularFile, 0o755),
+        Kind::File { executable: false } => (FileType::RegularFile, 0o644),
+        Kind::Symlink => (FileType::Symlink, 0o777),
     }
 }
 
@@ -1676,6 +1728,11 @@ mod tests {
         assert!(!fs.writing, "and keep nothing waiting");
         assert_eq!(&fs.read(ino, 0, 100).unwrap()[..], b"HE");
 
+        let link = fs.symlink(ROOT_INO, name("link"), OsStr::new("README.md")).unwrap().ino.0;
+        fs.unlink(ROOT_INO, name("link")).unwrap();
+        assert_eq!(fs.attr(link).unwrap().kind, FileType::Symlink, "a removed link is still a link");
+        assert_eq!(fs.readlink(link).unwrap(), "README.md");
+
         fs.forget(ino, 1);
         assert!(!fs.nodes.contains_key(&ino) && !fs.buffers.contains_key(&ino), "closed once forgotten");
     }
@@ -1689,6 +1746,57 @@ mod tests {
         assert_eq!(&fs.read(util, 0, 100).unwrap()[..], b"", "the old util.rs");
         fs.forget(util, 1);
         assert!(!fs.nodes.contains_key(&util));
+    }
+
+    #[test]
+    fn operations_that_would_follow_a_link_fail_with_eloop() {
+        let mut ws = Workspace::new();
+        ws.symlink("/link", "target").unwrap();
+        assert_eq!(errno(&ws.write("/link", "x").unwrap_err()), Errno::ELOOP);
+        assert_eq!(errno(&ws.read("/link").unwrap_err()), Errno::ELOOP);
+        assert_eq!(errno(&ws.remove("/", true).unwrap_err()), Errno::EPERM, "other refusals stay EPERM");
+    }
+
+    #[test]
+    fn a_link_has_no_size_to_set() {
+        let mut fs = fs();
+        let link = fs.symlink(ROOT_INO, name("link"), OsStr::new("README.md")).unwrap().ino.0;
+        for size in [0, 3] {
+            assert_eq!(fs.setattr(link, None, Some(size), None).unwrap_err(), Errno::EINVAL);
+        }
+        assert_eq!(fs.create(ROOT_INO, name("link"), 0o644, false, true).unwrap_err(), Errno::ELOOP);
+        assert_eq!(fs.create(ROOT_INO, name("link"), 0o644, false, false).unwrap().ino.0, link);
+        assert_eq!(fs.readlink(link).unwrap(), "README.md");
+        assert!(fs.buffers.is_empty());
+
+        // A link whose target can't be read now is still not a file to empty.
+        #[derive(Debug)]
+        struct Broken;
+        impl sandfs_core::Source for Broken {
+            fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+                Ok("".into())
+            }
+            fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+                let entry = sandfs_core::SourceEntry { kind: Kind::Symlink, key: "link".into(), size: Some(4) };
+                Ok([("link".to_owned(), entry)].into())
+            }
+            fn read_file(&self, _key: &str) -> sandfs_core::Result<Bytes> {
+                Err(Error::Source("gone".into()))
+            }
+        }
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(Broken)).unwrap();
+        let mut fs = Inner::new(
+            ws,
+            &VPath::parse("/mnt").unwrap(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            SystemTime::UNIX_EPOCH,
+            (1000, 1000),
+        );
+        let link = fs.lookup(ROOT_INO, name("link")).unwrap().ino.0;
+        assert_eq!(fs.setattr(link, None, Some(0), None).unwrap_err(), Errno::EIO);
+        assert!(fs.buffers.is_empty());
     }
 
     #[test]

@@ -101,7 +101,7 @@ impl Plan {
     /// The plan for the listings already fetched into `dir`.
     pub fn load(url: &str, subtree: Option<&str>, dir: &Path) -> Result<Plan> {
         let commit = git_output(Some(dir), &["rev-parse", "HEAD"])?;
-        // Regular files only: sandfs has no symbolic links, and submodules are other
+        // Regular files only: the git source shows no symbolic links, and submodules are other
         // repositories. `-z` keeps names with unusual characters unquoted, and names
         // that aren't UTF-8 are skipped, as the sandfs source skips them. So are names
         // holding a line break, which a sparse checkout pattern can't express.

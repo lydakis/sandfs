@@ -28,12 +28,21 @@ pub enum Kind {
         /// Whether the executable bit is set, reported as the mode on a FUSE mount.
         executable: bool,
     },
+    /// A symbolic link. Its target is its contents: what [`Source::read_file`] returns
+    /// for it. sandfs stores links but never follows them; in a mounted folder the
+    /// system resolves them, the same as on any other filesystem.
+    Symlink,
 }
 
 impl Kind {
     /// True for directories.
     pub fn is_dir(self) -> bool {
         matches!(self, Kind::Dir)
+    }
+
+    /// True for symbolic links.
+    pub fn is_symlink(self) -> bool {
+        matches!(self, Kind::Symlink)
     }
 }
 
@@ -63,7 +72,7 @@ pub trait Source: Send + Sync + fmt::Debug {
     fn root(&self) -> Result<SourceKey>;
     /// List the directory with this key.
     fn read_dir(&self, key: &str) -> Result<Listing>;
-    /// Read the file with this key.
+    /// Read the file with this key; for a symbolic link, its target.
     fn read_file(&self, key: &str) -> Result<Bytes>;
 
     /// Read up to `len` bytes of the file with this key, starting at `offset`. Fewer
@@ -188,8 +197,10 @@ impl Source for MemorySource {
 /// read when first touched, and ranged reads go back to the directory every time, so a
 /// directory that changes while mounted can show a mix of old and new contents.
 ///
-/// Symlinks and special files (sockets, devices, fifos) are skipped, so a link cannot
-/// lead the workspace outside `root`. Each read also checks that the resolved host
+/// Symlinks are listed as links, with their targets, and never followed, so a link
+/// cannot lead the workspace outside `root`. In a mounted folder a link reaches what it
+/// reaches on the host, except that one into `root` reaches the workspace's copy. Special files (sockets, devices, fifos) and links
+/// whose targets aren't UTF-8 are skipped. Each read also checks that the resolved host
 /// path is still inside `root`, in case a directory was swapped for a symlink after it
 /// was listed. That check is not atomic with the read, so treat the directory as
 /// trusted while it is mounted.
@@ -242,20 +253,119 @@ impl DirSource {
         self.check_inside(dir)
     }
 
+    /// The target of the link at `key`, if it is UTF-8 like every workspace path.
+    ///
+    /// The target keeps the meaning it has on the host, wherever the workspace is
+    /// mounted. A relative one that stays inside the folder is kept as written: in a
+    /// mount it stays in the mount, through the workspace's own links. Any other one
+    /// that lands inside is made relative to the link, so a mount reaches the
+    /// workspace's copy of the file instead of the folder itself, which a write must
+    /// never reach. A relative one that lands outside becomes the absolute path it
+    /// reaches on the host; an absolute one outside is kept as written.
+    fn link_target(&self, key: &str) -> Result<Bytes> {
+        let path = self.host_path(key);
+        let target = std::fs::read_link(&path).map_err(io_error)?;
+        let parent = Path::new(key).parent().unwrap_or(Path::new(""));
+        let rewritten = match self.named_inside(parent, &target) {
+            Some(_) if !target.has_root() => target.clone(),
+            Some(inside) => relative_link(parent, &inside),
+            None => {
+                let reached = resolve(&path.parent().unwrap_or(&self.root).join(&target));
+                // A `..` left over follows a folder that isn't there, so the link dangles
+                // on the host. Made relative, it would come alive once the folder is made
+                // in the workspace, and could then climb out of the mount; it stays a
+                // host path instead.
+                let inside = reached
+                    .strip_prefix(&self.root)
+                    .ok()
+                    .filter(|inside| inside.components().all(|part| part != Component::ParentDir));
+                match inside {
+                    Some(inside) => relative_link(parent, inside),
+                    // Rooted, even without a drive on Windows: the same path from anywhere.
+                    None if target.has_root() => target.clone(),
+                    None => reached,
+                }
+            }
+        };
+        // A trailing separator, or one and `.`, means the target must be a folder; the
+        // rewriting drops it.
+        let raw = target.as_os_str().as_encoded_bytes();
+        let separator = |byte: &u8| std::path::is_separator(*byte as char);
+        let folder_only = match raw {
+            [.., last] if separator(last) => true,
+            [.., before, b'.'] => separator(before),
+            _ => false,
+        };
+        match rewritten.into_os_string().into_string() {
+            Ok(rewritten) if folder_only && !rewritten.ends_with(std::path::is_separator) && rewritten != target => {
+                Ok(Bytes::from(rewritten + std::path::MAIN_SEPARATOR_STR))
+            }
+            Ok(rewritten) => Ok(Bytes::from(rewritten)),
+            Err(_) => Err(Error::NotText(path.display().to_string())),
+        }
+    }
+
+    /// The place in the folder that `target`, written in a link in the folder `parent`,
+    /// names without leaving the folder on the way, if it does. An absolute target with
+    /// `..` in it is left to the OS, since a link before the `..` could lead anywhere,
+    /// and so is any target that passes through a link out of the folder, which could
+    /// lead back into it.
+    fn named_inside(&self, parent: &Path, target: &Path) -> Option<PathBuf> {
+        let (mut inside, rest): (Vec<Component>, &Path) = if target.has_root() {
+            let rest = target.strip_prefix(&self.root).ok()?;
+            if rest.components().any(|part| part == Component::ParentDir) {
+                return None;
+            }
+            (Vec::new(), rest)
+        } else {
+            (parent.components().collect(), target)
+        };
+        let mut host = self.root.join(inside.iter().collect::<PathBuf>());
+        let mut exists = true;
+        for part in rest.components() {
+            match part {
+                Component::ParentDir => {
+                    inside.pop()?;
+                }
+                Component::Normal(_) => inside.push(part),
+                Component::CurDir => continue,
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+            // Each step that exists must still be in the folder once its links are
+            // followed; past a missing one, nothing does.
+            host.push(part);
+            if exists {
+                match host.canonicalize() {
+                    Ok(real) if !real.starts_with(&self.root) => return None,
+                    Ok(_) => {}
+                    Err(_) => exists = false,
+                }
+            }
+        }
+        Some(inside.into_iter().collect())
+    }
+
     fn host_path(&self, key: &str) -> PathBuf {
         if key.is_empty() { self.root.clone() } else { self.root.join(key) }
     }
 
-    /// Open the regular file at `key` inside `root`.
-    fn open_file(&self, key: &str) -> Result<std::fs::File> {
+    /// Open the regular file at `key` inside `root`, or read the target of the link there.
+    fn open_file(&self, key: &str) -> Result<Opened> {
         // Keys from listings are plain relative names; an absolute key or `..` would
         // name a file outside the folder that the check below would accept as-is.
         if !Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
             return Err(Error::Source(format!("{key} is outside the mounted directory")));
         }
         let path = self.host_path(key);
-        // Checked before opening, so a special file (a fifo) is never opened.
-        if !path.symlink_metadata().map_err(io_error)?.is_file() {
+        // Checked before opening, so a special file (a fifo) is never opened, and a
+        // link is never followed: its target is read from the folder holding it.
+        let file_type = path.symlink_metadata().map_err(io_error)?.file_type();
+        if file_type.is_symlink() {
+            let parent = Path::new(key).parent().and_then(Path::to_str).unwrap_or_default();
+            self.check_dir(parent, path.parent().unwrap_or(&self.root))?;
+            return Ok(Opened::Link(self.link_target(key)?));
+        }
+        if !file_type.is_file() {
             return Err(Error::Source(format!("{} is not a regular file", path.display())));
         }
         let file = std::fs::File::open(&path).map_err(io_error)?;
@@ -267,7 +377,7 @@ impl DirSource {
             use std::os::fd::AsRawFd;
             if let Ok(opened) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
                 return if opened == path {
-                    Ok(file)
+                    Ok(Opened::File(file))
                 } else {
                     Err(Error::Source(format!("{} is outside the mounted directory", path.display())))
                 };
@@ -276,8 +386,15 @@ impl DirSource {
         // Elsewhere, or without /proc, the parent is resolved instead; a symlink in
         // the final component was refused above.
         self.check_inside(path.parent().unwrap_or(&self.root))?;
-        Ok(file)
+        Ok(Opened::File(file))
     }
+}
+
+/// What [`DirSource::open_file`] found at a key.
+enum Opened {
+    File(std::fs::File),
+    /// A symbolic link's target.
+    Link(Bytes),
 }
 
 impl Source for DirSource {
@@ -298,22 +415,31 @@ impl Source for DirSource {
             // The entry's type usually comes with the listing, so only files, which
             // need a size and a mode, cost a stat (relative to the open directory).
             let file_type = entry.file_type().map_err(io_error)?;
+            let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
             let (kind, size) = if file_type.is_dir() {
                 (Kind::Dir, None)
             } else if file_type.is_file() {
                 let meta = entry.metadata().map_err(io_error)?;
                 (Kind::File { executable: is_executable(&meta) }, Some(meta.len()))
+            } else if file_type.is_symlink() {
+                match self.link_target(&child_key) {
+                    Ok(target) => (Kind::Symlink, Some(target.len() as u64)),
+                    Err(Error::NotText(_)) => continue, // a target no workspace path could hold
+                    Err(err) => return Err(err),
+                }
             } else {
-                continue; // symlinks and special files are not part of a workspace
+                continue; // special files are not part of a workspace
             };
-            let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
             listing.insert(name, SourceEntry { kind, key: child_key.as_str().into(), size });
         }
         Ok(listing)
     }
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
-        let mut file = self.open_file(key)?;
+        let mut file = match self.open_file(key)? {
+            Opened::File(file) => file,
+            Opened::Link(target) => return Ok(target),
+        };
         let size = file.metadata().map_err(io_error)?.len();
         let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
         file.read_to_end(&mut data).map_err(io_error)?;
@@ -321,13 +447,42 @@ impl Source for DirSource {
     }
 
     fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
-        let mut file = self.open_file(key)?;
+        let mut file = match self.open_file(key)? {
+            Opened::File(file) => file,
+            Opened::Link(target) => return Ok(slice(&target, offset, len)),
+        };
         let available = file.metadata().map_err(io_error)?.len().saturating_sub(offset);
         file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
         let mut data = Vec::with_capacity(usize::try_from(len.min(available)).unwrap_or(0));
         file.take(len).read_to_end(&mut data).map_err(io_error)?;
         Ok(Bytes::from(data))
     }
+}
+
+/// Where the OS would find the absolute `path`: the longest part of it that exists,
+/// resolved through every link, plus the rest as written. The OS can't take `..` back
+/// out of a folder that isn't there, so a missing folder before one keeps the link
+/// dangling here too.
+fn resolve(path: &Path) -> PathBuf {
+    let parts: Vec<Component> = path.components().collect();
+    (0..=parts.len())
+        .rev()
+        .find_map(|cut| {
+            let existing: PathBuf = parts[..cut].iter().collect();
+            let mut path = if cut == 0 { PathBuf::new() } else { existing.canonicalize().ok()? };
+            path.extend(&parts[cut..]);
+            Some(path)
+        })
+        .unwrap_or_default()
+}
+
+/// The relative link from the folder `from` to `to`, both relative to one root.
+fn relative_link(from: &Path, to: &Path) -> PathBuf {
+    let (from, to): (Vec<_>, Vec<_>) = (from.components().collect(), to.components().collect());
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut link: PathBuf = from[common..].iter().map(|_| Component::ParentDir).collect();
+    link.extend(&to[common..]);
+    if link.as_os_str().is_empty() { PathBuf::from(".") } else { link }
 }
 
 fn io_error(err: std::io::Error) -> Error {

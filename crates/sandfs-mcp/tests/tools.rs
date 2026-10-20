@@ -403,3 +403,54 @@ fn paths_with_control_characters_are_shown_quoted() {
     );
     assert_eq!(ok(&mut s, "changes", json!({ "path": "/d/sub\ndir/x" })), "No changes under \"/d/sub\\ndir/x\"");
 }
+
+#[test]
+fn links_are_shown_with_their_targets_and_never_followed() {
+    let source = MemorySource::from_files([("lib/site.py", "x = 1\n")]).unwrap();
+    let mut ws = Workspace::new();
+    ws.mount("/env", Arc::new(source)).unwrap();
+    ws.symlink("/env/lib64", "lib").unwrap();
+    ws.symlink("/env/two\nlines", "lib").unwrap();
+    let mut s = Server::new(ws);
+
+    assert!(ok(&mut s, "list", json!({ "path": "/env" })).starts_with("lib/\nlib64 -> lib\n"));
+    assert!(ok(&mut s, "read", json!({ "path": "/env/lib64" })).starts_with("/env/lib64: symlink to lib, version "));
+    let paged = ok(&mut s, "read", json!({ "path": "/env/lib64", "byte_offset": 0, "byte_length": 2 }));
+    assert!(paged.starts_with("/env/lib64: symlink to lib, version "), "{paged}");
+    assert!(ok(&mut s, "grep", json!({ "pattern": "x", "path": "/env" })).contains("1 matches in 1 file"));
+    assert_eq!(
+        ok(&mut s, "grep", json!({ "pattern": "x", "path": "/env/lib64" })),
+        "No matches for x under /env/lib64"
+    );
+    assert!(ok(&mut s, "changes", json!({})).starts_with("A /env/lib64 -> lib\n"));
+    assert!(fails(&mut s, "write", json!({ "path": "/env/lib64", "content": "y" })).contains("symbolic link"));
+    let shown = ok(&mut s, "read", json!({ "path": "/env/two\nlines" }));
+    assert!(shown.starts_with("\"/env/two\\nlines\": symlink to lib"), "one line: {shown}");
+}
+
+/// A source that lists a link whose target can't be fetched.
+#[derive(Debug)]
+struct DeadLink;
+
+impl sandfs_core::Source for DeadLink {
+    fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+        Ok("".into())
+    }
+    fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+        let link = sandfs_core::SourceEntry { kind: sandfs_core::Kind::Symlink, key: "link".into(), size: Some(3) };
+        Ok([("link".to_owned(), link)].into())
+    }
+    fn read_file(&self, _key: &str) -> sandfs_core::Result<bytes::Bytes> {
+        Err(sandfs_core::Error::Source("connection reset".to_owned()))
+    }
+}
+
+#[test]
+fn a_link_whose_target_cannot_be_fetched_says_why() {
+    let mut ws = Workspace::new();
+    ws.mount("/remote", Arc::new(DeadLink)).unwrap();
+    let mut s = Server::new(ws);
+    assert!(fails(&mut s, "read", json!({ "path": "/remote/link" })).contains("connection reset"));
+    let bytes = json!({ "path": "/remote/link", "byte_offset": 0 });
+    assert!(fails(&mut s, "read", bytes).contains("connection reset"));
+}

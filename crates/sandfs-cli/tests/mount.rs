@@ -383,6 +383,53 @@ fn a_directory_source_is_never_written() {
 }
 
 #[test]
+fn symlinks_work_in_a_mount_and_survive_a_remount() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(data.path().join("lib")).unwrap();
+    std::fs::write(data.path().join("lib/site.txt"), "site\n").unwrap();
+    std::os::unix::fs::symlink("lib", data.path().join("lib64")).unwrap();
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("env");
+    sandfs.mount(&["mount", data.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+
+    // The folder's own link, and new ones, resolve like on any filesystem.
+    assert_eq!(std::fs::read_link(ws.join("lib64")).unwrap(), Path::new("lib"));
+    assert_eq!(std::fs::read_to_string(ws.join("lib64/site.txt")).unwrap(), "site\n");
+    std::os::unix::fs::symlink("lib/site.txt", ws.join("site")).unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("site")).unwrap(), "site\n");
+    assert!(std::fs::symlink_metadata(ws.join("site")).unwrap().file_type().is_symlink());
+    std::fs::write(ws.join("site"), "written through the link\n").unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("lib/site.txt")).unwrap(), "written through the link\n");
+    std::os::unix::fs::symlink("missing", ws.join("dangling")).unwrap();
+    std::fs::rename(ws.join("dangling"), ws.join("lib/dangling")).unwrap();
+
+    // A Python virtual environment is made of links.
+    let venv = Command::new("python3").args(["-m", "venv", "--without-pip"]).arg(ws.join(".venv")).output().unwrap();
+    assert!(venv.status.success(), "venv: {}", String::from_utf8_lossy(&venv.stderr));
+    let python = Command::new(ws.join(".venv/bin/python")).args(["-c", "import sys; print(sys.prefix)"]).output();
+    // macOS reports temporary folders through their real path (/private/var).
+    let prefix = std::fs::canonicalize(String::from_utf8(python.unwrap().stdout).unwrap().trim()).unwrap();
+    assert_eq!(prefix, std::fs::canonicalize(ws.join(".venv")).unwrap());
+
+    let changes = sandfs.stdout(&["changes", "env"]);
+    assert!(changes.contains("A .venv/bin/python\n"), "{changes}");
+    assert!(changes.contains("A lib/dangling\nM lib/site.txt\nA site\n"), "{changes}");
+    assert!(std::fs::symlink_metadata(data.path().join("site")).is_err(), "the folder underneath is untouched");
+
+    sandfs.unmount(&ws);
+    sandfs.mount(&["mount", "env", ws.to_str().unwrap()], &ws);
+    assert_eq!(std::fs::read_link(ws.join("site")).unwrap(), Path::new("lib/site.txt"));
+    assert_eq!(std::fs::read_link(ws.join("lib/dangling")).unwrap(), Path::new("missing"));
+    assert!(Command::new(ws.join(".venv/bin/python")).arg("-c").arg("pass").status().unwrap().success());
+    sandfs.unmount(&ws);
+}
+
+#[test]
 fn rereading_a_changed_file_never_returns_cached_bytes() {
     if !fuse_available() {
         return;
