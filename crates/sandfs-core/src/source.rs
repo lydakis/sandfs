@@ -307,7 +307,9 @@ impl DirSource {
 
     /// The place in the folder that `target`, written in a link in the folder `parent`,
     /// names without leaving the folder on the way, if it does. An absolute target with
-    /// `..` in it is left to the OS, since a link before the `..` could lead anywhere.
+    /// `..` in it is left to the OS, since a link before the `..` could lead anywhere,
+    /// and so is any target that passes through a link out of the folder, which could
+    /// lead back into it.
     fn named_inside(&self, parent: &Path, target: &Path) -> Option<PathBuf> {
         let (mut inside, rest): (Vec<Component>, &Path) = if target.has_root() {
             let rest = target.strip_prefix(&self.root).ok()?;
@@ -318,14 +320,26 @@ impl DirSource {
         } else {
             (parent.components().collect(), target)
         };
+        let mut host = self.root.join(inside.iter().collect::<PathBuf>());
+        let mut exists = true;
         for part in rest.components() {
             match part {
                 Component::ParentDir => {
                     inside.pop()?;
                 }
                 Component::Normal(_) => inside.push(part),
-                Component::CurDir => {}
+                Component::CurDir => continue,
                 Component::RootDir | Component::Prefix(_) => return None,
+            }
+            // Each step that exists must still be in the folder once its links are
+            // followed; past a missing one, nothing does.
+            host.push(part);
+            if exists {
+                match host.canonicalize() {
+                    Ok(real) if !real.starts_with(&self.root) => return None,
+                    Ok(_) => {}
+                    Err(_) => exists = false,
+                }
             }
         }
         Some(inside.into_iter().collect())

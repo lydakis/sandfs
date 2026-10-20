@@ -589,6 +589,9 @@ fn dir_source_lists_symlinks_without_following_them() {
     std::os::unix::fs::symlink("../data.csv/.", root.join("lib/not-a-folder-in")).unwrap();
     std::os::unix::fs::symlink(".././lib/", root.join("lib/self")).unwrap();
     std::os::unix::fs::symlink("alias", root.join("lib/hop")).unwrap();
+    // Out through one link and back in through another, outside the folder.
+    std::os::unix::fs::symlink("../escape/alias", root.join("lib/round-trip")).unwrap();
+    std::os::unix::fs::symlink(root.join("escape/alias"), root.join("lib/round-trip-abs")).unwrap();
     std::os::unix::fs::symlink(root.join("lib/alias"), root.join("lib/hop-abs")).unwrap();
     std::os::unix::fs::symlink("missing/../../../root/data.csv", root.join("lib/dangling-out")).unwrap();
 
@@ -614,6 +617,8 @@ fn dir_source_lists_symlinks_without_following_them() {
     // follows that link if the workspace changes it.
     assert_eq!(ws.read_link("/host/lib/hop").unwrap(), "alias");
     assert_eq!(ws.read_link("/host/lib/hop-abs").unwrap(), "alias");
+    assert_eq!(ws.read_link("/host/lib/round-trip").unwrap(), "../data.csv");
+    assert_eq!(ws.read_link("/host/lib/round-trip-abs").unwrap(), "../data.csv");
     // A missing folder before `..` that would leave the folder stays on the host.
     let escaping = root.canonicalize().unwrap().join("lib/missing/../../../root/data.csv");
     assert_eq!(ws.read_link("/host/lib/dangling-out").unwrap(), escaping.to_str().unwrap());
