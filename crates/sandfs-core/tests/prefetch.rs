@@ -25,6 +25,8 @@ struct Remote {
     reads: AtomicUsize,
     /// How long each prefetch takes.
     delay: Duration,
+    /// How long each read takes.
+    read_delay: Duration,
 }
 
 impl Remote {
@@ -62,6 +64,7 @@ impl Source for Remote {
 
     fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(self.read_delay);
         self.inner.read_file(key)
     }
 
@@ -131,6 +134,16 @@ fn reading_by_path_one_file_after_another_prefetches_like_a_walk() {
         ws.read(&format!("/data/{path}")).unwrap();
     }
     assert_eq!(source.prefetches(), vec![(String::new(), true), ("s".to_owned(), false)]);
+}
+
+#[test]
+fn files_slower_to_arrive_than_a_pause_still_come_one_after_another() {
+    let source = Arc::new(Remote { read_delay: Duration::from_millis(2100), ..Remote::new(TREE) });
+    let ws = mounted(&source);
+    // Each read takes longer than a pause, but the next starts as soon as it ends.
+    ws.read("/data/s/x.txt").unwrap();
+    ws.read("/data/s/y.txt").unwrap();
+    assert_eq!(source.prefetches(), vec![("s".to_owned(), false)]);
 }
 
 #[test]

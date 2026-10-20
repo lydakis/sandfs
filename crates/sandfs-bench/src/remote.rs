@@ -310,7 +310,18 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     let mut file = std::fs::OpenOptions::new().append(true).open(&changed)?;
     std::io::Write::write_all(&mut file, b"\nchanged by sandfs-bench\n")?;
     drop(file);
-    in_copy(&["-c", "user.name=bench", "-c", "user.email=bench@example.com", "commit", "-q", "-a", "-m", "change"])?;
+    in_copy(&[
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.com",
+        "commit",
+        "-q",
+        "--no-gpg-sign",
+        "-a",
+        "-m",
+        "change",
+    ])?;
     let commit = start.elapsed();
     ensure!(in_copy(&["rev-parse", "HEAD^"])? == plan.commit, "the commit isn't on top of {}", plan.commit);
     let start = Instant::now();

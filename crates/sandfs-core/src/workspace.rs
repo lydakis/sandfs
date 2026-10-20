@@ -278,7 +278,11 @@ impl Workspace {
                         Some(size) => size,
                         None => match self.listed_size(&path, &content)? {
                             Some(size) => size,
-                            None => self.content_bytes(&content)?.len() as u64,
+                            None => {
+                                let size = self.content_bytes(&content)?.len() as u64;
+                                self.fetched(&path);
+                                size
+                            }
                         },
                     },
                 };
@@ -293,10 +297,13 @@ impl Workspace {
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { content, .. } => {
-                if let Content::Base { mount, key, .. } = &content {
-                    self.reading(&path, mount, key)?;
+                let Content::Base { mount, key, .. } = &content else { return self.content_bytes(&content) };
+                let fetching = self.reading(&path, mount, key)?;
+                let bytes = self.content_bytes(&content);
+                if fetching {
+                    self.fetched(&path);
                 }
-                self.content_bytes(&content)
+                bytes
             }
         }
     }
@@ -316,7 +323,9 @@ impl Workspace {
                     Some(bytes) => Ok(slice(&bytes, offset, len)),
                     None => {
                         self.reading(&path, &mount, &key)?;
-                        mount.source.read_range(&key, offset, len)
+                        let bytes = mount.source.read_range(&key, offset, len);
+                        self.fetched(&path);
+                        bytes
                     }
                 }
             }
@@ -646,16 +655,29 @@ impl Workspace {
     /// (`grep -r`, a copy), or a program reading files by path one after another (a
     /// build), has the source prefetch, once it has read two files in one directory.
     /// A read after a pause, as a person's next look, prefetches nothing.
-    fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<()> {
+    /// Whether the bytes are to be fetched, rather than cached already.
+    fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<bool> {
         if self.cache.peek_blob(&(mount.id, key.clone())).is_some() {
-            return Ok(());
+            return Ok(false);
         }
-        let Some(parent) = path.parent() else { return Ok(()) };
-        let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(()) };
+        let Some(parent) = path.parent() else { return Ok(true) };
+        let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(true) };
         if self.touch(key, &parent, mount, &dir, true)? == Touch::Warmed {
             self.prefetch_dir(mount, &dir);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// After a base file at `path` was fetched: a pause is measured from here, not from
+    /// when the fetch began, so files that each take longer than [`WALK_GAP`] to arrive
+    /// still come one after another.
+    fn fetched(&self, path: &VPath) {
+        let Some(parent) = path.parent() else { return };
+        let mut walks = self.walks.lock().expect("walks lock");
+        let start = walks.starts.get(&parent).cloned();
+        if let Some(reading) = walks.reading.get_mut(&start) {
+            reading.last = Instant::now();
+        }
     }
 
     /// Count the base file `file` of the directory `dir` at `path` as needing a fetch.
