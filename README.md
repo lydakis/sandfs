@@ -133,6 +133,8 @@ The mounted folder has a `.git`, so git itself works in it: `status`, `add`, `co
 
 `sandfs serve --mcp NAME` hands a saved workspace to an agent as MCP file tools instead of mounting it.
 
+Every mount is served by one background process, started by the first `mount` or `fork` and gone once the last mount is. It detaches from whatever started it: it runs in a session of its own and is adopted by init (or launchd, or the nearest subreaper). So a job runner or shell that kills a job's process group or its process tree leaves other jobs' mounts alone; killing a whole container or cgroup still ends it. It keeps the starting command's environment, which carries what git needs to fetch, except the variables that point git at a repository (`GIT_DIR` and the like).
+
 On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there is nothing to install: the mount is served over NFS on localhost and mounted with macOS's own NFS client. On Windows, `changes`, `list`, `rm` and `serve --mcp` work, and `sandfs serve --mcp SOURCE` gives an agent a workspace there; `fork` and `unmount` need a mount. When changes are saved, what a fork on disk costs and how offline git mounts behave are covered in [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md).
 
 ## More features

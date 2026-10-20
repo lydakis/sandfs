@@ -116,9 +116,13 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Serve every mount in this process (started by `mount` and `fork`).
+    /// Start the process that serves every mount (run by `mount` and `fork`), or with
+    /// `--serve`, be that process.
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        #[arg(long)]
+        serve: bool,
+    },
     /// Tell git which files of the mounted workspace it runs in have changed. A git
     /// mount's `.git` names this as git's file monitor (hook version 2).
     #[command(name = "git-fsmonitor", hide = true)]
@@ -260,7 +264,7 @@ fn run(cli: Cli) -> Result<()> {
             home.create(&name, &record)?;
             mcp::serve(&home, &name)
         }
-        Cmd::Daemon => serve_mounts(home),
+        Cmd::Daemon { serve } => serve_mounts(home, serve),
         Cmd::GitFsmonitor { version, token: _ } => {
             // Git runs its file monitor at the root of the checkout: the mount.
             let root = std::env::current_dir()?;
@@ -371,8 +375,8 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
 
 /// Serve every mount asked of this home's background process (see `server`).
 #[cfg(mount)]
-fn serve_mounts(home: Home) -> Result<()> {
-    server::run(home)
+fn serve_mounts(home: Home, serve: bool) -> Result<()> {
+    if serve { server::run(home) } else { server::detach() }
 }
 
 /// The canonical path `dir` will have once created: its nearest existing ancestor,
@@ -542,7 +546,7 @@ fn mount(_home: &Home, _name: &str, _dir: &Path, _foreground: bool) -> Result<()
 }
 
 #[cfg(not(mount))]
-fn serve_mounts(_home: Home) -> Result<()> {
+fn serve_mounts(_home: Home, _serve: bool) -> Result<()> {
     bail!(NO_MOUNT)
 }
 

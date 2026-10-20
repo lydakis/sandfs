@@ -249,6 +249,61 @@ fn a_process_on_its_way_out_leaves_a_new_home_at_the_same_path_alone() {
     sandfs.unmount(&one);
 }
 
+/// The parent, process group and session of `pid`, from /proc.
+#[cfg(target_os = "linux")]
+fn lineage(pid: u32) -> (u32, u32, u32) {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // After the command name, which may itself hold spaces and parentheses.
+    let fields: Vec<u32> =
+        stat[stat.rfind(')').unwrap() + 2..].split(' ').skip(1).take(3).map(|field| field.parse().unwrap()).collect();
+    (fields[0], fields[1], fields[2])
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_mount_process_shares_nothing_with_whoever_started_it() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(data.path().join("notes.txt"), "notes\n").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let work = dirs.path().join("work");
+    // Job runners find a job's processes by their process group or their descent from
+    // the job; neither may reach the process that serves every job's mounts. It keeps
+    // what git needs to fetch, such as a token for a credential helper, but not a
+    // caller's repository.
+    let output = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", sandfs.home.path())
+        .env("A_FETCH_TOKEN", "secret")
+        .env("GIT_DIR", "/nonexistent")
+        .args(["mount", data.path().to_str().unwrap(), work.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    sandfs.mounts.push(work.clone());
+    let pid: u32 = server_pid(&sandfs, "work").parse().unwrap();
+
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let names: Vec<&[u8]> = environ.split(|&b| b == 0).filter_map(|entry| entry.split(|&b| b == b'=').next()).collect();
+    assert!(names.contains(&&b"SANDFS_HOME"[..]) && names.contains(&&b"PATH"[..]));
+    assert!(names.contains(&&b"A_FETCH_TOKEN"[..]) && !names.contains(&&b"GIT_DIR"[..]));
+
+    let me = std::process::id();
+    let (_, my_group, my_session) = lineage(me);
+    let (_, group, session) = lineage(pid);
+    assert_ne!(group, my_group);
+    assert_ne!(session, my_session);
+    let mut ancestor = pid;
+    while ancestor > 1 {
+        ancestor = lineage(ancestor).0;
+        assert_ne!(ancestor, me, "the mount process descends from the test");
+    }
+    assert_eq!(std::fs::read_to_string(work.join("notes.txt")).unwrap(), "notes\n");
+    sandfs.unmount(&work);
+}
+
 /// Runs git in `dir` and returns what it printed.
 fn git_out(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
