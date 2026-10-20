@@ -57,7 +57,7 @@ pub struct SourceEntry {
     /// Size in bytes when the source knows it without reading the file. When it is
     /// `None`, [`crate::Workspace::stat`] reads the file once to find it.
     pub size: Option<u64>,
-    /// When the file's bytes last changed, if the source knows. Programs that skip
+    /// When the file's bytes (or a link's target) last changed, if the source knows. Programs that skip
     /// work for unchanged files (build and test caches, `make`) compare it, so it
     /// must stay the same for as long as the file does.
     pub modified: Option<SystemTime>,
@@ -428,8 +428,10 @@ impl Source for DirSource {
                 let meta = entry.metadata().map_err(io_error)?;
                 (Kind::File { executable: is_executable(&meta) }, Some(meta.len()), meta.modified().ok())
             } else if file_type.is_symlink() {
+                // The listing's metadata is the link's own, not its target's.
+                let modified = entry.metadata().ok().and_then(|meta| meta.modified().ok());
                 match self.link_target(&child_key) {
-                    Ok(target) => (Kind::Symlink, Some(target.len() as u64), None),
+                    Ok(target) => (Kind::Symlink, Some(target.len() as u64), modified),
                     Err(Error::NotText(_)) => continue, // a target no workspace path could hold
                     Err(err) => return Err(err),
                 }

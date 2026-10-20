@@ -399,8 +399,11 @@ fn files_keep_their_source_time_in_every_mount_and_fork() {
     }
     let data = tempfile::tempdir().unwrap();
     let then = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
-    std::fs::write(data.path().join("go.mod"), "module x\n").unwrap();
-    std::fs::File::options().write(true).open(data.path().join("go.mod")).unwrap().set_modified(then).unwrap();
+    std::fs::create_dir(data.path().join("pkg")).unwrap();
+    for name in ["go.mod", "go.sum", "pkg/a.go"] {
+        std::fs::write(data.path().join(name), "module x\n").unwrap();
+        std::fs::File::options().write(true).open(data.path().join(name)).unwrap().set_modified(then).unwrap();
+    }
     let mut sandfs = Sandfs::new();
     let dirs = tempfile::tempdir().unwrap();
     let (ws, fork) = (dirs.path().join("ws"), dirs.path().join("fork"));
@@ -415,6 +418,20 @@ fn files_keep_their_source_time_in_every_mount_and_fork() {
     assert!(modified(&fork.join("go.mod")) > then, "a write is a change");
     assert_eq!(modified(&ws.join("go.mod")), then);
     sandfs.unmount(&fork);
+
+    // A move or a second name keeps the time, after the move is saved and remounted too.
+    std::fs::rename(ws.join("go.sum"), ws.join("go.sum.old")).unwrap();
+    std::fs::rename(ws.join("pkg"), ws.join("lib")).unwrap();
+    std::fs::hard_link(ws.join("go.mod"), ws.join("go.mod.link")).unwrap();
+    let moved = ["go.sum.old", "lib/a.go", "go.mod", "go.mod.link"];
+    for name in moved {
+        assert_eq!(modified(&ws.join(name)), then, "{name}");
+    }
+    sandfs.unmount(&ws);
+    sandfs.mount(&["mount", "ws", ws.to_str().unwrap()], &ws);
+    for name in moved {
+        assert_eq!(modified(&ws.join(name)), then, "{name} after a remount");
+    }
     sandfs.unmount(&ws);
 }
 

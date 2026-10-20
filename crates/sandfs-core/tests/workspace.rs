@@ -607,6 +607,15 @@ fn files_nobody_wrote_keep_their_source_modification_time() {
     ws.write("/host/moved.csv", "b\n").unwrap();
     assert_eq!(ws.stat("/host/moved.csv").unwrap().modified, None);
     assert_eq!(ws.stat("/host").unwrap().modified, None);
+    // A link's own time, not its target's.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("data.csv", dir.join("link")).unwrap();
+        let link_time = std::fs::symlink_metadata(dir.join("link")).unwrap().modified().unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
+        assert_eq!(ws.stat("/host/link").unwrap().modified, Some(link_time));
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

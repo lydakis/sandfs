@@ -461,17 +461,17 @@ impl Inner {
         let node = self.nodes.get(&ino).ok_or(Errno::ENOENT)?;
         if !node.linked {
             // A removed file or link the kernel may still have open.
-            let (kind, perm, size) = match (self.buffers.get(&ino), &node.removed_from) {
-                (Some(buffer), _) => (FileType::RegularFile, 0o644, buffer.size),
+            let (kind, perm, size, modified) = match (self.buffers.get(&ino), &node.removed_from) {
+                (Some(buffer), _) => (FileType::RegularFile, 0o644, buffer.size, None),
                 (None, Some(before)) => {
                     let meta = before.stat(node.path.as_str()).fs()?;
                     let (kind, perm) = file_type(meta.kind);
-                    (kind, perm, meta.size)
+                    (kind, perm, meta.size, meta.modified)
                 }
                 (None, None) => return Err(Errno::ENOENT),
             };
             node.sized.set(true);
-            return Ok(self.make_attr(ino, kind, perm, size, self.base_time));
+            return Ok(self.make_attr(ino, kind, perm, size, modified.unwrap_or(self.base_time)));
         }
         let path = node.path.as_str();
         let meta = self.ws.stat(path).fs()?;
@@ -507,6 +507,16 @@ impl Inner {
             self.times.insert(other.to_string(), time);
         }
         self.times.insert(path.to_string(), time);
+    }
+
+    /// Note the source's time of a file nobody wrote that just got a new name. Its next
+    /// save keeps it apart from the source, so only `times` can carry that time on.
+    fn keep_source_time(&mut self, path: &VPath) {
+        if !self.times.contains_key(path.as_str())
+            && let Some(time) = self.ws.stat(path.as_str()).ok().and_then(|meta| meta.modified)
+        {
+            self.times.insert(path.to_string(), time);
+        }
     }
 
     /// Attributes for a file whose size isn't known without reading it: size 0, for
@@ -715,6 +725,7 @@ impl Inner {
         self.ws.hard_link(from.as_str(), to.as_str()).fs()?;
         self.inos.insert(to.to_string(), ino);
         // The file keeps its time; only the directory it gained a name in changes.
+        self.keep_source_time(&from);
         match self.times.get(from.as_str()).copied() {
             Some(time) => self.times.insert(to.to_string(), time),
             None => self.times.remove(to.as_str()),
@@ -817,13 +828,18 @@ impl Inner {
             let mut stack = vec![to.clone()];
             while let Some(dir) = stack.pop() {
                 for entry in self.ws.list(dir.as_str()).fs()? {
+                    let child = dir.join(&entry.name).map_err(|_| Errno::EINVAL)?;
                     if entry.kind.is_dir() {
-                        stack.push(dir.join(&entry.name).map_err(|_| Errno::EINVAL)?);
+                        stack.push(child);
+                    } else {
+                        self.keep_source_time(&child);
                     }
                 }
                 self.dirs.insert(dir.to_string());
             }
             self.dirs.insert(from.to_string());
+        } else {
+            self.keep_source_time(&to);
         }
         self.touch_parent(&from);
         self.touch_parent(&to);
