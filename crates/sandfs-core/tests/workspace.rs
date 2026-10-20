@@ -574,13 +574,25 @@ fn dir_source_lists_symlinks_without_following_them() {
     std::os::unix::fs::symlink(outside.join("alias"), root.join("lib/alias")).unwrap();
     std::os::unix::fs::symlink(root.join("lib"), outside.join("lib-alias")).unwrap();
     std::os::unix::fs::symlink(outside.join("lib-alias/../new.csv"), root.join("lib/new")).unwrap();
+    // Relative links that leave the folder and come back, which a mount elsewhere must
+    // not resolve back into it either.
+    std::os::unix::fs::symlink("../root/data.csv", root.join("again")).unwrap();
+    std::os::unix::fs::symlink("../../root/lib", root.join("lib/again")).unwrap();
+    // `..` after a link out of the folder ends outside it, however it is spelled.
+    std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+    std::os::unix::fs::symlink(root.join("escape/../data.csv"), root.join("lib/escaped")).unwrap();
 
     let mut ws = Workspace::new();
     ws.mount("/host", Arc::new(DirSource::new(&root).unwrap())).unwrap();
-    assert_eq!(names(&ws, "/host"), ["away", "data.csv", "lib", "lib64", "libs", "secret"]);
+    assert_eq!(names(&ws, "/host"), ["again", "away", "data.csv", "escape", "lib", "lib64", "libs", "secret"]);
     assert_eq!(ws.stat("/host/lib64").unwrap().kind, Kind::Symlink);
     assert_eq!(ws.read_link("/host/lib64").unwrap(), "lib");
-    assert_eq!(ws.read_link("/host/away").unwrap(), "../outside");
+    let away = outside.canonicalize().unwrap();
+    assert_eq!(ws.read_link("/host/away").unwrap(), away.to_str().unwrap(), "where it leads on the host");
+    assert_eq!(ws.read_link("/host/again").unwrap(), "data.csv");
+    assert_eq!(ws.read_link("/host/lib/again").unwrap(), ".");
+    let escaped = root.join("escape/../data.csv");
+    assert_eq!(ws.read_link("/host/lib/escaped").unwrap(), escaped.to_str().unwrap());
     assert_eq!(ws.read_link("/host/lib/data.csv").unwrap(), "../data.csv");
     assert_eq!(ws.read_link("/host/lib/x-abs").unwrap(), "x", "a target that doesn't exist yet");
     assert_eq!(ws.read_link("/host/lib/top").unwrap(), "..");

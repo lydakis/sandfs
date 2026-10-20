@@ -88,9 +88,14 @@ impl Tools {
         }
         // A link has no bytes to page through, however it is read. Asking for its
         // target first spares a file a stat, which may have to read it whole.
-        if let Ok(target) = self.workspace.read_link(&path) {
-            let version = self.workspace.stat(&path).map_err(err)?.version;
-            return Ok(format!("{}: symlink to {}, version {version}", shown(&path), shown(&target)));
+        match self.workspace.read_link(&path) {
+            Ok(target) => {
+                let version = self.workspace.stat(&path).map_err(err)?.version;
+                return Ok(format!("{}: symlink to {}, version {version}", shown(&path), shown(&target)));
+            }
+            // Not a link: the one refusal that lets the read go on.
+            Err(Error::Unsupported(..)) => {}
+            Err(error) => return Err(err(error)),
         }
         if bytes_wanted {
             return self.read_bytes(&path, byte_offset.unwrap_or(0), byte_length.unwrap_or(DEFAULT_READ_BYTES));

@@ -198,8 +198,8 @@ impl Source for MemorySource {
 /// directory that changes while mounted can show a mix of old and new contents.
 ///
 /// Symlinks are listed as links, with their targets, and never followed, so a link
-/// cannot lead the workspace outside `root`; in a mounted folder the system resolves
-/// them as it would in `root` itself. Special files (sockets, devices, fifos) and links
+/// cannot lead the workspace outside `root`. In a mounted folder a link reaches what it
+/// reaches on the host, except that one into `root` reaches the workspace's copy. Special files (sockets, devices, fifos) and links
 /// whose targets aren't UTF-8 are skipped. Each read also checks that the resolved host
 /// path is still inside `root`, in case a directory was swapped for a symlink after it
 /// was listed. That check is not atomic with the read, so treat the directory as
@@ -255,53 +255,24 @@ impl DirSource {
 
     /// The target of the link at `key`, if it is UTF-8 like every workspace path.
     ///
-    /// An absolute target inside the folder is made relative to the link. Followed
-    /// through a mount, the link then stays in the mount and reaches the workspace's
-    /// copy of the file, instead of the folder itself, which a write must never reach.
+    /// The target keeps the meaning it has on the host, wherever the workspace is
+    /// mounted. One that lands inside the folder is made relative to the link, so a
+    /// mount reaches the workspace's copy of the file instead of the folder itself, which
+    /// a write must never reach. A relative one that lands outside becomes the absolute
+    /// path it reaches on the host; an absolute one outside is kept as written.
     fn link_target(&self, key: &str) -> Result<Bytes> {
         let path = self.host_path(key);
         let target = std::fs::read_link(&path).map_err(io_error)?;
-        let target = match self.inside(&target) {
-            Some(inside) => relative_link(Path::new(key).parent().unwrap_or(Path::new("")), &inside),
-            None => target,
+        let reached = resolve(&path.parent().unwrap_or(&self.root).join(&target));
+        let target = match reached.strip_prefix(&self.root) {
+            Ok(inside) => relative_link(Path::new(key).parent().unwrap_or(Path::new("")), inside),
+            Err(_) if target.is_relative() => reached,
+            Err(_) => target,
         };
         match target.into_os_string().into_string() {
             Ok(target) => Ok(Bytes::from(target)),
             Err(_) => Err(Error::Source(format!("{}: link target is not UTF-8", path.display()))),
         }
-    }
-
-    /// Where an absolute link target lies inside `root`, relative to it, if it does:
-    /// spelled out from the root, or reaching it through other links.
-    fn inside(&self, target: &Path) -> Option<PathBuf> {
-        if !target.is_absolute() {
-            return None;
-        }
-        let parts: Vec<Component> = target.components().collect();
-        // The target as written, with `..` taken lexically, and as the OS would find
-        // it: the longest part of it that exists, resolved through every link, plus
-        // the rest. Either landing in the folder makes the link relative.
-        let rest = |mut path: PathBuf, parts: &[Component]| {
-            for part in parts {
-                match part {
-                    Component::ParentDir => {
-                        path.pop();
-                    }
-                    Component::CurDir => {}
-                    part => path.push(part),
-                }
-            }
-            path
-        };
-        let plain = rest(PathBuf::new(), &parts);
-        let resolved = (1..=parts.len()).rev().find_map(|cut| {
-            let existing: PathBuf = parts[..cut].iter().collect();
-            existing.canonicalize().ok().map(|path| rest(path, &parts[cut..]))
-        });
-        [Some(plain), resolved]
-            .into_iter()
-            .flatten()
-            .find_map(|path| path.strip_prefix(&self.root).ok().map(Path::to_path_buf))
     }
 
     fn host_path(&self, key: &str) -> PathBuf {
@@ -415,6 +386,29 @@ impl Source for DirSource {
         file.take(len).read_to_end(&mut data).map_err(io_error)?;
         Ok(Bytes::from(data))
     }
+}
+
+/// Where the OS would find the absolute `path`: the longest part of it that exists,
+/// resolved through every link, plus the rest, with its `..` taken lexically.
+fn resolve(path: &Path) -> PathBuf {
+    let parts: Vec<Component> = path.components().collect();
+    (0..=parts.len())
+        .rev()
+        .find_map(|cut| {
+            let existing: PathBuf = parts[..cut].iter().collect();
+            let mut path = if cut == 0 { PathBuf::new() } else { existing.canonicalize().ok()? };
+            for part in &parts[cut..] {
+                match part {
+                    Component::ParentDir => {
+                        path.pop();
+                    }
+                    Component::CurDir => {}
+                    part => path.push(part),
+                }
+            }
+            Some(path)
+        })
+        .unwrap_or_default()
 }
 
 /// The relative link from the folder `from` to `to`, both relative to one root.

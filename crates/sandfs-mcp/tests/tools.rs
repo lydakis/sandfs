@@ -423,3 +423,30 @@ fn links_are_shown_with_their_targets_and_never_followed() {
     let shown = ok(&mut s, "read", json!({ "path": "/env/two\nlines" }));
     assert!(shown.starts_with("\"/env/two\\nlines\": symlink to lib"), "one line: {shown}");
 }
+
+/// A source that lists a link whose target can't be fetched.
+#[derive(Debug)]
+struct DeadLink;
+
+impl sandfs_core::Source for DeadLink {
+    fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+        Ok("".into())
+    }
+    fn read_dir(&self, _key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+        let link = sandfs_core::SourceEntry { kind: sandfs_core::Kind::Symlink, key: "link".into(), size: Some(3) };
+        Ok([("link".to_owned(), link)].into())
+    }
+    fn read_file(&self, _key: &str) -> sandfs_core::Result<bytes::Bytes> {
+        Err(sandfs_core::Error::Source("connection reset".to_owned()))
+    }
+}
+
+#[test]
+fn a_link_whose_target_cannot_be_fetched_says_why() {
+    let mut ws = Workspace::new();
+    ws.mount("/remote", Arc::new(DeadLink)).unwrap();
+    let mut s = Server::new(ws);
+    assert!(fails(&mut s, "read", json!({ "path": "/remote/link" })).contains("connection reset"));
+    let bytes = json!({ "path": "/remote/link", "byte_offset": 0 });
+    assert!(fails(&mut s, "read", bytes).contains("connection reset"));
+}
