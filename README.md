@@ -189,6 +189,7 @@ A second copy of the mount (`sandfs fork`) takes 20 ms, against 0.2 to 4.4 s for
 ## Limits
 
 - **sandfs is not an execution sandbox.** It never runs commands, and it doesn't contain the programs that use it. It keeps their writes out of your sources, but a program working in a mounted folder can still read or change anything else its user can. Run untrusted programs in a container or microVM pointed at the mount.
+- **Git runs what a mount's `.git` settings name.** Git settings can name programs for git to run, and anything that can write to a mounted folder can change its `.git`. Don't run git yourself in a mounted folder that a program you don't trust can write to, just as with any folder someone else can change. Over MCP, sandfs refuses changes to a `git:` mount's `.git`; a host folder that holds its own `.git` gets no such protection, so treat an agent's changes there the same way.
 - **A mounted folder isn't frozen.** Folders are read lazily, so if one changes while it's mounted, a workspace can show a mix of old and new. Mount a folder nothing else writes to, copy it first, or mount a git commit when the view must not change.
 - **No symlinks.** A folder source skips them, along with sockets and devices.
 
