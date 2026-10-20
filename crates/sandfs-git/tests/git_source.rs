@@ -245,14 +245,18 @@ fn a_tree_too_large_for_one_request_comes_in_the_background() {
     let d0 = sandfs_core::Source::read_dir(&source, &root).unwrap()["d0"].key.clone();
     sandfs_core::Source::prefetch(&source, &d0, true);
     assert_eq!(missing(clone.path()), 2000);
-    let f0 = sandfs_core::Source::read_dir(&source, &d0).unwrap()["f0"].key.clone();
     sandfs_core::Source::prefetch(&source, &root, true);
-    // Requests go on while reads do; this reader rereads a file that is here already.
+    // Requests go on while what they fetched is read, as a walk reading d1 does.
+    let d1 = sandfs_core::Source::read_dir(&source, &root).unwrap()["d1"].key.clone();
+    let keys: Vec<_> = sandfs_core::Source::read_dir(&source, &d1).unwrap().into_values().map(|e| e.key).collect();
+    let mut files = keys.iter().cycle();
     let started = std::time::Instant::now();
     while missing(clone.path()) > 0 {
         assert!(started.elapsed() < std::time::Duration::from_secs(60), "the files never came");
-        sandfs_core::Source::read_file(&source, &f0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
+        if missing(clone.path()) <= 1000 {
+            sandfs_core::Source::read_file(&source, files.next().unwrap()).unwrap();
+        }
     }
     // Listings know the sizes of what came, without reading the files.
     let d4 = sandfs_core::Source::read_dir(&source, &root).unwrap()["d4"].key.clone();

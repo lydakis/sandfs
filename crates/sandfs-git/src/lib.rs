@@ -511,20 +511,19 @@ fn fetch_in_order(
         let (kind, data) = trees.read(id).ok()?;
         (kind == "tree").then(|| parse_tree(&data, hash_len).ok()).flatten().map(IntoIterator::into_iter)
     };
-    let first = std::cell::Cell::new(true);
     // Sends the request, or with `go` false gives its claims back.
     let send = |request: &mut Vec<(String, usize)>, go: bool| {
         if request.is_empty() {
             return true;
         }
-        let go = go && !cancel.load(Ordering::Relaxed) && (first.replace(false) || go_on());
-        let ok = go && fetch(repo, remote, request.iter().map(|(blob, _)| blob), cancel);
+        let ok =
+            go && !cancel.load(Ordering::Relaxed) && fetch(repo, remote, request.iter().map(|(blob, _)| blob), cancel);
         settle(&request.iter().map(|&(_, index)| index).collect::<Vec<_>>(), ok);
         request.clear();
         ok
     };
     let mut walked = vec![SourceKey::from(id)];
-    let mut request = Vec::new();
+    let (mut request, mut sent, mut asked) = (Vec::new(), false, false);
     let mut stack = vec![listing(id)?];
     while let Some(entries) = stack.last_mut() {
         if cancel.load(Ordering::Relaxed) {
@@ -543,12 +542,22 @@ fn fetch_in_order(
             stack.push(entries);
             walked.push(entry.key);
         } else if let Some(index) = missing.index_of(&entry.key) {
+            // Asked once a request, before claiming, so nothing waits claimed meanwhile.
+            if request.is_empty() && sent && !asked {
+                if !go_on() {
+                    return None;
+                }
+                asked = true;
+            }
             if claim(&entry.key, index) {
                 request.push((entry.key.to_string(), index));
             }
         }
-        if request.len() == PREFETCH_FILES && !send(&mut request, true) {
-            return None;
+        if request.len() == PREFETCH_FILES {
+            if !send(&mut request, true) {
+                return None;
+            }
+            (sent, asked) = (true, false);
         }
     }
     send(&mut request, true).then_some(walked)
