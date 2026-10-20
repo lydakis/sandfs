@@ -45,7 +45,7 @@ pub struct GitSource {
     /// The blobs of the whole tree a partial clone lacked, found by one walk started in
     /// the background by the first listing, so later listings don't each start git.
     /// `None` inside when git couldn't say.
-    absent: Arc<OnceLock<Option<Ids>>>,
+    absent: Arc<OnceLock<Option<ObjectIds>>>,
     walk: Once,
     /// Set when the source is dropped, which stops a walk still running.
     cancel: Arc<AtomicBool>,
@@ -148,9 +148,26 @@ impl GitSource {
         Ok(())
     }
 
+    /// The files of the tree a partial clone lacked when this source first looked, by
+    /// blob id, waiting for that look if it hasn't finished. Files fetched since are
+    /// still listed. `None` outside a partial clone that has every tree (as one that
+    /// leaves out only blobs does), or when git couldn't say.
+    pub fn missing_files(&self) -> Option<&ObjectIds> {
+        if !self.trees_local {
+            return None;
+        }
+        if self.absent.get().is_none() {
+            // Walk here rather than wait: a walk the first listing started may still be
+            // running, and two walks cost only time.
+            self.walk.call_once(|| {});
+            let _ = self.absent.set(walk_missing(&self.repo, &self.tree, self.hash_len, &self.cancel));
+        }
+        self.absent.get()?.as_ref()
+    }
+
     /// The blobs the whole tree lacked, once the background walk has found them. The
     /// first call in a partial clone starts that walk.
-    fn absent(&self) -> Option<&Ids> {
+    fn absent(&self) -> Option<&ObjectIds> {
         // A walk can't see the files inside trees the clone lacks.
         if !self.trees_local {
             return None;
@@ -347,10 +364,10 @@ fn parse_tree(data: &[u8], hash_len: usize) -> Result<Listing> {
     Ok(listing)
 }
 
-/// The blobs missing below the tree `id`, read straight into an [`Ids`], since a large
+/// The blobs missing below the tree `id`, read straight into [`ObjectIds`], since a large
 /// repository lacks hundreds of thousands. `None` when git can't say, or once `cancel`
 /// is set, which kills the walk.
-fn walk_missing(repo: &Path, id: &str, hash_len: usize, cancel: &AtomicBool) -> Option<Ids> {
+fn walk_missing(repo: &Path, id: &str, hash_len: usize, cancel: &AtomicBool) -> Option<ObjectIds> {
     let mut command = git(repo);
     command.args(["rev-list", "--objects", "--no-object-names", "--missing=print", id]);
     command.stdout(Stdio::piped()).stderr(Stdio::null());
@@ -374,33 +391,70 @@ fn walk_missing(repo: &Path, id: &str, hash_len: usize, cancel: &AtomicBool) -> 
     child.wait().ok()?.success().then_some(())?;
     ids.sort_unstable();
     ids.dedup();
-    Some(Ids { sorted: ids.iter().flat_map(|blob| blob[..hash_len].iter().copied()).collect(), len: hash_len })
+    Some(ObjectIds { sorted: ids.iter().flat_map(|blob| blob[..hash_len].iter().copied()).collect(), len: hash_len })
 }
 
-/// A set of object ids kept as sorted raw bytes: a large repository lacks hundreds of
+/// A set of object ids, kept as sorted raw bytes: a large repository lacks hundreds of
 /// thousands of blobs, which as strings would take several times the memory.
-struct Ids {
+pub struct ObjectIds {
     sorted: Vec<u8>,
     len: usize,
 }
 
-impl Ids {
-    fn contains(&self, hex_id: &str) -> bool {
+impl ObjectIds {
+    /// The number of ids.
+    pub fn len(&self) -> usize {
+        self.sorted.len() / self.len
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+
+    /// Whether the set holds the id `hex_id`.
+    pub fn contains(&self, hex_id: &str) -> bool {
+        self.index_of(hex_id).is_some()
+    }
+
+    /// Where `hex_id` is among the ids in order, from 0 to `len() - 1`, if it is one.
+    pub fn index_of(&self, hex_id: &str) -> Option<usize> {
         let mut id = [0; 32];
         if !unhex(hex_id, &mut id[..self.len]) {
-            return false;
+            return None;
         }
-        let id = &id[..self.len];
-        let (mut low, mut high) = (0, self.sorted.len() / self.len);
+        let index = self.first_at_least(&id[..self.len]);
+        (self.sorted.get(index * self.len..(index + 1) * self.len) == Some(&id[..self.len])).then_some(index)
+    }
+
+    /// The ids whose first byte is `first` (whose hex starts with its two digits), in order.
+    pub fn starting_with(&self, first: u8) -> impl Iterator<Item = String> + '_ {
+        let mut id = [0; 32];
+        id[0] = first;
+        self.sorted[self.first_at_least(&id[..self.len]) * self.len..]
+            .chunks(self.len)
+            .take_while(move |id| id[0] == first)
+            .map(hex)
+    }
+
+    /// The index of the first id not below `id`.
+    fn first_at_least(&self, id: &[u8]) -> usize {
+        let (mut low, mut high) = (0, self.len());
         while low < high {
             let mid = (low + high) / 2;
-            match self.sorted[mid * self.len..(mid + 1) * self.len].cmp(id) {
-                std::cmp::Ordering::Less => low = mid + 1,
-                std::cmp::Ordering::Greater => high = mid,
-                std::cmp::Ordering::Equal => return true,
+            if &self.sorted[mid * self.len..(mid + 1) * self.len] < id {
+                low = mid + 1;
+            } else {
+                high = mid;
             }
         }
-        false
+        low
+    }
+}
+
+impl fmt::Debug for ObjectIds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObjectIds").field("len", &self.len()).finish()
     }
 }
 
@@ -621,7 +675,7 @@ mod tests {
             assert!(start.elapsed().as_secs() < 30, "the walk never finished");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(source.absent.get().unwrap().as_ref().unwrap().sorted.len() / source.hash_len, 5);
+        assert_eq!(source.absent.get().unwrap().as_ref().unwrap().len(), 5);
 
         // What is read or fetched afterwards gets its size, though the walk found it missing.
         let listing = source.read_dir(&root).unwrap();
@@ -662,13 +716,13 @@ mod tests {
         run(clone.path(), &["fetch", "-q", "--filter=blob:none", "origin", "refs/tags/odd:refs/tags/odd"]);
         run(clone.path(), &["config", "core.quotePath", "false"]);
         let found = walk_missing(clone.path(), &tree, source.hash_len, &AtomicBool::new(false)).unwrap();
-        assert_eq!(found.sorted.len() / found.len, 1, "b.txt, as z");
+        assert_eq!(found.len(), 1, "b.txt, as z");
 
         // A walk stops when its source is dropped.
         let cancelled = AtomicBool::new(true);
         assert!(walk_missing(clone.path(), &root, source.hash_len, &cancelled).is_none());
         let found = walk_missing(clone.path(), &root, source.hash_len, &AtomicBool::new(false)).unwrap();
-        assert_eq!(found.sorted.len() / found.len, 2, "b.txt and dir/sub/e.txt are left on the server");
+        assert_eq!(found.len(), 2, "b.txt and dir/sub/e.txt are left on the server");
 
         // A prefetch of everything below a folder also notes files deep inside it that
         // something else fetched.
@@ -688,5 +742,41 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let listing = source.read_dir(&dir).unwrap();
         assert_eq!((size(&listing, "c.txt"), size(&listing, "d.txt")), (None, None), "nothing fetched to list");
+    }
+
+    #[test]
+    fn missing_files_are_found_by_id_and_by_first_byte() {
+        let origin = tempfile::tempdir().unwrap();
+        run(origin.path(), &["init", "-q"]);
+        for i in 0..40 {
+            std::fs::write(origin.path().join(format!("{i}.txt")), i.to_string()).unwrap();
+        }
+        run(origin.path(), &["add", "-A"]);
+        run(origin.path(), &["commit", "-q", "-m", "files"]);
+        run(origin.path(), &["config", "uploadpack.allowFilter", "true"]);
+        let clone = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", origin.path().display());
+        run(clone.path(), &["clone", "-q", "--bare", "--filter=blob:none", &url, "."]);
+        let mut blobs: Vec<String> =
+            run(origin.path(), &["ls-tree", "--object-only", "HEAD"]).lines().map(String::from).collect();
+        blobs.sort();
+        blobs.dedup();
+
+        // No listing came first, so this walks the tree itself.
+        let source = GitSource::open(clone.path(), "HEAD").unwrap();
+        let missing = source.missing_files().unwrap();
+        assert_eq!(missing.len(), blobs.len());
+        for (index, blob) in blobs.iter().enumerate() {
+            assert_eq!(missing.index_of(blob), Some(index));
+        }
+        assert_eq!(missing.index_of(&"0".repeat(40)), None);
+        assert!(!missing.contains("not hex"));
+        for first in 0..=255u8 {
+            let prefix = format!("{first:02x}");
+            let expected: Vec<String> = blobs.iter().filter(|blob| blob.starts_with(&prefix)).cloned().collect();
+            assert_eq!(missing.starting_with(first).collect::<Vec<_>>(), expected, "{prefix}");
+        }
+        // A repository with every blob local has nothing missing.
+        assert!(GitSource::open(origin.path(), "HEAD").unwrap().missing_files().is_none());
     }
 }

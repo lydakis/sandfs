@@ -128,7 +128,7 @@ sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sand
 sandfs mount git:https://github.com/pallets/flask@3.1.0 ~/ws/flask
 ```
 
-The mounted folder has a `.git`, so git itself works in it: `status`, `add`, `commit`, branches and `push`, with commits kept in the workspace and its forks. A mount of a remote repository holds only the mounted commit, not the history before it; a local repository's history is all there. `git status` doesn't read your files, because sandfs tells git which ones changed; on VS Code it takes 0.07 s once the first run (about 10 s on a fresh mount, which lists every folder) is done. The first `commit` fetches the contents of every file in the commit once, as git checks they all exist (VS Code: 16 s and 64 MiB).
+The mounted folder has a `.git`, so git itself works in it: `status`, `add`, `commit`, branches and `push`, with commits kept in the workspace and its forks. A mount of a remote repository holds only the mounted commit, not the history before it; a local repository's history is all there. `git status` doesn't read your files, because sandfs tells git which ones changed; on VS Code it takes 0.07 s once the first run (about 10 s on a fresh mount, which lists every folder) is done. A `commit` fetches only the files git compares: the others in each folder that holds a change, or holds a folder that does. On VS Code, a first commit changing two files takes 2.3 s and fetches 0.5 MiB, and later ones take 0.2 s.
 
 `sandfs serve --mcp NAME` hands a saved workspace to an agent as MCP file tools instead of mounting it.
 

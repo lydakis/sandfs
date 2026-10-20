@@ -253,7 +253,7 @@ fn git_works_inside_a_remote_git_mount() {
 
     // A checkout on the remote's default branch, read without fetching file contents.
     let alternates = std::fs::read_to_string(work.join(".git/objects/info/alternates")).unwrap();
-    let cache = Path::new(alternates.trim_end()).parent().unwrap().to_path_buf();
+    let cache = Path::new(alternates.lines().next().unwrap()).parent().unwrap().to_path_buf();
     let unread = || {
         let missing = git_out(&cache, &["rev-list", "--objects", "--missing=print", "--all"]);
         ["README.md", "src/lib.rs"].map(|path| {
@@ -274,6 +274,13 @@ fn git_works_inside_a_remote_git_mount() {
     assert_eq!(git_out(&work, &["status", "--porcelain"]), " M README.md\n?? notes.txt\n");
     git_out(&work, &["add", "-A"]);
     git_out(&work, &["commit", "-q", "-m", "change"]);
+    // Committing compared the files of the folders it changed, and fetched no others,
+    // into sandfs's local copy rather than the workspace.
+    if cfg!(target_os = "linux") {
+        assert_eq!(unread(), [false, true], "src/lib.rs is still unread");
+    }
+    let fetched_here = std::fs::read_dir(work.join(".git/objects/pack")).unwrap().count();
+    assert_eq!(fetched_here, 0, "the workspace holds no fetched files");
     assert_eq!(git_out(&work, &["status", "--porcelain", "-b"]), "## main...origin/main [ahead 1]\n");
     assert_eq!(git_out(&work, &["log", "--format=%s"]), "change\nfirst\n");
     assert_eq!(sandfs.stdout(&["changes", "work"]), "M README.md\nA docs/scratch.tmp\nA notes.txt\n", "not .git");

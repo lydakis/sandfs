@@ -11,16 +11,16 @@
 //! writing to it, and tells git which files changed (`sandfs git-fsmonitor`), so git
 //! never has to read the rest.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey};
-use sandfs_git::GitSource;
+use sandfs_git::{GitSource, ObjectIds};
 
 use crate::persist::PathState;
 use crate::store::expand;
@@ -109,7 +109,8 @@ pub fn open(
 ) -> Result<(Arc<dyn Source>, Arc<dyn Source>)> {
     // Sizes let FUSE answer `stat` without reading whole files.
     let files = Arc::new(GitSource::open(repo, commit)?.with_sizes()?);
-    Ok((files, Arc::new(GitDir::new(repo, commit, branch, home)?)))
+    let dir = GitDir::new(repo, commit, branch, home, Some(Arc::clone(&files)))?;
+    Ok((files, Arc::new(dir)))
 }
 
 /// The `.git` folder of a git mount: a repository whose checkout is the mount itself.
@@ -129,6 +130,14 @@ pub fn open(
 /// keep git's cache of untracked files current, so it lists folders only once.
 /// Symbolic links and submodules, which a mount doesn't show, are marked as outside
 /// the checkout, so git doesn't take them for deleted.
+///
+/// Before every commit, git in a partial clone checks that it has the contents of every
+/// file the index lists, and fetches whichever it lacks: on a fresh mount, all of them.
+/// So the files the local copy lacks are also served here, as loose objects in
+/// [`OBJECTS`] that git finds by listing those folders, without reading them. Git then
+/// fetches nothing, and reads only what it needs: the other files of each folder a
+/// commit changes, which it compares. Those are fetched into the local copy like any
+/// file read, a whole folder at once from its second.
 #[derive(Debug)]
 pub struct GitDir {
     dirs: BTreeMap<String, Listing>,
@@ -140,7 +149,41 @@ pub struct GitDir {
     managed: bool,
     commit: String,
     index: OnceLock<std::result::Result<Bytes, String>>,
+    /// The files the local copy lacks, served as loose objects; only for a partial
+    /// clone of sandfs's own.
+    objects: Option<Objects>,
 }
+
+/// The folder of [`GitDir`] holding the files the local copy lacks, as loose objects in
+/// folders named for the first two digits of their ids, as git keeps them.
+const OBJECTS: &str = "sandfs-objects";
+
+/// The files [`GitDir`] serves from [`OBJECTS`].
+struct Objects {
+    source: Arc<GitSource>,
+    /// Which folder each missing file is in, found when git first reads one.
+    folders: OnceLock<Folders>,
+    /// How many files of each folder (an index into `Folders::trees`) git has read here.
+    reads: Mutex<HashMap<u32, u32>>,
+}
+
+impl std::fmt::Debug for Objects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Objects").field("source", &self.source).finish_non_exhaustive()
+    }
+}
+
+/// The folders of the files a commit's local copy lacked.
+#[derive(Default)]
+struct Folders {
+    /// The ids of the commit's folders.
+    trees: Vec<String>,
+    /// For each missing file, in the order of [`ObjectIds::index_of`], the index of its
+    /// folder in `trees`, or [`NO_FOLDER`].
+    of: Vec<u32>,
+}
+
+const NO_FOLDER: u32 = u32::MAX;
 
 /// The file of [`GitDir`] built when first read.
 const INDEX: &str = "index";
@@ -149,7 +192,16 @@ const INDEX: &str = "index";
 const TOUCHED: &str = ".git/sandfs-touched";
 
 impl GitDir {
-    pub fn new(repo: &Path, commit: &str, branch: Option<&str>, home: &Path) -> Result<Self> {
+    /// The `.git` folder for `commit` of `repo`, for workspaces kept in the home at
+    /// `home`. With `files`, the source of the commit's files, it serves the files the
+    /// local copy lacks (see [`GitDir`]).
+    pub fn new(
+        repo: &Path,
+        commit: &str,
+        branch: Option<&str>,
+        home: &Path,
+        files: Option<Arc<GitSource>>,
+    ) -> Result<Self> {
         let info = git(repo, &["rev-parse", "--git-common-dir", "--show-object-format"])?;
         let mut lines = info.lines();
         let common = repo.join(lines.next().context("git rev-parse printed nothing")?);
@@ -164,6 +216,12 @@ impl GitDir {
             Some(url) if promisor => url,
             _ => repo.to_str().context("non-UTF-8 repository path")?.to_owned(),
         };
+        let managed = repo.starts_with(home.join("repos"));
+        let objects = files.filter(|_| promisor && managed).map(|source| Objects {
+            source,
+            folders: OnceLock::new(),
+            reads: Mutex::default(),
+        });
 
         // Git runs the monitor with the environment of whoever runs git, which may not
         // name the same home.
@@ -174,11 +232,14 @@ impl GitDir {
             shell_quote(exe.to_str().context("non-UTF-8 path to the sandfs binary")?)
         );
         // Newer git turns its file monitor off on network and FUSE file systems, a
-        // mount among them, unless `fsmonitor.allowRemote` says otherwise.
+        // mount among them, unless `fsmonitor.allowRemote` says otherwise. And it starts
+        // a maintenance process after commits and fetches, to pack loose objects, which
+        // a workspace's few aren't worth.
         let mut config = format!(
             "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\
              \tfsmonitor = {}\n\tfsmonitorHookVersion = 2\n\tuntrackedCache = true\n\
              [fsmonitor]\n\tallowRemote = true\n\
+             [maintenance]\n\tauto = false\n\
              [remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
             config_value(&format!("{hook} git-fsmonitor")),
             config_value(&origin),
@@ -213,9 +274,11 @@ impl GitDir {
             None => files.push(("HEAD".into(), format!("{commit}\n").into())),
         }
         files.push(("config".into(), config.into()));
-        let objects = common.join("objects");
-        let objects = objects.to_str().context("non-UTF-8 repository path")?;
-        files.push(("objects/info/alternates".into(), format!("{objects}\n").into()));
+        let common_objects = common.join("objects");
+        let common_objects = common_objects.to_str().context("non-UTF-8 repository path")?;
+        // A relative alternate is found from the `objects` folder.
+        let lazy = if objects.is_some() { format!("../{OBJECTS}\n") } else { String::new() };
+        files.push(("objects/info/alternates".into(), format!("{common_objects}\n{lazy}").into()));
         // The commits the local copy has without their parents, this one among them.
         if let Ok(shallow) = std::fs::read(common.join("shallow")) {
             files.push(("shallow".into(), shallow.into()));
@@ -225,10 +288,14 @@ impl GitDir {
             dirs: BTreeMap::from([(String::new(), Listing::new())]),
             files: BTreeMap::new(),
             common,
-            managed: repo.starts_with(home.join("repos")),
+            managed,
             commit: commit.to_owned(),
             index: OnceLock::new(),
+            objects,
         };
+        if dir.objects.is_some() {
+            dirs.extend((0..=255).map(|first| format!("{OBJECTS}/{first:02x}")));
+        }
         dirs.sort();
         for path in &dirs {
             dir.add_dir(path);
@@ -317,6 +384,15 @@ impl GitDir {
                 run(&["update-index", "-z", "--skip-worktree", "--stdin"], Some(&links))?;
             }
             run(&["update-index", "-z", "--fsmonitor", "--fsmonitor-valid", "--stdin"], Some(&all))?;
+            // Marking entries also forgot the folder ids `read-tree` put in the index, so
+            // a commit would compare every file, fetching each the local copy lacks.
+            // Writing the commit's folders again finds them again without reading a file;
+            // the monitor's empty answer keeps every entry marked. It rewrites folders
+            // the local copy already has, so a repository of the user's own, which holds
+            // every file, is left alone.
+            if self.managed {
+                let _ = run(&["-c", "core.fsmonitor=printf 'sandfs\\0'", "write-tree", "--missing-ok"], None);
+            }
             Ok(Bytes::from(std::fs::read(&index).context("reading the built index")?))
         })();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -359,16 +435,131 @@ impl GitDir {
     }
 }
 
+impl GitDir {
+    /// The loose objects of [`OBJECTS`] whose ids start with the hex digits `first`.
+    fn list_objects(&self, objects: &Objects, first: &str) -> Option<Listing> {
+        let first = u8::from_str_radix(first, 16).ok().filter(|_| first.len() == 2)?;
+        let mut listing = Listing::new();
+        for id in objects.source.missing_files().into_iter().flat_map(|missing| missing.starting_with(first)) {
+            let key = format!("{OBJECTS}/{}/{}", &id[..2], &id[2..]);
+            listing.insert(
+                id[2..].to_owned(),
+                SourceEntry { kind: Kind::File { executable: false }, key: key.into(), size: None },
+            );
+        }
+        Some(listing)
+    }
+
+    /// The loose object of the missing file `id`.
+    fn read_object(&self, objects: &Objects, id: &str) -> sandfs_core::Result<Bytes> {
+        // Git reads a folder's files one after another when it compares them, so from the
+        // second, fetch the rest of the folder with it.
+        if let Some(missing) = objects.source.missing_files()
+            && let Some(index) = missing.index_of(id)
+        {
+            let folders = objects.folders.get_or_init(|| self.folders(objects.source.tree_id(), missing));
+            let tree = folders.of.get(index).copied().unwrap_or(NO_FOLDER);
+            let second = tree != NO_FOLDER
+                && objects.reads.lock().is_ok_and(|mut reads| {
+                    let count = reads.entry(tree).or_insert(0);
+                    *count += 1;
+                    *count == 2
+                });
+            if second {
+                objects.source.prefetch(&folders.trees[tree as usize], false);
+            }
+        }
+        Ok(loose_object("blob", &objects.source.read_file(id)?))
+    }
+
+    /// The folder of each of the `missing` files of the commit, whose tree is `root`.
+    fn folders(&self, root: &str, missing: &ObjectIds) -> Folders {
+        let mut folders = Folders { trees: vec![root.to_owned()], of: vec![NO_FOLDER; missing.len()] };
+        // Trees are local, so listing them fetches nothing; `-t` lists each folder before
+        // what is in it.
+        let child = Command::new("git")
+            .arg("-C")
+            .arg(&self.common)
+            .args(["ls-tree", "-r", "-t", "-z", "--full-tree", &self.commit])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { return folders };
+        let Some(stdout) = child.stdout.take() else { return folders };
+        let mut trees: HashMap<Vec<u8>, u32> = HashMap::from([(Vec::new(), 0)]);
+        // `<mode> <type> <id>\t<path>`
+        for record in BufReader::new(stdout).split(0).map_while(std::result::Result::ok) {
+            let Some(tab) = record.iter().position(|&b| b == b'\t') else { continue };
+            let (info, path) = (&record[..tab], &record[tab + 1..]);
+            let mut fields = info.split(|&b| b == b' ').skip(1);
+            let (Some(kind), Some(id)) = (fields.next(), fields.next().and_then(|id| std::str::from_utf8(id).ok()))
+            else {
+                continue;
+            };
+            if kind == b"tree" {
+                trees.insert(path.to_vec(), folders.trees.len() as u32);
+                folders.trees.push(id.to_owned());
+            } else if let Some(index) = missing.index_of(id) {
+                let parent = path.iter().rposition(|&b| b == b'/').map_or(&path[..0], |slash| &path[..slash]);
+                folders.of[index] = trees.get(parent).copied().unwrap_or(NO_FOLDER);
+            }
+        }
+        let _ = child.wait();
+        folders
+    }
+}
+
+/// `data` as a loose object of `kind`, as git keeps one in a file: `<kind> <length>\0`
+/// and the data, compressed with zlib. This stores them uncompressed, in zlib's stored
+/// blocks, which cost nothing to make; git reads them as it reads any.
+fn loose_object(kind: &str, data: &[u8]) -> Bytes {
+    let mut content = format!("{kind} {}\0", data.len()).into_bytes();
+    content.extend_from_slice(data);
+    let mut out = Vec::with_capacity(content.len() + content.len() / 65535 * 5 + 11);
+    out.extend_from_slice(&[0x78, 0x01]);
+    let mut blocks = content.chunks(65535).peekable();
+    while let Some(block) = blocks.next() {
+        let len = block.len() as u16;
+        out.push(u8::from(blocks.peek().is_none()));
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(block);
+    }
+    // Adler-32, summed in runs short enough that the sums can't overflow before `%`.
+    let (mut a, mut b) = (1u32, 0u32);
+    for run in content.chunks(5552) {
+        for &byte in run {
+            a += u32::from(byte);
+            b += a;
+        }
+        (a, b) = (a % 65521, b % 65521);
+    }
+    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    out.into()
+}
+
 impl Source for GitDir {
     fn root(&self) -> sandfs_core::Result<SourceKey> {
         Ok("".into())
     }
 
     fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+        if let Some(objects) = &self.objects
+            && let Some(first) = key.strip_prefix(OBJECTS).and_then(|k| k.strip_prefix('/'))
+            && let Some(listing) = self.list_objects(objects, first)
+        {
+            return Ok(listing);
+        }
         self.dirs.get(key).cloned().ok_or_else(|| sandfs_core::Error::Source(format!("no directory {key:?}")))
     }
 
     fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        if let Some(objects) = &self.objects
+            && let Some((first, rest)) =
+                key.strip_prefix(OBJECTS).and_then(|k| k.strip_prefix('/')).and_then(|k| k.split_once('/'))
+        {
+            return self.read_object(objects, &format!("{first}{rest}"));
+        }
         if key == INDEX {
             let built = self.index.get_or_init(|| self.build_index().map_err(|err| format!("{err:#}")));
             return built.clone().map_err(|err| sandfs_core::Error::Source(format!("building the git index: {err}")));
@@ -713,7 +904,7 @@ mod tests {
         };
         let before = shared();
 
-        let dir = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("home")).unwrap();
+        let dir = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("home"), None).unwrap();
         assert!(!dir.common.to_string_lossy().starts_with(r"\\?\"), "a path git can open");
         let index = dir.read_file(INDEX).unwrap();
         assert!(!index.windows(4).any(|w| w == b"link"), "the index stands alone, with no shared part");
@@ -870,7 +1061,7 @@ mod tests {
         }
 
         let home = tmp.path().to_path_buf();
-        let dir = GitDir::new(&repo, &commit, Some("main"), &home).unwrap();
+        let dir = GitDir::new(&repo, &commit, Some("main"), &home, None).unwrap();
         let read = |key: &str| String::from_utf8(dir.read_file(key).unwrap().to_vec()).unwrap();
         assert_eq!(read("HEAD"), "ref: refs/heads/main\n");
         assert_eq!(read("refs/heads/main"), format!("{commit}\n"));
@@ -886,7 +1077,7 @@ mod tests {
         assert!(config.contains("[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main"), "{config}");
         let names: Vec<String> = dir.read_dir("").unwrap().into_keys().collect();
         assert_eq!(names, ["HEAD", "config", "index", "objects", "refs", "shallow"]);
-        let detached = GitDir::new(&repo, &first, None, &home).unwrap();
+        let detached = GitDir::new(&repo, &first, None, &home, None).unwrap();
         assert_eq!(&detached.read_file("HEAD").unwrap()[..], format!("{first}\n").as_bytes());
         assert!(!String::from_utf8_lossy(&detached.read_file("config").unwrap()).contains("[branch"));
 
@@ -896,11 +1087,16 @@ mod tests {
         let rules = run(&remote, &["rev-parse", "HEAD:docs/.gitignore"]);
         assert!(missing().contains(&format!("?{rules}")), "nothing is fetched before the index is read");
         // A repository outside sandfs's copies, as `git:/path` mounts, is never fetched into.
-        let elsewhere = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("elsewhere")).unwrap();
+        let elsewhere = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("elsewhere"), None).unwrap();
         elsewhere.read_file("index").unwrap();
         assert!(missing().contains(&format!("?{rules}")), "a repository of the user's own is left alone");
         let index = tmp.path().join("index");
-        std::fs::write(&index, dir.read_file("index").unwrap()).unwrap();
+        let built = dir.read_file("index").unwrap();
+        // Each folder's id is recorded (`-1` marks one that isn't), so a commit compares
+        // only the files of the folders it changes.
+        let tree = built.windows(4).position(|w| w == b"TREE").expect("folder ids");
+        assert!(!built[tree..].windows(3).any(|w| w == b"\0-1"), "every folder id is known");
+        std::fs::write(&index, &built).unwrap();
         // Git runs a file monitor with `sh`, which Windows may not have.
         if cfg!(unix) {
             index_marks_files_unchanged(&repo, &index, tmp.path());
@@ -910,6 +1106,65 @@ mod tests {
         let absent =
             |path: &str| missing.contains(&format!("?{}", run(&remote, &["rev-parse", &format!("HEAD:{path}")])));
         assert!(!absent("docs/.gitignore") && absent("a.txt"), "{missing}");
+    }
+
+    #[test]
+    fn git_mounts_serve_the_files_the_local_copy_lacks() {
+        let tmp = tempfile::Builder::new().prefix("sandfs-git").tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        for folder in ["a", "b"] {
+            std::fs::create_dir_all(remote.join(folder)).unwrap();
+            for i in 0..3 {
+                std::fs::write(remote.join(format!("{folder}/{i}.txt")), format!("{folder}{i}")).unwrap();
+            }
+        }
+        // Larger than one of zlib's stored blocks, and empty.
+        std::fs::write(remote.join("a/big"), "x".repeat(200_000)).unwrap();
+        std::fs::write(remote.join("empty"), "").unwrap();
+        run(&remote, &["init", "-q", "-b", "main"]);
+        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        run(&remote, &["add", "-A"]);
+        run(&remote, &["commit", "-q", "-m", "first"]);
+        let url = format!("file://{}", remote.display());
+        let home = tmp.path().to_path_buf();
+        let (repo, commit) = resolve(&home.join("repos"), &url).unwrap();
+        let id = |path: &str| run(&remote, &["rev-parse", &format!("HEAD:{path}")]);
+        let missing = || run(&repo, &["rev-list", "--objects", "--missing=print", &commit]);
+        let absent = |path: &str| missing().contains(&format!("?{}", id(path)));
+
+        let source = Arc::new(GitSource::open(&repo, &commit).unwrap());
+        let dir = GitDir::new(&repo, &commit, Some("main"), &home, Some(source)).unwrap();
+        let alternates = String::from_utf8(dir.read_file("objects/info/alternates").unwrap().to_vec()).unwrap();
+        assert_eq!(alternates.lines().nth(1), Some("../sandfs-objects"), "{alternates}");
+        assert_eq!(dir.read_dir("sandfs-objects").unwrap().len(), 256);
+        let key = |path: &str| {
+            let id = id(path);
+            let listing = dir.read_dir(&format!("sandfs-objects/{}", &id[..2])).unwrap();
+            assert_eq!(listing[&id[2..]].size, None, "listed without being read");
+            listing[&id[2..]].key.clone()
+        };
+        assert!(absent("a/0.txt") && absent("b/0.txt"), "listing fetched nothing");
+
+        // Each read is a loose object git can read, of a file fetched into the local copy.
+        let objects = tmp.path().join("objects");
+        let check = |path: &str, contents: &str| {
+            let id = id(path);
+            std::fs::create_dir_all(objects.join(&id[..2])).unwrap();
+            std::fs::write(objects.join(&id[..2]).join(&id[2..]), dir.read_file(&key(path)).unwrap()).unwrap();
+            let checkout = tmp.path().join("checkout");
+            std::fs::create_dir_all(&checkout).unwrap();
+            run(&checkout, &["init", "-q"]);
+            let alternates = checkout.join(".git/objects/info/alternates");
+            std::fs::write(alternates, format!("{}\n", objects.display())).unwrap();
+            assert_eq!(run(&checkout, &["cat-file", "blob", &id]), contents.trim_end(), "{path}");
+        };
+        check("a/0.txt", "a0");
+        assert!(!absent("a/0.txt") && absent("a/1.txt"), "one file of the folder");
+        // The second file of a folder fetches the rest of it, but no other folder.
+        check("a/1.txt", "a1");
+        assert!(!absent("a/2.txt") && !absent("a/big") && absent("b/0.txt"));
+        check("a/big", &"x".repeat(200_000));
+        check("empty", "");
     }
 
     /// Check the index at `index` of `repo`, as [`GitDir`] builds it.
