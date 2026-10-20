@@ -924,8 +924,14 @@ impl Saved {
         Ok(())
     }
 
+    /// Whether a replaced object or pack is waiting for a later save to delete it.
+    pub fn deleting_later(&self) -> bool {
+        !self.doomed.is_empty() || self.packs.values().any(|pack| pack.unnamed)
+    }
+
     /// Flush to disk what the last save left unflushed: the objects its index names, and
-    /// the index. This is all an `fsync` has to do when nothing changed since that save.
+    /// the index. This is all an `fsync` has to do when nothing changed since that save
+    /// and nothing waits for it to be deleted ([`Saved::deleting_later`]).
     pub fn flush(&mut self) -> Result<()> {
         let objects = std::mem::take(&mut self.objects);
         let synced = self.sync_objects(&objects);

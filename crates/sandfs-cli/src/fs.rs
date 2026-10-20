@@ -1252,7 +1252,8 @@ impl Shared {
             // Nothing changed since the last save took its snapshot, and that save
             // succeeded (a failed one sets `unsaved` again): its index still holds.
             // Rewriting it would cost a pass over every change, at every `fsync` and fork.
-            if !inner.unsaved && !inner.writing {
+            // Replaced files still waiting to be deleted take a save, as before.
+            if !inner.unsaved && !inner.writing && !saved.deleting_later() {
                 drop(inner);
                 return if durable { saved.flush() } else { Ok(()) };
             }
@@ -1965,11 +1966,14 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let state = tempfile::tempdir().unwrap();
-        let saved = Saved::new(state.path());
+        let mut saved = Saved::new(state.path());
+        // One object per file, so the files on disk count the objects.
+        saved.pack_limit = None;
         let mut inner = fs();
         inner.drafts = Some(saved.drafts());
         let shared = Shared::new(inner, saved, VPath::parse("/mnt").unwrap());
         let index = state.path().join("changes.json");
+        let objects = || std::fs::read_dir(state.path().join("objects")).unwrap().count();
         let index_ino = || std::fs::metadata(&index).unwrap().ino();
         shared.save(true).unwrap();
         assert!(!index.exists(), "nothing to save yet");
@@ -1987,10 +1991,21 @@ mod tests {
         shared.lock().write(new, 0, b"new\n").unwrap();
         shared.save(true).unwrap();
         assert_ne!(index_ino(), saved_ino, "a change is saved");
+
+        // Writing a saved file again replaces its object, which a later save deletes,
+        // even with nothing else changed by then.
+        shared.lock().write(new, 0, b"NEW\n").unwrap();
+        shared.save(true).unwrap();
+        assert_eq!(objects(), 3, "the replaced object waits one save");
+        shared.save(true).unwrap();
+        assert_eq!(objects(), 2);
+        let saved_ino = index_ino();
+        shared.save(true).unwrap();
+        assert_eq!(index_ino(), saved_ino, "and then nothing is left to do");
         let mut restored = fs().ws;
         Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
         assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");
-        assert_eq!(restored.read_text("/mnt/new.md").unwrap(), "new\n");
+        assert_eq!(restored.read_text("/mnt/new.md").unwrap(), "NEW\n");
     }
 
     #[test]
