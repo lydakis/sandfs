@@ -115,18 +115,23 @@ fn ask(mut stream: UnixStream, request: &str) -> Result<Option<Reply>> {
 
 /// Start the background process and return its pid.
 ///
-/// The process serves every mount of the home, whoever asked for it, so it shares
-/// nothing with the command that happens to start it: it runs in a session of its own
-/// (no terminal, no process group to be signalled with), its parent exits at once so it
-/// is adopted by init or launchd, and it gets only the environment it needs. A job
-/// runner that ends a job by killing its process group, its descendants or every
-/// process carrying the job's environment marker then leaves the other jobs' mounts
-/// alone.
+/// The process serves every mount of the home, whoever asked for it, so it shares as
+/// little as it can with the command that happens to start it: it runs in a session of
+/// its own (no terminal, no process group to be signalled with), and its parent exits
+/// at once so it is adopted by init, launchd or the nearest subreaper. A job runner
+/// that ends a job by killing its process group or the job's process tree then leaves
+/// the other jobs' mounts alone. It keeps the caller's environment, which carries what
+/// git needs to fetch (credentials, proxies, helpers), except what points git at the
+/// caller's own repository.
 fn start(home: &Home) -> Result<Pid> {
     run_dir(home)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path(home))?;
     let mut command = Command::new(std::env::current_exe()?);
-    command.env_clear().envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(inherited)));
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(names_a_repository) {
+            command.env_remove(name);
+        }
+    }
     // glibc's allocator raises the size it maps directly once a large block is freed,
     // so after the first mount ends, each new mount's 16 MiB request buffer comes
     // zeroed from memory the process keeps, and a process outliving its mounts grew by
@@ -155,43 +160,31 @@ fn start(home: &Home) -> Result<Pid> {
     }
 }
 
-/// Whether the background process keeps the environment variable `name`: what git
-/// needs to reach a remote (where it is, how to connect and authenticate, its global
-/// settings), the locale, and sandfs's own settings. Anything else, such as a caller's
-/// `GIT_DIR` or a job's marker, would leak one caller's setup into every mount.
-fn inherited(name: &str) -> bool {
+/// Whether `name` is one of the variables git sets or reads to find the repository it
+/// works in (`git rev-parse --local-env-vars`, less the configuration ones), which a
+/// caller running inside a repository or a git hook may carry. Kept, they would send
+/// every later mount's git commands to that caller's repository.
+fn names_a_repository(name: &str) -> bool {
     const NAMES: &[&str] = &[
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "TMPDIR",
-        "TZ",
-        "LANG",
-        "LANGUAGE",
-        "SSH_AUTH_SOCK",
-        "SSH_ASKPASS",
-        "GIT_ASKPASS",
-        "GIT_EXEC_PATH",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "CURL_CA_BUNDLE",
-        "NO_PROXY",
-        "no_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_GRAFT_FILE",
+        "GIT_SHALLOW_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
     ];
-    const PREFIXES: &[&str] =
-        &["LC_", "XDG_", "GIT_SSH", "GIT_SSL_", "GIT_CONFIG", "GIT_TRACE", "SANDFS_", "RUST_", "MALLOC_"];
-    NAMES.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    NAMES.contains(&name)
 }
 
 /// Start the server in a session of its own, print its pid and return, leaving it to
-/// init or launchd: `sandfs daemon`, run by [`start`].
+/// init, launchd or the nearest subreaper: `sandfs daemon`, run by [`start`].
 pub fn detach() -> Result<()> {
     // Not a process group leader, since `start` gives this process none of its own,
     // so this cannot fail with EPERM.

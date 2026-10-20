@@ -270,12 +270,13 @@ fn the_mount_process_shares_nothing_with_whoever_started_it() {
     let mut sandfs = Sandfs::new();
     let dirs = tempfile::tempdir().unwrap();
     let work = dirs.path().join("work");
-    // Job runners find a job's processes by a marker in their environment, their
-    // process group, or their descent from the job; none of them may reach the process
-    // that serves every job's mounts.
+    // Job runners find a job's processes by their process group or their descent from
+    // the job; neither may reach the process that serves every job's mounts. It keeps
+    // what git needs to fetch, such as a token for a credential helper, but not a
+    // caller's repository.
     let output = Command::new(env!("CARGO_BIN_EXE_sandfs"))
         .env("SANDFS_HOME", sandfs.home.path())
-        .env("A_JOB_MARKER", "job-1")
+        .env("A_FETCH_TOKEN", "secret")
         .env("GIT_DIR", "/nonexistent")
         .args(["mount", data.path().to_str().unwrap(), work.to_str().unwrap()])
         .output()
@@ -287,7 +288,7 @@ fn the_mount_process_shares_nothing_with_whoever_started_it() {
     let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
     let names: Vec<&[u8]> = environ.split(|&b| b == 0).filter_map(|entry| entry.split(|&b| b == b'=').next()).collect();
     assert!(names.contains(&&b"SANDFS_HOME"[..]) && names.contains(&&b"PATH"[..]));
-    assert!(!names.contains(&&b"A_JOB_MARKER"[..]) && !names.contains(&&b"GIT_DIR"[..]));
+    assert!(names.contains(&&b"A_FETCH_TOKEN"[..]) && !names.contains(&&b"GIT_DIR"[..]));
 
     let me = std::process::id();
     let (_, my_group, my_session) = lineage(me);
