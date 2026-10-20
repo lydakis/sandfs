@@ -315,6 +315,8 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         "user.name=bench",
         "-c",
         "user.email=bench@example.com",
+        "-c",
+        "core.hooksPath=/dev/null",
         "commit",
         "-q",
         "--no-gpg-sign",
