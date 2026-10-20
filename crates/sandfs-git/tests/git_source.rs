@@ -234,12 +234,22 @@ fn a_tree_too_large_for_one_request_comes_in_the_background() {
     git(clone.path(), &["clone", "-q", "--bare", "--filter=blob:none", &url, "."]);
     assert_eq!(missing(clone.path()), 2500);
 
-    let source = GitSource::open(clone.path(), "HEAD").unwrap();
+    let source = GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap();
     let root = sandfs_core::Source::root(&source).unwrap();
+    // A folder first, then the whole tree, as a long walk asks: the folder's files are
+    // fetched once between them.
+    let d0 = sandfs_core::Source::read_dir(&source, &root).unwrap()["d0"].key.clone();
+    sandfs_core::Source::prefetch(&source, &d0, true);
     sandfs_core::Source::prefetch(&source, &root, true);
     let started = std::time::Instant::now();
     while missing(clone.path()) > 0 {
         assert!(started.elapsed() < std::time::Duration::from_secs(60), "the files never came");
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Listings know the sizes of what came, without reading the files.
+    let started = std::time::Instant::now();
+    while sandfs_core::Source::read_dir(&source, &d0).unwrap()["f0"].size.is_none() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "the sizes never showed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
