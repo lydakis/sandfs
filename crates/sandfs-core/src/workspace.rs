@@ -6,7 +6,7 @@
 //! exactly the change set. Base content is read through a cache shared by every fork,
 //! so a file fetched once is never fetched again.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -186,15 +186,16 @@ struct Walks {
     /// Directories a walk listed (listed inside a listed directory), and the one it
     /// started from, each with the directory the walk started at.
     starts: HashMap<VPath, VPath>,
-    /// What each walk, by its start, needed files in lately.
-    reading: HashMap<VPath, Reading>,
+    /// What each walk, by its start, needed files in lately; `None` for files needed by
+    /// path, outside any walk.
+    reading: HashMap<Option<VPath>, Reading>,
 }
 
-/// The directories a walk needed files in, with no pause longer than [`WALK_GAP`].
+/// The last directories a walk, or a program reading files by path, needed files in,
+/// with no pause longer than [`WALK_GAP`].
 struct Reading {
-    dirs: HashSet<VPath>,
-    /// The deepest directory holding them all.
-    below: VPath,
+    /// At most [`WALK_DIRS`], the latest last.
+    recent: VecDeque<VPath>,
     last: Instant,
 }
 
@@ -642,31 +643,29 @@ impl Workspace {
     }
 
     /// Before a base file's bytes are fetched: a walk reading the files it lists
-    /// (`grep -r`, a copy) has the source prefetch, once it has read two files in one
-    /// directory. A read outside a walk prefetches nothing.
+    /// (`grep -r`, a copy), or a program reading files by path one after another (a
+    /// build), has the source prefetch, once it has read two files in one directory.
+    /// A read after a pause, as a person's next look, prefetches nothing.
     fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<()> {
-        // With no walk at all, a read costs nothing more.
-        if self.walks.lock().expect("walks lock").starts.is_empty()
-            || self.cache.peek_blob(&(mount.id, key.clone())).is_some()
-        {
+        if self.cache.peek_blob(&(mount.id, key.clone())).is_some() {
             return Ok(());
         }
         let Some(parent) = path.parent() else { return Ok(()) };
         let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(()) };
         if self.touch(key, &parent, mount, &dir, true)? == Touch::Warmed {
-            self.prefetch_dir(&parent, mount, &dir)?;
+            self.prefetch_dir(mount, &dir);
         }
         Ok(())
     }
 
     /// Count the base file `file` of the directory `dir` at `path` as needing a fetch.
     /// One file says nothing about the rest; the second shows the directory is being
-    /// gone through. Reads count only inside a walk.
+    /// gone through. Outside a walk, a read shows it only when it follows the last
+    /// file needed without a pause.
     fn touch(&self, file: &SourceKey, path: &VPath, mount: &Arc<Mount>, dir: &SourceKey, read: bool) -> Result<Touch> {
         let start = self.walks.lock().expect("walks lock").starts.get(path).cloned();
-        if read && start.is_none() {
-            return Ok(Touch::Cold);
-        }
+        let walking = start.is_some();
+        let steady = self.walk_reads(start, path, mount)?;
         let first = self.cache.touched.lock().expect("cache lock").insert((mount.id, file.clone()));
         let count = {
             let mut touches = self.cache.touches.lock().expect("cache lock");
@@ -676,8 +675,8 @@ impl Workspace {
             }
             *count
         };
-        if let Some(start) = start {
-            self.walk_reads(start, path, mount)?;
+        if read && !walking && !steady {
+            return Ok(Touch::Cold);
         }
         Ok(match (count, first) {
             (0 | 1, _) => Touch::Cold,
@@ -686,52 +685,54 @@ impl Workspace {
         })
     }
 
-    /// Record that the walk from `start` needed a file in the directory at `path`. Once
-    /// it has needed files in [`WALK_DIRS`] directories without pausing, it is reading
-    /// through them (`grep -r`, a copy) rather than looking around, so everything below
-    /// the directory holding them all is prefetched, once.
-    fn walk_reads(&self, start: VPath, path: &VPath, mount: &Arc<Mount>) -> Result<()> {
+    /// Record that the walk from `start` (`None`: a program reading by path) needed a
+    /// file in the directory at `path`, and say whether it came without a pause after
+    /// the last one. Once it has needed files in [`WALK_DIRS`] directories in a row
+    /// without pausing, it is reading through them (`grep -r`, a copy, a build) rather
+    /// than looking around, so everything below the directory holding the last three
+    /// is prefetched, once. Following the latest ones, rather than all since the walk
+    /// began, asks for the part of a large tree it is in now, ahead of the rest.
+    fn walk_reads(&self, start: Option<VPath>, path: &VPath, mount: &Arc<Mount>) -> Result<bool> {
         let now = Instant::now();
-        let below = {
+        let (steady, below) = {
             let mut walks = self.walks.lock().expect("walks lock");
-            let reading = walks.reading.entry(start).or_insert_with(|| Reading {
-                dirs: HashSet::new(),
-                below: path.clone(),
-                last: now,
+            let mut steady = true;
+            let reading = walks.reading.entry(start).or_insert_with(|| {
+                steady = false;
+                Reading { recent: VecDeque::new(), last: now }
             });
             if now.duration_since(reading.last) > WALK_GAP {
-                reading.dirs.clear();
-                reading.below = path.clone();
+                steady = false;
+                reading.recent.clear();
             }
             reading.last = now;
-            if !reading.dirs.insert(path.clone()) {
-                return Ok(());
+            if reading.recent.contains(path) {
+                return Ok(steady);
             }
-            reading.below = common_ancestor(&reading.below, path);
-            (reading.dirs.len() >= WALK_DIRS).then(|| reading.below.clone())
+            reading.recent.push_back(path.clone());
+            if reading.recent.len() > WALK_DIRS {
+                reading.recent.pop_front();
+            }
+            let below = (reading.recent.len() == WALK_DIRS)
+                .then(|| reading.recent.iter().fold(path.clone(), |below, dir| common_ancestor(&below, dir)));
+            (steady, below)
         };
-        let Some(below) = below else { return Ok(()) };
+        let Some(below) = below else { return Ok(steady) };
         if let Some(key) = self.base_dir(&below, mount)? {
             if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, key.clone()), true)) {
                 mount.source.prefetch(&key, true);
             }
         }
-        Ok(())
+        Ok(steady)
     }
 
-    /// Ask the source to prefetch the files of the directory `dir` at `path`, once,
-    /// unless everything below one of its parents was prefetched already.
-    fn prefetch_dir(&self, path: &VPath, mount: &Arc<Mount>, dir: &SourceKey) -> Result<()> {
-        for ancestor in path.ancestors().iter().chain([path]) {
-            let Some(key) = self.base_dir(ancestor, mount)? else { continue };
-            if self.cache.prefetched.lock().expect("cache lock").contains(&((mount.id, key), true)) {
-                return Ok(());
-            }
-        }
+    /// Ask the source to prefetch the files of the directory `dir`, once.
+    /// It is asked even when everything below a parent was: a source may still be
+    /// fetching a large tree, and this asks for these files first.
+    fn prefetch_dir(&self, mount: &Arc<Mount>, dir: &SourceKey) {
         if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, dir.clone()), false)) {
             mount.source.prefetch(dir, false);
         }
-        Ok(())
     }
 
     /// The size of a base file already read.
@@ -755,7 +756,7 @@ impl Workspace {
         // Single-flight, like every other cache entry: forks asking at once prefetch once.
         let cache_key = (mount.id, dir.clone());
         let listing = Cache::get_or_load(&self.cache.sized, cache_key.clone(), || {
-            self.prefetch_dir(&parent, mount, &dir)?;
+            self.prefetch_dir(mount, &dir);
             let listing = Arc::new(mount.source.read_dir(&dir)?);
             self.cache.replace_listing(cache_key.clone(), listing.clone());
             Ok(listing)
