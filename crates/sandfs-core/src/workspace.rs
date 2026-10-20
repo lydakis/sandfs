@@ -689,14 +689,15 @@ impl Workspace {
         let walking = start.is_some();
         let steady = self.walk_reads(start, path, mount)?;
         // A read by path after a pause starts the directory's count again: it is a new
-        // look, and the file read right after it is the second.
+        // look, its file the first (even one fetched before, as ranged reads do), and the
+        // file read right after it the second.
         let fresh = read && !walking && !steady;
         let first = self.cache.touched.lock().expect("cache lock").insert((mount.id, file.clone()));
         let count = {
             let mut touches = self.cache.touches.lock().expect("cache lock");
             let count = touches.entry((mount.id, dir.clone())).or_default();
             if fresh {
-                *count = u32::from(first);
+                *count = 1;
             } else if first {
                 *count = count.saturating_add(1);
             }

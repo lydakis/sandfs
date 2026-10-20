@@ -258,6 +258,9 @@ fn looking_around_with_pauses_or_from_forks_prefetches_nothing_below() {
     let other = Arc::new(Remote::new(TREE));
     let by_path = mounted(&other);
     by_path.read("/data/s/x.txt").unwrap();
+    let pieces = Arc::new(Remote::new(TREE));
+    let in_pieces = mounted(&pieces);
+    in_pieces.read_range("/data/s/x.txt", 0, 1).unwrap();
     thread::sleep(Duration::from_millis(2100));
     ws.read_range("/data/d4/a.txt", 0, 1).unwrap();
     by_path.read("/data/s/y.txt").unwrap();
@@ -267,6 +270,11 @@ fn looking_around_with_pauses_or_from_forks_prefetches_nothing_below() {
     // the second.
     by_path.read("/data/s/z.txt").unwrap();
     assert_eq!(other.prefetches(), vec![("s".to_owned(), false)]);
+    // That holds when the read after the pause is of a file read before, in pieces.
+    in_pieces.read_range("/data/s/x.txt", 1, 1).unwrap();
+    assert_eq!(pieces.prefetches(), Vec::<(String, bool)>::new());
+    in_pieces.read_range("/data/s/y.txt", 0, 1).unwrap();
+    assert_eq!(pieces.prefetches(), vec![("s".to_owned(), false)]);
 }
 
 #[test]
