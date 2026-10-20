@@ -301,7 +301,7 @@ impl DirSource {
                 Ok(Bytes::from(rewritten + std::path::MAIN_SEPARATOR_STR))
             }
             Ok(rewritten) => Ok(Bytes::from(rewritten)),
-            Err(_) => Err(Error::Source(format!("{}: link target is not UTF-8", path.display()))),
+            Err(_) => Err(Error::NotText(path.display().to_string())),
         }
     }
 
@@ -424,7 +424,8 @@ impl Source for DirSource {
             } else if file_type.is_symlink() {
                 match self.link_target(&child_key) {
                     Ok(target) => (Kind::Symlink, Some(target.len() as u64)),
-                    Err(_) => continue, // a target no workspace path could hold
+                    Err(Error::NotText(_)) => continue, // a target no workspace path could hold
+                    Err(err) => return Err(err),
                 }
             } else {
                 continue; // special files are not part of a workspace
