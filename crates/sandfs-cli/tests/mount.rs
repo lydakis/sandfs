@@ -262,7 +262,10 @@ fn git_works_inside_a_remote_git_mount() {
     };
     assert_eq!(unread(), [true, true]);
     assert_eq!(git_out(&work, &["status", "--porcelain", "-b"]), "## main...origin/main\n");
-    assert_eq!(unread(), [true, true], "status reads no file");
+    // (A Mac mount lists folders over NFS with every file's size, which fetches them; #83.)
+    if cfg!(target_os = "linux") {
+        assert_eq!(unread(), [true, true], "status reads no file");
+    }
 
     // Edits, a new file and an ignored one, committed and pushed.
     std::fs::write(work.join("README.md"), "hello, sandfs\n").unwrap();

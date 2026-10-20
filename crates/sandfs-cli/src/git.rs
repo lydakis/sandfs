@@ -149,6 +149,7 @@ impl GitDir {
         let mut lines = info.lines();
         let common = repo.join(lines.next().context("git rev-parse printed nothing")?);
         let common = common.canonicalize().with_context(|| format!("no repository at {}", common.display()))?;
+        let common = without_verbatim_prefix(common);
         let format = lines.next().unwrap_or("sha1");
         let get = |key: &str| git(&common, &["config", "--get", key]).ok();
         // A partial clone (every remote's local copy) borrows its origin; a local
@@ -420,6 +421,16 @@ fn config_value(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
 }
 
+/// `path` without the `\\?\` that canonical Windows paths start with, which git can't
+/// open as a repository.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str() {
+        Some(s) if s.starts_with(r"\\?\UNC\") => PathBuf::from(format!(r"\\{}", &s[8..])),
+        Some(s) if s.starts_with(r"\\?\") => PathBuf::from(&s[4..]),
+        _ => path,
+    }
+}
+
 /// `word` quoted for `sh`, which runs git's file monitor.
 fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
@@ -656,6 +667,10 @@ mod tests {
         assert_eq!(split(r"file://C:\src\repo@v1"), (r"file://C:\src\repo".into(), Some("v1".into())));
         assert_eq!(split("/srv/repo@main@{2.days.ago}"), ("/srv/repo".into(), Some("main@{2.days.ago}".into())));
         assert!(resolve(Path::new("/nonexistent"), "repo@").is_err());
+        let plain = |path: &str| without_verbatim_prefix(path.into());
+        assert_eq!(plain(r"\\?\C:\src\repo"), PathBuf::from(r"C:\src\repo"));
+        assert_eq!(plain(r"\\?\UNC\host\share\repo"), PathBuf::from(r"\\host\share\repo"));
+        assert_eq!(plain("/srv/repo"), PathBuf::from("/srv/repo"));
     }
 
     #[test]
@@ -688,6 +703,7 @@ mod tests {
         let before = shared();
 
         let dir = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("home")).unwrap();
+        assert!(!dir.common.to_string_lossy().starts_with(r"\\?\"), "a path git can open");
         let index = dir.read_file(INDEX).unwrap();
         assert!(!index.windows(4).any(|w| w == b"link"), "the index stands alone, with no shared part");
         assert_eq!(shared(), before, "nothing written into the repository");
