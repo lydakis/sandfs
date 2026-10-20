@@ -598,7 +598,8 @@ fn dir_source_lists_symlinks_without_following_them() {
     assert_eq!(ws.read_link("/host/lib/escaped").unwrap(), escaped.to_str().unwrap());
     let dangling = base.canonicalize().unwrap().join("missing/../outside/secret");
     assert_eq!(ws.read_link("/host/lib/dangling").unwrap(), dangling.to_str().unwrap());
-    assert_eq!(ws.read_link("/host/lib/dangling-in").unwrap(), "missing/../../data.csv");
+    let dangling_in = root.canonicalize().unwrap().join("lib/missing/../../data.csv");
+    assert_eq!(ws.read_link("/host/lib/dangling-in").unwrap(), dangling_in.to_str().unwrap(), "anchored to the host");
     assert_eq!(ws.read_link("/host/lib/data.csv").unwrap(), "../data.csv");
     assert_eq!(ws.read_link("/host/lib/x-abs").unwrap(), "x", "a target that doesn't exist yet");
     assert_eq!(ws.read_link("/host/lib/top").unwrap(), "..");

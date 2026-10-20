@@ -665,6 +665,8 @@ impl Inner {
         match self.ws.stat(path.as_str()) {
             Ok(_) if exclusive => return Err(Errno::EEXIST),
             Ok(meta) if meta.kind.is_dir() => return Err(Errno::EISDIR),
+            // Emptying a link would empty what it points to, which sandfs never follows.
+            Ok(meta) if truncate && meta.kind == Kind::Symlink => return Err(Errno::ELOOP),
             Ok(_) => {
                 if truncate {
                     let ino = self.ino_for(&path);
@@ -1581,6 +1583,8 @@ mod tests {
         for size in [0, 3] {
             assert_eq!(fs.setattr(link, None, Some(size), None).unwrap_err(), Errno::EINVAL);
         }
+        assert_eq!(fs.create(ROOT_INO, name("link"), 0o644, false, true).unwrap_err(), Errno::ELOOP);
+        assert_eq!(fs.create(ROOT_INO, name("link"), 0o644, false, false).unwrap().ino.0, link);
         assert_eq!(fs.readlink(link).unwrap(), "README.md");
         assert!(fs.buffers.is_empty());
 

@@ -264,11 +264,18 @@ impl DirSource {
         let path = self.host_path(key);
         let target = std::fs::read_link(&path).map_err(io_error)?;
         let reached = resolve(&path.parent().unwrap_or(&self.root).join(&target));
-        let target = match reached.strip_prefix(&self.root) {
-            Ok(inside) => relative_link(Path::new(key).parent().unwrap_or(Path::new("")), inside),
+        // A `..` left over follows a folder that isn't there, so the link dangles on the
+        // host. Made relative, it would come alive once the folder is made in the
+        // workspace, and could then climb out of the mount; it stays a host path instead.
+        let inside = reached
+            .strip_prefix(&self.root)
+            .ok()
+            .filter(|inside| inside.components().all(|part| part != Component::ParentDir));
+        let target = match inside {
+            Some(inside) => relative_link(Path::new(key).parent().unwrap_or(Path::new("")), inside),
             // Rooted, even without a drive on Windows: the same path from anywhere.
-            Err(_) if target.has_root() => target,
-            Err(_) => reached,
+            None if target.has_root() => target,
+            None => reached,
         };
         match target.into_os_string().into_string() {
             Ok(target) => Ok(Bytes::from(target)),
