@@ -266,8 +266,9 @@ impl DirSource {
         let reached = resolve(&path.parent().unwrap_or(&self.root).join(&target));
         let target = match reached.strip_prefix(&self.root) {
             Ok(inside) => relative_link(Path::new(key).parent().unwrap_or(Path::new("")), inside),
-            Err(_) if target.is_relative() => reached,
-            Err(_) => target,
+            // Rooted, even without a drive on Windows: the same path from anywhere.
+            Err(_) if target.has_root() => target,
+            Err(_) => reached,
         };
         match target.into_os_string().into_string() {
             Ok(target) => Ok(Bytes::from(target)),
