@@ -241,6 +241,7 @@ fn git_works_inside_a_remote_git_mount() {
     std::fs::write(remote.join("README.md"), "hello\n").unwrap();
     std::fs::write(remote.join("src/lib.rs"), "fn one() {}\n").unwrap();
     std::fs::write(remote.join("docs/.gitignore"), "*.tmp\n").unwrap();
+    std::fs::write(remote.join("LICENSE"), "free\n").unwrap();
     git(remote, &["add", "-A"]);
     git(remote, &["commit", "-q", "-m", "first"]);
 
@@ -284,6 +285,14 @@ fn git_works_inside_a_remote_git_mount() {
     std::fs::write(work.join("src/lib.rs"), "fn one() {}\n").unwrap();
     assert_eq!(git_out(&work, &["status", "--porcelain"]), "MM src/lib.rs\n");
     git_out(&work, &["reset", "-q"]);
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), "");
+
+    // A folder in place of a file git never saw change still shows the file deleted.
+    std::fs::remove_file(work.join("LICENSE")).unwrap();
+    std::fs::create_dir(work.join("LICENSE")).unwrap();
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), " D LICENSE\n");
+    std::fs::remove_dir(work.join("LICENSE")).unwrap();
+    std::fs::write(work.join("LICENSE"), "free\n").unwrap();
     assert_eq!(git_out(&work, &["status", "--porcelain"]), "");
 
     // A fork carries the commits and branches made so far, and goes its own way.

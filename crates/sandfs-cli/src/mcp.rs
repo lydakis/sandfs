@@ -15,7 +15,7 @@ use sandfs_mcp::Server;
 use serde_json::{Value, json};
 
 use crate::persist::{NotDurable, Restored, Snapshot};
-use crate::store::{Home, ROOT, subtree_keys};
+use crate::store::{Base, Home, ROOT, subtree_keys};
 
 /// Serve `name` over stdin and stdout until the client closes stdin.
 pub fn serve(home: &Home, name: &str) -> Result<()> {
@@ -29,6 +29,7 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
     let _writer = home.lock(name, &format!("an MCP session (process {})", std::process::id()))?;
     let opened = home.open(name)?;
     let root = VPath::parse(ROOT)?;
+    let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| root.join(".git")).transpose()?;
     let (mut saved, Restored { mut times, mut dirs }) = (opened.saved, opened.restored);
     saved.collect_garbage();
     let mut server = Server::new(opened.ws);
@@ -55,12 +56,15 @@ fn serve_on(home: &Home, name: &str, input: impl BufRead, mut output: impl Write
             .flat_map(VPath::ancestors)
             .filter(|p| below_root(p) && !server.workspace().exists(p.as_str()))
             .collect();
-        // Only changes inside the source's mount can be saved, so refuse the rest.
-        let reply = match touched.iter().find(|path| !path.starts_with(&root) || **path == root) {
-            Some(outside) => {
-                tool_error(&request, &format!("{outside} is outside {ROOT}; only files under {ROOT} are kept"))
-            }
-            None => server.handle(&line),
+        // Only changes inside the source's mount can be saved, so refuse the rest. A git
+        // mount's `.git` is git's to write: its config names commands git runs.
+        let reply = if let Some(outside) = touched.iter().find(|path| !path.starts_with(&root) || **path == root) {
+            tool_error(&request, &format!("{outside} is outside {ROOT}; only files under {ROOT} are kept"))
+        } else if let Some(git) = touched.iter().find(|path| git_dir.as_ref().is_some_and(|dir| path.starts_with(dir)))
+        {
+            tool_error(&request, &format!("{git} is in the git folder, which only git changes"))
+        } else {
+            server.handle(&line)
         };
         if reply.as_deref().is_some_and(succeeded) {
             // Changes reports files only, so record the directories a call may have
@@ -212,6 +216,42 @@ mod tests {
         let mut output = Vec::new();
         serve_on(home, "ws", input.as_bytes(), &mut output).unwrap();
         String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn an_agent_cannot_change_a_git_mounts_git_folder() {
+        let (state, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(data.path()).args(args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(data.path().join("a.txt"), "a\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "a"]);
+        let home = Home::at(state.path());
+        home.create("ws", &home.resolve(&format!("git:{}", data.path().display())).unwrap()).unwrap();
+
+        let input = [
+            call(
+                1,
+                "edit",
+                json!({ "path": "/mnt/.git/config", "old": "[core]", "new": "[core]\n\tfsmonitor = evil" }),
+            ),
+            call(2, "write", json!({ "path": "/mnt/.git/hooks/pre-commit", "content": "evil" })),
+            call(3, "move", json!({ "from": "/mnt/a.txt", "to": "/mnt/.git/a.txt" })),
+            call(4, "write", json!({ "path": "/mnt/b.txt", "content": "b" })),
+        ]
+        .concat();
+        let replies = session(&home, &input);
+        for reply in &replies[..3] {
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(reply["result"]["content"][0]["text"].as_str().unwrap().contains("the git folder"), "{reply}");
+        }
+        assert_eq!(replies[3]["result"]["isError"], false);
+        let ws = home.open("ws").unwrap().ws;
+        assert!(!ws.read_text("/mnt/.git/config").unwrap().contains("evil"));
+        assert!(!ws.exists("/mnt/.git/hooks/pre-commit") && ws.exists("/mnt/a.txt") && ws.exists("/mnt/b.txt"));
     }
 
     #[test]

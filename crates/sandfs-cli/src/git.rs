@@ -263,6 +263,7 @@ impl GitDir {
         let _ = std::fs::remove_dir_all(&tmp);
         // Marking entries needs a checkout to run in, though it looks at no files.
         std::fs::create_dir_all(tmp.join("checkout")).context("creating a temporary folder")?;
+        std::fs::create_dir_all(tmp.join("hooks")).context("creating a temporary folder")?;
         let built = (|| {
             let index = tmp.join(INDEX);
             let common = self.common.as_path();
@@ -274,6 +275,12 @@ impl GitDir {
                     .arg(tmp.join("checkout"))
                     // A failing monitor (`exit 1`): git asks none while marking entries.
                     .args(["-c", "core.fsmonitor=exit 1", "-c", "core.fsmonitorHookVersion=2"])
+                    // The repository's own settings must not change the index or run its
+                    // hooks: a split or sparse index would point at files the mount lacks.
+                    .args(["-c", "core.splitIndex=false", "-c", "index.sparse=false"])
+                    .args(["-c", "core.sparseCheckout=false"])
+                    .arg("-c")
+                    .arg(format!("core.hooksPath={}", tmp.join("hooks").display()))
                     .args(args)
                     .env("GIT_INDEX_FILE", &index)
                     .env("GIT_TERMINAL_PROMPT", "0");
@@ -380,11 +387,11 @@ pub fn fsmonitor(saved: &[(String, PathState)], version: &str) -> Result<()> {
         if path == ".git" || path.starts_with(".git/") {
             continue;
         }
-        // A trailing slash stands for everything below a directory.
+        // A trailing slash stands for everything below a directory. A directory may
+        // have replaced a file of the same name, which git checks only by the bare path.
         match state {
             PathState::File => current.push(path.clone()),
-            PathState::Dir => current.push(format!("{path}/")),
-            PathState::Absent => current.extend([path.clone(), format!("{path}/")]),
+            PathState::Dir | PathState::Absent => current.extend([path.clone(), format!("{path}/")]),
         }
     }
     touched.extend(current.iter().map(|path| path.as_bytes()));
@@ -649,6 +656,42 @@ mod tests {
         assert_eq!(split(r"file://C:\src\repo@v1"), (r"file://C:\src\repo".into(), Some("v1".into())));
         assert_eq!(split("/srv/repo@main@{2.days.ago}"), ("/srv/repo".into(), Some("main@{2.days.ago}".into())));
         assert!(resolve(Path::new("/nonexistent"), "repo@").is_err());
+    }
+
+    #[test]
+    fn building_the_index_leaves_a_local_repository_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-q", "-m", "a"]);
+        let commit = run(&repo, &["rev-parse", "HEAD"]);
+        // Settings of the repository's own that would otherwise apply to the build.
+        run(&repo, &["config", "core.splitIndex", "true"]);
+        let marker = tmp.path().join("hook-ran");
+        std::fs::write(repo.join(".git/hooks/post-index-change"), format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let hook = repo.join(".git/hooks/post-index-change");
+            std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shared = || {
+            std::fs::read_dir(repo.join(".git"))
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("sharedindex."))
+        };
+        let before = shared();
+
+        let dir = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("home")).unwrap();
+        let index = dir.read_file(INDEX).unwrap();
+        assert!(!index.windows(4).any(|w| w == b"link"), "the index stands alone, with no shared part");
+        assert_eq!(shared(), before, "nothing written into the repository");
+        assert!(!marker.exists(), "the repository's hooks don't run");
     }
 
     /// Run git in `dir` for a test, with an identity for commits.
