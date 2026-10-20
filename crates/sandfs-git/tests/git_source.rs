@@ -213,9 +213,8 @@ fn a_walk_fetches_only_once_it_reads() {
     assert_eq!(missing(clone.path()), before - root_blobs - 1);
 }
 
-#[test]
-fn a_tree_too_large_for_one_request_comes_in_the_background() {
-    // 2,500 files in five folders, more than one request fetches.
+/// A blobless clone missing 2,500 files in five folders, more than one request fetches.
+fn clone_with_many_files() -> (tempfile::TempDir, tempfile::TempDir) {
     let origin = tempfile::tempdir().unwrap();
     git(origin.path(), &["init", "-q"]);
     for folder in 0..5 {
@@ -233,23 +232,49 @@ fn a_tree_too_large_for_one_request_comes_in_the_background() {
     let url = format!("file://{}", origin.path().display());
     git(clone.path(), &["clone", "-q", "--bare", "--filter=blob:none", &url, "."]);
     assert_eq!(missing(clone.path()), 2500);
+    (origin, clone)
+}
+
+#[test]
+fn a_tree_too_large_for_one_request_comes_in_the_background() {
+    let (_origin, clone) = clone_with_many_files();
 
     let source = GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap();
     let root = sandfs_core::Source::root(&source).unwrap();
-    // A folder first, then the whole tree, as a long walk asks: the folder's files are
-    // fetched once between them.
+    // A folder first, then the whole tree, as a long walk asks.
     let d0 = sandfs_core::Source::read_dir(&source, &root).unwrap()["d0"].key.clone();
     sandfs_core::Source::prefetch(&source, &d0, true);
+    assert_eq!(missing(clone.path()), 2000);
+    let f0 = sandfs_core::Source::read_dir(&source, &d0).unwrap()["f0"].key.clone();
     sandfs_core::Source::prefetch(&source, &root, true);
+    // Requests go on while reads do; this reader rereads a file that is here already.
     let started = std::time::Instant::now();
     while missing(clone.path()) > 0 {
         assert!(started.elapsed() < std::time::Duration::from_secs(60), "the files never came");
+        sandfs_core::Source::read_file(&source, &f0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     // Listings know the sizes of what came, without reading the files.
+    let d4 = sandfs_core::Source::read_dir(&source, &root).unwrap()["d4"].key.clone();
     let started = std::time::Instant::now();
-    while sandfs_core::Source::read_dir(&source, &d0).unwrap()["f0"].size.is_none() {
+    while sandfs_core::Source::read_dir(&source, &d4).unwrap()["f0"].size.is_none() {
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "the sizes never showed");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+#[test]
+fn a_background_fetch_stops_once_reads_do() {
+    let (_origin, clone) = clone_with_many_files();
+    let source = GitSource::open(clone.path(), "HEAD").unwrap();
+    let root = sandfs_core::Source::root(&source).unwrap();
+    sandfs_core::Source::prefetch(&source, &root, true);
+    // The first request goes; nothing reads, so no other follows.
+    let started = std::time::Instant::now();
+    while missing(clone.path()) > 1500 {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the first request never came");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    assert_eq!(missing(clone.path()), 1500);
 }
