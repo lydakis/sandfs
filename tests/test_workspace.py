@@ -153,6 +153,21 @@ def test_symlinks_are_written_to_the_overlay() -> None:
         ws.read_link("/env/lib/site.py")
 
 
+def test_hard_links_share_one_file() -> None:
+    ws = Workspace()
+    ws.mount("/build", MemorySource({"out.o": "v1"}))
+
+    ws.hard_link("/build/out.o", "/build/cache/out.o")
+    ws.write("/build/cache/out.o", "v2")
+
+    assert ws.read_text("/build/out.o") == "v2"
+    assert ws.hard_links("/build/out.o") == ["/build/cache/out.o", "/build/out.o"]
+    ws.remove("/build/out.o")
+    assert ws.hard_links("/build/cache/out.o") == ["/build/cache/out.o"]
+    with pytest.raises(IsADirectoryError):
+        ws.hard_link("/build/cache", "/build/cache2")
+
+
 def test_python_sources_can_list_symlinks() -> None:
     class Links:
         def list(self, path: str) -> Iterable[DirEntry]:

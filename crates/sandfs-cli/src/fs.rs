@@ -385,6 +385,12 @@ impl Inner {
         if let Some(&ino) = self.inos.get(path.as_str()) {
             return ino;
         }
+        // Every name of a hard-linked file is one inode, so the kernel caches its
+        // pages once and a write through one name is read through the others.
+        if let Some(ino) = self.linked_ino(path) {
+            self.inos.insert(path.to_string(), ino);
+            return ino;
+        }
         let ino = self.next_ino;
         self.next_ino += 1;
         self.inos.insert(path.to_string(), ino);
@@ -393,6 +399,25 @@ impl Inner {
             Node { path: path.clone(), lookups: 0, linked: true, sized: Cell::new(false), removed_from: None },
         );
         ino
+    }
+
+    /// The inode another name of the file at `path` already has.
+    fn linked_ino(&self, path: &VPath) -> Option<u64> {
+        if !self.ws.has_hard_links() {
+            return None;
+        }
+        let names = self.ws.hard_links(path.as_str()).ok()?;
+        names.iter().find_map(|name| self.inos.get(name.as_str()).copied())
+    }
+
+    /// The other names of the file at `path`, if it has any.
+    fn other_names(&self, path: &VPath) -> Vec<VPath> {
+        if !self.ws.has_hard_links() {
+            return Vec::new();
+        }
+        let mut names = self.ws.hard_links(path.as_str()).unwrap_or_default();
+        names.retain(|name| name != path);
+        names
     }
 
     /// Reply data for a name the kernel will now hold: counts as one lookup.
@@ -431,7 +456,11 @@ impl Inner {
         };
         let (kind, perm) = file_type(meta.kind);
         let mtime = self.times.get(path).copied().unwrap_or(self.base_time);
-        Ok(self.make_attr(ino, kind, perm, size, mtime))
+        let mut attr = self.make_attr(ino, kind, perm, size, mtime);
+        if kind != FileType::Directory && self.ws.has_hard_links() {
+            attr.nlink = self.ws.hard_links(path).map_or(1, |names| names.len() as u32);
+        }
+        Ok(attr)
     }
 
     /// Attributes for a file whose size isn't known without reading it: size 0, for
@@ -493,10 +522,13 @@ impl Inner {
     fn maybe_drop(&mut self, ino: u64) {
         let unused = self.nodes.get(&ino).is_some_and(|node| node.lookups == 0) && !self.is_open(ino);
         if unused && ino != ROOT_INO {
-            if let Some(node) = self.nodes.remove(&ino)
-                && self.inos.get(node.path.as_str()) == Some(&ino)
-            {
-                self.inos.remove(node.path.as_str());
+            if let Some(node) = self.nodes.remove(&ino) {
+                let others = if node.linked { self.other_names(&node.path) } else { Vec::new() };
+                for name in others.iter().chain([&node.path]) {
+                    if self.inos.get(name.as_str()) == Some(&ino) {
+                        self.inos.remove(name.as_str());
+                    }
+                }
             }
             self.buffers.remove(&ino);
         }
@@ -505,8 +537,19 @@ impl Inner {
     /// Mark the inode at `path` as removed. A removed file keeps `before`, the
     /// workspace from before the removal, until the kernel forgets it, so reads and
     /// writes through handles still open on it keep working. Forking is O(1).
-    fn unlink_path(&mut self, path: &VPath, before: Option<Workspace>) {
+    ///
+    /// `others` are the file's other names (hard links), which keep the inode alive.
+    fn unlink_path(&mut self, path: &VPath, before: Option<Workspace>, others: &[VPath]) {
         let Some(ino) = self.inos.remove(path.as_str()) else { return };
+        if let Some(other) = others.first() {
+            if let Some(node) = self.nodes.get_mut(&ino)
+                && node.path == *path
+            {
+                node.path = other.clone();
+            }
+            self.inos.entry(other.to_string()).or_insert(ino);
+            return;
+        }
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.linked = false;
             node.removed_from = before.filter(|_| self.keep_removed);
@@ -616,14 +659,25 @@ impl Inner {
         })
     }
 
+    /// link(2): a second name for the file at `ino`, which stays one inode.
+    pub fn link(&mut self, ino: u64, new_parent: u64, new_name: &OsStr) -> FsResult<FileAttr> {
+        let from = self.path(ino)?;
+        let to = self.child(new_parent, new_name)?;
+        self.ws.hard_link(from.as_str(), to.as_str()).fs()?;
+        self.inos.insert(to.to_string(), ino);
+        self.touch(&to);
+        self.entry(&to)
+    }
+
     pub fn unlink(&mut self, parent: u64, name: &OsStr) -> FsResult<()> {
         let path = self.child(parent, name)?;
         if self.ws.stat(path.as_str()).fs()?.kind.is_dir() {
             return Err(Errno::EISDIR);
         }
         let before = self.ws.fork();
+        let others = self.other_names(&path);
         self.ws.remove(path.as_str(), false).fs()?;
-        self.unlink_path(&path, Some(before));
+        self.unlink_path(&path, Some(before), &others);
         self.times.remove(path.as_str());
         self.touch_parent(&path);
         Ok(())
@@ -635,7 +689,7 @@ impl Inner {
             return Err(Errno::ENOTDIR);
         }
         self.ws.remove(path.as_str(), false).fs()?;
-        self.unlink_path(&path, None);
+        self.unlink_path(&path, None, &[]);
         self.times.remove(path.as_str());
         self.dirs.insert(path.to_string());
         self.touch_parent(&path);
@@ -675,6 +729,10 @@ impl Inner {
                 if rename_noreplace(flags) {
                     return Err(Errno::EEXIST);
                 }
+                // Two names of one file: rename(2) leaves both.
+                if !moving_dir && self.other_names(&to).contains(&from) {
+                    return Ok(());
+                }
                 match (moving_dir, meta.kind.is_dir()) {
                     (true, false) => return Err(Errno::ENOTDIR),
                     (false, true) => return Err(Errno::EISDIR),
@@ -687,13 +745,14 @@ impl Inner {
         };
         // Work on a fork so a failure halfway leaves the workspace as it was.
         let mut next = self.ws.fork();
+        let others = if replacing && !moving_dir { self.other_names(&to) } else { Vec::new() };
         if replacing {
             next.remove(to.as_str(), true).fs()?;
         }
         next.rename(from.as_str(), to.as_str()).fs()?;
         if replacing {
             let before = (!moving_dir).then(|| self.ws.fork());
-            self.unlink_path(&to, before);
+            self.unlink_path(&to, before, &others);
             self.times.remove(to.as_str());
         }
         self.ws = next;
@@ -1233,6 +1292,11 @@ impl Filesystem for SandFs {
             Ok(target) => reply.data(target.as_bytes()),
             Err(err) => reply.error(err),
         }
+    }
+
+    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+        let result = self.0.lock().link(ino.0, newparent.0, newname);
+        self.reply_entry(reply, result);
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1797,6 +1861,32 @@ mod tests {
         let link = fs.lookup(ROOT_INO, name("link")).unwrap().ino.0;
         assert_eq!(fs.setattr(link, None, Some(0), None).unwrap_err(), Errno::EIO);
         assert!(fs.buffers.is_empty());
+    }
+
+    #[test]
+    fn hard_links_are_one_inode_until_the_last_name_goes() {
+        let mut fs = fs();
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let attr = fs.link(readme, src, name("readme")).unwrap();
+        assert_eq!((attr.ino.0, attr.nlink), (readme, 2));
+        assert_eq!(fs.lookup(src, name("readme")).unwrap().ino.0, readme);
+
+        fs.write(readme, 0, b"HELLO").unwrap();
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read_text("/mnt/src/readme").unwrap(), "HELLO\n");
+
+        // Renaming one name onto the other changes nothing.
+        fs.rename(ROOT_INO, name("README.md"), src, name("readme"), RenameFlags::empty()).unwrap();
+        assert_eq!(fs.attr(readme).unwrap().nlink, 2);
+
+        // The first name goes; the inode lives on under the second.
+        fs.unlink(ROOT_INO, name("README.md")).unwrap();
+        let attr = fs.attr(readme).unwrap();
+        assert_eq!((attr.nlink, attr.size), (1, 6));
+        assert_eq!(fs.read(readme, 0, 100).unwrap(), "HELLO\n");
+        assert_eq!(fs.lookup(src, name("readme")).unwrap().ino.0, readme);
+        assert!(matches!(fs.link(src, ROOT_INO, name("dir")), Err(Errno::EISDIR)));
     }
 
     #[test]
