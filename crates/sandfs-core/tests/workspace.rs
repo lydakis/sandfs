@@ -404,6 +404,51 @@ fn two_attempts_from_one_checkpoint_compare_without_reading_the_source() {
     assert_eq!(source.reads(), before, "only what the attempts wrote is compared");
 }
 
+/// One file of [`COMPARE_LIMIT`] bytes, zeros but the last, read only in ranges.
+#[derive(Debug)]
+struct Large {
+    last: u8,
+}
+
+impl Source for Large {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        Ok("".into())
+    }
+
+    fn read_dir(&self, _key: &str) -> sandfs_core::Result<Listing> {
+        let entry = sandfs_core::SourceEntry {
+            kind: Kind::File { executable: false },
+            key: "large.bin".into(),
+            size: Some(COMPARE_LIMIT),
+        };
+        Ok([("large.bin".to_owned(), entry)].into())
+    }
+
+    fn read_file(&self, _key: &str) -> sandfs_core::Result<Bytes> {
+        panic!("a large file is read in ranges")
+    }
+
+    fn read_range(&self, _key: &str, offset: u64, len: u64) -> sandfs_core::Result<Bytes> {
+        let end = (offset + len).min(COMPARE_LIMIT);
+        let mut bytes = vec![0; (end - offset) as usize];
+        if end == COMPARE_LIMIT {
+            *bytes.last_mut().unwrap() = self.last;
+        }
+        Ok(bytes.into())
+    }
+}
+
+#[test]
+fn large_files_mounted_separately_are_compared_in_pieces() {
+    let mounted = |last| {
+        let mut ws = Workspace::new();
+        ws.mount("/data", Arc::new(Large { last })).unwrap();
+        ws
+    };
+    assert!(changes_since(&mounted(0), &mounted(0)).is_empty(), "same bytes, separate mounts");
+    assert_eq!(changes_since(&mounted(1), &mounted(0)), [("/data/large.bin".into(), ChangeKind::Modified)]);
+}
+
 #[test]
 fn workspaces_with_their_own_mounts_are_compared_file_by_file() {
     let (mut ws, _) = workspace();

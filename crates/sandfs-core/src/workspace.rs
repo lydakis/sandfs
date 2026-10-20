@@ -1092,8 +1092,16 @@ impl Workspace {
         }
         match (content_size(content), content_size(&theirs.0)) {
             (Some(a), Some(b)) if a != b => return Ok(false),
-            // Comparing would read both files whole, at every call.
-            (Some(size), _) if size >= COMPARE_LIMIT => return Ok(false),
+            (Some(size), _) if size >= COMPARE_LIMIT => {
+                // A written file this large counts as modified without being read, since
+                // comparing would read both files at every call. Two source files (the
+                // same data mounted separately) are compared piece by piece instead.
+                let in_source = |content: &Content| matches!(content, Content::Base { .. });
+                if !(in_source(content) && in_source(&theirs.0)) {
+                    return Ok(false);
+                }
+                return same_bytes_in_pieces(content, &theirs.0, size);
+            }
             _ => {}
         }
         Ok(self.content_bytes(content)? == other.content_bytes(&theirs.0)?)
@@ -1356,6 +1364,25 @@ fn file(resolved: Option<Resolved>) -> Option<(Content, Kind)> {
         Resolved::File { content, kind, .. } => Some((content, kind)),
         Resolved::Dir { .. } => None,
     }
+}
+
+/// Whether two source files of `size` bytes hold the same bytes, read a piece at a time
+/// with ranged reads so neither is held in memory whole or cached.
+fn same_bytes_in_pieces(a: &Content, b: &Content, size: u64) -> Result<bool> {
+    const PIECE: u64 = 8 << 20;
+    let range = |content: &Content, offset: u64| match content {
+        Content::Base { mount, key, .. } => mount.source.read_range(key, offset, PIECE),
+        Content::Bytes(bytes) => Ok(slice(bytes, offset, PIECE)),
+        Content::Stored(stored) => stored.source.read_range(&stored.key, offset, PIECE),
+    };
+    let mut offset = 0;
+    while offset < size {
+        if range(a, offset)? != range(b, offset)? {
+            return Ok(false);
+        }
+        offset += PIECE;
+    }
+    Ok(true)
 }
 
 fn content_size(content: &Content) -> Option<u64> {
