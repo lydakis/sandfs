@@ -1,8 +1,9 @@
-//! A program that writes a lot: `cargo build` of one of this repository's packages, in
-//! a folder on the host and in a sandfs mount of the same folder. The first build
-//! writes every compiled file into the folder; a rebuild after changing one file
-//! rereads what the first build wrote and rewrites part of it, the way a person or an
-//! agent rebuilds after each edit.
+//! A program that reads and writes a lot, in a folder on the host and in a sandfs mount
+//! of the same folder: by default `cargo build` of one of this repository's packages,
+//! or any command in any folder (a test suite, another language's build). The first
+//! run writes every compiled file into the folder; a run after changing one file
+//! rereads what the first wrote and rewrites part of it, the way a person or an agent
+//! rebuilds after each edit.
 
 use std::fs;
 use std::io::Write;
@@ -17,8 +18,36 @@ use crate::targets::{Fuse, Target};
 /// The `--only` name of this table.
 pub const NAME: &str = "build";
 
-/// Names left out of the copy: build output, version control and local tools.
+/// Names left out of a copy of this repository: build output, version control and
+/// local tools. A folder given with `--build-dir` is copied whole but for `.git`.
 const SKIPPED: &[&str] = &["target", ".git", ".venv", "node_modules"];
+
+/// What to run, and where.
+pub enum Job {
+    /// `cargo build -p PACKAGE` in a copy of this repository.
+    Cargo { package: String },
+    /// `sh -c COMMAND` in a copy of `dir`, changing `change` (a path inside it) before
+    /// each run after the first when there is one.
+    Command { dir: PathBuf, command: String, change: Option<PathBuf> },
+}
+
+impl Job {
+    fn describe(&self) -> String {
+        match self {
+            Job::Cargo { package } => format!(
+                "Building `{package}` with cargo (debug, dependencies fetched), the build output inside the folder. Each run after the first changes one source file"
+            ),
+            Job::Command { dir, command, change } => format!(
+                "Running `{command}` in a copy of {}. {}",
+                dir.display(),
+                match change {
+                    Some(change) => format!("Each run after the first changes {}", change.display()),
+                    None => "Nothing changes between runs".to_owned(),
+                }
+            ),
+        }
+    }
+}
 
 /// One column: where the build ran, and its times.
 pub struct Column {
@@ -30,51 +59,70 @@ pub struct Column {
 }
 
 pub struct BuildResult {
-    pub package: String,
+    pub job: String,
     pub columns: Vec<Column>,
 }
 
-/// Build `package` from a copy of this repository, on the host (`host`) and, when
-/// asked (`mount`) and `bin` can mount here, in a mount; rebuild `iters` times after
-/// changing its first source file. A mount column that was asked for by name
-/// (`mount_named`) and can't run is an error, not a missing column.
+/// Run `job` in a copy of its folder on the host (`host`) and, when asked (`mount`) and
+/// `bin` can mount here, in a mount of another copy; run it again `iters` times. A
+/// mount column that was asked for by name (`mount_named`) and can't run is an error,
+/// not a missing column.
 pub fn run(
-    package: &str,
+    job: &Job,
     scratch: &Path,
     bin: &Path,
     iters: usize,
     host: bool,
     (mount, mount_named): (bool, bool),
 ) -> Result<BuildResult> {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
-    let changed = changed_file(&repo, package)?;
+    let (from, skipped, change): (PathBuf, &[&str], Option<PathBuf>) = match job {
+        Job::Cargo { package } => {
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
+            let change = changed_file(&repo, package)?;
+            (repo, SKIPPED, Some(change))
+        }
+        Job::Command { dir, change, .. } => {
+            let dir = dir.canonicalize().with_context(|| format!("--build-dir {}", dir.display()))?;
+            if let Some(change) = change {
+                ensure!(
+                    dir.join(change).is_file(),
+                    "--build-change {} is no file in {}",
+                    change.display(),
+                    dir.display()
+                );
+            }
+            (dir, &[".git"], change.clone())
+        }
+    };
     ensure!(host || mount, "the build table runs on the host and fuse targets only");
-    // A scratch folder inside the repository is left out of its copies, with the data
+    // A scratch folder inside the copied folder is left out of its copies, with the data
     // set and anything else the run put there.
     let scratch = scratch.canonicalize()?;
     let base = scratch.join("build");
+    let copy = |name: &str| -> Result<PathBuf> {
+        let dir = base.join(name);
+        copy_source(&from, &dir, &scratch, skipped)?;
+        if matches!(job, Job::Cargo { .. }) {
+            fetch(&dir)?;
+        }
+        Ok(dir)
+    };
     let mut columns = Vec::new();
     if host {
-        let dir = base.join("host");
-        copy_source(&repo, &dir, &scratch)?;
-        fetch(&dir)?;
-        columns.push(build_in("host folder", &dir, package, &changed, iters, None)?);
+        columns.push(run_in("host folder", &copy("host")?, job, change.as_deref(), iters, None)?);
     }
     if mount {
-        let mounted = base.join("mounted");
-        copy_source(&repo, &mounted, &scratch)?;
-        fetch(&mounted)?;
-        match Fuse::new(mounted, base.clone(), bin.to_owned()) {
+        match Fuse::new(copy("mounted")?, base.clone(), bin.to_owned()) {
             Ok(fuse) => {
                 let view = fuse.open(true)?;
                 let root = view.root_dir().context("a mount has a folder")?.to_owned();
-                columns.push(build_in("sandfs mount", &root, package, &changed, iters, Some(&fuse))?);
+                columns.push(run_in("sandfs mount", &root, job, change.as_deref(), iters, Some(&fuse))?);
             }
             Err(err) if mount_named || !host => return Err(err),
             Err(err) => eprintln!("build: no mount column ({err:#})"),
         }
     }
-    Ok(BuildResult { package: package.to_owned(), columns })
+    Ok(BuildResult { job: job.describe(), columns })
 }
 
 /// Fetch the dependencies once, so no build waits on the network.
@@ -82,31 +130,44 @@ fn fetch(dir: &Path) -> Result<()> {
     cargo(dir, &["fetch", "--quiet"]).context("cargo fetch (the build table needs the network once)")
 }
 
-fn build_in(
+fn run_in(
     name: &'static str,
     dir: &Path,
-    package: &str,
-    changed: &Path,
+    job: &Job,
+    change: Option<&Path>,
     iters: usize,
     fuse: Option<&Fuse>,
 ) -> Result<Column> {
-    eprintln!("{NAME}: {package} in a {name}");
-    let build = || -> Result<Duration> {
+    eprintln!("{NAME}: in a {name}");
+    let once = || -> Result<Duration> {
         let start = Instant::now();
-        // The output goes inside the folder, whatever a cargo config says.
-        let target = dir.join("target");
-        let target = target.to_str().context("a non-UTF-8 folder")?;
-        cargo(dir, &["build", "--offline", "--quiet", "-p", package, "--target-dir", target])?;
+        match job {
+            Job::Cargo { package } => {
+                // The output goes inside the folder, whatever a cargo config says.
+                let target = dir.join("target");
+                let target = target.to_str().context("a non-UTF-8 folder")?;
+                cargo(dir, &["build", "--offline", "--quiet", "-p", package, "--target-dir", target])?;
+            }
+            Job::Command { command, .. } => {
+                let status = Command::new("sh").args(["-c", command]).current_dir(dir).status()?;
+                ensure!(status.success(), "`{command}` failed in {}", dir.display());
+            }
+        }
         Ok(start.elapsed())
     };
-    let cold = build()?;
+    let cold = once()?;
     let mut rebuilds = Vec::new();
     for round in 0..iters {
-        // A real edit: a comment the compiler has to read, not just a newer timestamp.
-        let mut file = fs::File::options().append(true).open(dir.join(changed))?;
-        writeln!(file, "// edit {round}")?;
-        drop(file);
-        rebuilds.push(build()?);
+        // A real edit, not just a newer timestamp: a comment the compiler has to read,
+        // or for any other file an empty line, which no language minds.
+        if let Some(change) = change {
+            let mut file = fs::File::options().append(true).open(dir.join(change))?;
+            match job {
+                Job::Cargo { .. } => writeln!(file, "// edit {round}")?,
+                Job::Command { .. } => writeln!(file)?,
+            }
+        }
+        rebuilds.push(once()?);
     }
     let server_rss = fuse.and_then(|fuse| fuse.helper_pids().first().copied()).and_then(|pid| current_rss(pid).ok());
     Ok(Column { name, cold, rebuilds, server_rss })
@@ -141,20 +202,23 @@ fn changed_file(repo: &Path, package: &str) -> Result<PathBuf> {
     bail!("no package {package} in crates/ with a src/main.rs or src/lib.rs")
 }
 
-/// Copy the repository's files, without build output, version control or `scratch`.
-fn copy_source(from: &Path, to: &Path, scratch: &Path) -> Result<()> {
+/// Copy a folder's files and symbolic links, without `skipped` names or `scratch`.
+fn copy_source(from: &Path, to: &Path, scratch: &Path, skipped: &[&str]) -> Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
-        if SKIPPED.iter().any(|skipped| name == *skipped) || entry.path() == scratch {
+        if skipped.iter().any(|skipped| name == *skipped) || entry.path() == scratch {
             continue;
         }
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            copy_source(&entry.path(), &to.join(&name), scratch)?;
+            copy_source(&entry.path(), &to.join(&name), scratch, skipped)?;
         } else if kind.is_file() {
             fs::copy(entry.path(), to.join(&name))?;
+        } else if kind.is_symlink() {
+            // Such as the commands in node_modules/.bin.
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, to.join(&name))?;
         }
     }
     Ok(())
@@ -173,11 +237,7 @@ fn current_rss(pid: u32) -> Result<u64> {
 
 pub fn print(result: &BuildResult) {
     println!();
-    println!(
-        "Building `{}` with cargo (debug, dependencies fetched), the build output inside the folder. A rebuild changes one source file first; median of {}.",
-        result.package,
-        result.columns.first().map_or(0, |column| column.rebuilds.len())
-    );
+    println!("{}; median of {}.", result.job, result.columns.first().map_or(0, |column| column.rebuilds.len()));
     println!();
     let names: Vec<&str> = result.columns.iter().map(|column| column.name).collect();
     println!("| | {} |", names.join(" | "));
@@ -186,8 +246,8 @@ pub fn print(result: &BuildResult) {
         let cells: Vec<String> = result.columns.iter().map(cell).collect();
         println!("| {label} | {} |", cells.join(" | "));
     };
-    row("first build", &|column| crate::fmt_duration(column.cold));
-    row("rebuild after changing one file", &|column| crate::fmt_duration(crate::median(&column.rebuilds)));
+    row("first run", &|column| crate::fmt_duration(column.cold));
+    row("run again", &|column| crate::fmt_duration(crate::median(&column.rebuilds)));
     if result.columns.iter().any(|column| column.server_rss.is_some()) {
         row("memory of the mount's server after", &|column| {
             column.server_rss.map_or_else(|| "n/a".to_owned(), crate::fmt_bytes)
@@ -208,5 +268,5 @@ pub fn json(result: &BuildResult) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "package": result.package, "columns": columns })
+    serde_json::json!({ "job": result.job, "columns": columns })
 }

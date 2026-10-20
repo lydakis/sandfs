@@ -13,6 +13,9 @@ uv run python crates/sandfs-bench/python/bench.py --scratch /dev/shm   # the Pyt
 ./target/release/sandfs-bench --only remote --remote https://github.com/microsoft/vscode --scratch /dev/shm
 ./target/release/sandfs-bench --only everyday --remote https://github.com/microsoft/vscode --scratch /dev/shm
 ./target/release/sandfs-bench --only build --scratch /dev/shm
+./target/release/sandfs-bench --only build --scratch /dev/shm --build-dir ~/kubernetes \
+    --build-command 'go vet ./pkg/util/parsers && go test -count=1 ./pkg/util/parsers ./pkg/kubelet/images/...' \
+    --build-change pkg/kubelet/images/image_manager.go
 ```
 
 Put the scratch directory on tmpfs (`/dev/shm`) when comparing numbers. sandfs keeps its changes in memory, so a disk under the other targets mostly measures the disk, and writeback makes their write and copy timings swing by several times between runs.
@@ -100,3 +103,5 @@ Each copy then has a day of work done in it: the first `git status`, a commit of
 ## Build
 
 `--only build` runs a program that writes a lot: `cargo build` (debug) of one of this repository's packages (`--build-package`, default `sandfs-cli`), with the build output inside the folder, once in a copy of the repository on the host and once in a sandfs mount of another copy. Dependencies are fetched first, so it needs the network once. The first build writes every compiled file; each rebuild changes one source file first and then rereads what the first build wrote and rewrites part of it, the way a person or an agent rebuilds after an edit. The table shows the first build, the median rebuild, and the memory of the process serving the mount afterwards.
+
+`--build-dir DIR --build-command COMMAND` runs any command instead (`sh -c COMMAND`), such as a test suite or another language's build, in copies of `DIR` (all of it but `.git`, symbolic links included). `--build-change FILE` names a file inside `DIR` that gets an empty line added before each run after the first; without it the runs change nothing in between. The command must succeed. On the second example above (Kubernetes 1.34.1 without `.git`, 27,560 files, Go's build cache warm, median of 5), the first run took 11.0 s in a host folder and 11.7 s in a mount, a run after the change 11.0 s and 11.8 s, and the mount's process held 16 MiB.
