@@ -112,6 +112,15 @@ enum Cmd {
     /// Serve every mount in this process (started by `mount` and `fork`).
     #[command(hide = true)]
     Daemon,
+    /// Tell git which files of the mounted workspace it runs in have changed. A git
+    /// mount's `.git` names this as git's file monitor (hook version 2).
+    #[command(name = "git-fsmonitor", hide = true)]
+    GitFsmonitor {
+        version: String,
+        /// The token of git's last answer, which the answer doesn't depend on.
+        #[arg(allow_hyphen_values = true)]
+        token: Option<String>,
+    },
 }
 
 fn main() {
@@ -151,7 +160,13 @@ fn run(cli: Cli) -> Result<()> {
             sync(&home, &name)?;
             let opened = home.open(&name)?;
             let root = VPath::parse(ROOT)?;
+            // What git keeps in a git mount's `.git` would drown out the files themselves.
+            let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| VPath::parse(&format!("{ROOT}/.git")));
+            let git_dir = git_dir.transpose()?;
             for change in opened.ws.changes()? {
+                if git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)) {
+                    continue;
+                }
                 let marker = match change.kind {
                     ChangeKind::Added => 'A',
                     ChangeKind::Modified => 'M',
@@ -199,6 +214,13 @@ fn run(cli: Cli) -> Result<()> {
             mcp::serve(&home, &name)
         }
         Cmd::Daemon => serve_mounts(home),
+        Cmd::GitFsmonitor { version, token: _ } => {
+            // Git runs its file monitor at the root of the checkout: the mount.
+            let root = std::env::current_dir()?;
+            let name = home.find(root.to_str().context("non-UTF-8 mount path")?)?;
+            sync(&home, &name)?;
+            git::fsmonitor(&Saved::new(home.workspace_dir(&name)).paths()?, &version)
+        }
     }
 }
 

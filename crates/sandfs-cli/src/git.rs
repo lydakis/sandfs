@@ -5,15 +5,24 @@
 //! hold only the commits that were mounted, without their history, so a mount costs
 //! one request for the commit and its folder listings. File contents are fetched only
 //! when a directory or file is first read.
+//!
+//! A git mount also shows a `.git` folder ([`GitDir`]), so git itself works inside it:
+//! status, add, commit, branch and push. It borrows the local copy's objects without
+//! writing to it, and tells git which files changed (`sandfs git-fsmonitor`), so git
+//! never has to read the rest.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
-use sandfs_core::Source;
+use bytes::Bytes;
+use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey};
 use sandfs_git::GitSource;
 
+use crate::persist::PathState;
 use crate::store::expand;
 
 /// Resolve `spec` (what follows `git:`) to a local repository and a commit id,
@@ -39,10 +48,420 @@ fn commit_of(repo: &Path, rev: &str) -> Result<String> {
         .with_context(|| format!("{rev:?} is not a commit in {}", repo.display()))
 }
 
-/// The source for `commit` of `repo`.
-pub fn open(repo: &Path, commit: &str) -> Result<Arc<dyn Source>> {
+/// Like [`resolve`], and also the branch the commit was mounted as: the branch a
+/// remote's default `HEAD` points to, or a revision that names a branch, when that
+/// branch is at the commit. A commit id or a tag gives none.
+pub fn resolve_branch(repos: &Path, spec: &str) -> Result<(PathBuf, String, Option<String>)> {
+    let (location, rev) = split_rev(spec);
+    let rev = rev.unwrap_or_else(|| "HEAD".to_owned());
+    if !is_url(location) {
+        let (repo, commit) = resolve(repos, spec)?;
+        let branch = local_branch(&repo, &rev)
+            .filter(|branch| commit_of(&repo, &format!("refs/heads/{branch}")).is_ok_and(|tip| tip == commit));
+        return Ok((repo, commit, branch));
+    }
+    // Asking the server which branch it is takes a request of its own, so it runs
+    // while the commit is fetched rather than after.
+    std::thread::scope(|scope| {
+        let lookup = (!is_commit_id(&rev)).then(|| scope.spawn(|| remote_branch(location, &rev)));
+        let (repo, commit) = resolve(repos, spec)?;
+        let branch = lookup
+            .and_then(|lookup| lookup.join().ok().flatten())
+            .and_then(|(branch, tip)| (tip == commit).then_some(branch));
+        Ok((repo, commit, branch))
+    })
+}
+
+/// The branch `rev` names in a local repository, if any.
+fn local_branch(repo: &Path, rev: &str) -> Option<String> {
+    if rev == "HEAD" {
+        // The full name: `--short` gives `heads/main` when a tag is also called `main`.
+        let head = git(repo, &["symbolic-ref", "-q", "HEAD"]).ok()?;
+        return head.strip_prefix("refs/heads/").map(str::to_owned);
+    }
+    let name = rev.strip_prefix("refs/heads/").unwrap_or(rev);
+    git(repo, &["show-ref", "--verify", "-q", &format!("refs/heads/{name}")]).ok().map(|_| name.to_owned())
+}
+
+/// The branch `rev` names on the server at `url`, and the commit it is at.
+fn remote_branch(url: &str, rev: &str) -> Option<(String, String)> {
+    if rev == "HEAD" {
+        // `ref: refs/heads/main\tHEAD`, then `<commit>\tHEAD`.
+        let out = git(Path::new("."), &["ls-remote", "--symref", url, "HEAD"]).ok()?;
+        let branch = out.lines().find_map(|line| line.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD"))?;
+        let tip = out.lines().find_map(|line| line.strip_suffix("\tHEAD").filter(|id| is_commit_id(id)))?;
+        return Some((branch.to_owned(), tip.to_owned()));
+    }
+    let name = rev.strip_prefix("refs/heads/").unwrap_or(rev);
+    let full = format!("refs/heads/{name}");
+    let out = git(Path::new("."), &["ls-remote", url, &full]).ok()?;
+    let tip = out.lines().find_map(|line| line.strip_suffix(&format!("\t{full}")))?;
+    Some((name.to_owned(), tip.to_owned()))
+}
+
+/// The source for `commit` of `repo`, and the `.git` folder that goes inside it, for
+/// workspaces kept in the home at `home`.
+pub fn open(
+    repo: &Path,
+    commit: &str,
+    branch: Option<&str>,
+    home: &Path,
+) -> Result<(Arc<dyn Source>, Arc<dyn Source>)> {
     // Sizes let FUSE answer `stat` without reading whole files.
-    Ok(Arc::new(GitSource::open(repo, commit)?.with_sizes()?))
+    let files = Arc::new(GitSource::open(repo, commit)?.with_sizes()?);
+    Ok((files, Arc::new(GitDir::new(repo, commit, branch, home)?)))
+}
+
+/// The `.git` folder of a git mount: a repository whose checkout is the mount itself.
+///
+/// It holds only what makes the mount a checkout of the commit: `HEAD` (on the branch
+/// the commit was mounted as, else at the commit), the branch, a config with the
+/// origin, and an index listing the commit's files. Objects come from the local copy
+/// through `objects/info/alternates`, so git reads them there and writes new ones
+/// beside this folder's own files, into the workspace. A remote's local copy is a
+/// partial clone, and so is this repository: git fetches file contents it needs and
+/// doesn't have, as the local copy does.
+///
+/// The index is built when first read, so a mount nobody runs git in never pays for
+/// it. Its entries carry no file times or sizes, which git would otherwise compare
+/// by reading every file. Instead every entry is marked unchanged for git's file
+/// monitor, which asks `sandfs git-fsmonitor` what changed since; the same answers
+/// keep git's cache of untracked files current, so it lists folders only once.
+/// Symbolic links and submodules, which a mount doesn't show, are marked as outside
+/// the checkout, so git doesn't take them for deleted.
+#[derive(Debug)]
+pub struct GitDir {
+    dirs: BTreeMap<String, Listing>,
+    files: BTreeMap<String, Bytes>,
+    /// The repository the index is built from.
+    common: PathBuf,
+    /// Whether that is sandfs's own copy of a remote, which the index build may fetch
+    /// into. A repository of the user's own is never written to.
+    managed: bool,
+    commit: String,
+    index: OnceLock<std::result::Result<Bytes, String>>,
+}
+
+/// The file of [`GitDir`] built when first read.
+const INDEX: &str = "index";
+
+/// Where `sandfs git-fsmonitor` keeps every path it has reported (see [`fsmonitor`]).
+const TOUCHED: &str = ".git/sandfs-touched";
+
+impl GitDir {
+    pub fn new(repo: &Path, commit: &str, branch: Option<&str>, home: &Path) -> Result<Self> {
+        let info = git(repo, &["rev-parse", "--git-common-dir", "--show-object-format"])?;
+        let mut lines = info.lines();
+        let common = repo.join(lines.next().context("git rev-parse printed nothing")?);
+        let common = common.canonicalize().with_context(|| format!("no repository at {}", common.display()))?;
+        let common = without_verbatim_prefix(common);
+        let format = lines.next().unwrap_or("sha1");
+        let get = |key: &str| git(&common, &["config", "--get", key]).ok();
+        // A partial clone (every remote's local copy) borrows its origin; a local
+        // repository is the origin itself.
+        let promisor = get("remote.origin.promisor").is_some_and(|value| value == "true");
+        let origin = match get("remote.origin.url") {
+            Some(url) if promisor => url,
+            _ => repo.to_str().context("non-UTF-8 repository path")?.to_owned(),
+        };
+
+        // Git runs the monitor with the environment of whoever runs git, which may not
+        // name the same home.
+        let exe = std::env::current_exe().context("finding the sandfs binary")?;
+        let hook = format!(
+            "SANDFS_HOME={} {}",
+            shell_quote(home.to_str().context("non-UTF-8 home directory")?),
+            shell_quote(exe.to_str().context("non-UTF-8 path to the sandfs binary")?)
+        );
+        // Newer git turns its file monitor off on network and FUSE file systems, a
+        // mount among them, unless `fsmonitor.allowRemote` says otherwise.
+        let mut config = format!(
+            "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\
+             \tfsmonitor = {}\n\tfsmonitorHookVersion = 2\n\tuntrackedCache = true\n\
+             [fsmonitor]\n\tallowRemote = true\n\
+             [remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+            config_value(&format!("{hook} git-fsmonitor")),
+            config_value(&origin),
+        );
+        if promisor {
+            let filter = get("remote.origin.partialclonefilter").unwrap_or_else(|| "blob:none".to_owned());
+            config.push_str(&format!("\tpromisor = true\n\tpartialclonefilter = {}\n", config_value(&filter)));
+        }
+        if promisor || format != "sha1" {
+            config.push_str("[extensions]\n");
+            if promisor {
+                config.push_str("\tpartialClone = origin\n");
+            }
+            if format != "sha1" {
+                config.push_str(&format!("\tobjectFormat = {}\n", config_value(format)));
+            }
+        }
+
+        let mut files: Vec<(String, Bytes)> = Vec::new();
+        let mut dirs: Vec<String> =
+            ["objects/info", "objects/pack", "refs/heads", "refs/tags"].map(String::from).into();
+        match branch {
+            Some(branch) => {
+                files.push(("HEAD".into(), format!("ref: refs/heads/{branch}\n").into()));
+                files.push((format!("refs/heads/{branch}"), format!("{commit}\n").into()));
+                files.push((format!("refs/remotes/origin/{branch}"), format!("{commit}\n").into()));
+                config.push_str(&format!(
+                    "[branch {}]\n\tremote = origin\n\tmerge = refs/heads/{branch}\n",
+                    config_value(branch)
+                ));
+            }
+            None => files.push(("HEAD".into(), format!("{commit}\n").into())),
+        }
+        files.push(("config".into(), config.into()));
+        let objects = common.join("objects");
+        let objects = objects.to_str().context("non-UTF-8 repository path")?;
+        files.push(("objects/info/alternates".into(), format!("{objects}\n").into()));
+        // The commits the local copy has without their parents, this one among them.
+        if let Ok(shallow) = std::fs::read(common.join("shallow")) {
+            files.push(("shallow".into(), shallow.into()));
+        }
+
+        let mut dir = GitDir {
+            dirs: BTreeMap::from([(String::new(), Listing::new())]),
+            files: BTreeMap::new(),
+            common,
+            managed: repo.starts_with(home.join("repos")),
+            commit: commit.to_owned(),
+            index: OnceLock::new(),
+        };
+        dirs.sort();
+        for path in &dirs {
+            dir.add_dir(path);
+        }
+        for (path, data) in files {
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", &path));
+            dir.add_dir(parent);
+            let entry = SourceEntry {
+                kind: Kind::File { executable: false },
+                key: path.as_str().into(),
+                size: Some(data.len() as u64),
+            };
+            dir.dirs.get_mut(parent).expect("parent added").insert(name.to_owned(), entry);
+            dir.files.insert(path, data);
+        }
+        // Its size is unknown until it is built.
+        let entry = SourceEntry { kind: Kind::File { executable: false }, key: INDEX.into(), size: None };
+        dir.dirs.get_mut("").expect("root").insert(INDEX.to_owned(), entry);
+        Ok(dir)
+    }
+
+    /// Add the directory `path` and its parents.
+    fn add_dir(&mut self, path: &str) {
+        let mut key = String::new();
+        for part in path.split('/').filter(|part| !part.is_empty()) {
+            let child = if key.is_empty() { part.to_owned() } else { format!("{key}/{part}") };
+            let entry = SourceEntry { kind: Kind::Dir, key: child.as_str().into(), size: None };
+            self.dirs.get_mut(&key).expect("parent added").entry(part.to_owned()).or_insert(entry);
+            self.dirs.entry(child.clone()).or_default();
+            key = child;
+        }
+    }
+
+    /// The index of the commit's files, every one marked unchanged (see [`GitDir`]).
+    fn build_index(&self) -> Result<Bytes> {
+        static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("sandfs-index-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Marking entries needs a checkout to run in, though it looks at no files.
+        std::fs::create_dir_all(tmp.join("checkout")).context("creating a temporary folder")?;
+        std::fs::create_dir_all(tmp.join("hooks")).context("creating a temporary folder")?;
+        let built = (|| {
+            let index = tmp.join(INDEX);
+            let common = self.common.as_path();
+            let run = |args: &[&str], input: Option<&[u8]>| -> Result<Vec<u8>> {
+                let mut cmd = Command::new("git");
+                cmd.arg("--git-dir")
+                    .arg(common)
+                    .arg("--work-tree")
+                    .arg(tmp.join("checkout"))
+                    // A failing monitor (`exit 1`): git asks none while marking entries.
+                    .args(["-c", "core.fsmonitor=exit 1", "-c", "core.fsmonitorHookVersion=2"])
+                    // The repository's own settings must not change the index or run its
+                    // hooks: a split or sparse index would point at files the mount lacks.
+                    .args(["-c", "core.splitIndex=false", "-c", "index.sparse=false"])
+                    .args(["-c", "core.sparseCheckout=false"])
+                    .arg("-c")
+                    .arg(format!("core.hooksPath={}", tmp.join("hooks").display()))
+                    .args(args)
+                    .env("GIT_INDEX_FILE", &index)
+                    .env("GIT_TERMINAL_PROMPT", "0");
+                run_with_input(cmd, input)
+            };
+            run(&["read-tree", &self.commit], None)?;
+            let listed = run(&["ls-files", "-s", "-z"], None)?;
+            let (mut all, mut links, mut rules) = (Vec::new(), Vec::new(), Vec::new());
+            // `<mode> <id> <stage>\t<path>`
+            for record in listed.split(|&b| b == 0).filter(|record| !record.is_empty()) {
+                let Some(tab) = record.iter().position(|&b| b == b'\t') else { continue };
+                let path = &record[tab + 1..];
+                if record.starts_with(b"120000 ") || record.starts_with(b"160000 ") {
+                    links.extend_from_slice(path);
+                    links.push(0);
+                }
+                let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+                if name == b".gitignore" || name == b".gitattributes" {
+                    rules.extend(record.get(7..tab).and_then(|rest| rest.split(|&b| b == b' ').next()));
+                }
+                all.extend_from_slice(path);
+                all.push(0);
+            }
+            self.fetch_missing(&rules);
+            // Outside the checkout first: a path marked both ways would get only that.
+            if !links.is_empty() {
+                run(&["update-index", "-z", "--skip-worktree", "--stdin"], Some(&links))?;
+            }
+            run(&["update-index", "-z", "--fsmonitor", "--fsmonitor-valid", "--stdin"], Some(&all))?;
+            Ok(Bytes::from(std::fs::read(&index).context("reading the built index")?))
+        })();
+        let _ = std::fs::remove_dir_all(&tmp);
+        built
+    }
+}
+
+impl GitDir {
+    /// Fetch whichever of these blobs a partial clone lacks, in one request. Git reads
+    /// every `.gitignore` and `.gitattributes` it passes, and would otherwise fetch
+    /// each in a request of its own. Best effort: git fetches what this misses.
+    fn fetch_missing(&self, blobs: &[&[u8]]) {
+        if !self.managed
+            || blobs.is_empty()
+            || git(&self.common, &["config", "--get", "remote.origin.promisor"]).is_err()
+        {
+            return;
+        }
+        // Trees are local, so finding the missing blobs fetches nothing.
+        let Ok(objects) = git(&self.common, &["rev-list", "--objects", "--missing=print", &self.commit]) else {
+            return;
+        };
+        let missing: BTreeSet<&[u8]> =
+            objects.lines().filter_map(|line| line.strip_prefix('?')).map(str::as_bytes).collect();
+        let wanted: Vec<u8> = blobs
+            .iter()
+            .filter(|blob| missing.contains(*blob))
+            .flat_map(|blob| blob.iter().copied().chain(*b"\n"))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.common)
+            .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", "origin", "--no-tags", "--no-write-fetch-head"])
+            .args(["--recurse-submodules=no", "--filter=blob:none", "--stdin"])
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let _ = run_with_input(cmd, Some(&wanted));
+    }
+}
+
+impl Source for GitDir {
+    fn root(&self) -> sandfs_core::Result<SourceKey> {
+        Ok("".into())
+    }
+
+    fn read_dir(&self, key: &str) -> sandfs_core::Result<Listing> {
+        self.dirs.get(key).cloned().ok_or_else(|| sandfs_core::Error::Source(format!("no directory {key:?}")))
+    }
+
+    fn read_file(&self, key: &str) -> sandfs_core::Result<Bytes> {
+        if key == INDEX {
+            let built = self.index.get_or_init(|| self.build_index().map_err(|err| format!("{err:#}")));
+            return built.clone().map_err(|err| sandfs_core::Error::Source(format!("building the git index: {err}")));
+        }
+        self.files.get(key).cloned().ok_or_else(|| sandfs_core::Error::Source(format!("no file {key:?}")))
+    }
+}
+
+/// Answer git's file monitor (hook version 2) for the mounted workspace whose saved
+/// changes are `saved`, from the mount's root.
+///
+/// Git asks which files changed since a token it got from an earlier answer, and
+/// checks only those against its index. Every path the workspace ever changed is
+/// reported, not only those that differ now: a file changed and then put back is no
+/// longer a change, but git may have recorded it while it was different. The paths
+/// reported before are kept in [`TOUCHED`], inside the mount.
+pub fn fsmonitor(saved: &[(String, PathState)], version: &str) -> Result<()> {
+    if version != "2" {
+        bail!("unsupported file monitor version {version}; set core.fsmonitorHookVersion = 2");
+    }
+    let previous = std::fs::read(TOUCHED).unwrap_or_default();
+    let mut touched: BTreeSet<&[u8]> = previous.split(|&b| b == 0).filter(|path| !path.is_empty()).collect();
+    let before = touched.len();
+    let mut current = Vec::new();
+    for (path, state) in saved {
+        if path == ".git" || path.starts_with(".git/") {
+            continue;
+        }
+        // A trailing slash stands for everything below a directory. A directory may
+        // have replaced a file of the same name, which git checks only by the bare path.
+        match state {
+            PathState::File => current.push(path.clone()),
+            PathState::Dir | PathState::Absent => current.extend([path.clone(), format!("{path}/")]),
+        }
+    }
+    touched.extend(current.iter().map(|path| path.as_bytes()));
+    if touched.len() > before {
+        let mut list = Vec::new();
+        for path in &touched {
+            list.extend_from_slice(path);
+            list.push(0);
+        }
+        std::fs::write(TOUCHED, &list).with_context(|| format!("writing {TOUCHED}"))?;
+    }
+    // Any new token will do: the answer never depends on it.
+    let token = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut out = std::io::stdout().lock();
+    write!(out, "sandfs:{token}\0")?;
+    for path in touched {
+        out.write_all(path)?;
+        out.write_all(b"\0")?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// `value` as a quoted git config value.
+fn config_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
+}
+
+/// `path` without the `\\?\` that canonical Windows paths start with, which git can't
+/// open as a repository.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str() {
+        Some(s) if s.starts_with(r"\\?\UNC\") => PathBuf::from(format!(r"\\{}", &s[8..])),
+        Some(s) if s.starts_with(r"\\?\") => PathBuf::from(&s[4..]),
+        _ => path,
+    }
+}
+
+/// `word` quoted for `sh`, which runs git's file monitor.
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Run `cmd`, feeding it `input`, and return what it printed.
+fn run_with_input(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>> {
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("running git")?;
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().context("git's input")?;
+        // Written from a thread, so a full output pipe can't block the write.
+        let input = input.to_vec();
+        std::thread::spawn(move || stdin.write_all(&input));
+    }
+    let output = child.wait_with_output().context("running git")?;
+    if !output.status.success() {
+        bail!("git: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(output.stdout)
 }
 
 /// Fetch `rev` of `url` into its local partial clone, creating the clone on first use,
@@ -257,6 +676,49 @@ mod tests {
         assert_eq!(split(r"file://C:\src\repo@v1"), (r"file://C:\src\repo".into(), Some("v1".into())));
         assert_eq!(split("/srv/repo@main@{2.days.ago}"), ("/srv/repo".into(), Some("main@{2.days.ago}".into())));
         assert!(resolve(Path::new("/nonexistent"), "repo@").is_err());
+        let plain = |path: &str| without_verbatim_prefix(path.into());
+        assert_eq!(plain(r"\\?\C:\src\repo"), PathBuf::from(r"C:\src\repo"));
+        assert_eq!(plain(r"\\?\UNC\host\share\repo"), PathBuf::from(r"\\host\share\repo"));
+        assert_eq!(plain("/srv/repo"), PathBuf::from("/srv/repo"));
+    }
+
+    #[test]
+    fn building_the_index_leaves_a_local_repository_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-q", "-m", "a"]);
+        let commit = run(&repo, &["rev-parse", "HEAD"]);
+        run(&repo, &["tag", "main"]);
+        assert_eq!(local_branch(&repo, "HEAD").as_deref(), Some("main"), "a tag of the same name aside");
+        // Settings of the repository's own that would otherwise apply to the build.
+        run(&repo, &["config", "core.splitIndex", "true"]);
+        let marker = tmp.path().join("hook-ran");
+        std::fs::write(repo.join(".git/hooks/post-index-change"), format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let hook = repo.join(".git/hooks/post-index-change");
+            std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shared = || {
+            std::fs::read_dir(repo.join(".git"))
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("sharedindex."))
+        };
+        let before = shared();
+
+        let dir = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("home")).unwrap();
+        assert!(!dir.common.to_string_lossy().starts_with(r"\\?\"), "a path git can open");
+        let index = dir.read_file(INDEX).unwrap();
+        assert!(!index.windows(4).any(|w| w == b"link"), "the index stands alone, with no shared part");
+        assert_eq!(shared(), before, "nothing written into the repository");
+        assert!(!marker.exists(), "the repository's hooks don't run");
     }
 
     /// Run git in `dir` for a test, with an identity for commits.
@@ -325,14 +787,14 @@ mod tests {
         assert_eq!(commits.lines().filter(|kind| *kind == "commit").count(), 2, "{commits}");
         assert_eq!(resolve(&repos, &format!("{url}@main")).unwrap().1, third);
         let mut ws = sandfs_core::Workspace::new();
-        ws.mount("/old", open(&repo, &second).unwrap()).unwrap();
+        ws.mount("/old", open(&repo, &second, None, tmp.path()).unwrap().0).unwrap();
         assert_eq!(&ws.read("/old/a.txt").unwrap()[..], b"two");
 
         // A commit id already fetched mounts with no request, so it works offline.
         std::fs::remove_dir_all(&remote).unwrap();
         assert_eq!(resolve(&repos, &format!("{url}@{second}")).unwrap().1, second);
         let mut ws = sandfs_core::Workspace::new();
-        ws.mount("/old", open(&repo, &second).unwrap()).unwrap();
+        ws.mount("/old", open(&repo, &second, None, tmp.path()).unwrap().0).unwrap();
         assert_eq!(&ws.read("/old/a.txt").unwrap()[..], b"two");
         assert!(resolve(&repos, &format!("{url}@{first}")).is_err());
         // A name needs the server, so it fails offline instead of mounting something stale.
@@ -372,6 +834,105 @@ mod tests {
                 assert_eq!(&mount.join().unwrap().unwrap(), commit);
             }
         });
+    }
+
+    #[test]
+    fn git_mounts_hold_a_checkout_of_the_mounted_commit() {
+        let tmp = tempfile::Builder::new().prefix("sandfs-git").tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir_all(remote.join("docs")).unwrap();
+        run(&remote, &["init", "-q", "-b", "main"]);
+        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        std::fs::write(remote.join("a.txt"), "one").unwrap();
+        std::fs::write(remote.join("docs/.gitignore"), "*.tmp\n").unwrap();
+        run(&remote, &["add", "-A"]);
+        // A symbolic link and a submodule, neither of which a mount shows.
+        let blob = run(&remote, &["hash-object", "-w", "a.txt"]);
+        run(&remote, &["update-index", "--add", "--cacheinfo", &format!("120000,{blob},link")]);
+        run(&remote, &["commit", "-q", "-m", "first"]);
+        let first = run(&remote, &["rev-parse", "HEAD"]);
+        run(&remote, &["tag", "v1"]);
+        run(&remote, &["update-index", "--add", "--cacheinfo", &format!("160000,{first},sub")]);
+        run(&remote, &["commit", "-q", "-m", "second"]);
+        let commit = run(&remote, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", remote.display());
+        let repos = tmp.path().join("repos");
+
+        // The branch a mount starts on: the remote's default, or the one named.
+        let (repo, mounted, branch) = resolve_branch(&repos, &url).unwrap();
+        assert_eq!((mounted.as_str(), branch.as_deref()), (commit.as_str(), Some("main")));
+        assert_eq!(resolve_branch(&repos, &format!("{url}@main")).unwrap().2.as_deref(), Some("main"));
+        assert_eq!(resolve_branch(&repos, &format!("{url}@{first}")).unwrap().2, None);
+        assert_eq!(resolve_branch(&repos, &format!("{url}@v1")).unwrap().2, None, "a tag is no branch");
+        // (A Windows path is canonicalized to one git may not take.)
+        if cfg!(unix) {
+            assert_eq!(resolve_branch(&repos, remote.to_str().unwrap()).unwrap().2.as_deref(), Some("main"));
+        }
+
+        let home = tmp.path().to_path_buf();
+        let dir = GitDir::new(&repo, &commit, Some("main"), &home).unwrap();
+        let read = |key: &str| String::from_utf8(dir.read_file(key).unwrap().to_vec()).unwrap();
+        assert_eq!(read("HEAD"), "ref: refs/heads/main\n");
+        assert_eq!(read("refs/heads/main"), format!("{commit}\n"));
+        assert_eq!(read("refs/remotes/origin/main"), format!("{commit}\n"));
+        let alternates = PathBuf::from(read("objects/info/alternates").trim_end());
+        assert_eq!(alternates.canonicalize().unwrap(), repo.join("objects").canonicalize().unwrap());
+        assert!(read("shallow").contains(&commit), "the mounted commit has no parents here");
+        let config = read("config");
+        assert!(config.contains(&format!("url = {}", config_value(&url))), "{config}");
+        assert!(config.contains("partialClone = origin"), "{config}");
+        let quoted_home = config_value(&shell_quote(home.to_str().unwrap()));
+        assert!(config.contains("git-fsmonitor") && config.contains(quoted_home.trim_matches('"')), "{config}");
+        assert!(config.contains("[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main"), "{config}");
+        let names: Vec<String> = dir.read_dir("").unwrap().into_keys().collect();
+        assert_eq!(names, ["HEAD", "config", "index", "objects", "refs", "shallow"]);
+        let detached = GitDir::new(&repo, &first, None, &home).unwrap();
+        assert_eq!(&detached.read_file("HEAD").unwrap()[..], format!("{first}\n").as_bytes());
+        assert!(!String::from_utf8_lossy(&detached.read_file("config").unwrap()).contains("[branch"));
+
+        // The index lists every file as unchanged for git's file monitor, and keeps the
+        // link and the submodule out of the checkout.
+        let missing = || run(&repo, &["rev-list", "--objects", "--missing=print", &commit]);
+        let rules = run(&remote, &["rev-parse", "HEAD:docs/.gitignore"]);
+        assert!(missing().contains(&format!("?{rules}")), "nothing is fetched before the index is read");
+        // A repository outside sandfs's copies, as `git:/path` mounts, is never fetched into.
+        let elsewhere = GitDir::new(&repo, &commit, Some("main"), &tmp.path().join("elsewhere")).unwrap();
+        elsewhere.read_file("index").unwrap();
+        assert!(missing().contains(&format!("?{rules}")), "a repository of the user's own is left alone");
+        let index = tmp.path().join("index");
+        std::fs::write(&index, dir.read_file("index").unwrap()).unwrap();
+        // Git runs a file monitor with `sh`, which Windows may not have.
+        if cfg!(unix) {
+            index_marks_files_unchanged(&repo, &index, tmp.path());
+        }
+        // Git reads every rule file, so building the index fetched them, and only them.
+        let missing = missing();
+        let absent =
+            |path: &str| missing.contains(&format!("?{}", run(&remote, &["rev-parse", &format!("HEAD:{path}")])));
+        assert!(!absent("docs/.gitignore") && absent("a.txt"), "{missing}");
+    }
+
+    /// Check the index at `index` of `repo`, as [`GitDir`] builds it.
+    fn index_marks_files_unchanged(repo: &Path, index: &Path, checkout: &Path) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .arg("--git-dir")
+            .arg(repo)
+            .args(["--work-tree", ".", "-c", r"core.fsmonitor=printf 'token\0'", "-c", "core.fsmonitorHookVersion=2"])
+            .args(["ls-files", "-t", "-f"])
+            .env("GIT_INDEX_FILE", index)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let listed = String::from_utf8(output.stdout).unwrap();
+        let tags: BTreeMap<&str, char> = listed
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(tag, path)| (path, tag.chars().next().unwrap().to_ascii_lowercase()))
+            .collect();
+        assert_eq!(tags, BTreeMap::from([("a.txt", 'h'), ("docs/.gitignore", 'h'), ("link", 's'), ("sub", 's')]));
+        assert!(listed.contains("h a.txt"), "files are marked unchanged: {listed}");
     }
 
     #[test]

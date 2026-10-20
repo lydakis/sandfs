@@ -213,6 +213,110 @@ fn one_process_serves_every_mount_until_the_last_is_gone() {
     sandfs.unmount(&one);
 }
 
+/// Runs git in `dir` and returns what it printed.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn git_works_inside_a_remote_git_mount() {
+    if !fuse_available() {
+        return;
+    }
+    // Remote local copies are named after the URL, which can't have parts starting with '.'.
+    let remote = tempfile::Builder::new().prefix("sandfs-remote").tempdir().unwrap();
+    let remote = remote.path();
+    git(remote, &["init", "-q"]);
+    git(remote, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::create_dir_all(remote.join("src")).unwrap();
+    std::fs::create_dir_all(remote.join("docs")).unwrap();
+    std::fs::write(remote.join("README.md"), "hello\n").unwrap();
+    std::fs::write(remote.join("src/lib.rs"), "fn one() {}\n").unwrap();
+    std::fs::write(remote.join("docs/.gitignore"), "*.tmp\n").unwrap();
+    std::fs::write(remote.join("LICENSE"), "free\n").unwrap();
+    git(remote, &["add", "-A"]);
+    git(remote, &["commit", "-q", "-m", "first"]);
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let [work, copy] = ["work", "copy"].map(|name| dirs.path().join(name));
+    let source = format!("git:file://{}", remote.display());
+    sandfs.mount(&["mount", &source, work.to_str().unwrap()], &work);
+
+    // A checkout on the remote's default branch, read without fetching file contents.
+    let alternates = std::fs::read_to_string(work.join(".git/objects/info/alternates")).unwrap();
+    let cache = Path::new(alternates.trim_end()).parent().unwrap().to_path_buf();
+    let unread = || {
+        let missing = git_out(&cache, &["rev-list", "--objects", "--missing=print", "--all"]);
+        ["README.md", "src/lib.rs"].map(|path| {
+            missing.contains(&format!("?{}", git_out(remote, &["rev-parse", &format!("HEAD:{path}")]).trim()))
+        })
+    };
+    assert_eq!(unread(), [true, true]);
+    assert_eq!(git_out(&work, &["status", "--porcelain", "-b"]), "## main...origin/main\n");
+    // (A Mac mount lists folders over NFS with every file's size, which fetches them; #83.)
+    if cfg!(target_os = "linux") {
+        assert_eq!(unread(), [true, true], "status reads no file");
+    }
+
+    // Edits, a new file and an ignored one, committed and pushed.
+    std::fs::write(work.join("README.md"), "hello, sandfs\n").unwrap();
+    std::fs::write(work.join("notes.txt"), "notes\n").unwrap();
+    std::fs::write(work.join("docs/scratch.tmp"), "ignored\n").unwrap();
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), " M README.md\n?? notes.txt\n");
+    git_out(&work, &["add", "-A"]);
+    git_out(&work, &["commit", "-q", "-m", "change"]);
+    assert_eq!(git_out(&work, &["status", "--porcelain", "-b"]), "## main...origin/main [ahead 1]\n");
+    assert_eq!(git_out(&work, &["log", "--format=%s"]), "change\nfirst\n");
+    assert_eq!(sandfs.stdout(&["changes", "work"]), "M README.md\nA docs/scratch.tmp\nA notes.txt\n", "not .git");
+    git_out(&work, &["push", "-q", "origin", "HEAD:refs/heads/from-mount"]);
+    assert_eq!(git_out(remote, &["show", "from-mount:README.md"]), "hello, sandfs\n");
+    assert_eq!(git_out(remote, &["log", "--format=%s", "main"]), "first\n", "only the push reached the remote");
+
+    // A file changed, staged, then put back by something other than git differs from
+    // what was staged, though sandfs no longer counts it as changed.
+    std::fs::write(work.join("src/lib.rs"), "fn two() {}\n").unwrap();
+    git_out(&work, &["add", "src/lib.rs"]);
+    std::fs::write(work.join("src/lib.rs"), "fn one() {}\n").unwrap();
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), "MM src/lib.rs\n");
+    git_out(&work, &["reset", "-q"]);
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), "");
+
+    // A folder in place of a file git never saw change still shows the file deleted.
+    std::fs::remove_file(work.join("LICENSE")).unwrap();
+    std::fs::create_dir(work.join("LICENSE")).unwrap();
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), " D LICENSE\n");
+    std::fs::remove_dir(work.join("LICENSE")).unwrap();
+    std::fs::write(work.join("LICENSE"), "free\n").unwrap();
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), "");
+
+    // A fork carries the commits and branches made so far, and goes its own way.
+    git_out(&work, &["switch", "-q", "-c", "feature"]);
+    sandfs.mount(&["fork", "work", copy.to_str().unwrap()], &copy);
+    assert_eq!(git_out(&copy, &["status", "--porcelain", "-b"]), "## feature\n");
+    std::fs::write(copy.join("fork.txt"), "fork\n").unwrap();
+    git_out(&copy, &["add", "fork.txt"]);
+    git_out(&copy, &["commit", "-q", "-m", "in the fork"]);
+    assert_eq!(git_out(&work, &["log", "-1", "--format=%s"]), "change\n");
+    assert_eq!(git_out(&work, &["status", "--porcelain"]), "");
+
+    // And it all survives a remount.
+    sandfs.unmount(&copy);
+    sandfs.mount(&["mount", "copy", copy.to_str().unwrap()], &copy);
+    assert_eq!(git_out(&copy, &["log", "-1", "--format=%s"]), "in the fork\n");
+    assert_eq!(git_out(&copy, &["status", "--porcelain"]), "");
+    sandfs.unmount(&copy);
+    sandfs.unmount(&work);
+}
+
 #[test]
 fn a_directory_source_is_never_written() {
     if !fuse_available() {
