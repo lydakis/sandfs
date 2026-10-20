@@ -30,7 +30,7 @@ The core has three primitives: a **source** (a read-only tree read lazily), a **
 
 ## Known gaps in the CLI
 
-- A mounted workspace holds its writes in memory until they are saved, so it costs memory in proportion to what was written.
+- A mounted workspace holds a file in memory from its first write until it is saved (a quarter of a second after its last write), so a program writing many large files at once costs memory until they settle.
 - Only the executable bit of a file's mode is kept; owners, other mode bits and extended attributes are not.
 - No hard links or special files, matching the core. Symbolic links work; the git source doesn't show a commit's links yet.
 - macOS mounts over NFS on localhost, answering only the user who mounted it (and root). New `._name`, `.DS_Store` and `.nfs.*` files that macOS creates in a mount are kept out of saves. Windows has no mount.

@@ -35,7 +35,7 @@ use sandfs_core::{ChangeKind, VPath};
 use crate::fs::SandFs;
 #[cfg(mount)]
 use crate::fs::{Inner, Shared};
-use crate::persist::Saved;
+use crate::persist::{Saved, is_object_gone};
 #[cfg(mount)]
 use crate::store::Bases;
 use crate::store::{Base, Home, MountInfo, ROOT, check_name, is_mounted};
@@ -68,11 +68,14 @@ enum Cmd {
     },
     /// Fork a workspace, with its changes so far, and mount the fork at DIR. The source
     /// is never copied; each saved change is linked into the fork.
+    ///
+    /// Without DIR the fork is only kept, not mounted: a snapshot of the workspace as it
+    /// is now, which `mount NAME DIR` or `fork NAME DIR` brings back later.
     Fork {
         /// The workspace to fork: its name or the directory it is mounted on.
         from: String,
-        dir: PathBuf,
-        /// Name for the fork (default: DIR's last component).
+        dir: Option<PathBuf>,
+        /// Name for the fork (default: DIR's last component; required without DIR).
         #[arg(long)]
         name: Option<String>,
         /// Serve in the foreground instead of in the background.
@@ -145,7 +148,11 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Fork { from, dir, name, foreground } => {
             let from = home.find(&from)?;
-            let name = default_name(name, &dir)?;
+            let name = match (&dir, name) {
+                (Some(dir), name) => default_name(name, dir)?,
+                (None, Some(name)) => default_name(Some(name), Path::new(""))?,
+                (None, None) => bail!("name the snapshot with --name, or give a directory to mount the fork on"),
+            };
             sync(&home, &from)?;
             let record = home.record(&from)?;
             let target = home.create(&name, &record)?;
@@ -153,17 +160,38 @@ fn run(cli: Cli) -> Result<()> {
                 remove_unused(&home, &name);
                 return Err(err);
             }
-            mount_new(&home, &name, &dir, foreground)
+            match dir {
+                Some(dir) => mount_new(&home, &name, &dir, foreground),
+                None => {
+                    println!("{name} forked from {from}");
+                    Ok(())
+                }
+            }
         }
         Cmd::Changes { workspace } => {
             let name = home.find(&workspace)?;
             sync(&home, &name)?;
-            let opened = home.open(&name)?;
+            // Saved files are read as needed, and a mount saving meanwhile may replace
+            // one; reading again from the newer save works.
+            let mut attempts = 0;
+            let (opened, changes) = loop {
+                let opened = home.open(&name)?;
+                match opened.ws.changes() {
+                    Ok(changes) => break (opened, changes),
+                    Err(err) => {
+                        let err = anyhow::Error::from(err);
+                        if !is_object_gone(&err) || attempts == 10 {
+                            return Err(err);
+                        }
+                        attempts += 1;
+                    }
+                }
+            };
             let root = VPath::parse(ROOT)?;
             // What git keeps in a git mount's `.git` would drown out the files themselves.
             let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| VPath::parse(&format!("{ROOT}/.git")));
             let git_dir = git_dir.transpose()?;
-            for change in opened.ws.changes()? {
+            for change in changes {
                 if git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)) {
                     continue;
                 }

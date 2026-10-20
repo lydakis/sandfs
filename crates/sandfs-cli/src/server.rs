@@ -292,20 +292,20 @@ mod tests {
     fn the_process_closes_only_after_lingering_idle() {
         let state = Arc::new(State::default());
         let ticket = state.enter().unwrap();
-        // Timed from here, not from inside the thread, which may start late on a busy
-        // machine and so see less than the 100 ms the ticket is held.
-        let started = Instant::now();
         let waiter = {
             let state = state.clone();
             std::thread::spawn(move || {
                 state.wait_until_idle(Duration::from_millis(50));
-                started.elapsed()
+                Instant::now()
             })
         };
         std::thread::sleep(Duration::from_millis(100));
         assert!(!waiter.is_finished(), "a mount keeps the process");
+        // Timed from the drop, not from when the thread started, which a busy machine
+        // can delay.
+        let idle = Instant::now();
         drop(ticket);
-        assert!(waiter.join().unwrap() >= Duration::from_millis(150), "it lingers once idle");
+        assert!(waiter.join().unwrap() >= idle + Duration::from_millis(50), "it lingers once idle");
         assert!(state.enter().is_none(), "a closed process takes no more requests");
     }
 }

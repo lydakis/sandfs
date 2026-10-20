@@ -426,7 +426,12 @@ fn remote_json(result: &remote::RemoteResult) -> serde_json::Value {
         "first_nanos": result.first.as_nanos() as u64,
         "samples_nanos": result.samples.as_nanos() as u64,
         "search_nanos": result.search.as_nanos() as u64,
+        "status_nanos": result.status.as_nanos() as u64,
+        "commit_nanos": result.commit.as_nanos() as u64,
+        "status_again_nanos": result.status_again.as_nanos() as u64,
         "fork_nanos": result.fork.as_nanos() as u64,
+        "grep_nanos": result.grep.map(|grep| grep.map(|grep| grep.as_nanos() as u64)),
+        "grep_stopped": result.grep.is_some_and(|grep| grep.is_none()),
         "matches": result.matches,
         "bytes": result.bytes,
         "peak_rss_bytes": result.peak_rss,
@@ -443,7 +448,14 @@ fn remote_from_json(method: remote::Method, row: &serde_json::Value) -> Result<r
         first: nanos("first_nanos")?,
         samples: nanos("samples_nanos")?,
         search: nanos("search_nanos")?,
+        status: nanos("status_nanos")?,
+        commit: nanos("commit_nanos")?,
+        status_again: nanos("status_again_nanos")?,
         fork: nanos("fork_nanos")?,
+        grep: match (&row["grep_nanos"], row["grep_stopped"].as_bool()) {
+            (_, Some(true)) => Some(None),
+            (nanos, _) => nanos.as_u64().map(|nanos| Some(Duration::from_nanos(nanos))),
+        },
         matches: usize::try_from(number("matches")?)?,
         bytes: number("bytes")?,
         peak_rss: number("peak_rss_bytes")?,
@@ -480,6 +492,28 @@ fn print_remote(plan: &remote::Plan, results: &[remote::RemoteResult]) {
             fmt_duration(result.fork),
             fmt_bytes(result.peak_rss),
             fmt_bytes(result.disk),
+        );
+    }
+    println!();
+    println!(
+        "Then, in the same copy: the first `git status`, committing one changed file in {}/, `git status` again, and `grep -r` over the whole copy for a word it doesn't hold. Memory and disk above include these steps, except the disk the search fills.",
+        plan.subtree
+    );
+    println!();
+    println!("| method | first git status | commit | git status again | grep -r everything |");
+    println!("|---|---:|---:|---:|---:|");
+    for result in results {
+        println!(
+            "| {} | {} | {} | {} | {} |",
+            result.method.name(),
+            fmt_duration(result.status),
+            fmt_duration(result.commit),
+            fmt_duration(result.status_again),
+            match result.grep {
+                None => "not held".to_owned(),
+                Some(None) => format!("over {}", fmt_duration(remote::GREP_LIMIT)),
+                Some(Some(grep)) => fmt_duration(grep),
+            },
         );
     }
 }

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use sandfs_core::{
-    Change, ChangeKind, DirSource, Error, Kind, Listing, MemorySource, Source, SourceKey, VPath, Workspace,
+    Change, ChangeKind, DirSource, Error, Kind, Listing, MemorySource, Source, SourceKey, Stored, VPath, Workspace,
 };
 
 /// A source whose listing of one directory key always fails.
@@ -726,4 +726,76 @@ fn failed_fetches_are_retried_not_cached() {
     assert!(matches!(ws.read("/data/README.md"), Err(Error::Source(_))));
     assert_eq!(ws.read_text("/data/README.md").unwrap(), "hello\n");
     assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+}
+
+/// A store of saved files: a source that is never mounted, as a disk store would be.
+fn store(files: &[(&str, &str)]) -> Arc<Counting> {
+    Counting::new(MemorySource::from_files(files.iter().map(|(key, data)| (*key, data.to_string()))).unwrap())
+}
+
+fn stored(source: &Arc<Counting>, key: &str, size: u64) -> Stored {
+    Stored { source: source.clone(), key: key.into(), size }
+}
+
+#[test]
+fn stored_files_are_read_from_their_store_every_time() {
+    let saved = store(&[("1", "saved report"), ("2", "notes")]);
+    let mut ws = Workspace::new();
+    ws.mount("/data", Arc::new(repo())).unwrap();
+    let version = ws.write_stored("/data/report.txt", stored(&saved, "1", 12)).unwrap();
+    assert_eq!(saved.reads(), (0, 0), "writing a stored file reads nothing");
+    let meta = ws.stat("/data/report.txt").unwrap();
+    assert_eq!((meta.size, meta.version), (12, version), "its size comes from the store's record");
+    assert_eq!(ws.list("/data").unwrap().iter().find(|e| e.name == "report.txt").unwrap().size, Some(12));
+
+    assert_eq!(ws.read_text("/data/report.txt").unwrap(), "saved report");
+    assert_eq!(ws.read_text("/data/report.txt").unwrap(), "saved report");
+    assert_eq!(saved.reads(), (0, 2), "nothing is kept in memory, so each read goes to the store");
+    assert_eq!(ws.read_range("/data/report.txt", 6, 3).unwrap(), "rep");
+    assert_eq!(
+        ws.changes().unwrap(),
+        [Change { path: VPath::parse("/data/report.txt").unwrap(), kind: ChangeKind::Added }]
+    );
+
+    // Copies and moves keep reading from the store, and say where.
+    ws.rename("/data/report.txt", "/data/final.txt").unwrap();
+    ws.copy("/data/final.txt", "/data/copy.txt", false).unwrap();
+    for path in ["/data/final.txt", "/data/copy.txt"] {
+        assert_eq!(&*ws.stored(path).unwrap().unwrap().key, "1");
+        assert_eq!(ws.read_text(path).unwrap(), "saved report");
+    }
+    assert!(ws.stored("/data/README.md").unwrap().is_none(), "a base file isn't stored");
+    ws.write("/data/final.txt", "rewritten").unwrap();
+    assert!(ws.stored("/data/final.txt").unwrap().is_none(), "a new write lives in memory again");
+}
+
+#[test]
+fn storing_a_file_keeps_its_version_unless_it_changed_since() {
+    let saved = store(&[("1", "draft one"), ("2", "draft two")]);
+    let mut ws = Workspace::new();
+    ws.mount("/data", Arc::new(repo())).unwrap();
+    let version = ws.write("/data/draft.txt", "draft one").unwrap();
+    let fork = ws.fork();
+    assert!(ws.store("/data/draft.txt", version, stored(&saved, "1", 9)).unwrap());
+    let meta = ws.stat("/data/draft.txt").unwrap();
+    assert_eq!((meta.version, meta.size), (version, 9), "same bytes, same version");
+    assert_eq!(ws.read_text("/data/draft.txt").unwrap(), "draft one");
+    assert_eq!(saved.reads(), (0, 1));
+    assert!(fork.stored("/data/draft.txt").unwrap().is_none(), "forks taken before keep their own copy");
+
+    // A file written again since the save has bytes the store doesn't hold.
+    let newer = ws.write("/data/draft.txt", "draft two, longer").unwrap();
+    assert!(!ws.store("/data/draft.txt", version, stored(&saved, "2", 9)).unwrap());
+    assert_eq!(ws.read_text("/data/draft.txt").unwrap(), "draft two, longer");
+    assert_eq!(ws.stat("/data/draft.txt").unwrap().version, newer);
+    // Base files and missing files are never stored.
+    assert!(!ws.store("/data/README.md", 0, stored(&saved, "2", 9)).unwrap());
+    assert!(!ws.store("/data/missing.txt", 0, stored(&saved, "2", 9)).unwrap());
+    assert!(!ws.exists("/data/missing.txt"));
+
+    // Keeping the executable bit, which is part of the file, not its bytes.
+    let version = ws.write("/data/run.sh", "draft two").unwrap();
+    let version = ws.set_executable("/data/run.sh", true).unwrap().max(version);
+    assert!(ws.store("/data/run.sh", version, stored(&saved, "2", 9)).unwrap());
+    assert_eq!(ws.stat("/data/run.sh").unwrap().kind, Kind::File { executable: true });
 }

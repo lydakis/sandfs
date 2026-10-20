@@ -67,6 +67,11 @@ impl Server {
         &self.tools.workspace
     }
 
+    /// The workspace, to change outside the tools.
+    pub fn workspace_mut(&mut self) -> &mut Workspace {
+        &mut self.tools.workspace
+    }
+
     /// End the session and take the workspace back, for example to list its changes.
     pub fn into_workspace(self) -> Workspace {
         self.tools.workspace

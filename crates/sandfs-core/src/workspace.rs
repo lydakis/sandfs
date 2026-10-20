@@ -6,7 +6,7 @@
 //! exactly the change set. Base content is read through a cache shared by every fork,
 //! so a file fetched once is never fetched again.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,11 +52,10 @@ struct Cache {
     entries: Mutex<HashMap<u64, HashMap<Box<str>, SourceEntry>>>,
     /// Directories already prefetched, and whether recursively, so each is asked once.
     prefetched: Mutex<HashSet<(CacheKey, bool)>>,
-    /// Base files each directory needed fetched: sizes missing from its listing, and
-    /// files a walk read.
-    touches: Mutex<HashMap<CacheKey, u32>>,
-    /// Base files already counted in `touches`, so a file read in pieces counts once.
-    touched: Mutex<HashSet<CacheKey>>,
+    /// Base files each directory needed fetched in the current look: sizes missing
+    /// from its listing, and files a walk or a program reading by path read. A set,
+    /// so a file read in pieces counts once.
+    touched: Mutex<HashMap<CacheKey, HashSet<SourceKey>>>,
     /// Directories listed again for their files' sizes, at most once each.
     sized: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
 }
@@ -101,13 +100,30 @@ impl Cache {
     }
 }
 
-/// File content: bytes written into the overlay, or a reference to a base file that
-/// has not been (or need not be) read. References let copies and renames of base files
-/// stay lazy.
+/// File content: bytes written into the overlay, a reference to a base file that
+/// has not been (or need not be) read, or bytes kept in a store outside memory.
+/// References let copies and renames of base files stay lazy.
 #[derive(Clone, Debug)]
 enum Content {
     Bytes(Bytes),
     Base { mount: Arc<Mount>, key: SourceKey, size: Option<u64> },
+    Stored(Stored),
+}
+
+/// Where a file's bytes are kept outside memory: a file in a source its owner manages,
+/// such as files already saved to disk. See [`Workspace::write_stored`].
+///
+/// The workspace reads a stored file from its source every time and never keeps a
+/// copy, so it costs no memory however large it is; the source (or the operating
+/// system's cache under it) decides what stays in memory.
+#[derive(Clone, Debug)]
+pub struct Stored {
+    /// The source holding the bytes. It needn't be mounted anywhere.
+    pub source: Arc<dyn Source>,
+    /// The file's key in `source`.
+    pub key: SourceKey,
+    /// The file's size in bytes.
+    pub size: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -186,15 +202,16 @@ struct Walks {
     /// Directories a walk listed (listed inside a listed directory), and the one it
     /// started from, each with the directory the walk started at.
     starts: HashMap<VPath, VPath>,
-    /// What each walk, by its start, needed files in lately.
-    reading: HashMap<VPath, Reading>,
+    /// What each walk, by its start, needed files in lately; `None` for files needed by
+    /// path, outside any walk.
+    reading: HashMap<Option<VPath>, Reading>,
 }
 
-/// The directories a walk needed files in, with no pause longer than [`WALK_GAP`].
+/// The last directories a walk, or a program reading files by path, needed files in,
+/// with no pause longer than [`WALK_GAP`].
 struct Reading {
-    dirs: HashSet<VPath>,
-    /// The deepest directory holding them all.
-    below: VPath,
+    /// At most [`WALK_DIRS`], the latest last.
+    recent: VecDeque<VPath>,
     last: Instant,
 }
 
@@ -277,7 +294,11 @@ impl Workspace {
                         Some(size) => size,
                         None => match self.listed_size(&path, &content)? {
                             Some(size) => size,
-                            None => self.content_bytes(&content)?.len() as u64,
+                            None => {
+                                let size = self.content_bytes(&content)?.len() as u64;
+                                self.fetched(&path);
+                                size
+                            }
                         },
                     },
                 };
@@ -293,10 +314,13 @@ impl Workspace {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { kind: Kind::Symlink, .. } => Err(is_a_symlink(&path)),
             Resolved::File { content, .. } => {
-                if let Content::Base { mount, key, .. } = &content {
-                    self.reading(&path, mount, key)?;
+                let Content::Base { mount, key, .. } = &content else { return self.content_bytes(&content) };
+                let fetching = self.reading(&path, mount, key)?;
+                let bytes = self.content_bytes(&content);
+                if fetching {
+                    self.fetched(&path);
                 }
-                self.content_bytes(&content)
+                bytes
             }
         }
     }
@@ -312,12 +336,17 @@ impl Workspace {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { kind: Kind::Symlink, .. } => Err(is_a_symlink(&path)),
             Resolved::File { content: Content::Bytes(bytes), .. } => Ok(slice(&bytes, offset, len)),
+            Resolved::File { content: Content::Stored(stored), .. } => {
+                stored.source.read_range(&stored.key, offset, len)
+            }
             Resolved::File { content: Content::Base { mount, key, .. }, .. } => {
                 match self.cache.peek_blob(&(mount.id, key.clone())) {
                     Some(bytes) => Ok(slice(&bytes, offset, len)),
                     None => {
                         self.reading(&path, &mount, &key)?;
-                        mount.source.read_range(&key, offset, len)
+                        let bytes = mount.source.read_range(&key, offset, len);
+                        self.fetched(&path);
+                        bytes
                     }
                 }
             }
@@ -423,7 +452,46 @@ impl Workspace {
         self.write_checked(path, data, Some(expected))
     }
 
+    /// Write a file whose bytes stay in `stored`'s source, read from there whenever the
+    /// file is read and never copied into memory. Returns the new version. The source
+    /// must keep answering for the key while this workspace, or a fork of it, has the
+    /// file.
+    pub fn write_stored(&mut self, path: &str, stored: Stored) -> Result<u64> {
+        self.write_content(path, Content::Stored(stored), None)
+    }
+
+    /// Read the file at `path` from `stored` from now on instead of from memory, if it
+    /// still has `version`, which it keeps: the caller vouches that `stored` holds
+    /// exactly the file's bytes. Returns whether it did. This is how a file already
+    /// saved elsewhere stops taking memory.
+    pub fn store(&mut self, path: &str, version: u64, stored: Stored) -> Result<bool> {
+        let path = VPath::parse(path)?;
+        match self.overlay.get(&path) {
+            Some(Overlay::File { version: current, kind, .. }) if *current == version => {
+                let kind = *kind;
+                self.overlay.insert(path, Overlay::File { content: Content::Stored(stored), kind, version });
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Where the file at `path` is stored outside memory, if it is: written with
+    /// [`Workspace::write_stored`] or moved there with [`Workspace::store`], or a copy
+    /// or move of such a file.
+    pub fn stored(&self, path: &str) -> Result<Option<Stored>> {
+        let path = VPath::parse(path)?;
+        Ok(match self.resolve(&path)? {
+            Resolved::File { content: Content::Stored(stored), .. } => Some(stored),
+            _ => None,
+        })
+    }
+
     fn write_checked(&mut self, path: &str, data: impl Into<Bytes>, expected: Option<u64>) -> Result<u64> {
+        self.write_content(path, Content::Bytes(data.into()), expected)
+    }
+
+    fn write_content(&mut self, path: &str, content: Content, expected: Option<u64>) -> Result<u64> {
         let path = VPath::parse(path)?;
         let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
         let (kind, version) = match self.resolve(&path) {
@@ -439,7 +507,6 @@ impl Workspace {
             }
         }
         self.ensure_dir(&parent)?;
-        let content = Content::Bytes(data.into());
         let version = self.tick();
         self.overlay.insert(path, Overlay::File { content, kind, version });
         Ok(version)
@@ -683,42 +750,57 @@ impl Workspace {
     }
 
     /// Before a base file's bytes are fetched: a walk reading the files it lists
-    /// (`grep -r`, a copy) has the source prefetch, once it has read two files in one
-    /// directory. A read outside a walk prefetches nothing.
-    fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<()> {
-        // With no walk at all, a read costs nothing more.
-        if self.walks.lock().expect("walks lock").starts.is_empty()
-            || self.cache.peek_blob(&(mount.id, key.clone())).is_some()
-        {
-            return Ok(());
+    /// (`grep -r`, a copy), or a program reading files by path one after another (a
+    /// build), has the source prefetch, once it has read two files in one directory.
+    /// A read after a pause, as a person's next look, prefetches nothing.
+    /// Whether the bytes are to be fetched, rather than cached already.
+    fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<bool> {
+        if self.cache.peek_blob(&(mount.id, key.clone())).is_some() {
+            return Ok(false);
         }
-        let Some(parent) = path.parent() else { return Ok(()) };
-        let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(()) };
+        let Some(parent) = path.parent() else { return Ok(true) };
+        let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(true) };
         if self.touch(key, &parent, mount, &dir, true)? == Touch::Warmed {
-            self.prefetch_dir(&parent, mount, &dir)?;
+            self.prefetch_dir(mount, &dir);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// After a base file at `path` was fetched: a pause is measured from here, not from
+    /// when the fetch began, so files that each take longer than [`WALK_GAP`] to arrive
+    /// still come one after another.
+    fn fetched(&self, path: &VPath) {
+        let Some(parent) = path.parent() else { return };
+        let mut walks = self.walks.lock().expect("walks lock");
+        let start = walks.starts.get(&parent).cloned();
+        if let Some(reading) = walks.reading.get_mut(&start) {
+            reading.last = Instant::now();
+        }
     }
 
     /// Count the base file `file` of the directory `dir` at `path` as needing a fetch.
     /// One file says nothing about the rest; the second shows the directory is being
-    /// gone through. Reads count only inside a walk.
+    /// gone through. Outside a walk, a read shows it only when it follows the last
+    /// file needed without a pause.
     fn touch(&self, file: &SourceKey, path: &VPath, mount: &Arc<Mount>, dir: &SourceKey, read: bool) -> Result<Touch> {
         let start = self.walks.lock().expect("walks lock").starts.get(path).cloned();
-        if read && start.is_none() {
-            return Ok(Touch::Cold);
-        }
-        let first = self.cache.touched.lock().expect("cache lock").insert((mount.id, file.clone()));
-        let count = {
-            let mut touches = self.cache.touches.lock().expect("cache lock");
-            let count = touches.entry((mount.id, dir.clone())).or_default();
-            if first {
-                *count = count.saturating_add(1);
+        let walking = start.is_some();
+        let steady = self.walk_reads(start, path, mount)?;
+        // A read by path after a pause starts the directory's count again: it is a new
+        // look, its file the first (even one fetched before, as ranged reads do), and the
+        // next file read right after it the second.
+        let fresh = read && !walking && !steady;
+        let (count, first) = {
+            let mut touched = self.cache.touched.lock().expect("cache lock");
+            let files = touched.entry((mount.id, dir.clone())).or_default();
+            if fresh {
+                files.clear();
             }
-            *count
+            let first = files.insert(file.clone());
+            (files.len(), first)
         };
-        if let Some(start) = start {
-            self.walk_reads(start, path, mount)?;
+        if fresh {
+            return Ok(Touch::Cold);
         }
         Ok(match (count, first) {
             (0 | 1, _) => Touch::Cold,
@@ -727,52 +809,59 @@ impl Workspace {
         })
     }
 
-    /// Record that the walk from `start` needed a file in the directory at `path`. Once
-    /// it has needed files in [`WALK_DIRS`] directories without pausing, it is reading
-    /// through them (`grep -r`, a copy) rather than looking around, so everything below
-    /// the directory holding them all is prefetched, once.
-    fn walk_reads(&self, start: VPath, path: &VPath, mount: &Arc<Mount>) -> Result<()> {
+    /// Record that the walk from `start` (`None`: a program reading by path) needed a
+    /// file in the directory at `path`, and say whether it came without a pause after
+    /// the last one. Once it has needed files in [`WALK_DIRS`] directories in a row
+    /// without pausing, it is reading through them (`grep -r`, a copy, a build) rather
+    /// than looking around, so everything below the directory holding the last three
+    /// is prefetched, once. Following the latest ones, rather than all since the walk
+    /// began, asks for the part of a large tree it is in now, ahead of the rest.
+    fn walk_reads(&self, start: Option<VPath>, path: &VPath, mount: &Arc<Mount>) -> Result<bool> {
         let now = Instant::now();
-        let below = {
+        let (steady, below) = {
             let mut walks = self.walks.lock().expect("walks lock");
-            let reading = walks.reading.entry(start).or_insert_with(|| Reading {
-                dirs: HashSet::new(),
-                below: path.clone(),
-                last: now,
+            let mut steady = true;
+            let reading = walks.reading.entry(start).or_insert_with(|| {
+                steady = false;
+                Reading { recent: VecDeque::new(), last: now }
             });
             if now.duration_since(reading.last) > WALK_GAP {
-                reading.dirs.clear();
-                reading.below = path.clone();
+                steady = false;
+                reading.recent.clear();
             }
             reading.last = now;
-            if !reading.dirs.insert(path.clone()) {
-                return Ok(());
+            // A directory needed again becomes the latest.
+            let again = reading.recent.iter().position(|dir| dir == path);
+            if let Some(at) = again {
+                reading.recent.remove(at);
             }
-            reading.below = common_ancestor(&reading.below, path);
-            (reading.dirs.len() >= WALK_DIRS).then(|| reading.below.clone())
+            reading.recent.push_back(path.clone());
+            if again.is_some() {
+                return Ok(steady);
+            }
+            if reading.recent.len() > WALK_DIRS {
+                reading.recent.pop_front();
+            }
+            let below = (reading.recent.len() == WALK_DIRS)
+                .then(|| reading.recent.iter().fold(path.clone(), |below, dir| common_ancestor(&below, dir)));
+            (steady, below)
         };
-        let Some(below) = below else { return Ok(()) };
+        let Some(below) = below else { return Ok(steady) };
         if let Some(key) = self.base_dir(&below, mount)? {
             if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, key.clone()), true)) {
                 mount.source.prefetch(&key, true);
             }
         }
-        Ok(())
+        Ok(steady)
     }
 
-    /// Ask the source to prefetch the files of the directory `dir` at `path`, once,
-    /// unless everything below one of its parents was prefetched already.
-    fn prefetch_dir(&self, path: &VPath, mount: &Arc<Mount>, dir: &SourceKey) -> Result<()> {
-        for ancestor in path.ancestors().iter().chain([path]) {
-            let Some(key) = self.base_dir(ancestor, mount)? else { continue };
-            if self.cache.prefetched.lock().expect("cache lock").contains(&((mount.id, key), true)) {
-                return Ok(());
-            }
-        }
+    /// Ask the source to prefetch the files of the directory `dir`, once.
+    /// It is asked even when everything below a parent was: a source may still be
+    /// fetching a large tree, and this asks for these files first.
+    fn prefetch_dir(&self, mount: &Arc<Mount>, dir: &SourceKey) {
         if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, dir.clone()), false)) {
             mount.source.prefetch(dir, false);
         }
-        Ok(())
     }
 
     /// The size of a base file already read.
@@ -796,7 +885,7 @@ impl Workspace {
         // Single-flight, like every other cache entry: forks asking at once prefetch once.
         let cache_key = (mount.id, dir.clone());
         let listing = Cache::get_or_load(&self.cache.sized, cache_key.clone(), || {
-            self.prefetch_dir(&parent, mount, &dir)?;
+            self.prefetch_dir(mount, &dir);
             let listing = Arc::new(mount.source.read_dir(&dir)?);
             self.cache.replace_listing(cache_key.clone(), listing.clone());
             Ok(listing)
@@ -826,6 +915,7 @@ impl Workspace {
             Content::Base { mount, key, .. } => {
                 Cache::get_or_load(&self.cache.blobs, (mount.id, key.clone()), || mount.source.read_file(key))
             }
+            Content::Stored(stored) => stored.source.read_file(&stored.key),
         }
     }
 
@@ -1046,5 +1136,6 @@ fn content_size(content: &Content) -> Option<u64> {
     match content {
         Content::Bytes(bytes) => Some(bytes.len() as u64),
         Content::Base { size, .. } => *size,
+        Content::Stored(stored) => Some(stored.size),
     }
 }
