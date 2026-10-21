@@ -1,9 +1,24 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-10-21)
 
-The next release is 0.5.0 rather than 0.4.1 because two changes break custom sources and code that matches on kinds. `Kind` has a new variant, `Kind::Symlink`, so a `match` over it needs an arm for links. `SourceEntry` has a new field, `modified`, so a source that builds entries field by field must set it (`None` is fine).
+The main changes:
+- `sandfs mount` works on macOS with nothing to install.
+- A repository mounts from a plain URL, and listing it, `stat` and `git status` download almost nothing.
+- Git works inside a git mount.
+- Workspaces and mounts hold symbolic and hard links.
+- Read-only paths, `sandfs shell` and `changes --copy-to` let a workspace be all the files an agent has.
+- Forks, saves and memory cost far less after a large build.
+- Each GitHub release now carries the `sandfs` command, ready to run, for Linux and macOS.
 
+Breaking changes for Rust code that matches on these types or builds their entries:
+- `Kind` has a new variant, `Kind::Symlink`, so a `match` over it needs an arm for links.
+- `Error` has a new variant, `Error::ReadOnly`, so a `match` over it needs one too.
+- `SourceEntry` has a new field, `modified`, so a source that builds entries field by field must set it (`None` is fine).
+
+Every change:
+
+- **Prebuilt `sandfs` command**: each GitHub release has `sandfs` built for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), so the command needs no Rust toolchain. Download the archive for your machine from the release page, unpack it and put `sandfs` on your `PATH`. `sandfs-cli`'s license is now `MIT AND BSD-3-Clause`, since it carries nfsserve's NFS server.
 - **sandfs-cli, writes kept under memory pressure**: on Linux, a file written and closed could lose what was written if the kernel, short of memory, forgot it within a quarter second of the last write. Git's index was the usual victim (`index file smaller than expected`). Such writes are now kept.
 - **sandfs-cli, quicker unmount**: unmounting no longer waits out the quarter second the mount gives a burst of writes to settle before saving it; the final save at unmount does that work. Unmounting a copy after `git status` in it went from 270 ms to 5 ms.
 - **sandfs-cli, folders listed again**: on Linux the kernel now keeps each folder's listing once read and lists it again without asking the mount, until something changes that folder through the mount. A walk over folders already seen (`find`, an editor's file tree, git looking for new files) no longer costs four requests per folder. On a VS Code mount from GitHub, `find` over the whole tree takes 0.04 s instead of 0.66 s once it has run, as fast as on a clone; in the benchmark, a second walk of 10,000 files takes 5.6 ms instead of 32 ms and listing a 10,000-file folder again 1.5 ms instead of 6.7 ms.
