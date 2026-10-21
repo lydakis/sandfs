@@ -1316,13 +1316,13 @@ fn a_shell_sees_its_mount_and_nothing_else() {
     assert_eq!(sandfs.stdout(&["changes", "ws"]), "M budget.csv\nA notes.md\n");
     assert_eq!(std::fs::read_to_string(source.join("budget.csv")).unwrap(), "jan\n");
 
-    // The mount's folder works as well as its name, and --network lets the network in.
-    if cfg!(target_os = "linux") {
-        let net =
-            sandfs.stdout(&["shell", dir.to_str().unwrap(), "--network", "--", "grep", "-c", ":", "/proc/net/dev"]);
-        assert!(net.trim().parse::<u32>().unwrap() > 1, "only loopback with --network");
-    }
-    sandfs.run(&["shell", dir.to_str().unwrap(), "--", "true"]);
+    // The mount's folder works as well as its name, and only --network reaches a server
+    // on this machine.
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connect = format!("exec 3<>/dev/tcp/127.0.0.1/{} || exit 9", server.local_addr().unwrap().port());
+    let dir_arg = dir.to_str().unwrap();
+    assert_eq!(sandfs.try_run(&["shell", dir_arg, "--", "/bin/bash", "-c", &connect]).status.code(), Some(9));
+    sandfs.run(&["shell", dir_arg, "--network", "--", "/bin/bash", "-c", &connect]);
     // HOME would land in the workspace with a temporary folder inside the mount.
     let inside = Command::new(env!("CARGO_BIN_EXE_sandfs"))
         .env("SANDFS_HOME", sandfs.home.path())
