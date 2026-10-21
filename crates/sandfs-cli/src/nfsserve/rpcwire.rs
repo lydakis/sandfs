@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 
-use crate::nfsserve::context::RPCContext;
+use crate::nfsserve::context::{RPCContext, Verdict};
 use crate::nfsserve::rpc::*;
 use crate::nfsserve::xdr::*;
 use crate::nfsserve::{mount, mount_handlers, nfs, nfs_handlers, portmap, portmap_handlers};
@@ -16,6 +16,9 @@ use crate::nfsserve::{mount, mount_handlers, nfs, nfs_handlers, portmap, portmap
 const NFS_ACL_PROGRAM: u32 = 100227;
 const NFS_ID_MAP_PROGRAM: u32 = 100270;
 const NFS_METADATA_PROGRAM: u32 = 200024;
+
+/// The largest message read: a write of 1 MiB and its header, with room to spare.
+const MAX_MESSAGE: usize = 2 << 20;
 
 async fn handle_rpc(
     input: &mut impl Read,
@@ -99,6 +102,9 @@ async fn read_fragment(socket: &mut DuplexStream, append_to: &mut Vec<u8>) -> Re
     let length = (fragment_header & ((1 << 31) - 1)) as usize;
     trace!("Reading fragment length:{}, last:{}", length, is_last);
     let start_offset = append_to.len();
+    if start_offset + length > MAX_MESSAGE {
+        return Err(anyhow!("RPC message too large"));
+    }
     append_to.resize(append_to.len() + length, 0);
     socket.read_exact(&mut append_to[start_offset..]).await?;
     trace!("Finishing Reading fragment length:{}, last:{}", length, is_last);
@@ -111,9 +117,9 @@ pub async fn write_fragment(socket: &mut tokio::net::TcpStream, buf: &[u8]) -> R
     // set the last flag
     let fragment_header = buf.len() as u32 + (1 << 31);
     let header_buf = u32::to_be_bytes(fragment_header);
-    socket.write_all(&header_buf).await?;
     trace!("Writing fragment length:{}", buf.len());
-    socket.write_all(buf).await?;
+    // One write, so the header doesn't go out in a packet of its own.
+    socket.write_all(&[&header_buf[..], buf].concat()).await?;
     Ok(())
 }
 
@@ -152,6 +158,14 @@ impl SocketMessageHandler {
         let is_last = read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
         if is_last {
             let fragment = std::mem::take(&mut self.cur_fragment);
+            let correct = match self.context.filter.as_ref().map(|filter| filter.check(&fragment)) {
+                Some(Verdict::Reply(reply)) => {
+                    let _ = self.reply_send_channel.send(Ok(reply));
+                    return Ok(());
+                }
+                Some(Verdict::Correct(correct)) => Some(correct),
+                Some(Verdict::Serve) | None => None,
+            };
             let context = self.context.clone();
             let send = self.reply_send_channel.clone();
             tokio::spawn(async move {
@@ -165,6 +179,9 @@ impl SocketMessageHandler {
                     }
                     Ok(true) => {
                         let _ = std::io::Write::flush(&mut write_cursor);
+                        if let Some(correct) = correct {
+                            correct(&mut write_buf);
+                        }
                         let _ = send.send(Ok(write_buf));
                     }
                     Ok(false) => {

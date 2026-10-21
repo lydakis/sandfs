@@ -13,13 +13,12 @@
 //! The NFS server itself is [`crate::nfsserve`], a copy of the nfsserve crate.
 //!
 //! Any local user can connect to a port on localhost, so the server only answers its
-//! owner. The port the mount uses is a relay that passes on only calls whose
+//! owner. Before the server sees a call, a gate lets through only calls whose
 //! credentials name the user who mounted it (or root), as a FUSE mount only lets its
-//! owner in. The relay answers the mount request itself, handing out the root's file
-//! handle once, to a request naming a secret export path. The server behind it refuses
-//! every mount request and every file handle without another secret, so a program
-//! connecting to it directly gets nothing. Credentials can be made up, but not those
-//! secrets.
+//! owner in. The gate answers the mount request itself, handing out the root's file
+//! handle once, to a request naming a secret export path; the server refuses every
+//! other mount request, and every file handle without another secret. Credentials can
+//! be made up, but not those secrets.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -31,11 +30,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(nfs, test))]
+use crate::nfsserve::context::{CallFilter, Verdict};
 use crate::nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3,
     nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
 };
-#[cfg(nfs)]
+#[cfg(any(nfs, test))]
 use crate::nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use crate::nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 #[cfg(nfs)]
@@ -55,10 +56,6 @@ const MOUNT_CHECK: Duration = Duration::from_millis(500);
 /// Listed names kept track of, at most: past this the oldest are forgotten, and a
 /// client resuming after one of those resumes by the entry's current name.
 const LISTED_NAMES: usize = 16384;
-
-/// The largest RPC message relayed to the server: a write of `wsize` and its header.
-#[cfg(nfs)]
-const MAX_MESSAGE: usize = 2 << 20;
 
 /// Names handed out in listings, forgetting the oldest past [`LISTED_NAMES`].
 #[derive(Default)]
@@ -220,7 +217,7 @@ impl NFSFileSystem for SandNfs {
         }
     }
 
-    /// Asked for by a mount request, which the relay answers itself: one that reaches
+    /// Asked for by a mount request, which the gate answers itself: one that reaches
     /// the server came from somewhere else, and gets nothing.
     async fn path_to_id(&self, _path: &[u8]) -> Result<fileid3, nfsstat3> {
         Err(nfsstat3::NFS3ERR_ACCES)
@@ -435,15 +432,13 @@ pub fn run(
     runtime.block_on(async {
         let fs = SandNfs::new(shared.clone())?;
         let root = fs.id_to_fh(ROOT_INO).data;
-        let server = NFSTcpListener::bind("127.0.0.1:0", fs).await.context("starting the NFS server")?;
+        let mut server = NFSTcpListener::bind("127.0.0.1:0", fs).await.context("starting the NFS server")?;
         let export = format!("/sandfs/{name}/{}", hex(&random()?));
-        let server_port = server.get_listen_port();
-        tokio::spawn(async move { server.handle_forever().await });
-        let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("starting the NFS listener")?;
-        let port = front.local_addr()?.port();
         let users = vec![nix::unistd::getuid().as_raw(), 0];
         let gate = Gate { users, export: export.clone(), root, mounted: AtomicBool::new(false) };
-        tokio::spawn(guard(front, server_port, Arc::new(gate)));
+        server.with_filter(Arc::new(gate));
+        let port = server.get_listen_port();
+        tokio::spawn(async move { server.handle_forever().await });
         let saves = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("starting the save listener")?;
         let save_port = saves.local_addr()?.port();
         let save_secret = hex(&random()?);
@@ -464,7 +459,7 @@ pub fn run(
             return Err(err);
         }
 
-        // The relay keeps the client's unmount call from the server, since anyone could
+        // The gate keeps the client's unmount call from the server, since anyone could
         // send one, so the mount table says when the mount is gone (or replaced).
         let mut check = tokio::time::interval(MOUNT_CHECK);
         let ours = format!("sandfs:{name}");
@@ -500,102 +495,33 @@ fn mount_options(port: u16) -> String {
     .join(",")
 }
 
-/// What the relay decides each call by.
-#[cfg(nfs)]
+/// What decides each call before the server sees it: only calls [`call_allowed`] lets
+/// through for `users` reach it, and mount and unmount requests are answered here.
+#[cfg(any(nfs, test))]
 struct Gate {
     /// The users whose calls pass.
     users: Vec<u32>,
     /// The secret export path, which only the `mount_nfs` this process runs names.
     export: String,
-    /// The root's file handle, which the relay hands out itself.
+    /// The root's file handle, which the gate hands out itself.
     root: Vec<u8>,
     /// Whether it was.
     mounted: AtomicBool,
 }
 
-/// Relay each connection to `front` to the NFS server on `server_port`, passing on
-/// only the calls [`call_allowed`] lets through for the gate's users, refusing the
-/// rest, and answering mount and unmount requests itself.
-#[cfg(nfs)]
-async fn guard(front: tokio::net::TcpListener, server_port: u16, gate: Arc<Gate>) {
-    while let Ok((client, _)) = front.accept().await {
-        let gate = gate.clone();
-        tokio::spawn(async move { relay(client, server_port, &gate).await });
-    }
-}
-
-#[cfg(nfs)]
-async fn relay(client: tokio::net::TcpStream, server_port: u16, gate: &Gate) -> std::io::Result<()> {
-    let server = tokio::net::TcpStream::connect(("127.0.0.1", server_port)).await?;
-    client.set_nodelay(true)?;
-    server.set_nodelay(true)?;
-    let (mut from_client, to_client) = client.into_split();
-    let (mut from_server, mut to_server) = server.into_split();
-    // Replies and refusals both go to the client, a whole message at a time.
-    let to_client = Arc::new(tokio::sync::Mutex::new(to_client));
-    // The calls asking what access a caller has, whose replies need correcting.
-    let access_calls = Arc::new(Mutex::new(std::collections::HashSet::new()));
-    let replies = {
-        let to_client = to_client.clone();
-        let access_calls = access_calls.clone();
-        tokio::spawn(async move {
-            while let Ok(Some((mut message, mut reply))) = read_message(&mut from_server).await {
-                let xid = reply.get(..4).map(|xid| u32::from_be_bytes(xid.try_into().unwrap()));
-                if xid.is_some_and(|xid| access_calls.lock().unwrap().remove(&xid)) {
-                    limit_access(&mut reply);
-                    message = [&(0x8000_0000 | reply.len() as u32).to_be_bytes()[..], &reply].concat();
-                }
-                if to_client.lock().await.write_all(&message).await.is_err() {
-                    break;
-                }
-            }
-        })
-    };
-    let result = async {
-        while let Some((message, call)) = read_message(&mut from_client).await? {
-            if is_unmount_call(&call) {
-                to_client.lock().await.write_all(&unmounted(&call)).await?;
-            } else if !call_allowed(&call, &gate.users) {
-                to_client.lock().await.write_all(&refusal(&call)).await?;
-            } else if is_mount_call(&call) {
-                let reply = mount_reply(&call, &gate.export, &gate.root, &gate.mounted);
-                to_client.lock().await.write_all(&reply).await?;
-            } else {
-                if is_access_call(&call) {
-                    access_calls.lock().unwrap().insert(u32::from_be_bytes(call[..4].try_into().unwrap()));
-                }
-                to_server.write_all(&message).await?;
-            }
-        }
-        Ok(())
-    }
-    .await;
-    replies.abort();
-    result
-}
-
-/// Read one RPC message: its bytes as they came, record marks included, and its body.
-#[cfg(nfs)]
-async fn read_message(stream: &mut tokio::net::tcp::OwnedReadHalf) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let (mut message, mut body) = (Vec::new(), Vec::new());
-    loop {
-        let mut mark = [0; 4];
-        match stream.read_exact(&mut mark).await {
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof && message.is_empty() => return Ok(None),
-            result => result?,
-        };
-        let mark_value = u32::from_be_bytes(mark);
-        let len = (mark_value & 0x7fff_ffff) as usize;
-        if body.len() + len > MAX_MESSAGE {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "RPC message too large"));
-        }
-        let start = body.len();
-        body.resize(start + len, 0);
-        stream.read_exact(&mut body[start..]).await?;
-        message.extend_from_slice(&mark);
-        message.extend_from_slice(&body[start..]);
-        if mark_value & 0x8000_0000 != 0 {
-            return Ok(Some((message, body)));
+#[cfg(any(nfs, test))]
+impl CallFilter for Gate {
+    fn check(&self, call: &[u8]) -> Verdict {
+        if is_unmount_call(call) {
+            Verdict::Reply(unmounted(call))
+        } else if !call_allowed(call, &self.users) {
+            Verdict::Reply(refusal(call))
+        } else if is_mount_call(call) {
+            Verdict::Reply(mount_reply(call, &self.export, &self.root, &self.mounted))
+        } else if is_access_call(call) {
+            Verdict::Correct(limit_access)
+        } else {
+            Verdict::Serve
         }
     }
 }
@@ -625,7 +551,7 @@ fn call_allowed(call: &[u8], users: &[u32]) -> bool {
 }
 
 /// Whether `call` is a mount-protocol UMNT or UMNTALL call. The server stops serving
-/// when it gets one, whoever sent it, so the relay answers these itself; the server
+/// when it gets one, whoever sent it, so the gate answers these itself; the server
 /// sees the mount go from the mount table instead.
 fn is_unmount_call(call: &[u8]) -> bool {
     let word = |at: usize| call.get(at..at + 4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()));
@@ -662,12 +588,12 @@ fn mount_reply(call: &[u8], export: &str, root: &[u8], mounted: &AtomicBool) -> 
         reply.extend((root.len() as u32).to_be_bytes());
         reply.extend(root);
         reply.resize(reply.len().next_multiple_of(4), 0);
-        // One accepted flavor: Unix credentials, which the relay checks.
+        // One accepted flavor: Unix credentials, which the gate checks.
         reply.extend([1, AUTH_UNIX].map(u32::to_be_bytes).concat());
     } else {
         reply.extend(MNT3ERR_ACCES.to_be_bytes());
     }
-    [&(0x8000_0000 | reply.len() as u32).to_be_bytes()[..], &reply].concat()
+    reply
 }
 
 /// The reply to an unmount call: accepted, and done.
@@ -675,7 +601,7 @@ fn unmounted(call: &[u8]) -> Vec<u8> {
     let xid = call.get(..4).unwrap_or(&[0; 4]);
     // REPLY, MSG_ACCEPTED, an empty AUTH_NULL verifier, SUCCESS, and no result.
     let words = [1u32, 0, 0, 0, 0].map(u32::to_be_bytes).concat();
-    [&(0x8000_0000u32 | 24).to_be_bytes()[..], xid, &words].concat()
+    [xid, &words].concat()
 }
 
 /// Whether `call` is an NFS ACCESS call (program 100003, procedure 4).
@@ -708,12 +634,12 @@ fn limit_access(reply: &mut [u8]) {
     }
 }
 
-/// The record-marked reply refusing `call`: denied, its credentials too weak.
+/// The reply refusing `call`: denied, its credentials too weak.
 fn refusal(call: &[u8]) -> Vec<u8> {
     let xid = call.get(..4).unwrap_or(&[0; 4]);
     // REPLY, MSG_DENIED, AUTH_ERROR, AUTH_TOOWEAK.
     let words = [1u32, 1, 1, 5].map(u32::to_be_bytes).concat();
-    [&(0x8000_0000u32 | 20).to_be_bytes()[..], xid, &words].concat()
+    [xid, &words].concat()
 }
 
 /// Answer each connection to `saves` by saving everything written so far, then
@@ -774,7 +700,7 @@ mod tests {
     use sandfs_core::{MemorySource, VPath, Workspace};
 
     use super::*;
-    use crate::fs::is_bookkeeping;
+    use crate::fs::{drop_bookkeeping, is_bookkeeping};
     use crate::persist::Saved;
 
     fn served() -> (SandNfs, tempfile::TempDir) {
@@ -851,6 +777,8 @@ mod tests {
             assert_eq!(fs.read(id, 0, 100).await.unwrap().0, b"xattrs", "served while mounted");
             fs.shared.lock().snapshot(Duration::ZERO)
         });
+        let mut snapshot = snapshot;
+        drop_bookkeeping(&mut snapshot.ws);
         let changed: Vec<String> = snapshot.ws.changes().unwrap().iter().map(|c| c.path.to_string()).collect();
         assert_eq!(changed, ["/mnt/sub/kept.txt"]);
         assert!(snapshot.dirs.iter().any(|dir| dir.ends_with("/._cache")), "{:?}", snapshot.dirs);
@@ -1076,7 +1004,7 @@ mod tests {
         assert!(matches!(fs.fh_to_id(&nfs_fh3 { data: forged }), Err(nfsstat3::NFS3ERR_BADHANDLE)));
         assert!(matches!(fs.fh_to_id(&nfs_fh3 { data: fh.data[..20].to_vec() }), Err(nfsstat3::NFS3ERR_BADHANDLE)));
         block(async {
-            assert!(matches!(fs.path_to_id(b"/").await, Err(nfsstat3::NFS3ERR_ACCES)), "mounts go through the relay");
+            assert!(matches!(fs.path_to_id(b"/").await, Err(nfsstat3::NFS3ERR_ACCES)), "mounts go through the gate");
         });
     }
 
@@ -1119,7 +1047,7 @@ mod tests {
         assert!(!call_allowed(&mount_call(100005, 5, "mac", 501), &[501, 0]), "EXPORT names the secret");
         assert!(!call_allowed(&mount_call(100005, 2, "mac", 0), &[501, 0]), "DUMP");
 
-        // Mount requests are answered by the relay: the secret path gets the root's
+        // Mount requests are answered by the gate: the secret path gets the root's
         // handle, once, and anything else is refused.
         let mnt = |path: &str| {
             let mut name = path.as_bytes().to_vec();
@@ -1129,33 +1057,87 @@ mod tests {
         assert!(is_mount_call(&mnt("/x")) && !is_mount_call(&call(1, "mac", 501)));
         let (root, mounted) = ([7u8; 24], AtomicBool::new(false));
         let refused = mount_reply(&mnt("/sandfs/ws/other"), "/sandfs/ws/0f3a", &root, &mounted);
-        assert_eq!(refused[..8], [(0x8000_0000u32 | 28).to_be_bytes(), 42u32.to_be_bytes()].concat()[..]);
-        assert_eq!(refused[8..], [1u32, 0, 0, 0, 0, 13].map(u32::to_be_bytes).concat()[..]);
+        assert_eq!(refused[..4], 42u32.to_be_bytes(), "the call's xid");
+        assert_eq!(refused[4..], [1u32, 0, 0, 0, 0, 13].map(u32::to_be_bytes).concat()[..]);
         let granted = mount_reply(&mnt("/sandfs/ws/0f3a/"), "/sandfs/ws/0f3a", &root, &mounted);
-        assert_eq!(granted[..4], (0x8000_0000u32 | 64).to_be_bytes());
-        assert_eq!(granted[28..36], [0u32, 24].map(u32::to_be_bytes).concat()[..], "MNT3_OK and the handle's length");
-        assert_eq!(granted[36..60], root);
-        assert_eq!(granted[60..], [1u32, 1].map(u32::to_be_bytes).concat()[..], "AUTH_UNIX only");
+        assert_eq!(granted.len(), 64);
+        assert_eq!(granted[24..32], [0u32, 24].map(u32::to_be_bytes).concat()[..], "MNT3_OK and the handle's length");
+        assert_eq!(granted[32..56], root);
+        assert_eq!(granted[56..], [1u32, 1].map(u32::to_be_bytes).concat()[..], "AUTH_UNIX only");
         let again = mount_reply(&mnt("/sandfs/ws/0f3a"), "/sandfs/ws/0f3a", &root, &mounted);
-        assert_eq!(again[28..], 13u32.to_be_bytes(), "only once");
+        assert_eq!(again[24..], 13u32.to_be_bytes(), "only once");
         assert_eq!(
-            mount_reply(&mount_call(100005, 1, "mac", 501), "/x", &root, &AtomicBool::new(false))[28..],
+            mount_reply(&mount_call(100005, 1, "mac", 501), "/x", &root, &AtomicBool::new(false))[24..],
             13u32.to_be_bytes(),
             "no path"
         );
 
-        // Unmounts are answered by the relay, from anyone, and never reach the server.
+        // Unmounts are answered by the gate, from anyone, and never reach the server.
         assert!(is_unmount_call(&mount_call(100005, 3, "mac", 0)) && is_unmount_call(&mount_call(100005, 4, "x", 7)));
         assert!(!is_unmount_call(&mount_call(100005, 1, "mac", 501)) && !is_unmount_call(&call(3, "mac", 501)));
         let done = unmounted(&mount_call(100005, 3, "mac", 0));
-        assert_eq!(done[..8], [(0x8000_0000u32 | 24).to_be_bytes(), 42u32.to_be_bytes()].concat()[..]);
-        assert_eq!(done[8..], [1u32, 0, 0, 0, 0].map(u32::to_be_bytes).concat()[..]);
+        assert_eq!(done[..4], 42u32.to_be_bytes());
+        assert_eq!(done[4..], [1u32, 0, 0, 0, 0].map(u32::to_be_bytes).concat()[..]);
 
         let refused = refusal(&call(4, "mac", 502));
-        assert_eq!(refused.len(), 24);
-        assert_eq!(refused[..4], (0x8000_0000u32 | 20).to_be_bytes(), "one fragment of 20 bytes");
-        assert_eq!(refused[4..8], 42u32.to_be_bytes(), "the call's xid");
-        assert_eq!(refused[8..], [1u32, 1, 1, 5].map(u32::to_be_bytes).concat()[..]);
+        assert_eq!(refused[..4], 42u32.to_be_bytes(), "the call's xid");
+        assert_eq!(refused[4..], [1u32, 1, 1, 5].map(u32::to_be_bytes).concat()[..]);
+    }
+
+    /// Send `call` as one record and read the record that answers it, or `None` once
+    /// the server closes the connection.
+    async fn ask(stream: &mut tokio::net::TcpStream, call: &[u8]) -> Option<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mark = (0x8000_0000u32 | call.len() as u32).to_be_bytes();
+        stream.write_all(&[&mark[..], call].concat()).await.ok()?;
+        let mut mark = [0; 4];
+        stream.read_exact(&mut mark).await.ok()?;
+        let mut reply = vec![0; (u32::from_be_bytes(mark) & 0x7fff_ffff) as usize];
+        stream.read_exact(&mut reply).await.ok()?;
+        Some(reply)
+    }
+
+    #[test]
+    fn the_gate_answers_before_the_server_does() {
+        let (fs, _dir) = served();
+        let root = fs.id_to_fh(ROOT_INO).data;
+        let export = "/sandfs/ws/0f3a";
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut server = NFSTcpListener::bind("127.0.0.1:0", fs).await.unwrap();
+            let gate = Gate { users: vec![501, 0], export: export.into(), root: root.clone(), mounted: false.into() };
+            server.with_filter(Arc::new(gate));
+            let port = server.get_listen_port();
+            tokio::spawn(async move { server.handle_forever().await });
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let getattr =
+                |uid| [call(1, "mac", uid), (root.len() as u32).to_be_bytes().to_vec(), root.clone()].concat();
+
+            assert_eq!(ask(&mut stream, &getattr(502)).await.unwrap(), refusal(&getattr(502)), "another user");
+            let mut mnt = mount_call(100005, 1, "mac", 501);
+            mnt.extend((export.len() as u32).to_be_bytes());
+            mnt.extend(export.as_bytes());
+            let granted = ask(&mut stream, &mnt).await.unwrap();
+            assert_eq!(
+                granted[24..32],
+                [0u32, 24].map(u32::to_be_bytes).concat()[..],
+                "MNT3_OK and the handle's length"
+            );
+            assert_eq!(granted[32..56], root[..]);
+            // xid, REPLY, MSG_ACCEPTED, an empty verifier, SUCCESS, NFS3_OK.
+            let served = ask(&mut stream, &getattr(501)).await.unwrap();
+            assert_eq!(served[..28], [42u32, 1, 0, 0, 0, 0, 0].map(u32::to_be_bytes).concat()[..], "served");
+            let done = ask(&mut stream, &mount_call(100005, 3, "mac", 502)).await.unwrap();
+            assert_eq!(done, unmounted(&mount_call(100005, 3, "mac", 502)));
+            // Another call, as the server takes one with the same id for a retransmission.
+            let mut again = getattr(501);
+            again[..4].copy_from_slice(&43u32.to_be_bytes());
+            assert_eq!(ask(&mut stream, &again).await.unwrap()[4..28], served[4..28], "served after an unmount call");
+
+            let mut huge = getattr(501);
+            huge.resize(3 << 20, 0);
+            assert_eq!(ask(&mut stream, &huge).await, None, "messages over 2 MiB are refused");
+        });
     }
 
     /// A successful ACCESS reply for a file of `kind` and `mode`, granting `access`.
