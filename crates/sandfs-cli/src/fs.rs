@@ -288,6 +288,13 @@ pub struct Inner {
     /// without opening them, by folder inode.
     #[cfg(any(fuse, test))]
     listings: HashMap<u64, u64>,
+    /// Whether the kernel keeps folder listings, and the folders whose kept listing
+    /// names an inode dropped since: the kernel must let go of those listings, or they
+    /// would go on naming the old inode after a lookup gives the name a new one.
+    #[cfg(any(fuse, test))]
+    pub keep_listed: bool,
+    #[cfg(any(fuse, test))]
+    stale_listings: Vec<u64>,
     /// Open handles per directory.
     open: HashMap<u64, u32>,
     /// File contents written but not yet committed to the workspace.
@@ -349,6 +356,10 @@ impl Inner {
             handles: HashMap::new(),
             #[cfg(any(fuse, test))]
             listings: HashMap::new(),
+            #[cfg(any(fuse, test))]
+            keep_listed: false,
+            #[cfg(any(fuse, test))]
+            stale_listings: Vec::new(),
             next_fh: 1,
             open: HashMap::new(),
             buffers: HashMap::new(),
@@ -623,6 +634,16 @@ impl Inner {
         self.entry(&path)
     }
 
+    /// The folders whose kept listings name inodes dropped since the last call, once each.
+    #[cfg(any(fuse, test))]
+    pub fn take_stale_listings(&mut self) -> Vec<u64> {
+        let mut folders = std::mem::take(&mut self.stale_listings);
+        folders.retain(|folder| self.nodes.contains_key(folder));
+        folders.sort_unstable();
+        folders.dedup();
+        folders
+    }
+
     #[cfg(any(fuse, test))]
     pub fn forget(&mut self, ino: u64, count: u64) {
         if ino == ROOT_INO {
@@ -651,6 +672,11 @@ impl Inner {
                 {
                     let _ = buffer.commit(&mut self.ws, node.path.as_str());
                     self.unsaved = true;
+                }
+                #[cfg(any(fuse, test))]
+                if self.keep_listed && node.linked {
+                    let parent = node.path.parent().and_then(|parent| self.inos.get(parent.as_str()));
+                    self.stale_listings.extend(parent.filter(|parent| self.nodes.contains_key(parent)));
                 }
                 let others = if node.linked { self.other_names(&node.path) } else { Vec::new() };
                 for name in others.iter().chain([&node.path]) {
@@ -1377,6 +1403,10 @@ pub struct Shared {
     /// Whether the kernel lists folders without opening them, and keeps their listings.
     #[cfg(fuse)]
     no_opendir: AtomicBool,
+    /// Where folders whose kept listings went stale are sent, for a thread to tell the
+    /// kernel; telling it from a request could wait on the kernel while it waits on us.
+    #[cfg(fuse)]
+    stale_listings: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
 }
 
 impl Shared {
@@ -1391,6 +1421,8 @@ impl Shared {
             no_open: AtomicBool::new(false),
             #[cfg(fuse)]
             no_opendir: AtomicBool::new(false),
+            #[cfg(fuse)]
+            stale_listings: Mutex::new(None),
         })
     }
 
@@ -1480,6 +1512,43 @@ impl Shared {
         let _guard = self.lock();
         self.stop.store(true, Ordering::SeqCst);
         self.wake.notify_all();
+        #[cfg(fuse)]
+        self.stale_listings.lock().unwrap_or_else(PoisonError::into_inner).take();
+    }
+
+    /// Tell the kernel through `notifier` to let go of folder listings that went stale,
+    /// from a thread of its own, until [`Shared::stop`].
+    #[cfg(fuse)]
+    pub fn notify_stale_listings(&self, notifier: fuser::Notifier) {
+        let (send, folders) = std::sync::mpsc::channel::<u64>();
+        std::thread::spawn(move || {
+            while let Ok(folder) = folders.recv() {
+                // The kernel forgets in batches, often several entries of one folder:
+                // each folder waiting is told once.
+                let mut waiting = BTreeSet::from([folder]);
+                waiting.extend(folders.try_iter());
+                for folder in waiting {
+                    // Dropping a folder's cached pages drops its kept listing. A folder
+                    // the kernel has meanwhile forgotten too has nothing kept to drop.
+                    let _ = notifier.inval_inode(INodeNo(folder), 0, 0);
+                }
+            }
+        });
+        *self.stale_listings.lock().unwrap_or_else(PoisonError::into_inner) = Some(send);
+    }
+
+    /// Hand the folders whose kept listings went stale to the notifying thread.
+    #[cfg(fuse)]
+    fn send_stale_listings(&self, inner: &mut Inner) {
+        let folders = inner.take_stale_listings();
+        if folders.is_empty() {
+            return;
+        }
+        if let Some(send) = &*self.stale_listings.lock().unwrap_or_else(PoisonError::into_inner) {
+            for folder in folders {
+                let _ = send.send(folder);
+            }
+        }
     }
 
     /// Wake the saver if the last request left something unsaved. Most requests
@@ -1556,6 +1625,7 @@ impl Filesystem for SandFs {
         // seen (`find`, an editor's file tree, git looking for new files) sends nothing.
         let no_opendir = config.add_capabilities(InitFlags::FUSE_NO_OPENDIR_SUPPORT).is_ok();
         self.0.no_opendir.store(no_opendir, Ordering::SeqCst);
+        self.0.lock().keep_listed = no_opendir;
         Ok(())
     }
 
@@ -1572,7 +1642,9 @@ impl Filesystem for SandFs {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.0.lock().forget(ino.0, nlookup);
+        let mut inner = self.0.lock();
+        inner.forget(ino.0, nlookup);
+        self.0.send_stale_listings(&mut inner);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -2574,6 +2646,27 @@ mod tests {
         assert!(fs.readdir(again, 0).unwrap().iter().any(|(_, _, name)| name == "late.txt"));
         fs.end_listing(ROOT_INO);
         assert!(fs.handles.is_empty() && fs.listings.is_empty() && !fs.open.contains_key(&ROOT_INO));
+    }
+
+    #[test]
+    fn dropping_a_listed_inode_marks_its_folder_listing_stale() {
+        let mut fs = fs();
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let lib = fs.lookup(src, name("lib.rs")).unwrap().ino.0;
+        let util = fs.lookup(src, name("util.rs")).unwrap().ino.0;
+        fs.forget(lib, 1);
+        assert!(fs.take_stale_listings().is_empty(), "nothing is kept without kept listings");
+        fs.keep_listed = true;
+        let lib = fs.lookup(src, name("lib.rs")).unwrap().ino.0;
+        fs.forget(lib, 1);
+        fs.forget(util, 1);
+        assert_eq!(fs.take_stale_listings(), [src], "once per folder");
+        assert!(fs.take_stale_listings().is_empty());
+        // A folder the kernel forgot as well has no listing left to drop.
+        let lib = fs.lookup(src, name("lib.rs")).unwrap().ino.0;
+        fs.forget(lib, 1);
+        fs.forget(src, 1);
+        assert_eq!(fs.take_stale_listings(), [ROOT_INO]);
     }
 
     #[test]

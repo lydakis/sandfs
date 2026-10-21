@@ -663,6 +663,7 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
             }
             Err(err) => return Err(err).context("mounting with FUSE"),
         };
+        shared.notify_stale_listings(session.notifier());
         mounted(None)?;
         session.run().map_err(anyhow::Error::from)
     };
