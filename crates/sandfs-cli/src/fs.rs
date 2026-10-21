@@ -292,8 +292,13 @@ pub struct Inner {
     /// files would only pin their contents in memory.
     pub keep_removed: bool,
     /// Keep files macOS makes for its own bookkeeping out of saves, so they never
-    /// show up among the changes. See [`is_bookkeeping`].
+    /// show up among the changes, and the `._name` ones out of listings too. See
+    /// [`is_bookkeeping`].
     pub skip_bookkeeping: bool,
+    /// The workspace as it was mounted, which tells a `._name` file macOS made from one
+    /// that is part of the data.
+    #[cfg(any(nfs, test))]
+    mounted: Workspace,
 }
 
 /// Files macOS creates next to the ones people write: `._name` holds `name`'s extended
@@ -314,6 +319,8 @@ impl Inner {
         (uid, gid): (u32, u32),
     ) -> Self {
         let mut inner = Inner {
+            #[cfg(any(nfs, test))]
+            mounted: ws.fork(),
             ws,
             nodes: HashMap::new(),
             inos: BTreeMap::new(),
@@ -357,6 +364,35 @@ impl Inner {
             }
         }
         Snapshot { ws, times: self.times.clone(), dirs: self.dirs.clone() }
+    }
+
+    /// Whether the file `name` in folder `parent` is one macOS made to hold another
+    /// file's extended attributes (`._name`). Listings leave those out, so programs
+    /// that walk folders (git, cargo, find) never see them; macOS opens them by name.
+    #[cfg(any(nfs, test))]
+    pub fn is_added_appledouble(&self, parent: u64, name: &str, kind: FileType) -> bool {
+        self.skip_bookkeeping
+            && kind == FileType::RegularFile
+            && name.starts_with("._")
+            && self.child(parent, OsStr::new(name)).is_ok_and(|path| !self.mounted.exists(path.as_str()))
+    }
+
+    /// Remove the files of [`Inner::is_added_appledouble`] in folder `ino` when they
+    /// are all it holds: a listing shows the folder empty, so it should be removable.
+    #[cfg(any(nfs, test))]
+    pub fn clear_appledouble(&mut self, ino: u64) -> FsResult<()> {
+        let path = self.path(ino)?;
+        let entries = self.ws.list(path.as_str()).fs()?;
+        let all_added = entries.iter().all(|entry| {
+            matches!(entry.kind, Kind::File { .. })
+                && self.is_added_appledouble(ino, &entry.name, FileType::RegularFile)
+        });
+        if all_added {
+            for entry in entries {
+                self.unlink(ino, OsStr::new(&entry.name))?;
+            }
+        }
+        Ok(())
     }
 
     // NFS clients never forget an inode, and resume a listing after the inode its last
