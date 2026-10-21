@@ -116,10 +116,12 @@ pub fn mount_acl() -> fuser::SessionACL {
     }
 }
 
-/// Whether a `fuse.conf` lets users mount with `allow_other` (or `allow_root`).
+/// Whether a `fuse.conf` lets users mount with `allow_other` (or `allow_root`). Only
+/// a line that is exactly the directive counts: a looser reading than fusermount's
+/// would ask for an option it then refuses, failing the mount.
 #[cfg(any(fuse, test))]
 fn allows_other(conf: &str) -> bool {
-    conf.lines().any(|line| line.split('#').next().unwrap_or("").trim() == "user_allow_other")
+    conf.split('\n').any(|line| line == "user_allow_other")
 }
 
 /// Commands that unmount a directory, tried in order, and what to do when none exists.
@@ -150,10 +152,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fuse_conf_allows_other_only_when_uncommented() {
+    fn fuse_conf_allows_other_only_for_the_bare_directive() {
         assert!(allows_other("# comment\nuser_allow_other\n"));
-        assert!(allows_other("  user_allow_other  # for containers\n"));
+        assert!(allows_other("user_allow_other"));
         assert!(!allows_other("#user_allow_other\n"));
+        assert!(!allows_other("  user_allow_other  # for containers\n"), "fusermount may not read this form");
         assert!(!allows_other("mount_max = 1000\n"));
         assert!(!allows_other(""));
     }
