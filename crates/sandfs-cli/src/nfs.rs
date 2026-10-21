@@ -493,6 +493,9 @@ fn mount_options(port: u16) -> String {
         "sync",
         "rsize=1048576",
         "wsize=1048576",
+        // A folder, not a disk: Finder leaves it out of its sidebar and the Desktop, and
+        // offers no Eject for it. It still works as any folder, and `mount` lists it.
+        "nobrowse",
     ]
     .join(",")
 }
@@ -1191,5 +1194,6 @@ mod tests {
         let options = mount_options(4049);
         assert!(options.contains("port=4049,mountport=4049") && options.contains("vers=3"), "{options}");
         assert!(options.split(',').any(|option| option == "sync"), "{options}");
+        assert!(options.split(',').any(|option| option == "nobrowse"), "{options}");
     }
 }

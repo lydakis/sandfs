@@ -22,6 +22,7 @@ use bytes::Bytes;
 use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey};
 use sandfs_git::{GitSource, ObjectIds};
 
+use crate::github;
 use crate::persist::PathState;
 use crate::store::expand;
 
@@ -108,7 +109,9 @@ pub fn open(
     home: &Path,
 ) -> Result<(Arc<dyn Source>, Arc<dyn Source>)> {
     // Sizes let FUSE answer `stat` without reading whole files.
-    let files = Arc::new(GitSource::open(repo, commit)?.with_sizes()?);
+    let files = GitSource::open(repo, commit)?.with_sizes()?;
+    let sizes = github::known_sizes(repo, files.tree_id());
+    let files = Arc::new(files.with_known_sizes(sizes));
     let dir = GitDir::new(repo, commit, branch, home, Some(Arc::clone(&files)))?;
     Ok((files, Arc::new(dir)))
 }
@@ -448,9 +451,11 @@ impl GitDir {
         let mut listing = Listing::new();
         for id in objects.source.missing_files().into_iter().flat_map(|missing| missing.starting_with(first)) {
             let key = format!("{OBJECTS}/{}/{}", &id[..2], &id[2..]);
+            // Known from the file's size alone, so stat-ing it, as `find` does, fetches nothing.
+            let size = objects.source.known_size(&id).map(|size| loose_object_size("blob", size));
             listing.insert(
                 id[2..].to_owned(),
-                SourceEntry { kind: Kind::File { executable: false }, key: key.into(), size: None, modified: None },
+                SourceEntry { kind: Kind::File { executable: false }, key: key.into(), size, modified: None },
             );
         }
         Some(listing)
@@ -542,6 +547,13 @@ fn loose_object(kind: &str, data: &[u8]) -> Bytes {
     }
     out.extend_from_slice(&((b << 16) | a).to_be_bytes());
     out.into()
+}
+
+/// The length of [`loose_object`] for `len` bytes of `kind`.
+fn loose_object_size(kind: &str, len: u64) -> u64 {
+    let content = format!("{kind} {len}\0").len() as u64 + len;
+    // zlib's header, each stored block's own, and the checksum.
+    2 + content.div_ceil(65535) * 5 + content + 4
 }
 
 impl Source for GitDir {
@@ -694,7 +706,7 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     // to while another fetch is doing so ("shallow.lock: File exists", "shallow file has
     // changed since we read it"). Of two mounts fetching at once, one waits and retries.
     let mut waited = 0;
-    let fetch = loop {
+    let mut fetch = || loop {
         match git(&dest, &args) {
             Err(err) if waited < 300 && is_shallow_race(&format!("{err:#}")) => {
                 waited += 1;
@@ -703,6 +715,12 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
             result => break result,
         }
     };
+    // The host's list of file sizes (see `github`) takes a request of its own, so it
+    // runs while the commit is fetched.
+    let (fetch, sized) = std::thread::scope(|scope| {
+        let sizes = github::plain_rev(rev).then(|| scope.spawn(|| github::fetch_sizes(url, rev)));
+        (fetch(), sizes.and_then(|sizes| sizes.join().ok().flatten()))
+    });
     let commit = match fetch {
         Ok(_) => {
             // One local copy serves every URL that names the repository (https or ssh,
@@ -714,7 +732,18 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
             }
             let commit = commit_of(&dest, &fetched);
             let _ = git(&dest, &["update-ref", "-d", &fetched]);
-            commit?
+            let commit = commit?;
+            if let Ok(tree) = git(&dest, &["rev-parse", &format!("{commit}^{{tree}}")])
+                && !github::has_sizes(&dest, &tree)
+            {
+                // A revision that can't go in a request, or a branch that moved between
+                // the two requests: ask again, for the tree itself.
+                let sized = sized.filter(|(named, _)| *named == commit || *named == tree);
+                if let Some((_, sizes)) = sized.or_else(|| github::fetch_sizes(url, &tree)) {
+                    let _ = github::keep_sizes(&dest, &tree, &sizes);
+                }
+            }
+            commit
         }
         // Offline, or a revision the server can't name (`main~3`). A commit id mounted
         // before has already returned above, so only the server could answer this one.
@@ -1262,6 +1291,24 @@ mod tests {
         assert!(!absent("a/2.txt") && !absent("a/big") && absent("b/0.txt"));
         check("a/big", &"x".repeat(200_000));
         check("empty", "");
+
+        // Given the files' sizes, each object is listed at the length a read gives.
+        let b0 = id("b/0.txt");
+        let sized = GitSource::open(&repo, &commit).unwrap().with_known_sizes([(b0.as_str().into(), 2)].into());
+        let dir = GitDir::new(&repo, &commit, Some("main"), &home, Some(Arc::new(sized))).unwrap();
+        let listing = dir.read_dir(&format!("sandfs-objects/{}", &b0[..2])).unwrap();
+        let entry = &listing[&b0[2..]];
+        assert!(absent("b/0.txt"), "listed without being read");
+        assert_eq!(entry.size, Some(dir.read_file(&entry.key).unwrap().len() as u64));
+    }
+
+    #[test]
+    fn loose_object_sizes_are_known_from_the_file_size() {
+        // Around the edges of zlib's stored blocks, of 65,535 bytes each.
+        for len in (0..10).chain(65520..65540).chain(131060..131080).chain([200_000]) {
+            let data = vec![b'x'; len];
+            assert_eq!(loose_object_size("blob", len as u64), loose_object("blob", &data).len() as u64, "{len}");
+        }
     }
 
     /// Check the index at `index` of `repo`, as [`GitDir`] builds it.

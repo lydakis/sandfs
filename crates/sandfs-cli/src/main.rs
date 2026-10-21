@@ -14,6 +14,7 @@ mod copy;
 #[cfg(mount)]
 mod fs;
 mod git;
+mod github;
 mod host;
 mod mcp;
 #[cfg(any(nfs, all(test, fuse)))]
