@@ -840,7 +840,12 @@ fn kept_listings_follow_every_change() {
     check(&["one.txt", "sub", "three.txt"], &[]);
     std::fs::rename(ws.join("a/three.txt"), ws.join("b/three.txt")).unwrap();
     check(&["one.txt", "sub"], &["three.txt"]);
-    std::fs::hard_link(ws.join("a/one.txt"), ws.join("b/linked.txt")).unwrap();
+    // The Mac mount can't make hard links (#93); a copy adds the same entry there.
+    if cfg!(target_os = "linux") {
+        std::fs::hard_link(ws.join("a/one.txt"), ws.join("b/linked.txt")).unwrap();
+    } else {
+        std::fs::copy(ws.join("a/one.txt"), ws.join("b/linked.txt")).unwrap();
+    }
     check(&["one.txt", "sub"], &["linked.txt", "three.txt"]);
     std::os::unix::fs::symlink("one.txt", ws.join("a/pointer")).unwrap();
     check(&["one.txt", "pointer", "sub"], &["linked.txt", "three.txt"]);
