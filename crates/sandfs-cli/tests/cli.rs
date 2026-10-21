@@ -107,3 +107,22 @@ fn a_reader_that_stops_early_is_not_an_error() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn a_url_is_a_repository_without_git_prefix() {
+    // The local copy is named after the URL's path, which can't hold a hidden folder.
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::Builder::new().prefix("data").tempdir().unwrap();
+    let repo = data.path().join("notes");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    for args in
+        [&["init", "-q"][..], &["add", "a.txt"], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a"]]
+    {
+        assert!(Command::new("git").current_dir(&repo).args(args).status().unwrap().success());
+    }
+    let url = format!("file://{}", repo.display());
+    let served = sandfs(home.path(), &["serve", "--mcp", &url], "");
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    assert_eq!(stdout(home.path(), &["list"]), format!("notes\t{url}\t-\n"));
+}

@@ -123,10 +123,10 @@ sandfs changes cleanup --since survey            # how cleanup differs from surv
 sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sandfs mount cleanup ~/ws/cleanup` brings them back
 ```
 
-`git:<path or url>[@rev]` mounts a commit instead of a folder. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second. Listing a folder then fetches that folder's files in one request, since a real folder has to show their sizes:
+`git:<path or url>[@rev]` mounts a commit instead of a folder, and a URL needs no `git:`, so `sandfs mount https://github.com/owner/repo DIR` is all it takes to look through someone's repository. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second. Listing a folder then fetches that folder's files in one request, since a real folder has to show their sizes:
 
 ```bash
-sandfs mount git:https://github.com/pallets/flask@3.1.0 ~/ws/flask
+sandfs mount https://github.com/pallets/flask@3.1.0 ~/ws/flask
 ```
 
 The mounted folder has a `.git`, so git itself works in it: `status`, `add`, `commit`, branches and `push`, with commits kept in the workspace and its forks. A mount of a remote repository holds only the mounted commit, not the history before it; a local repository's history is all there. `git status` doesn't read your files, because sandfs tells git which ones changed; on VS Code it takes 0.07 s once the first run (about 10 s on a fresh mount, which lists every folder) is done. A `commit` fetches only the files git compares: the others in each folder that holds a change, or holds a folder that does. On VS Code, a first commit changing two files takes 2.3 s and fetches 0.5 MiB, and later ones take 0.2 s.

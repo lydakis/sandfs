@@ -55,9 +55,10 @@ enum Cmd {
     ///
     /// SOURCE is a host folder, which is read lazily and never written to, or the
     /// name of an existing workspace (write ./NAME for a folder that shares a
-    /// workspace's name). git:<path or url>[@rev] mounts a commit; remote
-    /// repositories become partial clones, so file contents are fetched only when a
-    /// directory or file is first read.
+    /// workspace's name). git:<path or url>[@rev] mounts a commit, and so does a URL
+    /// on its own, such as https://github.com/owner/repo; remote repositories become
+    /// partial clones, so file contents are fetched only when a directory or file is
+    /// first read.
     Mount {
         source: String,
         dir: PathBuf,
