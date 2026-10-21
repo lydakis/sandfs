@@ -66,8 +66,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # musl, so the Linux builds are static and run on any distribution.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
@@ -118,6 +119,11 @@ jobs:
       - name: Attach the commands to the release
         run: |
           version="${GITHUB_REF_NAME#v}"
+          # The other jobs check this too, but they run alongside this one.
+          if [ "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sandfs-core") | .version')" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version"
+            exit 1
+          fi
           if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             awk -v heading="## $version" 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found' docs/changelog.md > notes.md
             gh release create "$GITHUB_REF_NAME" --verify-tag --title "sandfs $version" --notes-file notes.md

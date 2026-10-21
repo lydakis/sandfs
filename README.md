@@ -16,7 +16,7 @@ Files are bytes of any kind: documents, spreadsheets, images, data sets and code
 pip install sandfs             # Python 3.11+, prebuilt for Linux, macOS and Windows
 ```
 
-The `sandfs` command, which mounts workspaces as folders, comes ready to run with each [release](https://github.com/lydakis/sandfs/releases) for Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), or builds with `cargo install sandfs-cli`. On a Mac with Apple silicon:
+The `sandfs` command, which mounts workspaces as folders, comes ready to run with each [release](https://github.com/lydakis/sandfs/releases) for Linux (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, static, so any distribution) and macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), or builds with `cargo install sandfs-cli`. On a Mac with Apple silicon:
 
 ```bash
 curl -L https://github.com/lydakis/sandfs/releases/latest/download/sandfs-aarch64-apple-darwin.tar.gz | tar xz
