@@ -83,6 +83,11 @@ const RECENT_BYTES: usize = 256 << 20;
 /// Nothing tells this filesystem when a file is closed, so a quiet spell stands in.
 pub const SETTLE: Duration = Duration::from_millis(250);
 
+/// How many listings of folders that weren't opened are kept going at once, for
+/// kernels that list folders without opening them.
+#[cfg(any(fuse, test))]
+const LISTINGS_KEPT: usize = 64;
+
 // renameat2's flags, which only Linux's FUSE passes (NFS has none). Swapping two paths,
 // and overlay whiteouts, are not supported.
 #[cfg(target_os = "linux")]
@@ -261,6 +266,10 @@ pub struct Inner {
     next_ino: u64,
     handles: HashMap<u64, DirHandle>,
     next_fh: u64,
+    /// The handle each folder is being listed through when the kernel lists folders
+    /// without opening them, by folder inode.
+    #[cfg(any(fuse, test))]
+    listings: HashMap<u64, u64>,
     /// Open handles per directory.
     open: HashMap<u64, u32>,
     /// File contents written but not yet committed to the workspace.
@@ -327,6 +336,8 @@ impl Inner {
             inos: BTreeMap::new(),
             next_ino: ROOT_INO + 1,
             handles: HashMap::new(),
+            #[cfg(any(fuse, test))]
+            listings: HashMap::new(),
             next_fh: 1,
             open: HashMap::new(),
             buffers: HashMap::new(),
@@ -1286,6 +1297,39 @@ impl Inner {
         }
     }
 
+    /// The handle to list folder `ino` through from `offset` on, for a kernel that lists
+    /// folders without opening them. A listing from the start takes a fresh look at
+    /// the folder; one that goes on reuses the handle it started with.
+    #[cfg(any(fuse, test))]
+    pub fn listing(&mut self, ino: u64, offset: u64) -> FsResult<u64> {
+        match self.listings.get(&ino) {
+            Some(&fh) if offset > 0 => Ok(fh),
+            _ => {
+                self.end_listing(ino);
+                let fh = self.opendir(ino)?;
+                self.listings.insert(ino, fh);
+                // Nothing tells sandfs that a reader gave up halfway, so only the
+                // newest listings are kept; a reader going on with an older one gets a
+                // fresh look at the folder from where it was.
+                while self.listings.len() > LISTINGS_KEPT {
+                    let Some(oldest) = self.listings.iter().min_by_key(|(_, fh)| **fh).map(|(&ino, _)| ino) else {
+                        break;
+                    };
+                    self.end_listing(oldest);
+                }
+                Ok(fh)
+            }
+        }
+    }
+
+    /// Let go of the handle folder `ino` was listed through, once its listing is done.
+    #[cfg(any(fuse, test))]
+    pub fn end_listing(&mut self, ino: u64) {
+        if let Some(fh) = self.listings.remove(&ino) {
+            self.releasedir(fh);
+        }
+    }
+
     pub fn releasedir(&mut self, fh: u64) {
         let Some(DirHandle { ino, .. }) = self.handles.remove(&fh) else { return };
         if let Some(count) = self.open.get_mut(&ino) {
@@ -1308,6 +1352,9 @@ pub struct Shared {
     /// Whether the kernel took no-open mode, so opens and flushes can be refused.
     #[cfg(fuse)]
     no_open: AtomicBool,
+    /// Whether the kernel lists folders without opening them, and keeps their listings.
+    #[cfg(fuse)]
+    no_opendir: AtomicBool,
 }
 
 impl Shared {
@@ -1320,6 +1367,8 @@ impl Shared {
             stop: AtomicBool::new(false),
             #[cfg(fuse)]
             no_open: AtomicBool::new(false),
+            #[cfg(fuse)]
+            no_opendir: AtomicBool::new(false),
         })
     }
 
@@ -1438,6 +1487,25 @@ impl SandFs {
 }
 
 #[cfg(fuse)]
+impl SandFs {
+    /// The handle a page of folder `ino` from `offset` is read through: the kernel's
+    /// own, or where the kernel lists folders without opening them, one of
+    /// [`Inner::listing`]'s.
+    fn listing(&self, inner: &mut Inner, ino: u64, fh: u64, offset: u64) -> FsResult<u64> {
+        if self.0.no_opendir.load(Ordering::SeqCst) { inner.listing(ino, offset) } else { Ok(fh) }
+    }
+
+    /// After a page of `added` entries: the kernel takes a listing as whole only after
+    /// a page with nothing in it, so a handle of [`Inner::listing`]'s goes with that
+    /// page, and until then the next page reuses it.
+    fn end_listing(&self, inner: &mut Inner, ino: u64, added: usize) {
+        if added == 0 && self.0.no_opendir.load(Ordering::SeqCst) {
+            inner.end_listing(ino);
+        }
+    }
+}
+
+#[cfg(fuse)]
 impl Filesystem for SandFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         // Listings carry attributes, so a walk that stats every entry (`ls -l`, `find`)
@@ -1450,6 +1518,12 @@ impl Filesystem for SandFs {
         // never told apart by handle here anyway.
         let no_open = config.add_capabilities(InitFlags::FUSE_NO_OPEN_SUPPORT).is_ok();
         self.0.no_open.store(no_open, Ordering::SeqCst);
+        // The same for folders, and more: without an open the kernel keeps each
+        // folder's listing once read, until something changes the folder through this
+        // mount. Nothing else changes a mounted workspace, so a walk over folders already
+        // seen (`find`, an editor's file tree, git looking for new files) sends nothing.
+        let no_opendir = config.add_capabilities(InitFlags::FUSE_NO_OPENDIR_SUPPORT).is_ok();
+        self.0.no_opendir.store(no_opendir, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1648,36 +1722,57 @@ impl Filesystem for SandFs {
         self.reply_empty(reply, result);
     }
 
+    /// Answered once at most where the kernel lists folders without opening them: see
+    /// `init`. Listings then go through [`Inner::listing`].
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.0.no_opendir.load(Ordering::SeqCst) {
+            return reply.error(Errno::ENOSYS);
+        }
         match self.0.lock().opendir(ino.0) {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(err) => reply.error(err),
         }
     }
 
-    fn readdir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        let inner = self.0.lock();
-        match inner.readdir(fh.0, offset) {
+    fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        let mut inner = self.0.lock();
+        let fh = match self.listing(&mut inner, ino.0, fh.0, offset) {
+            Ok(fh) => fh,
+            Err(err) => return reply.error(err),
+        };
+        let mut added = 0;
+        match inner.readdir(fh, offset) {
             Ok(entries) => {
                 for (idx, (ino, kind, name)) in entries.iter().enumerate() {
                     if reply.add(INodeNo(*ino), offset + idx as u64 + 1, *kind, name) {
                         break;
                     }
+                    added += 1;
                 }
                 reply.ok();
             }
-            Err(err) => reply.error(err),
+            Err(err) => return reply.error(err),
         }
+        self.end_listing(&mut inner, ino.0, added);
     }
 
-    fn readdirplus(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
-        let result = self.0.lock().readdirplus(fh.0, offset, |ino, next, name, attr, ttl| {
-            reply.add(INodeNo(ino), next, name, &ttl, attr, Generation(0))
+    fn readdirplus(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
+        let mut inner = self.0.lock();
+        let fh = match self.listing(&mut inner, ino.0, fh.0, offset) {
+            Ok(fh) => fh,
+            Err(err) => return reply.error(err),
+        };
+        let mut added = 0;
+        let result = inner.readdirplus(fh, offset, |ino, next, name, attr, ttl| {
+            let full = reply.add(INodeNo(ino), next, name, &ttl, attr, Generation(0));
+            added += usize::from(!full);
+            full
         });
         match result {
             Ok(()) => reply.ok(),
-            Err(err) => reply.error(err),
+            Err(err) => return reply.error(err),
         }
+        self.end_listing(&mut inner, ino.0, added);
     }
 
     fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
@@ -2402,6 +2497,41 @@ mod tests {
         assert_eq!((name_seen.as_str(), *kind), ("src", FileType::Directory), "the forgotten child is still listed");
         assert_eq!(fs.path(*ino).unwrap().as_str(), "/mnt/src");
         assert_eq!(fs.nodes[ino].lookups, 1);
+    }
+
+    #[test]
+    fn unopened_listings_page_through_one_look_and_let_go_at_the_end() {
+        let mut fs = fs();
+        let fh = fs.listing(ROOT_INO, 0).unwrap();
+        // A page that stops early keeps its handle for the next one, which sees the
+        // listing as it was even if the folder changed in between.
+        let first = fs.readdir(fh, 0).unwrap()[..3].to_vec();
+        fs.create(ROOT_INO, name("late.txt"), 0o644, true, false).unwrap();
+        assert_eq!(fs.listing(ROOT_INO, 3).unwrap(), fh);
+        let rest: Vec<String> = fs.readdir(fh, 3).unwrap().iter().map(|(_, _, name)| name.clone()).collect();
+        assert!(!rest.contains(&"late.txt".to_owned()), "{first:?} then {rest:?}");
+        // Listing from the start takes a fresh look, and the old handle is let go.
+        let again = fs.listing(ROOT_INO, 0).unwrap();
+        assert_ne!(again, fh);
+        assert!(!fs.handles.contains_key(&fh));
+        assert!(fs.readdir(again, 0).unwrap().iter().any(|(_, _, name)| name == "late.txt"));
+        fs.end_listing(ROOT_INO);
+        assert!(fs.handles.is_empty() && fs.listings.is_empty() && !fs.open.contains_key(&ROOT_INO));
+    }
+
+    #[test]
+    fn only_the_newest_unopened_listings_are_kept() {
+        let mut fs = fs();
+        let folders: Vec<u64> =
+            (0..LISTINGS_KEPT + 6).map(|i| fs.mkdir(ROOT_INO, name(&format!("d{i}"))).unwrap().ino.0).collect();
+        let first = fs.listing(folders[0], 0).unwrap();
+        for &ino in &folders[1..] {
+            fs.listing(ino, 0).unwrap();
+        }
+        assert_eq!((fs.listings.len(), fs.handles.len()), (LISTINGS_KEPT, LISTINGS_KEPT));
+        assert!(!fs.handles.contains_key(&first), "the oldest listing was let go");
+        // A reader going on with a listing that was let go gets a fresh one.
+        assert_ne!(fs.listing(folders[0], 2).unwrap(), first);
     }
 
     #[test]

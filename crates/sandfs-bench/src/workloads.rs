@@ -161,6 +161,18 @@ pub fn all(data: &Data) -> Vec<Workload> {
             check: nothing(),
         },
         Workload {
+            name: "small/walk-warm",
+            what: format!("list every directory of the {files}-file tree again"),
+            writable: false,
+            prepare: step(|_, view| walk(view, "small").map(drop)),
+            run: step(move |_, view| {
+                let found = walk(view, "small")?;
+                ensure!(found == files, "walk found {found} files, expected {files}");
+                Ok(())
+            }),
+            check: nothing(),
+        },
+        Workload {
             name: "wide/list",
             what: format!("list one directory of {} files (already read once)", s.wide),
             writable: false,

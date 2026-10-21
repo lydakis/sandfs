@@ -45,6 +45,7 @@ Every timed run starts from a fresh view (a new workspace or a new mount), so sa
 | small/read-warm | read them all again |
 | small/stat | stat every small file, after listing their directories |
 | small/walk | list every directory of the small-file tree |
+| small/walk-warm | list them all again, after one walk |
 | wide/list | list the 10,000-entry directory, already read once |
 | deep/stat | stat the file at the bottom of the chain 10,000 times |
 | large/read-whole | read the large file whole |
