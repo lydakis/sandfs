@@ -7,7 +7,11 @@
 //! last save, so saving costs the index plus whatever was written in between.
 //!
 //! The entries come from [`Workspace::changes`] (files) plus the directories the mount
-//! created or removed, which `changes` does not report.
+//! created or removed, which `changes` does not report. Only the first save of a
+//! process goes over every change: each later one starts from what the save before it
+//! saw and looks again only at the files changed since ([`Workspace::changes_since`]),
+//! so after a build a save costs what the next edit changed, not the whole build
+//! output.
 //!
 //! Saved files stay on disk. A loaded workspace reads them from their objects (see
 //! [`Workspace::write_stored`]), and once a save has written a file's object the
@@ -38,6 +42,13 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use sandfs_core::{ChangeKind, Error, Kind, Listing, Source, SourceKey, Stored, VPath, Workspace};
 use serde::{Deserialize, Serialize};
+
+/// Files macOS creates next to the ones people write: `._name` holds `name`'s extended
+/// attributes on filesystems without them (NFS), `.DS_Store` holds Finder's view
+/// settings, and `.nfs.*` is a removed file that is still open.
+pub fn is_bookkeeping(name: &str) -> bool {
+    name.starts_with("._") || name == ".DS_Store" || name.starts_with(".nfs.")
+}
 
 /// A point in time as `(seconds, nanoseconds)` since the Unix epoch.
 type Time = (u64, u32);
@@ -522,6 +533,20 @@ pub struct Saved {
     written: Written,
     /// The objects being deleted in the background, if any; see [`Saved::delete`].
     deleting: Option<std::thread::JoinHandle<()>>,
+    /// What the last save saw, which the next one starts from.
+    last: Option<Last>,
+    /// Leave the files macOS makes for its own bookkeeping ([`is_bookkeeping`]) out.
+    pub skip_bookkeeping: bool,
+}
+
+/// What a save saw: the snapshot it saved, each change with its index key, and the
+/// entries it wrote. A later save takes the entries of files unchanged since as they are.
+struct Last {
+    ws: Workspace,
+    root: VPath,
+    changes: BTreeMap<VPath, (ChangeKind, String)>,
+    entries: BTreeMap<String, Entry>,
+    times: BTreeMap<String, SystemTime>,
 }
 
 impl Drop for Saved {
@@ -550,6 +575,8 @@ impl Saved {
             pack_limit: Some(PACK_LIMIT),
             written: Written::new(),
             deleting: None,
+            last: None,
+            skip_bookkeeping: false,
         }
     }
 
@@ -617,6 +644,7 @@ impl Saved {
     /// one serves it.
     pub fn load(&mut self, ws: &mut Workspace, root: &VPath) -> Result<Restored> {
         let changes = self.read_index()?;
+        self.last = None;
         let mut restored = Restored::default();
         // Files saved as one object share its name.
         let mut names: HashMap<&str, SourceKey> = HashMap::new();
@@ -830,18 +858,34 @@ impl Saved {
             packed: HashMap::new(),
             pack_limit: self.pack_limit,
         };
-        let changes = snap.ws.changes()?;
-        let changed: HashSet<&VPath> = changes.iter().map(|change| &change.path).collect();
-        for change in &changes {
-            let rel = relative(root, &change.path)?;
-            let entry = match change.kind {
+        // Taken now: if this save fails, the next one goes over everything again.
+        let last = self.last.take().filter(|last| last.root == *root);
+        let (changes, touched) = changes(snap, root, last.as_ref())?;
+        // A hard link ties a file's entry to its other names', so then every entry is made again.
+        let reuse = last.as_ref().zip(touched.as_ref()).filter(|_| !snap.ws.has_hard_links());
+        let skip_bookkeeping = self.skip_bookkeeping;
+        let skip = |path: &VPath, kind: ChangeKind| {
+            skip_bookkeeping && kind == ChangeKind::Added && path.name().is_some_and(is_bookkeeping)
+        };
+        let changed: HashSet<&VPath> =
+            changes.iter().filter(|(path, (kind, _))| !skip(path, *kind)).map(|(path, _)| path).collect();
+        for (path, (kind, rel)) in &changes {
+            if skip(path, *kind) {
+                continue;
+            }
+            let unchanged = reuse.and_then(|since| self.unchanged_entry(snap, since, path, *kind, rel, &mut saving));
+            if let Some(entry) = unchanged {
+                entries.insert(rel.clone(), entry);
+                continue;
+            }
+            let entry = match kind {
                 ChangeKind::Deleted => Entry::Absent,
                 ChangeKind::Added | ChangeKind::Modified => {
-                    let link = linked_name(snap, root, &changed, &change.path)?;
-                    self.entry(snap, &change.path, &rel, link, &mut saving)?
+                    let link = linked_name(snap, root, &changed, path)?;
+                    self.entry(snap, path, rel, link, &mut saving)?
                 }
             };
-            entries.insert(rel, entry);
+            entries.insert(rel.clone(), entry);
         }
         for dir in &snap.dirs {
             let path = VPath::parse(dir)?;
@@ -861,6 +905,8 @@ impl Saved {
             entries.insert(rel, entry);
         }
 
+        // The snapshot before this one reads from objects that may be deleted below.
+        drop(last);
         let Saving { kept, written, pack, .. } = saving;
         // The pack stays the save's to delete until the index naming it is in place.
         let pack = match pack {
@@ -871,17 +917,25 @@ impl Saved {
             }
             None => None,
         };
-        let index = serde_json::to_vec(&Changes { entries, next: self.store.next.load(Ordering::SeqCst) })?;
+        let index = Changes { entries, next: self.store.next.load(Ordering::SeqCst) };
+        let data = serde_json::to_vec(&index)?;
         let tmp = self.dir.join("changes.json.tmp");
         if durable {
             // Objects reach the disk before the index that names them.
             self.sync_objects(&kept)?;
         }
-        std::fs::write(&tmp, index).context("writing changes.json")?;
+        std::fs::write(&tmp, data).context("writing changes.json")?;
         if durable {
             sync_path(&tmp)?;
         }
         std::fs::rename(&tmp, self.index_path()).context("writing changes.json")?;
+        self.last = Some(Last {
+            ws: snap.ws.fork(),
+            root: root.clone(),
+            changes,
+            entries: index.entries,
+            times: snap.times.clone(),
+        });
         if let Some((name, pack, unfinished)) = pack {
             unfinished.finished();
             self.packs.insert(name.to_string(), pack);
@@ -974,6 +1028,37 @@ impl Saved {
     /// taken, even when that save then failed to flush the index to disk.
     pub fn take_written(&mut self) -> Written {
         std::mem::take(&mut self.written)
+    }
+
+    /// The entry the last save wrote for `path`, if it still holds: the file is the
+    /// same as then (not `touched` since `last`), and so are its time and object.
+    fn unchanged_entry(
+        &self,
+        snap: &Snapshot,
+        (last, touched): (&Last, &HashSet<VPath>),
+        path: &VPath,
+        kind: ChangeKind,
+        rel: &str,
+        saving: &mut Saving,
+    ) -> Option<Entry> {
+        if touched.contains(path) || snap.times.get(path.as_str()) != last.times.get(path.as_str()) {
+            return None;
+        }
+        let entry = last.entries.get(rel)?;
+        match (kind, entry) {
+            (ChangeKind::Added | ChangeKind::Modified, Entry::File { object, link: None, .. }) => {
+                let (version, saved) = self.objects.get(rel)?;
+                if **saved != *object || saving.repack.contains(file_of(saved)) {
+                    return None;
+                }
+                saving.kept.insert(rel.to_owned(), (*version, saved.clone()));
+            }
+            (ChangeKind::Added | ChangeKind::Modified, Entry::Symlink { link: None, .. })
+            | (ChangeKind::Deleted, Entry::Absent) => {}
+            // A directory there now, or another name of the same file.
+            _ => return None,
+        }
+        Some(entry.clone())
     }
 
     /// The entry for a file or directory, writing its bytes to a new object unless the
@@ -1241,6 +1326,59 @@ fn place(object: &str) -> Result<Place<'_>> {
 /// The file in `objects/` holding `object`'s bytes. Only for names [`place`] accepted.
 fn file_of(object: &str) -> &str {
     object.split_once('@').map_or(object, |(file, _)| file)
+}
+
+/// Every change in `snap`, with its index key, and the files changed since `last` if
+/// they came from there. With no `last`, or a change since that doesn't follow from
+/// it, they are worked out from the source, going over every change.
+///
+/// A file changed since `last` keeps what it was then: a file `last` added is still
+/// added, one it found modified or deleted still differs from the source. A file
+/// changed back to what the source has counts as modified, which saves its bytes again.
+#[allow(clippy::type_complexity)]
+fn changes(
+    snap: &Snapshot,
+    root: &VPath,
+    last: Option<&Last>,
+) -> Result<(BTreeMap<VPath, (ChangeKind, String)>, Option<HashSet<VPath>>)> {
+    if let Some(last) = last {
+        let since = snap.ws.changes_since(&last.ws)?;
+        let mut changes = last.changes.clone();
+        let mut follows = true;
+        for change in &since {
+            use ChangeKind::*;
+            let before = changes.get(&change.path).map(|(kind, _)| *kind);
+            let now = match (before, change.kind) {
+                (None, kind) => Some(kind),
+                (Some(Added), Modified) => Some(Added),
+                (Some(Added), Deleted) => None,
+                (Some(Modified), Modified | Deleted) => Some(change.kind),
+                (Some(Deleted), Added) => Some(Modified),
+                _ => {
+                    follows = false;
+                    break;
+                }
+            };
+            match now {
+                Some(kind) => {
+                    let rel = relative(root, &change.path)?;
+                    changes.insert(change.path.clone(), (kind, rel));
+                }
+                None => {
+                    changes.remove(&change.path);
+                }
+            }
+        }
+        if follows {
+            return Ok((changes, Some(since.into_iter().map(|change| change.path).collect())));
+        }
+    }
+    let mut changes = BTreeMap::new();
+    for change in snap.ws.changes()? {
+        let rel = relative(root, &change.path)?;
+        changes.insert(change.path, (change.kind, rel));
+    }
+    Ok((changes, None))
 }
 
 /// `path` relative to `root`, as stored in the index.
@@ -1612,6 +1750,106 @@ mod tests {
         saved.save(&snap(ws), &root(), false).unwrap();
         for (path, version, stored) in saved.take_written() {
             assert!(ws.store(path.as_str(), version, stored).unwrap());
+        }
+    }
+
+    /// Every path below `path` with what it holds, for comparing two workspaces.
+    fn tree(ws: &Workspace, path: &str, out: &mut Vec<(String, String)>) {
+        for entry in ws.list(path).unwrap() {
+            let child = format!("{path}/{}", entry.name);
+            let held = match entry.kind {
+                Kind::Dir => "dir".to_owned(),
+                Kind::Symlink => format!("-> {}", ws.read_link(&child).unwrap()),
+                Kind::File { executable } => {
+                    let data = ws.read(&child).unwrap();
+                    format!("{executable} {} {:?}", data.len(), &data[..data.len().min(8)])
+                }
+            };
+            out.push((child.clone(), held));
+            if entry.kind.is_dir() {
+                tree(ws, &child, out);
+            }
+        }
+    }
+
+    #[test]
+    fn saves_that_start_from_the_last_one_load_back_what_was_saved() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        let mut saved = Saved::new(state.path());
+        let mut times: BTreeMap<String, SystemTime> = BTreeMap::new();
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        let paths = ["a.txt", "dir/b.txt", "dir/sub/c.txt", "n0", "dir/n1", "dir/sub/n2", "new/n3", "new/deep/n4"];
+        let mut seed: u64 = 7;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        for step in 0..400 {
+            let path = format!("/mnt/{}", paths[next(paths.len())]);
+            let other = format!("/mnt/{}", paths[next(paths.len())]);
+            let parent = VPath::parse(&path).unwrap().parent().unwrap().to_string();
+            // As a mount does, every directory made is kept track of.
+            if parent.matches('/').count() > 1 {
+                dirs.insert(parent.clone());
+                dirs.insert(VPath::parse(&parent).unwrap().parent().unwrap().to_string());
+                dirs.remove("/mnt");
+            }
+            // Each step may fail (a missing file, a file where a folder should be): what
+            // the workspace then holds is what has to be saved.
+            let _ = match next(10) {
+                0 | 1 => ws.mkdir(&parent, true).and_then(|_| ws.write(&path, format!("{step}")).map(|_| ())),
+                // Back to what the source has.
+                2 => ws
+                    .write(
+                        &path,
+                        path.trim_start_matches("/mnt/dir/sub/")
+                            .trim_start_matches("/mnt/dir/")
+                            .trim_start_matches("/mnt/")
+                            .trim_end_matches(".txt")
+                            .to_owned(),
+                    )
+                    .map(|_| ()),
+                3 => ws.remove(&path, true),
+                4 => ws.mkdir(&parent, true).and_then(|_| ws.rename(&other, &path)),
+                5 => ws.set_executable(&path, next(2) == 0).map(|_| ()),
+                6 => ws.mkdir(&parent, true).and_then(|_| ws.symlink(&path, "a.txt").map(|_| ())),
+                7 if next(2) == 0 => {
+                    dirs.insert(path.clone());
+                    ws.mkdir(&path, true)
+                }
+                7 if parent != "/mnt" => {
+                    dirs.insert(parent.clone());
+                    ws.remove(&parent, true)
+                }
+                7 => Ok(()),
+                8 => {
+                    times.insert(path.clone(), UNIX_EPOCH + Duration::from_secs(step));
+                    Ok(())
+                }
+                9 if step > 300 => ws.mkdir(&parent, true).and_then(|_| ws.hard_link(&other, &path)),
+                _ => ws.write(&path, vec![step as u8; PACK_LIMIT as usize + 1]).map(|_| ()),
+            };
+            let snapshot = Snapshot { ws: ws.fork(), times: times.clone(), dirs: dirs.clone() };
+            saved.save(&snapshot, &root(), false).unwrap();
+            for (path, version, stored) in saved.take_written() {
+                let _ = ws.store(path.as_str(), version, stored);
+            }
+
+            let mut loaded = base();
+            let restored = Saved::new(state.path()).load(&mut loaded, &root()).unwrap();
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            tree(&ws, "/mnt", &mut want);
+            tree(&loaded, "/mnt", &mut got);
+            let differ: Vec<_> =
+                want.iter().filter(|w| !got.contains(w)).chain(got.iter().filter(|g| !want.contains(g))).collect();
+            assert_eq!(got, want, "after step {step}: {differ:?}");
+            for change in ws.changes().unwrap() {
+                let p = change.path.as_str();
+                if change.kind != ChangeKind::Deleted && !ws.stat(p).unwrap().kind.is_dir() {
+                    assert_eq!(restored.times.get(p), times.get(p), "time of {p} after step {step}");
+                }
+            }
         }
     }
 

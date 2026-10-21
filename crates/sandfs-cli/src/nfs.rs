@@ -257,9 +257,12 @@ impl NFSFileSystem for SandNfs {
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let inner = self.shared.lock();
-        let data = inner.read(id, offset, count).nfs()?;
-        let eof = offset + data.len() as u64 >= inner.attr(id).nfs()?.size;
+        let (reading, size) = {
+            let inner = self.shared.lock();
+            (inner.reading(id, offset, count).nfs()?, inner.attr(id).nfs()?.size)
+        };
+        let data = reading.read(offset, count).nfs()?;
+        let eof = offset + data.len() as u64 >= size;
         Ok((data.to_vec(), eof))
     }
 
@@ -700,8 +703,8 @@ mod tests {
     use sandfs_core::{MemorySource, VPath, Workspace};
 
     use super::*;
-    use crate::fs::{drop_bookkeeping, is_bookkeeping};
     use crate::persist::Saved;
+    use crate::persist::is_bookkeeping;
 
     fn served() -> (SandNfs, tempfile::TempDir) {
         served_from(&[("notes.txt", "draft\n"), ("in/a.txt", "a")])
@@ -764,8 +767,12 @@ mod tests {
 
     #[test]
     fn finder_files_are_served_but_never_saved() {
-        let (fs, _dir) = served();
-        let snapshot = block(async {
+        let (fs, dir) = served();
+        let saved = || -> Vec<String> {
+            fs.shared.save(false).unwrap();
+            Saved::new(dir.path()).paths().unwrap().into_iter().map(|(rel, _)| rel).collect()
+        };
+        block(async {
             let (id, _) = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await.unwrap();
             fs.write(id, 0, b"xattrs").await.unwrap();
             fs.create(ROOT_INO, &name(".DS_Store"), sattr3::default()).await.unwrap();
@@ -775,13 +782,15 @@ mod tests {
             // A folder with such a name is someone's: macOS only makes files.
             fs.mkdir(ROOT_INO, &name("._cache")).await.unwrap();
             assert_eq!(fs.read(id, 0, 100).await.unwrap().0, b"xattrs", "served while mounted");
-            fs.shared.lock().snapshot(Duration::ZERO)
         });
-        let mut snapshot = snapshot;
-        drop_bookkeeping(&mut snapshot.ws);
-        let changed: Vec<String> = snapshot.ws.changes().unwrap().iter().map(|c| c.path.to_string()).collect();
-        assert_eq!(changed, ["/mnt/sub/kept.txt"]);
-        assert!(snapshot.dirs.iter().any(|dir| dir.ends_with("/._cache")), "{:?}", snapshot.dirs);
+        assert_eq!(saved(), ["._cache", "sub", "sub/kept.txt"]);
+        // A later save, which only looks at what changed since, leaves them out too.
+        block(async {
+            let sub = fs.lookup(ROOT_INO, &name("sub")).await.unwrap();
+            fs.create(sub, &name("._kept.txt"), sattr3::default()).await.unwrap();
+            fs.create(sub, &name("more.txt"), sattr3::default()).await.unwrap();
+        });
+        assert_eq!(saved(), ["._cache", "sub", "sub/kept.txt", "sub/more.txt"]);
         assert!(is_bookkeeping("._notes.txt") && is_bookkeeping(".DS_Store") && !is_bookkeeping("notes.txt"));
     }
 

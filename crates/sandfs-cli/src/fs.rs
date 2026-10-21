@@ -31,7 +31,7 @@ use fuser::{
     ReplyStatfs, ReplyWrite, Request, WriteFlags,
 };
 use fuser::{Errno, FileAttr, FileType, INodeNo, RenameFlags, TimeOrNow};
-use sandfs_core::{ChangeKind, Error, Kind, VPath, Workspace};
+use sandfs_core::{Error, Kind, VPath, Workspace};
 
 use crate::persist::{Draft, Drafts, Saved, Snapshot};
 use crate::store::subtree_keys;
@@ -74,7 +74,7 @@ pub const MAX_FILE_SIZE: usize = i64::MAX as usize;
 const COPY_PIECE: u64 = 8 << 20;
 /// The largest file kept in memory while it is written, where there are no drafts.
 const MAX_MEMORY_FILE: u64 = 4 << 30;
-/// How many whole files, and bytes of them, [`Inner::read`] keeps for sources that
+/// How many whole files, and bytes of them, [`Inner::reading`] keeps for sources that
 /// can't read a range on its own. The kernel asks for a file in chunks and caches
 /// what it gets, so only the few files being read right now are worth keeping.
 const RECENT_FILES: usize = 16;
@@ -132,6 +132,24 @@ pub fn errno(err: &Error) -> Errno {
         other => {
             eprintln!("sandfs: {other}");
             Errno::EIO
+        }
+    }
+}
+
+/// A read [`Inner::reading`] started.
+pub enum Reading {
+    /// The bytes, read already.
+    Read(Bytes),
+    /// A saved file, to read from disk.
+    Stored(sandfs_core::Stored),
+}
+
+impl Reading {
+    /// The bytes asked for: `size` of them from `offset`, or fewer at the end.
+    pub fn read(self, offset: u64, size: u32) -> FsResult<Bytes> {
+        match self {
+            Reading::Read(data) => Ok(data),
+            Reading::Stored(stored) => stored.source.read_range(&stored.key, offset, size.into()).fs(),
         }
     }
 }
@@ -303,30 +321,12 @@ pub struct Inner {
     pub keep_removed: bool,
     /// Keep files macOS makes for its own bookkeeping out of saves, so they never
     /// show up among the changes, and the `._name` ones out of listings too. See
-    /// [`is_bookkeeping`].
+    /// [`crate::persist::is_bookkeeping`].
     pub skip_bookkeeping: bool,
     /// The workspace as it was mounted, which tells a `._name` file macOS made from one
     /// that is part of the data.
     #[cfg(any(nfs, test))]
     mounted: Workspace,
-}
-
-/// Files macOS creates next to the ones people write: `._name` holds `name`'s extended
-/// attributes on filesystems without them (NFS), `.DS_Store` holds Finder's view
-/// settings, and `.nfs.*` is a removed file that is still open.
-pub fn is_bookkeeping(name: &str) -> bool {
-    name.starts_with("._") || name == ".DS_Store" || name.starts_with(".nfs.")
-}
-
-/// Remove the [`is_bookkeeping`] files `ws` added. A pass over every change, which a
-/// build's thousands of files make long, so it runs on a snapshot, never under the lock
-/// every request waits on.
-pub fn drop_bookkeeping(ws: &mut Workspace) {
-    for change in ws.changes().unwrap_or_default() {
-        if change.kind == ChangeKind::Added && change.path.name().is_some_and(is_bookkeeping) {
-            let _ = ws.remove(change.path.as_str(), true);
-        }
-    }
 }
 
 impl Inner {
@@ -373,9 +373,7 @@ impl Inner {
         inner
     }
 
-    /// A copy of what a save needs; the workspace part is an O(1) fork. With
-    /// [`Inner::skip_bookkeeping`], the save then takes macOS's files out of it
-    /// ([`drop_bookkeeping`]). Files written
+    /// A copy of what a save needs; the workspace part is an O(1) fork. Files written
     /// within `settle` stay out (see [`Inner::commit_written`]).
     pub fn snapshot(&mut self, settle: Duration) -> Snapshot {
         self.commit_written(settle);
@@ -992,18 +990,29 @@ impl Inner {
         }
     }
 
+    #[cfg(test)]
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> FsResult<Bytes> {
+        self.reading(ino, offset, size)?.read(offset, size)
+    }
+
+    /// A read of `ino`, done here unless the file is saved on disk: then the caller
+    /// reads it ([`Reading::read`]) after letting go of the lock, so reading a file
+    /// holds up no other request.
+    pub fn reading(&self, ino: u64, offset: u64, size: u32) -> FsResult<Reading> {
         let range = |len: usize| {
             let start = usize::try_from(offset).unwrap_or(usize::MAX).min(len);
             start..start.saturating_add(size as usize).min(len)
         };
         if let Some(buffer) = self.buffers.get(&ino) {
-            return buffer.read(offset, size.into());
+            return buffer.read(offset, size.into()).map(Reading::Read);
         }
         let (ws, path) = self.contents(ino)?;
         // Saved files are on disk, where reading a range is cheap.
-        if self.ranged_reads || ws.stored(path.as_str()).is_ok_and(|stored| stored.is_some()) {
-            return ws.read_range(path.as_str(), offset, size.into()).fs();
+        if let Some(stored) = ws.stored(path.as_str()).fs()? {
+            return Ok(Reading::Stored(stored));
+        }
+        if self.ranged_reads {
+            return ws.read_range(path.as_str(), offset, size.into()).fs().map(Reading::Read);
         }
         let meta = ws.stat(path.as_str()).fs()?;
         let data = match self.kept(ino, meta.version) {
@@ -1016,7 +1025,7 @@ impl Inner {
                 data
             }
         };
-        Ok(data.slice(range(data.len())))
+        Ok(Reading::Read(data.slice(range(data.len()))))
     }
 
     /// The kept copy of `ino` at `version`, moved to the back as the latest read, so
@@ -1390,7 +1399,7 @@ impl Shared {
     /// Save, leaving out files written within `settle`.
     fn save_settled(&self, settle: Duration, durable: bool) -> anyhow::Result<()> {
         let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
-        let (mut snapshot, skip_bookkeeping) = {
+        let (snapshot, skip_bookkeeping) = {
             let mut inner = self.lock();
             inner.commit_written(settle);
             // Nothing changed since the last save took its snapshot, and that save
@@ -1403,9 +1412,7 @@ impl Shared {
             }
             (inner.snapshot(settle), inner.skip_bookkeeping)
         };
-        if skip_bookkeeping {
-            drop_bookkeeping(&mut snapshot.ws);
-        }
+        saved.skip_bookkeeping = skip_bookkeeping;
         let result = saved.save(&snapshot, &self.root, durable);
         let mut inner = self.lock();
         // Saved files are read from disk from now on, unless written again meanwhile.
@@ -1653,7 +1660,8 @@ impl Filesystem for SandFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.0.lock().read(ino.0, offset, size) {
+        let reading = self.0.lock().reading(ino.0, offset, size);
+        match reading.and_then(|reading| reading.read(offset, size)) {
             Ok(data) => reply.data(&data),
             Err(err) => reply.error(err),
         }
