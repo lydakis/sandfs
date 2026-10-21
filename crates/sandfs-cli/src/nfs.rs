@@ -703,8 +703,8 @@ mod tests {
     use sandfs_core::{MemorySource, VPath, Workspace};
 
     use super::*;
-    use crate::fs::is_bookkeeping;
     use crate::persist::Saved;
+    use crate::persist::is_bookkeeping;
 
     fn served() -> (SandNfs, tempfile::TempDir) {
         served_from(&[("notes.txt", "draft\n"), ("in/a.txt", "a")])

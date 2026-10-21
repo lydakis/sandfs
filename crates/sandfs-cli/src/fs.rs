@@ -74,7 +74,7 @@ pub const MAX_FILE_SIZE: usize = i64::MAX as usize;
 const COPY_PIECE: u64 = 8 << 20;
 /// The largest file kept in memory while it is written, where there are no drafts.
 const MAX_MEMORY_FILE: u64 = 4 << 30;
-/// How many whole files, and bytes of them, [`Inner::read`] keeps for sources that
+/// How many whole files, and bytes of them, [`Inner::reading`] keeps for sources that
 /// can't read a range on its own. The kernel asks for a file in chunks and caches
 /// what it gets, so only the few files being read right now are worth keeping.
 const RECENT_FILES: usize = 16;
@@ -321,19 +321,12 @@ pub struct Inner {
     pub keep_removed: bool,
     /// Keep files macOS makes for its own bookkeeping out of saves, so they never
     /// show up among the changes, and the `._name` ones out of listings too. See
-    /// [`is_bookkeeping`].
+    /// [`crate::persist::is_bookkeeping`].
     pub skip_bookkeeping: bool,
     /// The workspace as it was mounted, which tells a `._name` file macOS made from one
     /// that is part of the data.
     #[cfg(any(nfs, test))]
     mounted: Workspace,
-}
-
-/// Files macOS creates next to the ones people write: `._name` holds `name`'s extended
-/// attributes on filesystems without them (NFS), `.DS_Store` holds Finder's view
-/// settings, and `.nfs.*` is a removed file that is still open.
-pub fn is_bookkeeping(name: &str) -> bool {
-    name.starts_with("._") || name == ".DS_Store" || name.starts_with(".nfs.")
 }
 
 impl Inner {

@@ -43,7 +43,12 @@ use bytes::Bytes;
 use sandfs_core::{ChangeKind, Error, Kind, Listing, Source, SourceKey, Stored, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
-use crate::fs::is_bookkeeping;
+/// Files macOS creates next to the ones people write: `._name` holds `name`'s extended
+/// attributes on filesystems without them (NFS), `.DS_Store` holds Finder's view
+/// settings, and `.nfs.*` is a removed file that is still open.
+pub fn is_bookkeeping(name: &str) -> bool {
+    name.starts_with("._") || name == ".DS_Store" || name.starts_with(".nfs.")
+}
 
 /// A point in time as `(seconds, nanoseconds)` since the Unix epoch.
 type Time = (u64, u32);
