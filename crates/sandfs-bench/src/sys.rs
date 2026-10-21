@@ -22,12 +22,19 @@ pub fn peak_rss(pid: u32) -> Result<u64> {
     #[cfg(target_os = "linux")]
     return proc_status_kib(pid, "VmHWM:");
     #[cfg(target_os = "macos")]
-    if pid == std::process::id() {
-        // Bytes on macOS.
-        Ok(nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF)?.max_rss() as u64)
-    } else {
-        vmmap_peak(pid)
-    }
+    if pid == std::process::id() { max_rss(nix::sys::resource::UsageWho::RUSAGE_SELF) } else { vmmap_peak(pid) }
+}
+
+/// The largest peak resident memory among this process's children that have exited
+/// and been waited for, in bytes.
+pub fn children_peak_rss() -> Result<u64> {
+    max_rss(nix::sys::resource::UsageWho::RUSAGE_CHILDREN)
+}
+
+/// `getrusage`'s peak resident memory in bytes: Linux counts it in KiB, macOS in bytes.
+fn max_rss(who: nix::sys::resource::UsageWho) -> Result<u64> {
+    let max = u64::try_from(nix::sys::resource::getrusage(who)?.max_rss())?;
+    Ok(if cfg!(target_os = "macos") { max } else { max * 1024 })
 }
 
 /// Start measuring this process's peak memory from now. Linux 4.0 and later can; on
@@ -157,7 +164,7 @@ fn parse_size(text: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_rss, disk_usage, parse_size, peak_rss, tree_peak_rss};
+    use super::{children_peak_rss, current_rss, disk_usage, parse_size, peak_rss, tree_peak_rss};
 
     #[test]
     fn sizes_parse_as_vmmap_prints_them() {
@@ -193,6 +200,10 @@ mod tests {
     #[test]
     fn memory_and_disk_read_back() {
         assert!(current_rss(std::process::id()).unwrap() > 0);
+        // A small command peaks at a few MiB; counted in the wrong unit it would be GiB.
+        std::process::Command::new("true").status().unwrap();
+        let child = children_peak_rss().unwrap();
+        assert!((64 << 10..512 << 20).contains(&child), "a child peaked at {child} bytes");
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file"), vec![1; 1 << 20]).unwrap();
         assert!(disk_usage(dir.path()).unwrap() >= 1 << 20);
