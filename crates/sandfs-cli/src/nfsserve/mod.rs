@@ -15,6 +15,11 @@
 //! - Messages over 2 MiB are refused instead of read whole, closing the connection
 //!   (which upstream left open, reading on), and a reply goes out in one write instead
 //!   of two (its record mark, then the rest).
+//! - A listing's entries carry cookies of their own ([`vfs::DirEntry::cookie`])
+//!   instead of their file ids, which two names of one file share, and READDIR
+//!   resumes from the cookie it is given instead of starting over.
+//! - LINK (hard links) is answered, through [`vfs::NFSFileSystem::link`], which
+//!   upstream left unimplemented, and PATHCONF says how many names a file may have.
 //! - Left out: `fs_util` and the `filetime` conversion, which sandfs doesn't use.
 //!
 //! [nfsserve]: https://github.com/huggingface/nfsserve

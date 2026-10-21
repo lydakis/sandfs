@@ -149,12 +149,12 @@ pub async fn handle_nfs(
         NFSProgram::NFSPROC3_MKDIR => nfsproc3_mkdir(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_SYMLINK => nfsproc3_symlink(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_READLINK => nfsproc3_readlink(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_LINK => nfsproc3_link(xid, input, output, context).await?,
         _ => {
             warn!("Unimplemented message {:?}", prog);
             proc_unavail_reply_message(xid).serialize(output)?;
         } /*
           NFSPROC3_MKNOD,
-          NFSPROC3_LINK,
           NFSPROC3_COMMIT,
           INVALID*/
     }
@@ -599,7 +599,8 @@ pub async fn nfsproc3_pathconf(
     };
     let res = PATHCONF3resok {
         obj_attributes: obj_attr,
-        linkmax: 0,
+        // Names a file may have, now that LINK is answered (as on APFS).
+        linkmax: 32767,
         name_max: 32768,
         no_trunc: true,
         chown_restricted: true,
@@ -888,7 +889,7 @@ pub async fn nfsproc3_readdirplus(
                 let entry = entryplus3 {
                     fileid: entry.fileid,
                     name: entry.name,
-                    cookie: entry.fileid,
+                    cookie: entry.cookie,
                     name_attributes: obj_attr.map_or(nfs::post_op_attr::Void, nfs::post_op_attr::attributes),
                     name_handle: handle,
                 };
@@ -991,7 +992,7 @@ pub async fn nfsproc3_readdir(
     // This is hard to ballpark, so we just divide it by 16
     let estimated_max_results = args.dircount / 16;
     let mut ctr = 0;
-    match context.vfs.readdir_simple(dirid, estimated_max_results as usize).await {
+    match context.vfs.readdir_simple(dirid, args.cookie, estimated_max_results as usize).await {
         Ok(result) => {
             // we count dir_count seperately as it is just a subset of fields
             let mut accumulated_dircount: usize = 0;
@@ -1006,7 +1007,7 @@ pub async fn nfsproc3_readdir(
             dir_attr.serialize(&mut counting_output)?;
             dirversion.serialize(&mut counting_output)?;
             for entry in result.entries {
-                let entry = entry3 { fileid: entry.fileid, name: entry.name, cookie: entry.fileid };
+                let entry = entry3 { fileid: entry.fileid, name: entry.name, cookie: entry.cookie };
                 // write the entry into a buffer first
                 let mut write_buf: Vec<u8> = Vec::new();
                 let mut write_cursor = std::io::Cursor::new(&mut write_buf);
@@ -1887,6 +1888,74 @@ struct SYMLINK3args {
     symlink: nfs::symlinkdata3,
 }
 xdr_struct!(SYMLINK3args, dirops, symlink);
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct LINK3args {
+    file: nfs::nfs_fh3,
+    link: nfs::diropargs3,
+}
+xdr_struct!(LINK3args, file, link);
+
+/*
+LINK3res NFSPROC3_LINK(LINK3args) = 15;
+struct LINK3resok {
+     post_op_attr   file_attributes;
+     wcc_data       linkdir_wcc;
+};
+struct LINK3resfail {
+     post_op_attr   file_attributes;
+     wcc_data       linkdir_wcc;
+};
+*/
+pub async fn nfsproc3_link(
+    xid: u32,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    context: &RPCContext,
+) -> Result<(), anyhow::Error> {
+    let mut args = LINK3args::default();
+    args.deserialize(input)?;
+    debug!("nfsproc3_link({:?}, {:?}) ", xid, args);
+    let fail = |stat: nfs::nfsstat3, output: &mut _| -> Result<(), anyhow::Error> {
+        make_success_reply(xid).serialize(output)?;
+        stat.serialize(output)?;
+        nfs::post_op_attr::Void.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
+        Ok(())
+    };
+    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
+        return fail(nfs::nfsstat3::NFS3ERR_ROFS, output);
+    }
+    let (id, dirid) = match (context.vfs.fh_to_id(&args.file), context.vfs.fh_to_id(&args.link.dir)) {
+        (Ok(id), Ok(dirid)) => (id, dirid),
+        (Err(stat), _) | (_, Err(stat)) => return fail(stat, output),
+    };
+    let pre_dir_attr = match context.vfs.getattr(dirid).await {
+        Ok(v) => nfs::pre_op_attr::attributes(nfs::wcc_attr { size: v.size, mtime: v.mtime, ctime: v.ctime }),
+        Err(stat) => return fail(stat, output),
+    };
+    let res = context.vfs.link(id, dirid, &args.link.name).await;
+    let post_dir_attr = match context.vfs.getattr(dirid).await {
+        Ok(v) => nfs::post_op_attr::attributes(v),
+        Err(_) => nfs::post_op_attr::Void,
+    };
+    let wcc_res = nfs::wcc_data { before: pre_dir_attr, after: post_dir_attr };
+    make_success_reply(xid).serialize(output)?;
+    match res {
+        Ok(attr) => {
+            nfs::nfsstat3::NFS3_OK.serialize(output)?;
+            nfs::post_op_attr::attributes(attr).serialize(output)?;
+        }
+        Err(stat) => {
+            stat.serialize(output)?;
+            let attr = context.vfs.getattr(id).await.map_or(nfs::post_op_attr::Void, nfs::post_op_attr::attributes);
+            attr.serialize(output)?;
+        }
+    }
+    wcc_res.serialize(output)?;
+    Ok(())
+}
 
 pub async fn nfsproc3_symlink(
     xid: u32,

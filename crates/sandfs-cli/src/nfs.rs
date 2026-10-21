@@ -33,8 +33,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(any(nfs, test))]
 use crate::nfsserve::context::{CallFilter, Verdict};
 use crate::nfsserve::nfs::{
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3,
-    nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
+    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3,
+    nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
 };
 #[cfg(any(nfs, test))]
 use crate::nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -57,18 +57,26 @@ const MOUNT_CHECK: Duration = Duration::from_millis(500);
 /// client resuming after one of those resumes by the entry's current name.
 const LISTED_NAMES: usize = 16384;
 
-/// Names handed out in listings, forgetting the oldest past [`LISTED_NAMES`].
+/// Set in the cookies of names of a file with another name in the same folder (a hard
+/// link), which can't be told apart by their file id; never set in a file id.
+const NAME_COOKIE: u64 = 1 << 63;
+
+/// Names handed out in listings, by folder and cookie, forgetting the oldest past
+/// [`LISTED_NAMES`]. A cookie is the entry's file id, or for a file with two names in
+/// the folder a number of its own ([`NAME_COOKIE`]).
 #[derive(Default)]
 struct Listed {
-    names: HashMap<(fileid3, fileid3), String>,
-    order: VecDeque<(fileid3, fileid3)>,
+    names: HashMap<(fileid3, u64), String>,
+    order: VecDeque<(fileid3, u64)>,
+    /// The last number handed out as a [`NAME_COOKIE`].
+    last: u64,
 }
 
 impl Listed {
     /// Note that `key` was listed as `name`. An entry listed again under a new name
     /// keeps whichever name sorts first, since an older page may still be resumed from
     /// it: resuming from the earlier name can list some entries twice, but never skips one.
-    fn insert(&mut self, key: (fileid3, fileid3), name: String) {
+    fn insert(&mut self, key: (fileid3, u64), name: String) {
         match self.names.entry(key) {
             Entry::Occupied(mut listed) => {
                 if name < *listed.get() {
@@ -323,13 +331,18 @@ impl NFSFileSystem for SandNfs {
         })
     }
 
-    /// Entries in name order, after the one with id `start_after` (0 for the first page).
+    /// Entries in name order, after the one with cookie `start_after` (0 for the first
+    /// page).
     async fn readdir(
         &self,
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
+        // Every entry handed out is remembered, and the server may send only the first
+        // few, so a page stays well under what is remembered, or the names a client
+        // resumes from could already be forgotten.
+        let max_entries = max_entries.min(LISTED_NAMES / 4);
         let mut inner = self.shared.lock();
         let fh = inner.opendir(dirid).nfs()?;
         // Skip `.` and `..`: the client makes those up itself.
@@ -343,6 +356,9 @@ impl NFSFileSystem for SandNfs {
             0
         } else if let Some(after) = listed_as {
             listing.partition_point(|(_, _, name)| *name <= after)
+        } else if start_after & NAME_COOKIE != 0 {
+            // A name of a linked file, forgotten: there is no telling where it was.
+            return Err(nfsstat3::NFS3ERR_BAD_COOKIE);
         } else if let Some(position) = listing.iter().position(|(ino, ..)| *ino == start_after) {
             position + 1
         } else {
@@ -351,6 +367,10 @@ impl NFSFileSystem for SandNfs {
             let after = inner.last_name_of(start_after).ok_or(nfsstat3::NFS3ERR_BAD_COOKIE)?;
             listing.partition_point(|(_, _, name)| *name <= after)
         };
+        // Files with more than one name here, whose names each need a cookie of their own.
+        let mut seen = std::collections::HashSet::new();
+        let linked: std::collections::HashSet<u64> =
+            listing.iter().filter(|(ino, ..)| !seen.insert(*ino)).map(|(ino, ..)| *ino).collect();
         let (mut entries, mut names) = (Vec::new(), Vec::new());
         let mut end = true;
         for (ino, _, name) in listing.iter().skip(start) {
@@ -369,14 +389,18 @@ impl NFSFileSystem for SandNfs {
                 Some(attributes(&attr))
             };
             inner.hold(*ino);
-            entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), attr });
+            entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), cookie: *ino, attr });
             names.push(name.clone());
         }
         // The server may send only some of these and end the page early, so the client
         // can resume after any of them.
         let mut listed = self.listed.lock().unwrap();
-        for (entry, name) in entries.iter().zip(names) {
-            listed.insert((dirid, entry.fileid), name);
+        for (entry, name) in entries.iter_mut().zip(names) {
+            if linked.contains(&entry.fileid) {
+                listed.last += 1;
+                entry.cookie = NAME_COOKIE | listed.last;
+            }
+            listed.insert((dirid, entry.cookie), name);
         }
         Ok(ReadDirResult { entries, end })
     }
@@ -398,7 +422,7 @@ impl NFSFileSystem for SandNfs {
             dtpref: 1 << 20,
             maxfilesize: MAX_FILE_SIZE as u64,
             time_delta: nfstime3 { seconds: 0, nseconds: 1_000_000 },
-            properties: FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME,
+            properties: FSF_LINK | FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME,
         })
     }
 
@@ -416,6 +440,11 @@ impl NFSFileSystem for SandNfs {
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
         let target = self.shared.lock().readlink(id).nfs()?;
         Ok(target.into_bytes().into())
+    }
+
+    async fn link(&self, id: fileid3, dirid: fileid3, linkname: &filename3) -> Result<fattr3, nfsstat3> {
+        let attr = self.change(|inner| inner.link(id, dirid, os_name(linkname)))?;
+        Ok(attributes(&attr))
     }
 }
 
@@ -763,6 +792,52 @@ mod tests {
         // A save moves the buffered writes into the workspace.
         let snapshot = fs.shared.lock().snapshot(Duration::ZERO);
         assert_eq!(snapshot.ws.read_text("/mnt/new.txt").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn hard_links_are_one_file_under_two_names() {
+        let (fs, _dir) = served();
+        block(async {
+            let (id, _) = fs.create(ROOT_INO, &name("a.o"), sattr3::default()).await.unwrap();
+            fs.write(id, 0, b"object").await.unwrap();
+            let attr = fs.link(id, ROOT_INO, &name("b.o")).await.unwrap();
+            assert_eq!(attr.nlink, 2);
+            let other = fs.lookup(ROOT_INO, &name("b.o")).await.unwrap();
+            assert_eq!(other, id, "one inode");
+            fs.write(other, 0, b"OB").await.unwrap();
+            assert_eq!(fs.read(id, 0, 100).await.unwrap().0, b"OBject");
+            fs.remove(ROOT_INO, &name("a.o")).await.unwrap();
+            assert_eq!(fs.read(other, 0, 100).await.unwrap().0, b"OBject", "the other name stays");
+            assert_eq!(fs.getattr(other).await.unwrap().nlink, 1);
+            assert!(matches!(fs.link(id, ROOT_INO, &name("b.o")).await, Err(nfsstat3::NFS3ERR_EXIST)));
+        });
+        let info = block(fs.fsinfo(ROOT_INO)).unwrap();
+        assert_ne!(info.properties & crate::nfsserve::nfs::FSF_LINK, 0, "hard links are supported");
+    }
+
+    #[test]
+    fn a_listing_in_pages_goes_past_every_name_of_a_linked_file() {
+        let (fs, _dir) = served();
+        block(async {
+            let (id, _) = fs.create(ROOT_INO, &name("a"), sattr3::default()).await.unwrap();
+            fs.create(ROOT_INO, &name("b"), sattr3::default()).await.unwrap();
+            fs.link(id, ROOT_INO, &name("c")).await.unwrap();
+            fs.create(ROOT_INO, &name("d"), sattr3::default()).await.unwrap();
+            fs.link(id, ROOT_INO, &name("e")).await.unwrap();
+            for page in [1, 2, 3] {
+                let (mut names, mut cookie) = (Vec::new(), 0);
+                for _ in 0..20 {
+                    let result = fs.readdir(ROOT_INO, cookie, page).await.unwrap();
+                    names.extend(result.entries.iter().map(|e| String::from_utf8_lossy(&e.name).into_owned()));
+                    match result.entries.last() {
+                        Some(last) if !result.end => cookie = last.cookie,
+                        _ => break,
+                    }
+                }
+                let listed: Vec<&str> = names.iter().map(String::as_str).filter(|n| n.len() == 1).collect();
+                assert_eq!(listed, ["a", "b", "c", "d", "e"], "pages of {page}");
+            }
+        });
     }
 
     #[test]

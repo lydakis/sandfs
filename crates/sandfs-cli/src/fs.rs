@@ -820,7 +820,6 @@ impl Inner {
     }
 
     /// link(2): a second name for the file at `ino`, which stays one inode.
-    #[cfg(any(fuse, test))]
     pub fn link(&mut self, ino: u64, new_parent: u64, new_name: &OsStr) -> FsResult<FileAttr> {
         let from = self.path(ino)?;
         let to = self.child(new_parent, new_name)?;
