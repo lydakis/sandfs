@@ -1007,11 +1007,15 @@ impl Workspace {
     /// Before a base file's bytes are fetched: a walk reading the files it lists
     /// (`grep -r`, a copy), or a program reading files by path one after another (a
     /// build), has the source prefetch, once it has read two files in one directory.
-    /// A read after a pause, as a person's next look, prefetches nothing.
+    /// A read after a pause, as a person's next look, prefetches nothing, and so does a
+    /// read of a file the source has at hand ([`Source::is_local`]).
     /// Whether the bytes are to be fetched, rather than cached already.
     fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<bool> {
         if self.cache.peek_blob(&(mount.id, key.clone())).is_some() {
             return Ok(false);
+        }
+        if mount.source.is_local(key) {
+            return Ok(true);
         }
         let Some(parent) = path.parent() else { return Ok(true) };
         let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(true) };
@@ -1134,7 +1138,7 @@ impl Workspace {
         let Content::Base { mount, key, .. } = content else { return Ok(None) };
         let (Some(parent), Some(name)) = (path.parent(), path.name()) else { return Ok(None) };
         let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(None) };
-        if self.touch(key, &parent, mount, &dir, false)? == Touch::Cold {
+        if mount.source.is_local(key) || self.touch(key, &parent, mount, &dir, false)? == Touch::Cold {
             return Ok(None);
         }
         // Single-flight, like every other cache entry: forks asking at once prefetch once.

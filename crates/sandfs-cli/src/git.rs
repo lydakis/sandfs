@@ -440,7 +440,13 @@ impl GitDir {
             .args(["-c", "fetch.negotiationAlgorithm=noop", "fetch", "origin", "--no-tags", "--no-write-fetch-head"])
             .args(["--recurse-submodules=no", "--filter=blob:none", "--stdin"])
             .env("GIT_TERMINAL_PROMPT", "0");
-        let _ = run_with_input(cmd, Some(&wanted));
+        if run_with_input(cmd, Some(&wanted)).is_ok()
+            && let Some(objects) = &self.objects
+        {
+            // Reading them later is then no reason for a background fetch to go on.
+            let ids = wanted.split(|&b| b == b'\n').filter_map(|id| std::str::from_utf8(id).ok());
+            objects.source.fetched_elsewhere(ids.filter(|id| !id.is_empty()));
+        }
     }
 }
 
