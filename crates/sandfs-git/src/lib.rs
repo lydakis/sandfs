@@ -161,6 +161,11 @@ impl GitSource {
         self
     }
 
+    /// The size of the blob `id` given to [`GitSource::with_known_sizes`], if it was.
+    pub fn known_size(&self, id: &str) -> Option<u64> {
+        self.known_sizes.get(id).copied()
+    }
+
     /// The id of the mounted tree.
     pub fn tree_id(&self) -> &str {
         &self.tree

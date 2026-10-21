@@ -451,9 +451,11 @@ impl GitDir {
         let mut listing = Listing::new();
         for id in objects.source.missing_files().into_iter().flat_map(|missing| missing.starting_with(first)) {
             let key = format!("{OBJECTS}/{}/{}", &id[..2], &id[2..]);
+            // Known from the file's size alone, so stat-ing it, as `find` does, fetches nothing.
+            let size = objects.source.known_size(&id).map(|size| loose_object_size("blob", size));
             listing.insert(
                 id[2..].to_owned(),
-                SourceEntry { kind: Kind::File { executable: false }, key: key.into(), size: None, modified: None },
+                SourceEntry { kind: Kind::File { executable: false }, key: key.into(), size, modified: None },
             );
         }
         Some(listing)
@@ -545,6 +547,13 @@ fn loose_object(kind: &str, data: &[u8]) -> Bytes {
     }
     out.extend_from_slice(&((b << 16) | a).to_be_bytes());
     out.into()
+}
+
+/// The length of [`loose_object`] for `len` bytes of `kind`.
+fn loose_object_size(kind: &str, len: u64) -> u64 {
+    let content = format!("{kind} {len}\0").len() as u64 + len;
+    // zlib's header, each stored block's own, and the checksum.
+    2 + content.div_ceil(65535) * 5 + content + 4
 }
 
 impl Source for GitDir {
@@ -1282,6 +1291,24 @@ mod tests {
         assert!(!absent("a/2.txt") && !absent("a/big") && absent("b/0.txt"));
         check("a/big", &"x".repeat(200_000));
         check("empty", "");
+
+        // Given the files' sizes, each object is listed at the length a read gives.
+        let b0 = id("b/0.txt");
+        let sized = GitSource::open(&repo, &commit).unwrap().with_known_sizes([(b0.as_str().into(), 2)].into());
+        let dir = GitDir::new(&repo, &commit, Some("main"), &home, Some(Arc::new(sized))).unwrap();
+        let listing = dir.read_dir(&format!("sandfs-objects/{}", &b0[..2])).unwrap();
+        let entry = &listing[&b0[2..]];
+        assert!(absent("b/0.txt"), "listed without being read");
+        assert_eq!(entry.size, Some(dir.read_file(&entry.key).unwrap().len() as u64));
+    }
+
+    #[test]
+    fn loose_object_sizes_are_known_from_the_file_size() {
+        // Around the edges of zlib's stored blocks, of 65,535 bytes each.
+        for len in (0..10).chain(65520..65540).chain(131060..131080).chain([200_000]) {
+            let data = vec![b'x'; len];
+            assert_eq!(loose_object_size("blob", len as u64), loose_object("blob", &data).len() as u64, "{len}");
+        }
     }
 
     /// Check the index at `index` of `repo`, as [`GitDir`] builds it.
