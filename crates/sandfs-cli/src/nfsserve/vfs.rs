@@ -21,7 +21,8 @@ pub struct ReadDirSimpleResult {
 pub struct DirEntry {
     pub fileid: fileid3,
     pub name: filename3,
-    pub attr: fattr3,
+    /// Left out of READDIRPLUS when `None`, so the client asks for them when it needs them.
+    pub attr: Option<fattr3>,
 }
 #[derive(Default, Debug)]
 pub struct ReadDirResult {

@@ -333,8 +333,9 @@ impl NFSFileSystem for SandNfs {
         let fh = inner.opendir(dirid).nfs()?;
         // Skip `.` and `..`: the client makes those up itself.
         let listing = inner.readdir(fh, 2).map(<[_]>::to_vec);
+        let sizeless = inner.sizeless(fh);
         inner.releasedir(fh);
-        let mut listing = listing.nfs()?;
+        let (mut listing, sizeless) = (listing.nfs()?, sizeless.nfs()?);
         listing.retain(|(_, kind, name)| !inner.is_added_appledouble(dirid, name, *kind));
         let listed_as = self.listed.lock().unwrap().names.get(&(dirid, start_after)).cloned();
         let start = if start_after == 0 {
@@ -356,10 +357,18 @@ impl NFSFileSystem for SandNfs {
                 end = false;
                 break;
             }
-            // Gone since the listing was made.
-            let Ok(attr) = inner.attr(*ino) else { continue };
+            // A file's size can mean reading it, so one the listing had no size for comes
+            // without attributes, which the client then asks for if it needs them (`ls -l`,
+            // a read). A walk that needs only names (`find`, `git status`) reads nothing.
+            let attr = if sizeless.contains(ino) {
+                None
+            } else {
+                // Gone since the listing was made.
+                let Ok(attr) = inner.attr(*ino) else { continue };
+                Some(attributes(&attr))
+            };
             inner.hold(*ino);
-            entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), attr: attributes(&attr) });
+            entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), attr });
             names.push(name.clone());
         }
         // The server may send only some of these and end the page early, so the client
@@ -769,9 +778,12 @@ mod tests {
     }
 
     fn served_from(files: &[(&'static str, &'static str)]) -> (SandNfs, tempfile::TempDir) {
-        let source = MemorySource::from_files(files.iter().copied()).unwrap();
+        serve(Arc::new(MemorySource::from_files(files.iter().copied()).unwrap()))
+    }
+
+    fn serve(source: Arc<dyn sandfs_core::Source>) -> (SandNfs, tempfile::TempDir) {
         let mut ws = Workspace::new();
-        ws.mount("/mnt", Arc::new(source)).unwrap();
+        ws.mount("/mnt", source).unwrap();
         let root = VPath::parse("/mnt").unwrap();
         let mut inner = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), UNIX_EPOCH, (501, 20));
         inner.keep_removed = false;
@@ -825,6 +837,47 @@ mod tests {
         assert_eq!(changed, ["/mnt/sub/kept.txt"]);
         assert!(snapshot.dirs.iter().any(|dir| dir.ends_with("/._cache")), "{:?}", snapshot.dirs);
         assert!(is_bookkeeping("._notes.txt") && is_bookkeeping(".DS_Store") && !is_bookkeeping("notes.txt"));
+    }
+
+    #[test]
+    fn listings_leave_out_attributes_that_mean_reading_a_file() {
+        /// A source that lists no sizes and counts the files it reads.
+        #[derive(Debug)]
+        struct Sizeless(MemorySource, std::sync::atomic::AtomicUsize);
+        impl sandfs_core::Source for Sizeless {
+            fn root(&self) -> sandfs_core::Result<sandfs_core::SourceKey> {
+                self.0.root()
+            }
+            fn read_dir(&self, key: &str) -> sandfs_core::Result<sandfs_core::Listing> {
+                let mut listing = self.0.read_dir(key)?;
+                listing.values_mut().for_each(|entry| entry.size = None);
+                Ok(listing)
+            }
+            fn read_file(&self, key: &str) -> sandfs_core::Result<bytes::Bytes> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                self.0.read_file(key)
+            }
+        }
+        let source = Arc::new(Sizeless(
+            MemorySource::from_files([("README.md", "hello\n"), ("src/lib.rs", "")]).unwrap(),
+            Default::default(),
+        ));
+        let (fs, _dir) = serve(source.clone());
+        block(async {
+            let attrs = |result: ReadDirResult| -> Vec<(String, Option<u64>)> {
+                let entries = result.entries.into_iter();
+                entries.map(|e| (String::from_utf8(e.name.0).unwrap(), e.attr.map(|a| a.size))).collect()
+            };
+            let listed = attrs(fs.readdir(ROOT_INO, 0, 100).await.unwrap());
+            assert_eq!(listed, [("README.md".to_owned(), None), ("src".to_owned(), Some(0))]);
+            assert_eq!(source.1.load(Ordering::SeqCst), 0, "listing read no file");
+            // The client asks when it needs them, and from then on listings have them.
+            let readme = fs.lookup(ROOT_INO, &name("README.md")).await.unwrap();
+            assert_eq!(fs.getattr(readme).await.unwrap().size, 6);
+            let listed = attrs(fs.readdir(ROOT_INO, 0, 100).await.unwrap());
+            assert_eq!(listed[0], ("README.md".to_owned(), Some(6)));
+            assert_eq!(source.1.load(Ordering::SeqCst), 1);
+        });
     }
 
     #[test]

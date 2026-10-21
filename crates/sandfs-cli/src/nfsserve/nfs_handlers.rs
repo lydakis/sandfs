@@ -889,7 +889,7 @@ pub async fn nfsproc3_readdirplus(
                     fileid: entry.fileid,
                     name: entry.name,
                     cookie: entry.fileid,
-                    name_attributes: nfs::post_op_attr::attributes(obj_attr),
+                    name_attributes: obj_attr.map_or(nfs::post_op_attr::Void, nfs::post_op_attr::attributes),
                     name_handle: handle,
                 };
                 // write the entry into a buffer first
