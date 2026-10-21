@@ -794,6 +794,75 @@ fn names_and_sizes_stay_fresh_within_the_cache_ttl() {
     sandfs.unmount(&ws);
 }
 
+/// The kernel keeps each folder's listing once read, so every change made through the
+/// mount must show in the next listing of every folder it touched, including folders
+/// too big for one page and listings abandoned halfway.
+#[test]
+fn kept_listings_follow_every_change() {
+    if !fuse_available() {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(folder.path().join("a")).unwrap();
+    std::fs::create_dir_all(folder.path().join("b")).unwrap();
+    std::fs::write(folder.path().join("a/one.txt"), "1\n").unwrap();
+    std::fs::create_dir(folder.path().join("big")).unwrap();
+    for i in 0..1000 {
+        std::fs::write(folder.path().join(format!("big/file-with-a-long-name-{i:04}.txt")), "x").unwrap();
+    }
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+
+    let names = |dir: &str| {
+        let mut names: Vec<String> = std::fs::read_dir(ws.join(dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    // Each check lists both folders twice: the first listing after a change must be
+    // fresh, and the second comes from what the kernel kept.
+    let check = |a: &[&str], b: &[&str]| {
+        for _ in 0..2 {
+            assert_eq!(names("a"), a);
+            assert_eq!(names("b"), b);
+        }
+    };
+    check(&["one.txt"], &[]);
+    std::fs::write(ws.join("a/two.txt"), "2\n").unwrap();
+    check(&["one.txt", "two.txt"], &[]);
+    std::fs::create_dir(ws.join("a/sub")).unwrap();
+    check(&["one.txt", "sub", "two.txt"], &[]);
+    std::fs::rename(ws.join("a/two.txt"), ws.join("a/three.txt")).unwrap();
+    check(&["one.txt", "sub", "three.txt"], &[]);
+    std::fs::rename(ws.join("a/three.txt"), ws.join("b/three.txt")).unwrap();
+    check(&["one.txt", "sub"], &["three.txt"]);
+    std::fs::hard_link(ws.join("a/one.txt"), ws.join("b/linked.txt")).unwrap();
+    check(&["one.txt", "sub"], &["linked.txt", "three.txt"]);
+    std::os::unix::fs::symlink("one.txt", ws.join("a/pointer")).unwrap();
+    check(&["one.txt", "pointer", "sub"], &["linked.txt", "three.txt"]);
+    std::fs::rename(ws.join("a/sub"), ws.join("b/sub")).unwrap();
+    check(&["one.txt", "pointer"], &["linked.txt", "sub", "three.txt"]);
+    std::fs::remove_file(ws.join("a/one.txt")).unwrap();
+    std::fs::remove_dir(ws.join("b/sub")).unwrap();
+    check(&["pointer"], &["linked.txt", "three.txt"]);
+
+    // A big folder, listed in several pages, then a listing given up after a few
+    // entries, then whole listings again, around a change.
+    let big: Vec<String> = (0..1000).map(|i| format!("file-with-a-long-name-{i:04}.txt")).collect();
+    assert_eq!(names("big"), big);
+    assert_eq!(std::fs::read_dir(ws.join("big")).unwrap().take(3).count(), 3);
+    assert_eq!(names("big"), big);
+    std::fs::remove_file(ws.join("big/file-with-a-long-name-0500.txt")).unwrap();
+    let fewer: Vec<String> = big.iter().filter(|name| !name.ends_with("0500.txt")).cloned().collect();
+    assert_eq!(names("big"), fewer);
+    assert_eq!(names("big"), fewer);
+    sandfs.unmount(&ws);
+}
+
 /// Start `sandfs args...` without waiting for it.
 fn spawn(sandfs: &Sandfs, args: &[&str]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_sandfs"))
