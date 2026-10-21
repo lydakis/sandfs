@@ -160,7 +160,7 @@ struct DirHandle {
     entries: Vec<(u64, FileType, String)>,
     /// Files the listing gave no size for, with their executable bits. Their sizes
     /// aren't looked up for `readdirplus`, since that can mean reading the file.
-    #[cfg_attr(not(any(fuse, test)), allow(dead_code))]
+    #[cfg_attr(not(any(fuse, nfs, test)), allow(dead_code))]
     sizeless: HashMap<String, bool>,
 }
 
@@ -1190,6 +1190,19 @@ impl Inner {
     pub fn readdir(&self, fh: u64, offset: u64) -> FsResult<&[(u64, FileType, String)]> {
         let handle = self.handles.get(&fh).ok_or(Errno::EBADF)?;
         Ok(handle.entries.get(usize::try_from(offset).unwrap_or(usize::MAX)..).unwrap_or_default())
+    }
+
+    /// The files listing `fh` has no size for and whose size nobody worked out since,
+    /// which can mean reading them: an NFS listing leaves their attributes out.
+    #[cfg(any(nfs, test))]
+    pub fn sizeless(&self, fh: u64) -> FsResult<std::collections::HashSet<u64>> {
+        let handle = self.handles.get(&fh).ok_or(Errno::EBADF)?;
+        let sizeless = handle.entries.iter().filter(|(ino, _, name)| {
+            handle.sizeless.contains_key(name)
+                && !self.buffers.contains_key(ino)
+                && !self.nodes.get(ino).is_some_and(|node| node.sized.get())
+        });
+        Ok(sizeless.map(|(ino, ..)| *ino).collect())
     }
 
     /// Like [`Inner::readdir`], with each entry's attributes and how long the kernel

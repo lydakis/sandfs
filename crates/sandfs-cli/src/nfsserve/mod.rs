@@ -5,6 +5,8 @@
 //!   call, whose cost grew with the number of calls a minute and took most of the
 //!   server's time under load: a cold Rust build on the mount took 65 s with it and
 //!   14 s without.
+//! - A listing's entry may come without attributes ([`vfs::DirEntry::attr`]), which
+//!   READDIRPLUS allows, so a listing needn't work out every file's size.
 //! - The generation number is a `OnceLock` instead of a `static mut`, as sandfs
 //!   forbids unsafe code.
 //! - Left out: `fs_util` and the `filetime` conversion, which sandfs doesn't use.
