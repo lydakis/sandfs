@@ -31,6 +31,7 @@ sandfs-git.workspace = true
 sandfs-mcp.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -51,7 +52,6 @@ tracing = { version = "0.1.31", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 
 [dev-dependencies]
-tempfile = "3"
 
 # The NFS server's unit tests also run on Linux, where it isn't used.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

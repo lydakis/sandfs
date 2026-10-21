@@ -203,3 +203,128 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     found
 }
+
+fn call(id: u32, tool: &str, arguments: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments}}}}}"#
+    ) + "\n"
+}
+
+#[test]
+fn changes_copy_to_writes_only_the_changes_asked_for() {
+    let (home, data, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let folder = data.path().join("books");
+    std::fs::create_dir_all(folder.join("2025")).unwrap();
+    std::fs::write(folder.join("budget.csv"), "jan,1200\n").unwrap();
+    std::fs::write(folder.join("2025/q1.csv"), "q1\n").unwrap();
+    std::fs::write(folder.join("2025/q2.csv"), "q2\n").unwrap();
+    let source = folder.to_str().unwrap();
+
+    let session = call(1, "write", r#"{"path":"/mnt/budget.csv","content":"jan,1250\n"}"#)
+        + &call(2, "write", r#"{"path":"/mnt/notes/summary.md","content":"up 4%\n"}"#)
+        + &call(3, "delete", r#"{"path":"/mnt/2025/q1.csv"}"#)
+        + &call(4, "delete", r#"{"path":"/mnt/2025/q2.csv"}"#);
+    let served = sandfs(home.path(), &["serve", "--mcp", source], &session);
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+
+    // A folder holding the original, as a person keeps one.
+    let kept = out.path().join("books");
+    std::fs::create_dir_all(kept.join("2025")).unwrap();
+    for name in ["budget.csv", "2025/q1.csv", "2025/q2.csv"] {
+        std::fs::copy(folder.join(name), kept.join(name)).unwrap();
+    }
+    let dir = kept.to_str().unwrap();
+
+    // Only the summary first: one file, nothing else touched.
+    assert_eq!(stdout(home.path(), &["changes", "books", "notes", "--copy-to", dir]), "A notes/summary.md\n");
+    assert_eq!(std::fs::read_to_string(kept.join("notes/summary.md")).unwrap(), "up 4%\n");
+    assert_eq!(std::fs::read_to_string(kept.join("budget.csv")).unwrap(), "jan,1200\n");
+    assert!(kept.join("2025/q1.csv").exists());
+
+    // Then everything. The workspace still has the emptied folder, so the copy keeps it.
+    assert_eq!(
+        stdout(home.path(), &["changes", "books", "--copy-to", dir]),
+        "D 2025/q1.csv\nD 2025/q2.csv\nM budget.csv\nA notes/summary.md\n"
+    );
+    assert_eq!(std::fs::read_to_string(kept.join("budget.csv")).unwrap(), "jan,1250\n");
+    assert_eq!(std::fs::read_dir(kept.join("2025")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_to_string(folder.join("budget.csv")).unwrap(), "jan,1200\n", "the source is untouched");
+}
+
+#[test]
+fn changes_copy_to_removes_folders_a_deletion_emptied_even_when_its_files_are_gone() {
+    let (home, data, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let folder = data.path().join("books");
+    std::fs::create_dir_all(folder.join("2025")).unwrap();
+    std::fs::write(folder.join("2025/q1.csv"), "q1\n").unwrap();
+    let session = call(1, "delete", r#"{"path":"/mnt/2025/q1.csv"}"#) + &call(2, "delete", r#"{"path":"/mnt/2025"}"#);
+    let served = sandfs(home.path(), &["serve", "--mcp", folder.to_str().unwrap()], &session);
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+
+    // The file is already gone from the copy, but its folder is left.
+    std::fs::create_dir(out.path().join("2025")).unwrap();
+    assert_eq!(
+        stdout(home.path(), &["changes", "books", "--copy-to", out.path().to_str().unwrap()]),
+        "D 2025/q1.csv\n"
+    );
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0, "neither 2025 nor the copy's own folder is left");
+}
+
+#[cfg(unix)]
+#[test]
+fn changes_copy_to_never_writes_through_a_link() {
+    let (home, data, out, elsewhere) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let folder = data.path().join("books");
+    std::fs::create_dir(&folder).unwrap();
+    let session = call(1, "write", r#"{"path":"/mnt/notes/summary.md","content":"up 4%\n"}"#);
+    let served = sandfs(home.path(), &["serve", "--mcp", folder.to_str().unwrap()], &session);
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+
+    std::os::unix::fs::symlink(elsewhere.path(), out.path().join("notes")).unwrap();
+    let copied = sandfs(home.path(), &["changes", "books", "--copy-to", out.path().to_str().unwrap()], "");
+    assert!(!copied.status.success());
+    assert!(
+        String::from_utf8_lossy(&copied.stderr).contains("is a link"),
+        "{}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    assert!(!elsewhere.path().join("summary.md").exists());
+}
+
+#[test]
+fn changes_copy_to_leaves_out_git_folders_in_any_spelling() {
+    let (home, data, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let folder = data.path().join("books");
+    std::fs::create_dir(&folder).unwrap();
+    // A Mac or Windows disk would read both as the `.git` of the folder copied into.
+    let session = call(1, "write", r#"{"path":"/mnt/.GIT/config","content":"[core]\n\tfsmonitor = evil\n"}"#)
+        + &call(2, "write", r#"{"path":"/mnt/GIT~1/hooks/post-checkout","content":"evil\n"}"#)
+        + &call(3, "write", r#"{"path":"/mnt/notes.md","content":"fine\n"}"#);
+    let served = sandfs(home.path(), &["serve", "--mcp", folder.to_str().unwrap()], &session);
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+
+    let copied = sandfs(home.path(), &["changes", "books", "--copy-to", out.path().to_str().unwrap()], "");
+    assert!(copied.status.success(), "{}", String::from_utf8_lossy(&copied.stderr));
+    assert!(String::from_utf8_lossy(&copied.stderr).contains("left out 2 changes in .git"));
+    let mut names: Vec<_> =
+        std::fs::read_dir(out.path()).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["notes.md"]);
+}
+
+#[test]
+fn changes_refuses_paths_outside_the_workspace() {
+    let (home, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let folder = data.path().join("books");
+    std::fs::create_dir(&folder).unwrap();
+    let served = sandfs(home.path(), &["serve", "--mcp", folder.to_str().unwrap()], "");
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    let outside = sandfs(home.path(), &["changes", "books", ".."], "");
+    assert!(!outside.status.success());
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("outside the workspace"));
+}

@@ -10,6 +10,7 @@
 // Without a mount, mounting is stubbed out below, which leaves its helpers unused.
 #![cfg_attr(not(mount), allow(dead_code, unused_imports))]
 
+mod copy;
 #[cfg(mount)]
 mod fs;
 mod git;
@@ -92,10 +93,18 @@ enum Cmd {
     Changes {
         /// A workspace name or the directory it is mounted on.
         workspace: String,
+        /// Only these files, or the files in these folders, relative to the workspace.
+        paths: Vec<String>,
         /// Compare against this workspace instead of the source: a fork kept as a
         /// checkpoint, or another attempt forked from the same one.
         #[arg(long, value_name = "WORKSPACE")]
         since: Option<String>,
+        /// Also write the changes listed into DIR: added and modified files are copied
+        /// there and deleted ones removed, so a copy of the source in DIR (or of the
+        /// --since workspace) comes to match the workspace. Nothing else is written,
+        /// and never through a link in DIR.
+        #[arg(long, value_name = "DIR")]
+        copy_to: Option<PathBuf>,
     },
     /// List workspaces and where they are mounted.
     List,
@@ -203,7 +212,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Changes { workspace, since } => {
+        Cmd::Changes { workspace, paths, since, copy_to } => {
             let name = home.find(&workspace)?;
             sync(&home, &name)?;
             let since = since.map(|since| home.find(&since)).transpose()?;
@@ -212,51 +221,44 @@ fn run(cli: Cli) -> Result<()> {
             }
             // Comparing reads the source, so `sandfs clean` waits until this is done.
             let _reading = home.repos_lock(false)?;
+            let root = VPath::parse(ROOT)?;
+            let wanted = paths
+                .iter()
+                .map(|path| {
+                    let full = VPath::parse(&format!("{ROOT}/{}", path.trim_start_matches("./")))?;
+                    if !full.starts_with(&root) {
+                        bail!("{path} is outside the workspace");
+                    }
+                    Ok(full)
+                })
+                .collect::<Result<Vec<_>>>()?;
             // Saved files are read as needed, and a mount saving meanwhile may replace
-            // one; reading again from the newer save works.
+            // one; reading again from the newer save works. A copy interrupted that way
+            // starts over, writing what it already wrote again.
             let mut attempts = 0;
-            let (opened, changes) = loop {
-                let (opened, changes) = match &since {
-                    Some(since) => {
-                        let (opened, base) = home.open_pair(&name, since)?;
-                        let changes = opened.ws.changes_since(&base.ws);
-                        (opened, changes)
-                    }
-                    None => {
-                        let opened = home.open(&name)?;
-                        let changes = opened.ws.changes();
-                        (opened, changes)
-                    }
-                };
-                match changes {
-                    Ok(changes) => break (opened, changes),
-                    Err(err) => {
-                        let err = anyhow::Error::from(err);
-                        if !is_object_gone(&err) || attempts == 10 {
-                            return Err(err);
-                        }
-                        attempts += 1;
-                    }
+            let Listed { changes, held_back } = loop {
+                match changes_and_copy(&home, &name, since.as_deref(), &wanted, copy_to.as_deref()) {
+                    Ok(found) => break found,
+                    Err(err) if is_object_gone(&err) && attempts < 10 => attempts += 1,
+                    Err(err) => return Err(err),
                 }
             };
-            let root = VPath::parse(ROOT)?;
-            // What git keeps in a git mount's `.git` would drown out the files themselves.
-            let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| VPath::parse(&format!("{ROOT}/.git")));
-            let git_dir = git_dir.transpose()?;
             let mut out = String::new();
-            for change in changes {
-                if git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)) {
-                    continue;
-                }
-                let marker = match change.kind {
+            for (kind, rel) in &changes {
+                let marker = match kind {
                     ChangeKind::Added => 'A',
                     ChangeKind::Modified => 'M',
                     ChangeKind::Deleted => 'D',
                 };
-                let rel = change.path.strip_prefix(&root).unwrap_or_default().join("/");
                 writeln!(out, "{marker} {rel}")?;
             }
-            print_out(&out)
+            print_out(&out)?;
+            if held_back > 0 {
+                eprintln!(
+                    "sandfs: left out {held_back} changes in .git, whose settings name programs git runs; copy them by hand if you mean to"
+                );
+            }
+            Ok(())
         }
         Cmd::List => {
             let mut out = String::new();
@@ -348,6 +350,54 @@ fn sync(home: &Home, name: &str) -> Result<()> {
         _ => std::fs::File::open(&info.mountpoint).and_then(|dir| dir.sync_all()).map_err(anyhow::Error::from),
     };
     saved.with_context(|| format!("saving {name} before reading it"))
+}
+
+/// Changes as their kinds and paths relative to the workspace, and how many of them
+/// a copy left out.
+struct Listed {
+    changes: Vec<(ChangeKind, String)>,
+    held_back: usize,
+}
+
+/// The changes of workspace `name` (against `since`, or its source) under any of
+/// `wanted`, as their kinds and paths relative to the workspace, after writing them
+/// into `copy_to` if given.
+fn changes_and_copy(
+    home: &Home,
+    name: &str,
+    since: Option<&str>,
+    wanted: &[VPath],
+    copy_to: Option<&Path>,
+) -> Result<Listed> {
+    let (opened, changes) = match since {
+        Some(since) => {
+            let (opened, base) = home.open_pair(name, since)?;
+            let changes = opened.ws.changes_since(&base.ws)?;
+            (opened, changes)
+        }
+        None => {
+            let opened = home.open(name)?;
+            let changes = opened.ws.changes()?;
+            (opened, changes)
+        }
+    };
+    let root = VPath::parse(ROOT)?;
+    // What git keeps in a git mount's `.git` would drown out the files themselves.
+    let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| VPath::parse(&format!("{ROOT}/.git")));
+    let git_dir = git_dir.transpose()?;
+    let listed: Vec<_> = changes
+        .iter()
+        .filter(|change| !git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)))
+        .filter(|change| wanted.is_empty() || wanted.iter().any(|path| change.path.starts_with(path)))
+        .map(|change| (change, change.path.strip_prefix(&root).unwrap_or_default().join("/")))
+        .collect();
+    let mut held_back = 0;
+    if let Some(dir) = copy_to {
+        let items: Vec<_> =
+            listed.iter().map(|(change, rel)| copy::Item { path: &change.path, rel, kind: change.kind }).collect();
+        held_back = copy::copy_to(&opened.ws, &items, dir)?;
+    }
+    Ok(Listed { changes: listed.into_iter().map(|(change, rel)| (change.kind, rel)).collect(), held_back })
 }
 
 /// Mount a workspace that was just created, removing it again if the mount fails so

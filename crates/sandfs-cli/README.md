@@ -10,6 +10,7 @@ sandfs fork ~/ws/survey ~/ws/cleanup             # survey's changes so far, with
 python clean.py ~/ws/cleanup                     # real files, any tool
 sandfs changes ~/ws/cleanup                      # A/M/D against the source
 sandfs changes cleanup --since survey            # A/M/D against another workspace of the same source
+sandfs changes cleanup report --copy-to ~/keep   # write the changes under report/ into ~/keep
 sandfs unmount ~/ws/cleanup                      # changes stay saved
 sandfs mount cleanup ~/ws/cleanup                # and come back
 sandfs fork cleanup --name cleanup-1             # a snapshot, kept but not mounted
@@ -17,6 +18,8 @@ sandfs list                                      # workspaces and where they are
 sandfs rm cleanup                                # forget a workspace and its changes
 sandfs clean                                     # free the space downloaded repository files take
 ```
+
+`sandfs changes NAME [PATH...] --copy-to DIR` is how changes leave a workspace: it writes the files listed (all of them, or those under each PATH) into DIR, copying added and modified files and links with their executable bit and removing deleted ones, so a copy of the source kept in DIR comes to match the workspace. It writes nothing outside DIR and never writes through a link it finds there. DIR may be the source folder itself, which is how a host folder keeps an agent's work: name it on purpose, since that is the one time sandfs changes the source. It also leaves out changes in a `.git` folder, in any spelling a Mac or Windows disk would read as one, since git runs the programs named there; it says how many it left out, and you copy those by hand if you mean to.
 
 `sandfs serve --mcp NAME` hands an unmounted workspace to an agent as MCP file tools over stdin and stdout (read, list, glob, grep, write, edit, move, delete, changes), with the source's files under `/mnt`. Each change is saved before its reply, so a later `mount` or `changes` sees it, and a change that can't be saved is undone and reported as an error.
 

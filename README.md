@@ -120,6 +120,7 @@ sandfs fork ~/ws/survey ~/ws/cleanup             # survey's changes so far, with
 python clean.py ~/ws/cleanup                     # real files, any tool
 sandfs changes ~/ws/cleanup                      # A/M/D for each changed file
 sandfs changes cleanup --since survey            # how cleanup differs from survey, file by file
+sandfs changes cleanup --copy-to ~/kept          # write cleanup's changed files into ~/kept
 sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sandfs mount cleanup ~/ws/cleanup` brings them back
 ```
 
