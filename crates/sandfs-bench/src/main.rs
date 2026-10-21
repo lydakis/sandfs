@@ -12,6 +12,7 @@
 //! empty except the kernel's page cache, which is warm for every target alike.
 
 mod build;
+mod compare;
 mod data;
 mod everyday;
 mod lazy;
@@ -59,6 +60,9 @@ struct Args {
     /// Only run workloads whose name contains this.
     #[arg(long)]
     only: Option<String>,
+    /// Leave out workloads whose name contains this (repeatable), such as `build`.
+    #[arg(long)]
+    skip: Vec<String>,
     /// Timed runs per workload (default depends on the scale).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     iters: Option<u64>,
@@ -118,6 +122,17 @@ struct Args {
     remote_child: Option<PathBuf>,
     #[arg(long, hide = true, value_enum)]
     remote_child_method: Option<remote::Method>,
+    /// Compare runs saved with `--json` instead of running anything: each number of
+    /// AFTER against BEFORE, and against what it has to beat in its own run. Either side
+    /// may be several files, comma-separated, whose samples are pooled.
+    #[arg(long, num_args = 2, value_names = ["BEFORE", "AFTER"])]
+    compare: Option<Vec<PathBuf>>,
+    /// With `--compare`: how much a median must move to count, as a fraction.
+    #[arg(long, default_value_t = 0.25)]
+    threshold: f64,
+    /// With `--compare`: list the numbers that didn't move too.
+    #[arg(long)]
+    all: bool,
 }
 
 fn main() {
@@ -128,6 +143,19 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
+    if let Some(paths) = &args.compare {
+        // Each side may name several runs, comma-separated, whose samples are pooled.
+        let load = |paths: &PathBuf| -> Result<_> {
+            let mut runs = Vec::new();
+            for path in paths.to_string_lossy().split(',') {
+                let report = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("reading {path}"))?)?;
+                runs.push(compare::rows(&report).with_context(|| format!("reading the numbers in {path}"))?);
+            }
+            Ok(compare::pool(runs))
+        };
+        compare::print(&load(&paths[0])?, &load(&paths[1])?, args.threshold, args.all);
+        return Ok(());
+    }
     let mut scale = match args.scale {
         ScaleArg::Full => Scale::FULL,
         ScaleArg::Quick => Scale::QUICK,
@@ -221,7 +249,10 @@ fn run(args: Args) -> Result<()> {
         }
     }
 
-    let selected = |name: &str| args.only.as_ref().is_none_or(|only| name.contains(only.as_str()));
+    let selected = |name: &str| {
+        args.only.as_ref().is_none_or(|only| name.contains(only.as_str()))
+            && !args.skip.iter().any(|skip| name.contains(skip.as_str()))
+    };
     let workloads: Vec<_> = workloads::all(&data).into_iter().filter(|w| selected(w.name)).collect();
     let run_workflow = selected(WORKFLOW);
     let run_everyday = everyday::Op::ALL.iter().any(|op| selected(&format!("everyday/{}", op.name())));
