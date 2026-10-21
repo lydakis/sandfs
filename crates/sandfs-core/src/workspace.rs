@@ -454,9 +454,11 @@ impl Workspace {
                 match self.cache.peek_blob(&(mount.id, key.clone())) {
                     Some(bytes) => Ok(slice(&bytes, offset, len)),
                     None => {
-                        self.reading(&path, &mount, &key)?;
+                        let fetching = self.reading(&path, &mount, &key)?;
                         let bytes = mount.source.read_range(&key, offset, len);
-                        self.fetched(&path);
+                        if fetching {
+                            self.fetched(&path);
+                        }
                         bytes
                     }
                 }
@@ -1009,13 +1011,14 @@ impl Workspace {
     /// build), has the source prefetch, once it has read two files in one directory.
     /// A read after a pause, as a person's next look, prefetches nothing, and so does a
     /// read of a file the source has at hand ([`Source::is_local`]).
-    /// Whether the bytes are to be fetched, rather than cached already.
+    /// Whether the bytes are to be fetched, rather than cached already or at hand.
     fn reading(&self, path: &VPath, mount: &Arc<Mount>, key: &SourceKey) -> Result<bool> {
         if self.cache.peek_blob(&(mount.id, key.clone())).is_some() {
             return Ok(false);
         }
+        // Not a fetch either, so it doesn't count as the last one for a pause.
         if mount.source.is_local(key) {
-            return Ok(true);
+            return Ok(false);
         }
         let Some(parent) = path.parent() else { return Ok(true) };
         let Some(dir) = self.base_dir(&parent, mount)? else { return Ok(true) };

@@ -453,19 +453,23 @@ impl Source for GitSource {
     /// background, a request at a time (see [`GitSource::fetch_behind`]); a larger
     /// folder is left to fetch file by file. Outside a partial clone every blob is
     /// local and this does nothing.
-    /// Every blob outside a partial clone; in one, those the walk of the tree didn't
-    /// find missing, or that were fetched since. Until the walk is done, or without
-    /// sizes (which keep track of fetches), none.
+    /// Every blob outside a partial clone; in one, those fetched since this source
+    /// opened, and once the walk of the tree is done, those it didn't find missing.
+    /// Without sizes (which keep track of fetches), none.
     fn is_local(&self, key: &str) -> bool {
         if self.promisor.is_none() {
             return true;
         }
-        let (Some(Some(absent)), Some(_), true) = (self.absent.get(), &self.sizes, self.trees_local) else {
+        if self.sizes.is_none() || !self.trees_local {
             return false;
-        };
+        }
+        // Known fetched even before the walk is in, as rule files the index build fetched.
+        if self.fetched.lock().is_ok_and(|fetched| fetched.contains(key)) {
+            return true;
+        }
+        let Some(Some(absent)) = self.absent.get() else { return false };
         let Some(index) = absent.index_of(key) else { return true };
         self.behind.lock().is_ok_and(|behind| behind.blobs.get(index) == Some(&BROUGHT))
-            || self.fetched.lock().is_ok_and(|fetched| fetched.contains(key))
     }
 
     fn prefetch(&self, key: &str, recursive: bool) {

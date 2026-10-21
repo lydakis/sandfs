@@ -311,7 +311,13 @@ fn files_at_hand_are_told_from_those_on_the_server() {
     let (had, lacked, by_git) = (id("d0/f0"), id("d0/f1"), id("d0/f2"));
     git(clone.path(), &["cat-file", "-p", &had]);
     let source = GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap();
-    assert_eq!(source.missing_files().unwrap().len(), 2499);
+    // Before the walk for missing files, only what was fetched since is known.
+    let early = id("d1/f0");
+    git(clone.path(), &["cat-file", "-p", &early]);
+    source.fetched_elsewhere([early.as_str()]);
+    assert!(sandfs_core::Source::is_local(&source, &early), "known before the walk");
+    assert_eq!(source.missing_files().unwrap().len(), 2498);
+    assert!(sandfs_core::Source::is_local(&source, &early));
     assert!(sandfs_core::Source::is_local(&source, &had));
     assert!(!sandfs_core::Source::is_local(&source, &lacked));
     sandfs_core::Source::read_file(&source, &lacked).unwrap();

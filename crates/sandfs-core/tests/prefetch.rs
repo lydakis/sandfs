@@ -161,6 +161,17 @@ fn files_the_source_has_at_hand_never_prefetch() {
     ws.read("/data/s/z.txt").unwrap();
     ws.read("/data/s/w.txt").unwrap();
     assert_eq!(source.prefetches(), vec![("s".to_owned(), false)]);
+
+    // One it lacks, a pause, then one at hand: the next one it lacks doesn't come right
+    // after the last, as reading through the folder would.
+    let source = Arc::new(Remote { local: ["s/x.txt".to_owned()].into(), ..Remote::new(TREE) });
+    let ws = mounted(&source);
+    ws.read("/data/s/z.txt").unwrap();
+    thread::sleep(Duration::from_millis(2100));
+    ws.read("/data/s/x.txt").unwrap();
+    ws.read_range("/data/s/x.txt", 0, 1).unwrap();
+    ws.read("/data/s/w.txt").unwrap();
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
 }
 
 #[test]
