@@ -123,7 +123,7 @@ sandfs changes cleanup --since survey            # how cleanup differs from surv
 sandfs unmount ~/ws/cleanup                      # changes stay saved, and `sandfs mount cleanup ~/ws/cleanup` brings them back
 ```
 
-`git:<path or url>[@rev]` mounts a commit instead of a folder, and a URL needs no `git:`, so `sandfs mount https://github.com/owner/repo DIR` is all it takes to look through someone's repository. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second. Listing a folder then fetches that folder's files in one request, since a real folder has to show their sizes:
+`git:<path or url>[@rev]` mounts a commit instead of a folder, and a URL needs no `git:`, so `sandfs mount https://github.com/owner/repo DIR` is all it takes to look through someone's repository. For a remote repository, sandfs fetches only that commit and its folder listings, so even a large project mounts in about a second. What it fetches later is kept for every workspace of that repository until `sandfs clean` drops it, from repositories not mounted, and deletes what no workspace uses. Listing a folder then fetches that folder's files in one request, since a real folder has to show their sizes:
 
 ```bash
 sandfs mount https://github.com/pallets/flask@3.1.0 ~/ws/flask

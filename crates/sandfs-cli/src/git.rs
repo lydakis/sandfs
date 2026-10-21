@@ -226,10 +226,14 @@ impl GitDir {
         // Git runs the monitor with the environment of whoever runs git, which may not
         // name the same home.
         let exe = std::env::current_exe().context("finding the sandfs binary")?;
+        let exe = exe.to_str().context("non-UTF-8 path to the sandfs binary")?;
+        // Linux names a binary replaced since it started, as by `cargo install`, with
+        // this suffix; its replacement at the same path is the one git should run.
+        let exe = exe.strip_suffix(" (deleted)").unwrap_or(exe);
         let hook = format!(
             "SANDFS_HOME={} {}",
             shell_quote(home.to_str().context("non-UTF-8 home directory")?),
-            shell_quote(exe.to_str().context("non-UTF-8 path to the sandfs binary")?)
+            shell_quote(exe)
         );
         // Newer git turns its file monitor off on network and FUSE file systems, a
         // mount among them, unless `fsmonitor.allowRemote` says otherwise. And it starts
@@ -759,6 +763,89 @@ fn create_clone(dest: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// sandfs's own local copies of remote repositories under `repos`.
+pub fn local_copies(repos: &Path) -> Result<Vec<PathBuf>> {
+    let mut copies = Vec::new();
+    let mut folders = vec![repos.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let entries = match std::fs::read_dir(&folder) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            entries => entries.with_context(|| format!("listing {}", folder.display()))?,
+        };
+        for entry in entries {
+            let path = entry?.path();
+            // Half-made copies (`.name.tmp-PID`) are hidden, and a copy is never inside another.
+            let hidden = path.file_name().and_then(|n| n.to_str()).is_none_or(|n| n.starts_with('.'));
+            if hidden || !path.is_dir() {
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "git") && path.join("HEAD").exists() {
+                copies.push(path);
+            } else {
+                folders.push(path);
+            }
+        }
+    }
+    copies.sort();
+    Ok(copies)
+}
+
+/// Drop the file contents a local copy has fetched, keeping the commits in `keep` and
+/// their folder listings, so their workspaces still open without the network and fetch
+/// a file's contents again when it is next read. Commits not in `keep` are forgotten.
+///
+/// Nothing may be reading the copy: its workspaces are to be locked by the caller.
+pub fn drop_contents(copy: &Path, keep: &BTreeSet<String>) -> Result<()> {
+    let pins = git(copy, &["for-each-ref", "--format=%(refname)", "refs/sandfs/"])?;
+    for pin in pins.lines() {
+        let kept = pin.strip_prefix("refs/sandfs/commits/").is_some_and(|commit| keep.contains(commit));
+        if !kept {
+            git(copy, &["update-ref", "-d", pin])?;
+        }
+    }
+    let packs = copy.join("objects/pack");
+    let old: Vec<PathBuf> = std::fs::read_dir(&packs)
+        .with_context(|| format!("listing {}", packs.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()?;
+    // Commits and folder listings only. In a partial clone, every file left out is one
+    // its origin can send again.
+    let objects =
+        git_raw(copy, &["rev-list", "--objects", "--all", "--filter=blob:none", "--missing=allow-promisor"], None)?;
+    let pack = git_raw(copy, &["pack-objects", "-q", "objects/pack/pack"], Some(&objects))?;
+    let pack = String::from_utf8_lossy(&pack).trim().to_owned();
+    if pack.is_empty() {
+        bail!("git pack-objects named no pack");
+    }
+    // Marked as from the promisor, as fetched packs are, so git fetches what it lacks.
+    let stem = format!("pack-{pack}");
+    std::fs::write(packs.join(format!("{stem}.promisor")), "")?;
+    for path in old {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if !name.starts_with(&format!("{stem}.")) {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    // Loose objects, and indexes that may name objects or packs now gone.
+    let objects = copy.join("objects");
+    for entry in std::fs::read_dir(&objects)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            std::fs::remove_dir_all(&path)?;
+        }
+    }
+    for index in ["info/commit-graph", "info/commit-graphs"] {
+        let path = objects.join(index);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// The commit `rev` names if it is a full commit id that was mounted before.
 ///
 /// This checks the pin ref rather than the object: in a partial clone, asking git
@@ -831,6 +918,14 @@ fn cache_path(url: &str) -> Result<PathBuf> {
     }
     path.set_extension("git");
     Ok(path)
+}
+
+/// Run git in `repo` with `input`, and return what it printed, untrimmed.
+fn git_raw(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"]).args(args);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    run_with_input(cmd, input).with_context(|| format!("git {}", args.join(" ")))
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {

@@ -44,6 +44,8 @@ The next release is 0.5.0 rather than 0.4.1 because two changes break custom sou
 - **sandfs-cli background process**: the process serving every mount now detaches fully from the command that starts it: a session of its own, adopted by init, launchd or the nearest subreaper. A job runner that ends a job by killing its process group or tree no longer takes other jobs' mounts down with it, and a caller's `GIT_DIR` or similar no longer leaks into later mounts. Starting it costs one more short-lived process, about 2 ms on the first mount.
 - **sandfs-cli output into a pipe**: `sandfs changes` and `sandfs list` piped into a reader that stops early, such as `head`, no longer panic with "failed printing to stdout"; they stop quietly.
 - **sandfs-cli URLs**: a source that is a URL, such as `https://github.com/owner/repo`, mounts that repository without the `git:` prefix, which is still needed for a local repository path.
+- **sandfs-cli clean**: `sandfs clean` frees the disk space a remote repository's downloaded files take. For each repository whose workspaces are all unmounted, it keeps only the commits and folder listings they need (VS Code: 88 MiB down to 1.5 MiB) and they fetch a file again when it is next read; a repository no workspace uses is deleted. Workspaces and their changes are untouched.
+- **sandfs-cli after an upgrade**: on Linux, a git mount made by a mount process whose binary was replaced since it started, as by `cargo install`, names the new binary as git's file monitor instead of the deleted one, so `git status` doesn't fall back to reading every file.
 
 ## 0.4.0 (2026-10-19)
 

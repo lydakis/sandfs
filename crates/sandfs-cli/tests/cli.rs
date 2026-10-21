@@ -126,3 +126,78 @@ fn a_url_is_a_repository_without_git_prefix() {
     assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
     assert_eq!(stdout(home.path(), &["list"]), format!("notes\t{url}\t-\n"));
 }
+
+#[test]
+fn clean_drops_downloaded_files_and_unused_copies() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::Builder::new().prefix("data").tempdir().unwrap();
+    let mut urls = Vec::new();
+    for name in ["notes", "photos"] {
+        let repo = data.path().join(name);
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("a.txt"), format!("{name}\n")).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "a.txt"],
+            &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a"],
+        ] {
+            assert!(Command::new("git").current_dir(&repo).args(args).status().unwrap().success());
+        }
+        urls.push(format!("file://{}", repo.display()));
+    }
+    let read =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"/mnt/a.txt"}}}"#;
+    for url in &urls {
+        let served = sandfs(home.path(), &["serve", "--mcp", url], &format!("{read}\n"));
+        assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    }
+    assert!(stdout(home.path(), &["rm", "photos"]).is_empty());
+
+    let copy = |name: &str| {
+        let copies = home.path().join("repos");
+        let found = walkdir(&copies).into_iter().find(|path| path.ends_with(format!("{name}.git")));
+        found.unwrap_or_else(|| copies.join("missing"))
+    };
+    let blobs = |copy: &std::path::Path| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(copy)
+            .args(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().filter(|kind| *kind == "blob").count()
+    };
+    let notes = copy("notes");
+    assert!(blobs(&notes) > 0, "reading fetched the file");
+    assert!(copy("photos").exists());
+
+    let cleaned = stdout(home.path(), &["clean"]);
+    assert!(cleaned.contains("notes.git: ") && cleaned.contains(" freed"), "{cleaned}");
+    assert!(cleaned.contains("photos.git: deleted"), "{cleaned}");
+    assert!(!copy("photos").exists(), "no workspace uses it");
+    assert_eq!(blobs(&notes), 0, "the downloaded file is gone");
+
+    // The workspace still opens, and the file comes back from the repository.
+    let served = sandfs(home.path(), &["serve", "--mcp", "notes"], &format!("{read}\n"));
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    assert!(
+        String::from_utf8_lossy(&served.stdout).contains("notes\\n"),
+        "{}",
+        String::from_utf8_lossy(&served.stdout)
+    );
+}
+
+/// Every folder under `root`.
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                folders.push(entry.path());
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
