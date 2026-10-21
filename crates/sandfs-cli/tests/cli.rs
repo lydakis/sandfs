@@ -328,3 +328,20 @@ fn changes_refuses_paths_outside_the_workspace() {
     assert!(!outside.status.success());
     assert!(String::from_utf8_lossy(&outside.stderr).contains("outside the workspace"));
 }
+
+#[test]
+fn served_workspaces_keep_read_only_paths() {
+    let (home, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let folder = data.path().join("books");
+    std::fs::create_dir_all(folder.join("contracts")).unwrap();
+    std::fs::write(folder.join("contracts/lease.md"), "12 months\n").unwrap();
+
+    let session = call(1, "write", r#"{"path":"/mnt/contracts/lease.md","content":"6 months\n"}"#)
+        + &call(2, "write", r#"{"path":"/mnt/notes.md","content":"fine\n"}"#);
+    let served =
+        sandfs(home.path(), &["serve", "--mcp", folder.to_str().unwrap(), "--read-only", "./contracts/"], &session);
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    let replies = String::from_utf8_lossy(&served.stdout);
+    assert!(replies.contains("/mnt/contracts/lease.md: read-only"), "{replies}");
+    assert_eq!(stdout(home.path(), &["changes", "books"]), "A notes.md\n");
+}

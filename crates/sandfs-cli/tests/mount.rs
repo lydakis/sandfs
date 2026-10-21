@@ -1049,3 +1049,47 @@ fn changes_points_out_git_settings_that_run_programs() {
     let warned = String::from_utf8_lossy(&loud.stderr);
     assert!(warned.contains(".git/config changed") && warned.contains(".git/hooks/pre-commit changed"), "{warned}");
 }
+
+#[test]
+fn read_only_paths_can_be_read_but_not_changed_through_a_mount() {
+    if !fuse_available() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut sandfs = Sandfs::new();
+    let data = tempfile::tempdir().unwrap();
+    let source = data.path().join("books");
+    std::fs::create_dir_all(source.join("contracts")).unwrap();
+    std::fs::write(source.join("contracts/lease.md"), "12 months\n").unwrap();
+    std::fs::write(source.join("budget.csv"), "jan\n").unwrap();
+    let dir = data.path().join("ws");
+    let (src, at) = (source.to_str().unwrap(), dir.to_str().unwrap());
+    sandfs.mount(&["mount", src, at, "--read-only", "contracts"], &dir);
+
+    let lease = dir.join("contracts/lease.md");
+    assert_eq!(std::fs::read_to_string(&lease).unwrap(), "12 months\n");
+    assert_eq!(std::fs::metadata(&lease).unwrap().permissions().mode() & 0o222, 0, "shown without write bits");
+    // EROFS is 30 on Linux and macOS alike.
+    let erofs = |result: std::io::Result<()>| assert_eq!(result.unwrap_err().raw_os_error(), Some(30));
+    erofs(std::fs::write(&lease, "6 months\n"));
+    erofs(std::fs::OpenOptions::new().append(true).open(&lease).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(b"more\n")
+    }));
+    erofs(std::fs::remove_file(&lease));
+    erofs(std::fs::write(dir.join("contracts/new.md"), "x"));
+    erofs(std::fs::rename(dir.join("budget.csv"), dir.join("contracts/budget.csv")));
+    erofs(std::fs::remove_dir_all(dir.join("contracts")));
+    std::fs::write(dir.join("budget.csv"), "feb\n").unwrap();
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M budget.csv\n");
+
+    // Forks keep it, and it can't be added to a workspace that exists.
+    let fork = data.path().join("fork");
+    sandfs.mount(&["fork", at, fork.to_str().unwrap()], &fork);
+    erofs(std::fs::write(fork.join("contracts/lease.md"), "6 months\n"));
+    sandfs.unmount(&dir);
+    let again = sandfs.try_run(&["mount", "ws", at, "--read-only", "budget.csv"]);
+    assert!(String::from_utf8_lossy(&again.stderr).contains("applies when a workspace is created"));
+    assert_eq!(std::fs::read_to_string(source.join("contracts/lease.md")).unwrap(), "12 months\n");
+}
