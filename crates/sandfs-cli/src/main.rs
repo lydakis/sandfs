@@ -22,6 +22,7 @@ mod persist;
 mod server;
 mod store;
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,9 +56,10 @@ enum Cmd {
     ///
     /// SOURCE is a host folder, which is read lazily and never written to, or the
     /// name of an existing workspace (write ./NAME for a folder that shares a
-    /// workspace's name). git:<path or url>[@rev] mounts a commit; remote
-    /// repositories become partial clones, so file contents are fetched only when a
-    /// directory or file is first read.
+    /// workspace's name). git:<path or url>[@rev] mounts a commit, and so does a URL
+    /// on its own, such as https://github.com/owner/repo; remote repositories become
+    /// partial clones, so file contents are fetched only when a directory or file is
+    /// first read.
     Mount {
         source: String,
         dir: PathBuf,
@@ -102,6 +104,14 @@ enum Cmd {
     },
     /// Delete an unmounted workspace and its changes.
     Rm { name: String },
+    /// Free the disk space remote repositories' downloaded files take up.
+    ///
+    /// For each remote repository none of whose workspaces is in use, drop the file
+    /// contents fetched so far and keep only the commits and folder listings its
+    /// workspaces need, so they still mount at once and fetch a file again when it is
+    /// next read. A repository no workspace uses any more is deleted. Workspaces and
+    /// their changes, commits among them, are never touched.
+    Clean,
     /// Serve an unmounted workspace to an agent as MCP file tools over stdin and stdout,
     /// or create one over a source and serve that.
     ///
@@ -161,8 +171,10 @@ fn run(cli: Cli) -> Result<()> {
                 return mount(&home, &source, &dir, foreground);
             }
             let name = default_name(name, &dir)?;
+            let repos = home.repos_lock(false)?;
             let record = home.resolve(&source)?;
             home.create(&name, &record)?;
+            drop(repos);
             mount_new(&home, &name, &dir, foreground)
         }
         Cmd::Fork { from, dir, name, foreground } => {
@@ -173,12 +185,14 @@ fn run(cli: Cli) -> Result<()> {
                 (None, None) => bail!("name the snapshot with --name, or give a directory to mount the fork on"),
             };
             sync(&home, &from)?;
+            let repos = home.repos_lock(false)?;
             let record = home.record(&from)?;
             let target = home.create(&name, &record)?;
             if let Err(err) = Saved::new(home.workspace_dir(&from)).copy_to(&target) {
                 remove_unused(&home, &name);
                 return Err(err);
             }
+            drop(repos);
             match dir {
                 Some(dir) => mount_new(&home, &name, &dir, foreground),
                 None => {
@@ -194,6 +208,8 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(since) = &since {
                 sync(&home, since)?;
             }
+            // Comparing reads the source, so `sandfs clean` waits until this is done.
+            let _reading = home.repos_lock(false)?;
             // Saved files are read as needed, and a mount saving meanwhile may replace
             // one; reading again from the newer save works.
             let mut attempts = 0;
@@ -262,6 +278,7 @@ fn run(cli: Cli) -> Result<()> {
             let _writer = home.lock(&name, "sandfs rm")?;
             home.remove(&name)
         }
+        Cmd::Clean => clean(&home),
         Cmd::Serve { mcp, workspace, name } => {
             if !mcp {
                 bail!("say what to serve: sandfs serve --mcp {workspace}");
@@ -272,9 +289,11 @@ fn run(cli: Cli) -> Result<()> {
                 return mcp::serve(&home, &workspace);
             }
             // Named after the resolved folder or repository, so `.` and `repo@v1` work.
+            let repos = home.repos_lock(false)?;
             let record = home.resolve(&workspace)?;
             let name = default_name(name, &source_dir(&record.base))?;
             home.create(&name, &record)?;
+            drop(repos);
             mcp::serve(&home, &name)
         }
         Cmd::Daemon { serve } => serve_mounts(home, serve),
@@ -384,6 +403,75 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
     server::mount(home, name, &dir)?;
     println!("{name} mounted at {}", dir.display());
     Ok(())
+}
+
+/// `sandfs clean`: shrink each local copy of a remote repository to what its
+/// workspaces need, and delete those none uses.
+fn clean(home: &Home) -> Result<()> {
+    let _creating = home.repos_lock(true)?;
+    let repos = home.root().join("repos");
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // The workspaces over each local copy, and the commits they are of.
+    let mut users: BTreeMap<PathBuf, Vec<(String, String)>> = BTreeMap::new();
+    for name in home.names()? {
+        if let Base::Git { repo, commit, .. } = home.record(&name)?.base {
+            users.entry(canonical(&repo)).or_default().push((name, commit));
+        }
+    }
+    let mut out = String::new();
+    for copy in git::local_copies(&repos)? {
+        let shown = copy.strip_prefix(&repos).unwrap_or(&copy).display().to_string();
+        let before = disk_usage(&copy);
+        let Some(users) = users.get(&canonical(&copy)) else {
+            std::fs::remove_dir_all(&copy).with_context(|| format!("removing {}", copy.display()))?;
+            writeln!(out, "{shown}: deleted, {} freed (no workspace uses it)", size(before))?;
+            continue;
+        };
+        // Held until the copy is shrunk, so no workspace over it mounts in the meantime.
+        let mut locks = Vec::new();
+        for (name, _) in users {
+            match home.lock(name, "sandfs clean") {
+                Ok(lock) => locks.push(lock),
+                Err(_) => break,
+            }
+        }
+        if locks.len() < users.len() {
+            let busy = &users[locks.len()].0;
+            writeln!(out, "{shown}: kept, {busy} is in use (unmount it to clean)")?;
+            continue;
+        }
+        let keep = users.iter().map(|(_, commit)| commit.clone()).collect();
+        git::drop_contents(&copy, &keep).with_context(|| format!("cleaning {shown}"))?;
+        let freed = before.saturating_sub(disk_usage(&copy));
+        writeln!(out, "{shown}: {} freed", size(freed))?;
+    }
+    print_out(&out)
+}
+
+/// The bytes the files under `path` take up.
+fn disk_usage(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut folders = vec![path.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => folders.push(entry.path()),
+                Ok(meta) => total += meta.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// `bytes` for people: 1.5 MiB.
+fn size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} KiB", bytes as f64 / 1024.0),
+        1_048_576..1_073_741_824 => format!("{:.1} MiB", bytes as f64 / 1_048_576.0),
+        _ => format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0),
+    }
 }
 
 /// Serve every mount asked of this home's background process (see `server`).

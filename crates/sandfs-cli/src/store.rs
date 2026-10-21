@@ -267,6 +267,27 @@ impl Home {
             .is_ok_and(|holder| holder.ends_with(&format!("(process {pid})")))
     }
 
+    /// Wait for the right to use sandfs's local copies of repositories without a
+    /// workspace's own lock: shared to create a workspace or read one unmounted,
+    /// exclusive for `sandfs clean`, so a copy is never shrunk or deleted between
+    /// resolving a source and recording the workspace over it, or while it is read.
+    /// Held until the file is dropped.
+    pub fn repos_lock(&self, exclusive: bool) -> Result<File> {
+        let repos = self.root.join("repos");
+        std::fs::create_dir_all(&repos).with_context(|| format!("creating {}", repos.display()))?;
+        // Hidden, so it is never taken for a local copy.
+        let path = repos.join(".lock");
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        if exclusive { file.lock() } else { file.lock_shared() }
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
+    }
+
     /// Take the right to save `name`, or fail saying who holds it. `holder` describes
     /// this process to whoever is refused next.
     pub fn lock(&self, name: &str, holder: &str) -> Result<Writer> {
@@ -357,10 +378,12 @@ impl Home {
         std::fs::remove_dir_all(self.workspace_dir(name)).with_context(|| format!("removing workspace {name:?}"))
     }
 
-    /// Turn a source into a record: a host folder, or `git:<path or url>[@rev]`.
+    /// Turn a source into a record: a host folder, or `git:<path or url>[@rev]`. A URL
+    /// needs no `git:`, since it can't name a folder.
     pub fn resolve(&self, source: &str) -> Result<Record> {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let base = if let Some(spec) = source.strip_prefix("git:") {
+        let spec = source.strip_prefix("git:").or_else(|| source.contains("://").then_some(source));
+        let base = if let Some(spec) = spec {
             let (repo, commit, branch) = crate::git::resolve_branch(&self.root.join("repos"), spec)?;
             Base::Git { repo, commit, branch }
         } else {
