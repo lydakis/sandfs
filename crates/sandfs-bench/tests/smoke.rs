@@ -35,8 +35,10 @@ fn a_command_runs_in_copies_of_a_folder() {
     std::fs::set_permissions(dir.path().join("fixed.txt"), std::fs::Permissions::from_mode(0o444)).unwrap();
     // Each run notes what it found in its copy, outside the copies.
     let log = tempfile::NamedTempFile::new().unwrap();
+    // macOS pads `wc -l` with spaces and its `stat` takes `-f %m` for the modified time.
     let command = format!(
-        "echo \"$(wc -l < change.txt) $(stat -c %Y fixed.txt) $(basename \"$XDG_CACHE_HOME\") $PWD\" >> {}",
+        "echo \"$(wc -l < change.txt | tr -d ' ') $(stat -c %Y fixed.txt 2>/dev/null || stat -f %m fixed.txt) \
+         $(basename \"$XDG_CACHE_HOME\") $PWD\" >> {}",
         log.path().display()
     );
     let scratch = tempfile::tempdir().unwrap();
