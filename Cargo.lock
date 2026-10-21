@@ -211,16 +211,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
-name = "filetime"
-version = "0.2.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
-dependencies = [
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "fuser"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -369,22 +359,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
-]
-
-[[package]]
-name = "nfsserve"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef1424b6d88c60a091931392970999ea3ceab132d968e6a5545c770fad5b97d7"
-dependencies = [
- "anyhow",
- "async-trait",
- "byteorder",
- "filetime",
- "num-derive",
- "num-traits",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -716,12 +690,14 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "byteorder",
  "bytes",
  "clap",
  "fuser",
  "libc",
- "nfsserve",
  "nix",
+ "num-derive",
+ "num-traits",
  "sandfs-core",
  "sandfs-git",
  "sandfs-mcp",
@@ -729,6 +705,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

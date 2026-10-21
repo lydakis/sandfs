@@ -17,6 +17,8 @@ mod host;
 mod mcp;
 #[cfg(any(nfs, all(test, fuse)))]
 mod nfs;
+#[cfg(any(nfs, all(test, fuse)))]
+mod nfsserve;
 mod persist;
 #[cfg(mount)]
 mod server;

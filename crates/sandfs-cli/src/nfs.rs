@@ -7,7 +7,10 @@
 //! answered as already stable), so it saves nothing by itself; instead the server
 //! answers save requests on a second localhost port, which `sandfs changes`, `fork`
 //! and `unmount` use to have everything written so far saved first. And macOS's NFS
-//! client keeps extended attributes in `._name` files, which are kept out of saves.
+//! client keeps extended attributes in `._name` files, which are kept out of saves and
+//! out of listings, so git, cargo and the like never see them.
+//!
+//! The NFS server itself is [`crate::nfsserve`], a copy of the nfsserve crate.
 //!
 //! Any local user can connect to a port on localhost, so the server only answers its
 //! owner. The port the mount uses is a relay that passes on only calls whose
@@ -28,18 +31,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::nfsserve::nfs::{
+    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3,
+    nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
+};
+#[cfg(nfs)]
+use crate::nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use crate::nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 #[cfg(nfs)]
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use fuser::{Errno, FileAttr, FileType, RenameFlags, TimeOrNow};
-use nfsserve::nfs::{
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3,
-    nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
-};
-#[cfg(nfs)]
-use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 #[cfg(nfs)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -297,7 +300,9 @@ impl NFSFileSystem for SandNfs {
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let name = os_name(filename);
         self.change(|inner| {
-            if inner.lookup(dirid, name)?.kind == FileType::Directory {
+            let attr = inner.lookup(dirid, name)?;
+            if attr.kind == FileType::Directory {
+                inner.clear_appledouble(attr.ino.0)?;
                 inner.rmdir(dirid, name)
             } else {
                 inner.unlink(dirid, name)
@@ -329,7 +334,8 @@ impl NFSFileSystem for SandNfs {
         // Skip `.` and `..`: the client makes those up itself.
         let listing = inner.readdir(fh, 2).map(<[_]>::to_vec);
         inner.releasedir(fh);
-        let listing = listing.nfs()?;
+        let mut listing = listing.nfs()?;
+        listing.retain(|(_, kind, name)| !inner.is_added_appledouble(dirid, name, *kind));
         let listed_as = self.listed.lock().unwrap().names.get(&(dirid, start_after)).cloned();
         let start = if start_after == 0 {
             0
@@ -759,7 +765,11 @@ mod tests {
     use crate::persist::Saved;
 
     fn served() -> (SandNfs, tempfile::TempDir) {
-        let source = MemorySource::from_files([("notes.txt", "draft\n"), ("in/a.txt", "a")]).unwrap();
+        served_from(&[("notes.txt", "draft\n"), ("in/a.txt", "a")])
+    }
+
+    fn served_from(files: &[(&'static str, &'static str)]) -> (SandNfs, tempfile::TempDir) {
+        let source = MemorySource::from_files(files.iter().copied()).unwrap();
         let mut ws = Workspace::new();
         ws.mount("/mnt", Arc::new(source)).unwrap();
         let root = VPath::parse("/mnt").unwrap();
@@ -815,6 +825,32 @@ mod tests {
         assert_eq!(changed, ["/mnt/sub/kept.txt"]);
         assert!(snapshot.dirs.iter().any(|dir| dir.ends_with("/._cache")), "{:?}", snapshot.dirs);
         assert!(is_bookkeeping("._notes.txt") && is_bookkeeping(".DS_Store") && !is_bookkeeping("notes.txt"));
+    }
+
+    #[test]
+    fn appledouble_files_stay_out_of_listings() {
+        let (fs, _dir) = served_from(&[("notes.txt", "draft\n"), ("._data", "theirs")]);
+        block(async {
+            let names = |result: ReadDirResult| -> Vec<String> {
+                result.entries.iter().map(|e| String::from_utf8(e.name.0.clone()).unwrap()).collect()
+            };
+            let (id, _) = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await.unwrap();
+            fs.write(id, 0, b"xattrs").await.unwrap();
+            let (sub, _) = fs.mkdir(ROOT_INO, &name("sub")).await.unwrap();
+            fs.create(sub, &name("._kept.txt"), sattr3::default()).await.unwrap();
+            fs.mkdir(ROOT_INO, &name("._cache")).await.unwrap();
+            // Only the ones macOS made are left out, and they still open by name.
+            assert_eq!(names(fs.readdir(ROOT_INO, 0, 100).await.unwrap()), ["._cache", "._data", "notes.txt", "sub"]);
+            assert_eq!(fs.lookup(ROOT_INO, &name("._notes.txt")).await.unwrap(), id);
+            assert!(names(fs.readdir(sub, 0, 100).await.unwrap()).is_empty());
+
+            // A folder that lists empty can be removed, and one that doesn't can't.
+            fs.create(sub, &name("kept.txt"), sattr3::default()).await.unwrap();
+            assert!(matches!(fs.remove(ROOT_INO, &name("sub")).await, Err(nfsstat3::NFS3ERR_NOTEMPTY)));
+            fs.remove(sub, &name("kept.txt")).await.unwrap();
+            fs.remove(ROOT_INO, &name("sub")).await.unwrap();
+            assert!(fs.lookup(ROOT_INO, &name("sub")).await.is_err());
+        });
     }
 
     #[test]
@@ -913,7 +949,7 @@ mod tests {
         let (fs, _dir) = served();
         let info = block(fs.fsinfo(ROOT_INO)).unwrap();
         assert_eq!(info.maxfilesize, MAX_FILE_SIZE as u64);
-        assert_ne!(info.properties & nfsserve::nfs::FSF_SYMLINK, 0, "symlinks are supported");
+        assert_ne!(info.properties & crate::nfsserve::nfs::FSF_SYMLINK, 0, "symlinks are supported");
     }
 
     #[test]
