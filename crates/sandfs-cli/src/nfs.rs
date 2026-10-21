@@ -348,6 +348,10 @@ impl NFSFileSystem for SandNfs {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
+        // Every entry handed out is remembered, and the server may send only the first
+        // few, so a page stays well under what is remembered, or the names a client
+        // resumes from could already be forgotten.
+        let max_entries = max_entries.min(LISTED_NAMES / 4);
         let mut inner = self.shared.lock();
         let fh = inner.opendir(dirid).nfs()?;
         // Skip `.` and `..`: the client makes those up itself.
