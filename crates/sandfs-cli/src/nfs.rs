@@ -7,10 +7,8 @@
 //! answered as already stable), so it saves nothing by itself; instead the server
 //! answers save requests on a second localhost port, which `sandfs changes`, `fork`
 //! and `unmount` use to have everything written so far saved first. And macOS's NFS
-//! client keeps extended attributes in `._name` files. The server refuses to create
-//! them, so files in the mount have no extended attributes, and any that come by
-//! another way (a rename) are kept out of saves and out of listings, so git, cargo and
-//! the like never see them.
+//! client keeps extended attributes in `._name` files, which are kept out of saves and
+//! out of listings, so git, cargo and the like never see them.
 //!
 //! The NFS server itself is [`crate::nfsserve`], a copy of the nfsserve crate.
 //!
@@ -200,13 +198,6 @@ impl SandNfs {
         exclusive: bool,
         empty: bool,
     ) -> Result<FileAttr, nfsstat3> {
-        // macOS tags every new file with extended attributes (`com.apple.provenance`),
-        // which over NFS each cost a `._name` file: a create, writes and setattrs for
-        // every file a build writes, which made rebuilds half again as slow. Refused as
-        // unsupported, macOS goes without; programs copying files skip the attributes.
-        if self.shared.lock().is_added_appledouble(dirid, &String::from_utf8_lossy(name), FileType::RegularFile) {
-            return Err(nfsstat3::NFS3ERR_NOTSUPP);
-        }
         self.change(|inner| inner.create(dirid, os_name(name), mode, exclusive, empty))
     }
 }
@@ -857,14 +848,11 @@ mod tests {
             Saved::new(dir.path()).paths().unwrap().into_iter().map(|(rel, _)| rel).collect()
         };
         block(async {
-            // macOS's own `._name` files are refused; one renamed into place is served.
-            let refused = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await;
-            assert!(matches!(refused, Err(nfsstat3::NFS3ERR_NOTSUPP)));
-            let (id, _) = fs.create(ROOT_INO, &name("notes.tmp"), sattr3::default()).await.unwrap();
+            let (id, _) = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await.unwrap();
             fs.write(id, 0, b"xattrs").await.unwrap();
-            fs.rename(ROOT_INO, &name("notes.tmp"), ROOT_INO, &name("._notes.txt")).await.unwrap();
             fs.create(ROOT_INO, &name(".DS_Store"), sattr3::default()).await.unwrap();
             let (sub, _) = fs.mkdir(ROOT_INO, &name("sub")).await.unwrap();
+            fs.create(sub, &name("._sub"), sattr3::default()).await.unwrap();
             fs.create(sub, &name("kept.txt"), sattr3::default()).await.unwrap();
             // A folder with such a name is someone's: macOS only makes files.
             fs.mkdir(ROOT_INO, &name("._cache")).await.unwrap();
@@ -874,8 +862,7 @@ mod tests {
         // A later save, which only looks at what changed since, leaves them out too.
         block(async {
             let sub = fs.lookup(ROOT_INO, &name("sub")).await.unwrap();
-            fs.create(sub, &name("kept.tmp"), sattr3::default()).await.unwrap();
-            fs.rename(sub, &name("kept.tmp"), sub, &name("._kept.txt")).await.unwrap();
+            fs.create(sub, &name("._kept.txt"), sattr3::default()).await.unwrap();
             fs.create(sub, &name("more.txt"), sattr3::default()).await.unwrap();
         });
         assert_eq!(saved(), ["._cache", "sub", "sub/kept.txt", "sub/more.txt"]);
@@ -930,12 +917,10 @@ mod tests {
             let names = |result: ReadDirResult| -> Vec<String> {
                 result.entries.iter().map(|e| String::from_utf8(e.name.0.clone()).unwrap()).collect()
             };
-            let (id, _) = fs.create(ROOT_INO, &name("notes.tmp"), sattr3::default()).await.unwrap();
+            let (id, _) = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await.unwrap();
             fs.write(id, 0, b"xattrs").await.unwrap();
-            fs.rename(ROOT_INO, &name("notes.tmp"), ROOT_INO, &name("._notes.txt")).await.unwrap();
             let (sub, _) = fs.mkdir(ROOT_INO, &name("sub")).await.unwrap();
-            fs.create(sub, &name("kept.tmp"), sattr3::default()).await.unwrap();
-            fs.rename(sub, &name("kept.tmp"), sub, &name("._kept.txt")).await.unwrap();
+            fs.create(sub, &name("._kept.txt"), sattr3::default()).await.unwrap();
             fs.mkdir(ROOT_INO, &name("._cache")).await.unwrap();
             // Only the ones macOS made are left out, and they still open by name.
             assert_eq!(names(fs.readdir(ROOT_INO, 0, 100).await.unwrap()), ["._cache", "._data", "notes.txt", "sub"]);
