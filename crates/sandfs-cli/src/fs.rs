@@ -119,6 +119,7 @@ pub fn errno(err: &Error) -> Errno {
         Error::NotADirectory(_) => Errno::ENOTDIR,
         Error::IsADirectory(_) => Errno::EISDIR,
         Error::DirectoryNotEmpty(_) => Errno::ENOTEMPTY,
+        Error::ReadOnly(_) => Errno::EROFS,
         Error::InvalidPath(_) => Errno::EINVAL,
         // An operation that would have to follow a link, as with O_NOFOLLOW.
         Error::Unsupported(_, reason) if reason.contains("symbolic link") => Errno::ELOOP,

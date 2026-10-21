@@ -32,6 +32,9 @@ pub enum Error {
     /// The operation would change workspace structure that is fixed, such as a mount point.
     #[error("{0}: {1}")]
     Unsupported(String, &'static str),
+    /// The path is read-only in this workspace (see `Workspace::set_read_only`).
+    #[error("{0}: read-only")]
+    ReadOnly(String),
     /// An optimistic write found a different version than the caller expected.
     #[error("{path}: version mismatch (expected {expected}, found {actual})")]
     VersionMismatch {

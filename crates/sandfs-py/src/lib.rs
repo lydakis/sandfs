@@ -47,6 +47,8 @@ fn to_py(err: Error) -> PyErr {
             let _ = value.setattr("actual", actual);
             err
         }),
+        // As the system reports a read-only file system: OSError with errno EROFS.
+        Error::ReadOnly(_) => PyOSError::new_err((30, message)),
         Error::DirectoryNotEmpty(_) | Error::Unsupported(..) | Error::Source(_) => PyOSError::new_err(message),
     }
 }
@@ -362,11 +364,30 @@ impl Workspace {
     /// Mount `source` read-only at `path`: a `DirSource`, `MemorySource`, `GitSource`,
     /// or any object with `list(path)` and `read(path)` methods. Writes go to the
     /// overlay, never to the source, and the source must return the same answer every
-    /// time, since what it returns is cached and shared with forks.
-    fn mount(&mut self, py: Python<'_>, path: &str, source: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// time, since what it returns is cached and shared with forks. With `read_only`,
+    /// the workspace refuses changes under `path` too (see `set_read_only`).
+    #[pyo3(signature = (path, source, *, read_only = false))]
+    fn mount(&mut self, py: Python<'_>, path: &str, source: &Bound<'_, PyAny>, read_only: bool) -> PyResult<()> {
         let source = as_source(source)?;
         let inner = &mut self.inner;
-        py.detach(|| inner.mount(path, source)).or_raise()
+        py.detach(|| {
+            inner.mount(path, source)?;
+            if read_only { inner.set_read_only(path, true) } else { Ok(()) }
+        })
+        .or_raise()
+    }
+
+    /// Make `path` and everything below it read-only in this workspace and its later
+    /// forks, or writable again with `read_only=False`. Changes there raise OSError
+    /// with errno EROFS; reading is unaffected. The path needn't exist.
+    #[pyo3(signature = (path, read_only = true))]
+    fn set_read_only(&mut self, path: &str, read_only: bool) -> PyResult<()> {
+        self.inner.set_read_only(path, read_only).or_raise()
+    }
+
+    /// Whether `path` is at or below a read-only path.
+    fn is_read_only(&self, path: &str) -> bool {
+        self.inner.is_read_only(path)
     }
 
     /// A new workspace with the same mounts and changes. O(1); later changes to

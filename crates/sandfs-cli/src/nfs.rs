@@ -119,6 +119,7 @@ fn status(err: Errno) -> nfsstat3 {
         Errno::ENOTDIR => nfsstat3::NFS3ERR_NOTDIR,
         Errno::EISDIR => nfsstat3::NFS3ERR_ISDIR,
         Errno::ENOTEMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
+        Errno::EROFS => nfsstat3::NFS3ERR_ROFS,
         Errno::EINVAL => nfsstat3::NFS3ERR_INVAL,
         Errno::EFBIG => nfsstat3::NFS3ERR_FBIG,
         Errno::ENOSPC => nfsstat3::NFS3ERR_NOSPC,
