@@ -39,4 +39,4 @@ A git mount shows a `.git` folder, which makes it a checkout of the mounted comm
 
 See the [repository](https://github.com/lydakis/sandfs) for the design.
 
-License: MIT
+License: MIT, except the NFS server in `src/nfsserve`, which is nfsserve's and BSD-3-Clause (see its `LICENSE`).
