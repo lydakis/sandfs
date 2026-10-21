@@ -1191,3 +1191,49 @@ fn read_only_paths_can_be_read_but_not_changed_through_a_mount() {
     assert!(String::from_utf8_lossy(&again.stderr).contains("applies when a workspace is created"));
     assert_eq!(std::fs::read_to_string(source.join("contracts/lease.md")).unwrap(), "12 months\n");
 }
+
+/// A kept listing names each entry's inode. When the kernel forgets entries, a later
+/// lookup gives them new inodes, and the listing must follow. Forgetting is forced by
+/// dropping the kernel's caches, which only root may do; elsewhere this has nothing to
+/// test.
+#[cfg(target_os = "linux")]
+#[test]
+fn kept_listings_name_the_inodes_stat_reports() {
+    use std::os::unix::fs::MetadataExt;
+    if !fuse_available() || std::fs::OpenOptions::new().write(true).open("/proc/sys/vm/drop_caches").is_err() {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    for i in 0..3 {
+        std::fs::write(folder.path().join(format!("f{i}")), "x").unwrap();
+    }
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+    let inodes = || -> Vec<(u64, u64)> {
+        let mut inodes: Vec<(u64, u64)> = std::fs::read_dir(&ws)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (std::os::unix::fs::DirEntryExt::ino(&entry), entry.path().metadata().unwrap().ino())
+            })
+            .collect();
+        inodes.sort();
+        inodes
+    };
+    let before = inodes();
+    assert_eq!(inodes(), before, "the second listing is the kept one");
+    std::fs::write("/proc/sys/vm/drop_caches", "2\n").unwrap();
+    // The kernel's forgets and the notices that follow them arrive on their own time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let after = inodes();
+        if after.iter().all(|(listed, stat)| listed == stat) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "listings name old inodes: {after:?}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    sandfs.unmount(&ws);
+}
