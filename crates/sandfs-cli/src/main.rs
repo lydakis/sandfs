@@ -22,6 +22,7 @@ mod persist;
 mod server;
 mod store;
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(mount)]
@@ -137,12 +138,17 @@ enum Cmd {
 
 fn main() {
     if let Err(err) = run(Cli::parse()) {
-        // A reader that stops early, like `sandfs changes NAME | head`, isn't an error.
-        if err.downcast_ref::<std::io::Error>().is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe) {
-            return;
-        }
         eprintln!("sandfs: {err:#}");
         std::process::exit(1);
+    }
+}
+
+/// Print a listing. A reader that stops early, like `sandfs changes NAME | head`, isn't
+/// an error.
+fn print_out(text: &str) -> Result<()> {
+    match std::io::stdout().lock().write_all(text.as_bytes()) {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => Ok(result?),
     }
 }
 
@@ -219,7 +225,7 @@ fn run(cli: Cli) -> Result<()> {
             // What git keeps in a git mount's `.git` would drown out the files themselves.
             let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| VPath::parse(&format!("{ROOT}/.git")));
             let git_dir = git_dir.transpose()?;
-            let mut out = std::io::stdout().lock();
+            let mut out = String::new();
             for change in changes {
                 if git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)) {
                     continue;
@@ -232,16 +238,16 @@ fn run(cli: Cli) -> Result<()> {
                 let rel = change.path.strip_prefix(&root).unwrap_or_default().join("/");
                 writeln!(out, "{marker} {rel}")?;
             }
-            Ok(())
+            print_out(&out)
         }
         Cmd::List => {
-            let mut out = std::io::stdout().lock();
+            let mut out = String::new();
             for name in home.names()? {
                 let record = home.record(&name)?;
                 let mounted = home.mount_info(&name).map(|info| info.mountpoint.display().to_string());
                 writeln!(out, "{name}\t{}\t{}", record.source, mounted.as_deref().unwrap_or("-"))?;
             }
-            Ok(())
+            print_out(&out)
         }
         Cmd::Unmount { workspace } => {
             let name = home.find(&workspace)?;
