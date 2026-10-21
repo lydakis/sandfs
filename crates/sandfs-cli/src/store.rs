@@ -63,6 +63,9 @@ pub struct Record {
     pub base: Base,
     /// Creation time in seconds; untouched base files report it as their mtime.
     pub created: u64,
+    /// Paths, relative to the source, that the workspace can read but not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only: Vec<String>,
 }
 
 /// `mount.json`: the process serving a mounted workspace.
@@ -366,7 +369,12 @@ impl Home {
             let mut ws = base.fork();
             let mut saved = Saved::new(self.workspace_dir(name));
             match saved.load(&mut ws, &VPath::parse(ROOT)?) {
-                Ok(restored) => return Ok(Opened { ws, saved, restored, record }),
+                Ok(restored) => {
+                    for path in &record.read_only {
+                        ws.set_read_only(&format!("{ROOT}/{path}"), true)?;
+                    }
+                    return Ok(Opened { ws, saved, restored, record });
+                }
                 Err(err) if is_object_gone(&err) && attempts < 10 => attempts += 1,
                 Err(err) => return Err(err),
             }
@@ -401,7 +409,7 @@ impl Home {
             }
             Base::Dir { path }
         };
-        Ok(Record { source: source.to_owned(), base, created })
+        Ok(Record { source: source.to_owned(), base, created, read_only: Vec::new() })
     }
 }
 

@@ -782,9 +782,23 @@ mod tests {
         serve(Arc::new(MemorySource::from_files(files.iter().copied()).unwrap()))
     }
 
+    /// [`served`], with `prepare` run on the workspace first.
+    fn served_with(prepare: impl FnOnce(&mut Workspace)) -> (SandNfs, tempfile::TempDir) {
+        let source = MemorySource::from_files([("notes.txt", "draft\n"), ("in/a.txt", "a")]).unwrap();
+        serve_with(Arc::new(source), prepare)
+    }
+
     fn serve(source: Arc<dyn sandfs_core::Source>) -> (SandNfs, tempfile::TempDir) {
+        serve_with(source, |_| {})
+    }
+
+    fn serve_with(
+        source: Arc<dyn sandfs_core::Source>,
+        prepare: impl FnOnce(&mut Workspace),
+    ) -> (SandNfs, tempfile::TempDir) {
         let mut ws = Workspace::new();
         ws.mount("/mnt", source).unwrap();
+        prepare(&mut ws);
         let root = VPath::parse("/mnt").unwrap();
         let mut inner = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), UNIX_EPOCH, (501, 20));
         inner.keep_removed = false;
@@ -978,6 +992,24 @@ mod tests {
             fs.remove(ROOT_INO, &name("in")).await.unwrap();
             assert!(fs.create_exclusive(ROOT_INO, &name("in")).await.is_ok());
             assert!(matches!(fs.create_exclusive(ROOT_INO, &name("in")).await, Err(nfsstat3::NFS3ERR_EXIST)));
+        });
+    }
+
+    #[test]
+    fn read_only_paths_answer_with_a_read_only_file_system() {
+        let (fs, _dir) = served_with(|ws| ws.set_read_only("/mnt/in", true).unwrap());
+        block(async {
+            let dir = fs.lookup(ROOT_INO, &name("in")).await.unwrap();
+            let file = fs.lookup(dir, &name("a.txt")).await.unwrap();
+            assert_eq!(fs.read(file, 0, 10).await.unwrap().0, b"a");
+            assert_eq!(fs.getattr(file).await.unwrap().mode, 0o444);
+            let rofs = |result: Result<_, nfsstat3>| assert!(matches!(result, Err(nfsstat3::NFS3ERR_ROFS)));
+            rofs(fs.write(file, 0, b"b").await.map(|_| ()));
+            let truncate = sattr3 { size: set_size3::size(0), ..sattr3::default() };
+            rofs(fs.setattr(file, truncate).await.map(|_| ()));
+            rofs(fs.remove(dir, &name("a.txt")).await);
+            rofs(fs.create(dir, &name("new.txt"), sattr3::default()).await.map(|_| ()));
+            fs.write(fs.lookup(ROOT_INO, &name("notes.txt")).await.unwrap(), 0, b"D").await.unwrap();
         });
     }
 
