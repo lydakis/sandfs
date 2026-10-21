@@ -345,3 +345,14 @@ fn served_workspaces_keep_read_only_paths() {
     assert!(replies.contains("/mnt/contracts/lease.md: read-only"), "{replies}");
     assert_eq!(stdout(home.path(), &["changes", "books"]), "A notes.md\n");
 }
+
+#[test]
+fn read_only_paths_outside_the_source_are_refused() {
+    let (home, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let folder = data.path().join("books");
+    std::fs::create_dir_all(&folder).unwrap();
+    let served = sandfs(home.path(), &["serve", "--mcp", folder.to_str().unwrap(), "--read-only", "../contracts"], "");
+    assert!(!served.status.success());
+    assert!(String::from_utf8_lossy(&served.stderr).contains("--read-only ../contracts is outside the source"));
+    assert!(!home.path().join("workspaces/books").exists(), "no workspace was made");
+}

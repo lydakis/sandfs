@@ -433,7 +433,10 @@ fn relative_paths(paths: &[String]) -> Result<Vec<String>> {
         .map(|path| {
             let rel = path.trim_start_matches("./").trim_matches('/');
             let full = VPath::parse(&format!("{ROOT}/{rel}")).with_context(|| format!("--read-only {path}"))?;
-            Ok(full.strip_prefix(&VPath::parse(ROOT)?).unwrap_or_default().join("/"))
+            match full.strip_prefix(&VPath::parse(ROOT)?) {
+                Some(parts) => Ok(parts.join("/")),
+                None => bail!("--read-only {path} is outside the source"),
+            }
         })
         .collect()
 }
