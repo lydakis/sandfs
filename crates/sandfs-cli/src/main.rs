@@ -447,6 +447,7 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     let result = {
         let mut config = fuser::Config::default();
         config.mount_options = host::mount_options(name);
+        config.acl = host::mount_acl();
         let session = fuser::Session::new(SandFs(shared.clone()), dir, &config).context("mounting with FUSE")?;
         mounted(None)?;
         session.run().map_err(anyhow::Error::from)
