@@ -25,10 +25,13 @@ pub struct Row {
 pub enum Unit {
     Nanos,
     Bytes,
+    /// Calls to a source, which don't depend on the machine.
+    Count,
 }
 
 /// The columns of things sandfs doesn't change.
-const BASELINES: &[&str] = &["host", "eager", "overlayfs", "sparse", "shallow", "blobless", "full", "host folder"];
+const BASELINES: &[&str] =
+    &["host", "eager", "overlayfs", "sparse", "shallow", "blobless", "full", "host folder", "host folders"];
 
 /// What a whole-copy search stopped at its time limit counts as: the limit itself, so a
 /// search that stops where it used to finish shows as slower.
@@ -76,6 +79,9 @@ pub fn rows(report: &Value) -> Result<BTreeMap<String, Row>> {
             let samples = list(&row[way]).iter().filter_map(|run| run["nanos"].as_u64()).collect();
             let reference = (way == "lazy").then(|| format!("{name} | eager"));
             add(format!("{name} | {way}"), samples, Unit::Nanos, reference);
+            let calls = list(&row[way]).iter().filter_map(|run| run["calls"].as_u64()).collect();
+            let reference = (way == "lazy").then(|| format!("{name} calls | eager"));
+            add(format!("{name} calls | {way}"), calls, Unit::Count, reference);
         }
     }
     // Parallel attempts: time, memory and disk per target, against overlayfs where it
@@ -137,9 +143,13 @@ pub fn rows(report: &Value) -> Result<BTreeMap<String, Row>> {
     }
     // A build or command, against the host folder.
     if let Some(build) = report["build"].as_object() {
-        for column in list(&build["columns"]) {
-            let name = text(&column, "column")?;
-            let reference = |label: &str| (name != "host folder").then(|| format!("build {label} | host folder"));
+        let columns = list(&build["columns"]);
+        // "host folder", or "host folders" when the build runs in several at once.
+        let host = columns.iter().filter_map(|column| column["column"].as_str()).find(|name| name.starts_with("host"));
+        for column in &columns {
+            let name = text(column, "column")?;
+            let reference =
+                |label: &str| host.filter(|host| *host != name).map(|host| format!("build {label} | {host}"));
             add(
                 format!("build first run | {name}"),
                 column["cold_nanos"].as_u64().into_iter().collect(),
@@ -207,6 +217,7 @@ fn show(row: &Row) -> String {
     match row.unit {
         Unit::Nanos => crate::fmt_duration(Duration::from_nanos(value as u64)),
         Unit::Bytes => crate::fmt_bytes(value as u64),
+        Unit::Count => format!("{value:.0}"),
     }
 }
 
@@ -227,11 +238,20 @@ pub fn pool(runs: Vec<BTreeMap<String, Row>>) -> BTreeMap<String, Row> {
 }
 
 /// Print the comparison as a Markdown table, the moved rows first, and return how many
-/// rows got slower. Baselines are left out.
+/// rows got slower or went missing. Baselines are left out.
 pub fn print(base: &BTreeMap<String, Row>, head: &BTreeMap<String, Row>, threshold: f64, all: bool) -> usize {
     let mut lines = Vec::new();
     let mut slower = 0;
     let mut compared = 0;
+    // A number the second run lacks while it still has others of its row, such as a
+    // target that no longer ran: what it measured is no longer measured.
+    let name = |key: &str| key.rsplit_once(" | ").map_or(key, |(name, _)| name).to_owned();
+    let names: std::collections::BTreeSet<String> = head.keys().map(|key| name(key)).collect();
+    let missing: Vec<&String> = base
+        .iter()
+        .filter(|(key, row)| !row.baseline && !head.contains_key(*key) && names.contains(&name(key)))
+        .map(|(key, _)| key)
+        .collect();
     for (key, now) in head {
         let Some(before) = base.get(key) else { continue };
         if now.baseline {
@@ -271,19 +291,23 @@ pub fn print(base: &BTreeMap<String, Row>, head: &BTreeMap<String, Row>, thresho
     });
     let moved = lines.iter().filter(|(verdict, _)| *verdict != Verdict::Same).count();
     println!(
-        "{moved} of {} numbers moved by more than {:.0}% beyond both runs' spread; {slower} got slower.",
+        "{moved} of {} numbers moved by more than {:.0}% beyond both runs' spread; {slower} got slower; {} went missing.",
         compared,
-        threshold * 100.0
+        threshold * 100.0,
+        missing.len()
     );
-    if !lines.is_empty() {
+    if !lines.is_empty() || !missing.is_empty() {
         println!();
         println!("| number | column | before | after | after / before | after against its reference |");
         println!("|---|---|---:|---:|---|---|");
+        for key in &missing {
+            println!("| {key} | {} | missing | | |", show(&base[*key]));
+        }
         for (_, line) in &lines {
             println!("{line}");
         }
     }
-    slower
+    slower + missing.len()
 }
 
 #[cfg(test)]
@@ -307,6 +331,30 @@ mod tests {
         // The threshold is a share of the first run's median both ways.
         assert_eq!(verdict(&row(&[100]), &row(&[79]), 0.25), Verdict::Same);
         assert_eq!(verdict(&row(&[100]), &row(&[74]), 0.25), Verdict::Faster);
+    }
+
+    #[test]
+    fn a_number_gone_from_the_second_run_counts() {
+        let host = Row { baseline: true, ..row(&[1]) };
+        let base = BTreeMap::from([
+            ("a | host".to_owned(), host.clone()),
+            ("a | sandfs FUSE".to_owned(), row(&[2])),
+            ("b | sandfs".to_owned(), row(&[3])),
+        ]);
+        // The FUSE column of row a is gone; row b, skipped as a whole, isn't counted.
+        let head = BTreeMap::from([("a | host".to_owned(), host)]);
+        assert_eq!(print(&base, &head, 0.25, false), 1);
+    }
+
+    #[test]
+    fn parallel_builds_compare_with_the_host_folders() {
+        let report = serde_json::json!({"build": {"job": "", "parallel": 2, "columns": [
+            {"column": "host folders", "cold_nanos": 10, "rebuild_nanos": [1], "server_rss": null},
+            {"column": "sandfs forks", "cold_nanos": 12, "rebuild_nanos": [3], "server_rss": 5}
+        ]}});
+        let rows = rows(&report).unwrap();
+        assert_eq!(rows["build first run | sandfs forks"].reference.as_deref(), Some("build first run | host folders"));
+        assert!(rows["build first run | host folders"].baseline);
     }
 
     #[test]
@@ -366,6 +414,8 @@ mod tests {
         assert!(!rows["workflow wall | sandfs FUSE"].baseline && !rows["remote ready | sandfs"].baseline);
         assert_eq!(reference("build run again | sandfs mount").as_deref(), Some("build run again | host folder"));
         assert_eq!(rows["build server memory | sandfs mount"].samples, [5]);
+        assert_eq!(rows["lazy/read-1% calls | lazy"].samples, [1]);
+        assert_eq!(rows["lazy/read-1% calls | lazy"].unit, Unit::Count);
         assert!(!rows.contains_key("build server memory | host folder"));
     }
 }

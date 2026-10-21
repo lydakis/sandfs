@@ -64,9 +64,10 @@ jobs:
             echo
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
-          slower=$(sed -n 's/.*; \([0-9]*\) got slower\./\1/p' /tmp/compare.md)
-          if [ "${slower:-0}" -gt 0 ]; then
-            echo "::warning title=Benchmarks::$slower numbers got slower than on main; see the run's summary"
+          slower=$(sed -n 's/.*; \([0-9]*\) got slower;.*/\1/p' /tmp/compare.md)
+          missing=$(sed -n 's/.*; \([0-9]*\) went missing\./\1/p' /tmp/compare.md)
+          if [ "${slower:-0}" -gt 0 ] || [ "${missing:-0}" -gt 0 ]; then
+            echo "::warning title=Benchmarks::${slower:-0} numbers got slower than on main and ${missing:-0} went missing; see the run's summary"
           fi
       - name: Summarize
         if: github.event_name == 'push'
