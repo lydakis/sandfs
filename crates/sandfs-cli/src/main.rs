@@ -24,6 +24,7 @@ mod nfsserve;
 mod persist;
 #[cfg(mount)]
 mod server;
+mod shell;
 mod store;
 
 use std::collections::BTreeMap;
@@ -147,6 +148,36 @@ enum Cmd {
         /// For a new workspace, a path the agent may read but not change, as for `mount`.
         #[arg(long, value_name = "PATH")]
         read_only: Vec<String>,
+    },
+    /// Run a shell, or a command, that sees a mounted workspace and none of the
+    /// machine's other files.
+    ///
+    /// The program starts in the mount and may change anything there that isn't
+    /// read-only. It can run the system's programs but not read your home folder, other
+    /// folders, or the workspace's source, and it gets no network unless --network is
+    /// given. HOME is an empty folder outside the mount, deleted afterwards along with
+    /// anything else written outside it. Only a few environment variables pass through
+    /// (PATH, TERM, the locale, USER and SHELL, and with --network the proxy settings),
+    /// so tokens and keys in yours stay out.
+    ///
+    /// The operating system does the confining: bubblewrap on Linux (install the
+    /// bubblewrap package), the built-in sandbox on macOS.
+    Shell {
+        /// A mounted workspace's name or folder.
+        workspace: String,
+        /// Let the program use the network.
+        #[arg(long)]
+        network: bool,
+        /// The command to run, after `--`, instead of your shell.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<std::ffi::OsString>,
+    },
+    /// Start a new session, then run COMMAND in place of this process (run by `shell`
+    /// on macOS).
+    #[command(name = "shell-exec", hide = true)]
+    ShellExec {
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
     },
     /// Start the process that serves every mount (run by `mount` and `fork`), or with
     /// `--serve`, be that process.
@@ -316,6 +347,23 @@ fn run(cli: Cli) -> Result<()> {
             drop(repos);
             mcp::serve(&home, &name)
         }
+        Cmd::Shell { workspace, network, command } => {
+            let name = home.find(&workspace)?;
+            let info = home
+                .attached_mount(&name)
+                .with_context(|| format!("{name} is not mounted; mount it first with sandfs mount {name} DIR"))?;
+            // A git workspace's .git reads its objects from the local copy, by absolute path.
+            let (source, readable) = match home.record(&name)?.base {
+                Base::Dir { path } => (path, Vec::new()),
+                Base::Git { repo, .. } => {
+                    let objects = git::object_folders(&repo)?;
+                    (repo, objects)
+                }
+            };
+            let confined = shell::Confined { dir: info.mountpoint, source: Some(source), readable, network, command };
+            std::process::exit(shell::run(&confined)?)
+        }
+        Cmd::ShellExec { command } => shell::exec_in_new_session(&command),
         Cmd::Daemon { serve } => serve_mounts(home, serve),
         Cmd::GitFsmonitor { version, token: _ } => {
             // Git runs its file monitor at the root of the checkout: the mount.

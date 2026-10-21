@@ -592,6 +592,30 @@ impl Source for GitDir {
     }
 }
 
+/// The object folders git reads a checkout of `repo` from: the local copy's own, and
+/// those it borrows from in turn through its `objects/info/alternates`.
+pub fn object_folders(repo: &Path) -> Result<Vec<PathBuf>> {
+    let common = repo.join(git(repo, &["rev-parse", "--git-common-dir"])?);
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut next = vec![common.join("objects")];
+    // Git follows at most five levels of alternates.
+    for _ in 0..6 {
+        let mut borrowed = Vec::new();
+        for objects in next {
+            let Ok(objects) = objects.canonicalize().map(without_verbatim_prefix) else { continue };
+            if found.contains(&objects) {
+                continue;
+            }
+            let alternates = std::fs::read_to_string(objects.join("info/alternates")).unwrap_or_default();
+            let lines = alternates.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#'));
+            borrowed.extend(lines.map(|line| objects.join(line)));
+            found.push(objects);
+        }
+        next = borrowed;
+    }
+    Ok(found)
+}
+
 /// Answer git's file monitor (hook version 2) for the mounted workspace whose saved
 /// changes are `saved`, from the mount's root.
 ///
@@ -1003,6 +1027,25 @@ mod tests {
         assert_eq!(plain(r"\\?\C:\src\repo"), PathBuf::from(r"C:\src\repo"));
         assert_eq!(plain(r"\\?\UNC\host\share\repo"), PathBuf::from(r"\\host\share\repo"));
         assert_eq!(plain("/srv/repo"), PathBuf::from("/srv/repo"));
+    }
+
+    #[test]
+    fn object_folders_follow_borrowed_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        run(&first, &["init", "-q", "-b", "main"]);
+        std::fs::write(first.join("a.txt"), "a\n").unwrap();
+        run(&first, &["add", "."]);
+        run(&first, &["commit", "-q", "-m", "a"]);
+        run(tmp.path(), &["clone", "-q", "--shared", "first", "second"]);
+        run(tmp.path(), &["clone", "-q", "--shared", "second", "third"]);
+        let objects =
+            |name: &str| without_verbatim_prefix(tmp.path().join(name).join(".git/objects").canonicalize().unwrap());
+        assert_eq!(
+            object_folders(&tmp.path().join("third")).unwrap(),
+            [objects("third"), objects("second"), objects("first")]
+        );
     }
 
     #[test]

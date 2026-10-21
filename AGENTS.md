@@ -33,5 +33,5 @@
 
 ## Scope
 - sandfs is a general-purpose sandbox filesystem: files are bytes of any kind, and code is one use case among many. Don't add features that only make sense for source code to the core; text tools belong in the MCP crate.
-- It never runs commands. Execution belongs to a container or microVM pointed at the files.
+- It runs no commands of its own. The one exception is `sandfs shell`, which hands a program to the operating system's sandbox (bubblewrap, macOS's `sandbox-exec`) confined to a mount; the OS enforces it, and sandfs only sets it up. Code that may attack the kernel itself still belongs in a container or microVM pointed at the files.
 - Sources are read-only; every change goes to the workspace overlay. Never add a path that writes back to a source implicitly.
