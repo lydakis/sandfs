@@ -34,7 +34,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
 use nix::sys::resource::{UsageWho, getrusage};
 
-use crate::workflow::{disk_usage, tree_peak_rss};
+use crate::sys::{disk_usage, force_unmount, tree_peak_rss};
 
 /// Files read in step 2, besides the first one.
 pub const SAMPLES: usize = 20;
@@ -525,7 +525,7 @@ impl Drop for Mounts {
                 .status()
                 .is_ok_and(|status| status.success());
             if !unmounted {
-                let _ = Command::new("fusermount3").arg("-uz").arg(&mountpoint).stderr(Stdio::null()).status();
+                force_unmount(&mountpoint);
             }
         }
     }

@@ -2,7 +2,7 @@
 //!
 //! Targets are the host filesystem used directly (the floor), sandfs through its Rust
 //! API, Linux overlayfs (the kernel's copy-on-write filesystem, when this process can
-//! mount it) and the `sandfs` command's FUSE mount (when FUSE is available). A second
+//! mount it) and the `sandfs` command's mount (FUSE on Linux, NFS on macOS). A second
 //! table compares a slow, lazily read source with copying it all up front, a third
 //! runs a whole task (search, edit, check, list changes) in several parallel attempts,
 //! and with `--remote URL` a fourth mounts a large repository from a git server and
@@ -17,6 +17,7 @@ mod data;
 mod everyday;
 mod lazy;
 mod remote;
+mod sys;
 mod targets;
 mod workflow;
 mod workloads;
@@ -230,7 +231,12 @@ fn run(args: Args) -> Result<()> {
         kinds.push(TargetArg::Sandfs);
     }
     if wanted(TargetArg::Overlayfs) {
-        if Overlay::available(&scratch) {
+        if !cfg!(target_os = "linux") {
+            if explicit(TargetArg::Overlayfs) {
+                bail!("overlayfs is Linux only");
+            }
+            skipped.push("overlayfs (Linux only)".to_owned());
+        } else if Overlay::available(&scratch) {
             targets.push(Box::new(Overlay { data: root.clone(), scratch: scratch.clone() }));
             kinds.push(TargetArg::Overlayfs);
         } else if explicit(TargetArg::Overlayfs) {
@@ -246,7 +252,7 @@ fn run(args: Args) -> Result<()> {
                 kinds.push(TargetArg::Fuse);
             }
             Err(err) if explicit(TargetArg::Fuse) => return Err(err),
-            Err(err) => skipped.push(format!("sandfs FUSE ({err})")),
+            Err(err) => skipped.push(format!("sandfs mount ({err})")),
         }
     }
 

@@ -85,6 +85,11 @@ jobs:
       - name: Build the CLI without the mount
         if: runner.os == 'macOS'
         run: cargo clippy -p sandfs-cli --no-default-features --all-targets -- -D warnings
+      - name: Check and test the benchmarks
+        if: runner.os == 'macOS'
+        run: |
+          cargo clippy -p sandfs-bench --all-targets -- -D warnings
+          cargo test -p sandfs-bench
       - name: Install uv
         run: pip install uv
       - name: Install the package (builds the Rust extension)

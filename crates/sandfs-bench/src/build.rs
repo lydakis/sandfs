@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::sys::current_rss;
 use crate::targets::{Fuse, Target};
 
 /// The `--only` name of this table.
@@ -283,17 +284,6 @@ fn copy_source(from: &Path, to: &Path, scratch: &Path, skipped: &[&str]) -> Resu
         }
     }
     Ok(())
-}
-
-/// A process's current resident memory in bytes, from `VmRSS`.
-fn current_rss(pid: u32) -> Result<u64> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
-    let kib = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        .context("no VmRSS in /proc status")?;
-    Ok(kib * 1024)
 }
 
 pub fn print(result: &BuildResult) {

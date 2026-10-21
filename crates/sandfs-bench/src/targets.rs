@@ -246,9 +246,9 @@ impl Target for Overlay {
     }
 }
 
-/// The `sandfs` command's FUSE mount over the data set as a host folder. Forking runs
-/// `sandfs fork` and the changes come from `sandfs changes`, both as separate
-/// processes, the way a harness would call them.
+/// The `sandfs` command's mount over the data set as a host folder: FUSE on Linux, NFS
+/// on localhost on macOS. Forking runs `sandfs fork` and the changes come from `sandfs
+/// changes`, both as separate processes, the way a harness would call them.
 #[derive(Clone)]
 pub struct Fuse {
     data: PathBuf,
@@ -262,11 +262,14 @@ pub struct Fuse {
 impl Fuse {
     /// A FUSE target using the `sandfs` binary at `bin`, if FUSE is usable here.
     pub fn new(data: PathBuf, scratch: PathBuf, bin: PathBuf) -> Result<Fuse> {
-        if !Path::new("/dev/fuse").exists() {
-            bail!("/dev/fuse is missing");
-        }
-        if Command::new("fusermount3").arg("-V").stdout(Stdio::null()).status().is_err() {
-            bail!("fusermount3 is not installed");
+        // macOS mounts over NFS on localhost and needs nothing installed.
+        if cfg!(target_os = "linux") {
+            if !Path::new("/dev/fuse").exists() {
+                bail!("/dev/fuse is missing");
+            }
+            if Command::new("fusermount3").arg("-V").stdout(Stdio::null()).status().is_err() {
+                bail!("fusermount3 is not installed");
+            }
         }
         if !bin.is_file() {
             bail!("{} not found; build it with `cargo build --release -p sandfs-cli`", bin.display());
@@ -276,7 +279,7 @@ impl Fuse {
         // Mount once and throw it away: the device and helper can exist while this
         // process is still not allowed to mount.
         let probe = tempfile::Builder::new().prefix("fuse-probe-").tempdir_in(&fuse.scratch)?;
-        drop(fuse.open_dir(probe.path()).context("cannot mount FUSE here")?);
+        drop(fuse.open_dir(probe.path()).context("cannot mount here")?);
         Ok(fuse)
     }
 
@@ -306,7 +309,8 @@ impl Fuse {
 
 impl Target for Fuse {
     fn name(&self) -> &'static str {
-        "sandfs FUSE"
+        // Named by how the mount is served, so Linux and macOS runs aren't compared.
+        if cfg!(target_os = "macos") { "sandfs NFS" } else { "sandfs FUSE" }
     }
 
     fn open(&self, _writable: bool) -> Result<Box<dyn View>> {

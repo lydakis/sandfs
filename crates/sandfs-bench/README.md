@@ -18,6 +18,8 @@ uv run python crates/sandfs-bench/python/bench.py --scratch /dev/shm   # the Pyt
     --build-change pkg/kubelet/images/image_manager.go
 ```
 
+On macOS, the mount is the NFS one `sandfs mount` serves there, shown as `sandfs NFS`; overlayfs is skipped. Use a short scratch path such as `--scratch /tmp`: the system temp directory is long enough to push the mount's socket past macOS's path limit. macOS has no tmpfs, so its numbers include the disk.
+
 Put the scratch directory on tmpfs (`/dev/shm`) when comparing numbers. sandfs keeps its changes in memory, so a disk under the other targets mostly measures the disk, and writeback makes their write and copy timings swing by several times between runs.
 
 `--targets host,sandfs,overlayfs,fuse` picks targets (default: every one available), `--only` filters workloads by name and `--skip` leaves some out (`--skip build`), `--json FILE` keeps every sample, and `--scratch DIR` sets where the data set and mounts go (default: the system temp directory). Targets that cannot run here are listed as skipped.
@@ -41,9 +43,9 @@ CI does this on every pull request that touches the Rust code (`.github/workflow
 | host | the data set read and written directly with `std::fs`: the floor | copy the tree | compare the copy with the original, file by file |
 | sandfs | a `Workspace` with the data set mounted from a `DirSource` | `Workspace::fork` | `Workspace::changes` |
 | overlayfs | Linux's copy-on-write filesystem, data set as the lower layer (needs root) | copy the upper layer, mount a new overlay | walk the upper layer |
-| sandfs FUSE | `sandfs mount` of the data set as a host folder | `sandfs fork` | `sandfs changes` |
+| sandfs FUSE (Linux), sandfs NFS (macOS) | `sandfs mount` of the data set as a host folder | `sandfs fork` | `sandfs changes` |
 
-The FUSE fork and changes run the `sandfs` command, so they include starting a process, the way a harness calls them.
+The mount's fork and changes run the `sandfs` command, so they include starting a process, the way a harness calls them.
 
 ## Data and workloads
 
@@ -72,7 +74,7 @@ The lazy-source table mounts 1,000 of the small files from a source that sleeps 
 
 `--only workflow` runs a whole task several times side by side (`--attempts 8` by default), the way a harness runs parallel attempts at one job. Each attempt gets its own fork of one prepared view, then searches every small file for a byte pattern, rewrites the 50 files it picked (matches first), adds 10 notes and deletes 5, checks its work by running `cksum` over two directories and the rewritten files, and lists its changes. Forks are made one after another; the attempts then run on a thread each. On targets that are real directories the check is a separate process reading through the filesystem; through the Rust API the same checksums are computed in-process. Every checksum is compared with the contents the attempt should have left, so a target that writes the wrong bytes fails the run.
 
-Besides wall time and the median of each step, the table shows peak memory and the bytes the attempts left in the scratch directory. Each target's workflow runs in a fresh process, so its memory peak holds only its own work: that process plus any serving processes, each counted whole, so shared pages are counted more than once. A host fork is a full copy, so it pays in time and disk for every attempt; the FUSE mount saves each fork's changes to disk when they are listed.
+Besides wall time and the median of each step, the table shows peak memory and the bytes the attempts left in the scratch directory. Each target's workflow runs in a fresh process, so its memory peak holds only its own work: that process plus any serving processes, each counted whole, so shared pages are counted more than once. macOS reports a peak resident size only to the process itself, so there a serving process counts its peak physical footprint instead, the memory Activity Monitor shows. A host fork is a full copy, so it pays in time and disk for every attempt; the FUSE mount saves each fork's changes to disk when they are listed.
 
 ## Everyday operations
 
