@@ -1237,3 +1237,101 @@ fn kept_listings_name_the_inodes_stat_reports() {
     }
     sandfs.unmount(&ws);
 }
+
+/// Whether `sandfs shell` can confine a program here: macOS has its sandbox built in,
+/// Linux needs bubblewrap.
+fn confinement_available() -> bool {
+    let available = cfg!(target_os = "macos") || Path::new("/usr/bin/bwrap").exists();
+    if !available {
+        assert!(std::env::var_os("SANDFS_REQUIRE_FUSE").is_none(), "bubblewrap is required but missing");
+        eprintln!("skipping: bubblewrap is not installed");
+    }
+    available
+}
+
+#[test]
+fn git_works_in_a_shell_on_a_git_workspace() {
+    if !fuse_available() || !confinement_available() {
+        return;
+    }
+    let mut sandfs = Sandfs::new();
+    let data = tempfile::tempdir().unwrap();
+    let repo = data.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("notes.md"), "draft\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "first"]);
+    let dir = data.path().join("ws");
+    sandfs.mount(&["mount", &format!("git:{}", repo.display()), dir.to_str().unwrap()], &dir);
+
+    // The repository is hidden, but its objects, which the mount's .git reads, are not.
+    let script = r#"
+        cat "$REPO/notes.md" 2>/dev/null && exit 10
+        echo final > notes.md
+        git log --format=%s && git status --short || exit 11
+        git -c user.name=t -c user.email=t@example.com commit -qam second || exit 12
+        git log --format=%s
+    "#;
+    let run = sandfs.stdout(&["shell", "ws", "--", "sh", "-c", &script.replace("$REPO", repo.to_str().unwrap())]);
+    assert_eq!(run, "first\n M notes.md\nsecond\nfirst\n");
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M notes.md\n");
+}
+
+#[test]
+fn a_shell_sees_its_mount_and_nothing_else() {
+    if !fuse_available() || !confinement_available() {
+        return;
+    }
+    let mut sandfs = Sandfs::new();
+    let data = tempfile::tempdir().unwrap();
+    let source = data.path().join("books");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("budget.csv"), "jan\n").unwrap();
+    std::fs::write(data.path().join("secret.txt"), "key\n").unwrap();
+    let dir = data.path().join("ws");
+    sandfs.mount(&["mount", source.to_str().unwrap(), dir.to_str().unwrap()], &dir);
+
+    let script = r#"
+        cat budget.csv && echo feb > budget.csv && echo hello > notes.md || exit 10
+        cat "$OUTSIDE/secret.txt" 2>/dev/null && exit 11
+        ls "$OUTSIDE/books" 2>/dev/null && exit 12
+        case "$HOME" in "$PWD"*) exit 13;; esac
+        echo cache > "$HOME/.cache" || exit 14
+        [ -z "$SANDFS_TEST_TOKEN" ] || exit 15
+        if [ -e /proc/net/dev ]; then
+            [ "$(grep -c : /proc/net/dev)" = 1 ] || exit 16
+        fi
+        exit 7
+    "#;
+    let outside = data.path().canonicalize().unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", sandfs.home.path())
+        .env("SANDFS_TEST_TOKEN", "abc")
+        .args(["shell", "ws", "--", "sh", "-c", &script.replace("$OUTSIDE", outside.to_str().unwrap())])
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(7), "stderr: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "jan\n");
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "M budget.csv\nA notes.md\n");
+    assert_eq!(std::fs::read_to_string(source.join("budget.csv")).unwrap(), "jan\n");
+
+    // The mount's folder works as well as its name, and --network lets the network in.
+    if cfg!(target_os = "linux") {
+        let net =
+            sandfs.stdout(&["shell", dir.to_str().unwrap(), "--network", "--", "grep", "-c", ":", "/proc/net/dev"]);
+        assert!(net.trim().parse::<u32>().unwrap() > 1, "only loopback with --network");
+    }
+    sandfs.run(&["shell", dir.to_str().unwrap(), "--", "true"]);
+    // HOME would land in the workspace with a temporary folder inside the mount.
+    let inside = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", sandfs.home.path())
+        .env("TMPDIR", &dir)
+        .args(["shell", "ws", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&inside.stderr).contains("set TMPDIR to another folder"));
+    sandfs.unmount(&dir);
+    let unmounted = sandfs.try_run(&["shell", "ws", "--", "true"]);
+    assert!(String::from_utf8_lossy(&unmounted.stderr).contains("ws is not mounted"));
+}

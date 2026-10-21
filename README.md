@@ -132,6 +132,14 @@ sandfs mount https://github.com/pallets/flask@3.1.0 ~/ws/flask
 
 The mounted folder has a `.git`, so git itself works in it: `status`, `add`, `commit`, branches and `push`, with commits kept in the workspace and its forks. A mount of a remote repository holds only the mounted commit, not the history before it; a local repository's history is all there. `git status` doesn't read your files, because sandfs tells git which ones changed; on VS Code it takes 0.07 s once the first run (about 10 s on a fresh mount, which lists every folder) is done. A `commit` fetches only the files git compares: the others in each folder that holds a change, or holds a folder that does. On VS Code, a first commit changing two files takes 2.3 s and fetches 0.5 MiB, and later ones take 0.2 s.
 
+An agent that works through a shell can have the mount as its only files. `sandfs shell NAME` starts a shell, or `sandfs shell NAME -- COMMAND` a command, in the mount with the rest of the machine out of reach: no home folder, no other folders, no network unless `--network` is given, and none of your environment's tokens. The operating system does the confining (bubblewrap on Linux, the built-in sandbox on macOS); sandfs only sets it up.
+
+```bash
+sandfs mount ~/finance ~/ws/finance --read-only contracts
+sandfs shell finance -- my-agent      # sees ~/ws/finance and the system's programs, nothing else of yours
+sandfs changes finance                # then review what it did
+```
+
 `sandfs serve --mcp NAME` hands a saved workspace to an agent as MCP file tools instead of mounting it.
 
 Every mount is served by one background process, started by the first `mount` or `fork` and gone once the last mount is. It detaches from whatever started it: it runs in a session of its own and is adopted by init (or launchd, or the nearest subreaper). So a job runner or shell that kills a job's process group or its process tree leaves other jobs' mounts alone; killing a whole container or cgroup still ends it. It keeps the starting command's environment, which carries what git needs to fetch, except the variables that point git at a repository (`GIT_DIR` and the like).
@@ -196,7 +204,7 @@ A second copy of the mount (`sandfs fork`) takes 20 ms, against 0.2 to 4.4 s for
 
 ## Limits
 
-- **sandfs is not an execution sandbox.** It never runs commands, and it doesn't contain the programs that use it. It keeps their writes out of your sources, but a program working in a mounted folder can still read or change anything else its user can. Run untrusted programs in a container or microVM pointed at the mount.
+- **sandfs is not an execution sandbox.** It doesn't contain the programs that use a mount. It keeps their writes out of your sources, but a program working in a mounted folder can still read or change anything else its user can. `sandfs shell` runs one under the operating system's own sandbox, which keeps it to the mount; it shares the machine's kernel, so for code that may attack the system itself use a container or microVM pointed at the mount.
 - **Git runs what a mount's `.git` settings name.** Git settings can name programs for git to run, and anything that can write to a mounted folder can change its `.git`. Don't run git yourself in a mounted folder that a program you don't trust can write to, just as with any folder someone else can change. `sandfs changes` points out any change to a `git:` mount's `.git/config` or `.git/hooks`, so a review catches one. Over MCP, sandfs refuses changes to a `git:` mount's `.git`; a host folder that holds its own `.git` gets no such protection, so treat an agent's changes there the same way.
 - **A mounted folder isn't frozen.** Folders are read lazily, so if one changes while it's mounted, a workspace can show a mix of old and new. Mount a folder nothing else writes to, copy it first, or mount a git commit when the view must not change.
 - **Symbolic links are kept, never followed.** A link is stored as its target, and a host folder's links are listed as links. In a mounted folder the system resolves them, as on any filesystem; the library and the MCP tools never do, so `read` refuses a link and `read_link` gives its target. In a mount, a host folder's link into the folder reaches the workspace's copy, and one out of it reaches the host itself, where a link of the host's own can still lead back into the folder. A git commit's links aren't shown yet.

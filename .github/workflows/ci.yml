@@ -49,8 +49,11 @@ jobs:
         run: cargo fmt --all --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Install FUSE
-        run: sudo apt-get update && sudo apt-get install -y fuse3
+      - name: Install FUSE and bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y fuse3 bubblewrap
+          # Ubuntu keeps unprivileged programs out of user namespaces, which `sandfs shell` uses.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Run tests
         run: cargo test --workspace
         env:
