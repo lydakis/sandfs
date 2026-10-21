@@ -2234,6 +2234,30 @@ mod tests {
     }
 
     #[test]
+    fn stopping_cuts_the_savers_settle_wait_short() {
+        let state = tempfile::tempdir().unwrap();
+        let saved = Saved::new(state.path());
+        let mut inner = fs();
+        inner.drafts = Some(saved.drafts());
+        let shared = Shared::new(inner, saved, VPath::parse("/mnt").unwrap());
+        let saver = shared.spawn_saver();
+        let readme = shared.lock().lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        shared.lock().write(readme, 0, b"HE").unwrap();
+        shared.changed();
+        // Long enough for the saver to be waiting for the write to settle.
+        std::thread::sleep(SETTLE / 5);
+        let stopped = std::time::Instant::now();
+        shared.stop();
+        saver.join().unwrap();
+        assert!(stopped.elapsed() < SETTLE / 2, "the saver took {:?} to stop", stopped.elapsed());
+        // The final save, as at unmount, keeps the write.
+        shared.save(true).unwrap();
+        let mut restored = fs().ws;
+        Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
+        assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");
+    }
+
+    #[test]
     fn a_failed_copy_keeps_the_destination_emptied() {
         let state = tempfile::tempdir().unwrap();
         let mut fs = fs();
