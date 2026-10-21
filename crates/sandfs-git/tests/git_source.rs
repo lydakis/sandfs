@@ -194,6 +194,24 @@ fn sizes_come_from_local_blobs_and_a_folder_prefetch() {
 }
 
 #[test]
+fn known_sizes_fill_listings_without_fetching() {
+    let (_origin, clone) = partial_clone();
+    let before = missing(clone.path());
+    let readme = git(clone.path(), &["rev-parse", "HEAD:README.md"]);
+    let sizes = [(readme.trim().into(), 7)].into_iter().collect();
+
+    let mut ws = Workspace::new();
+    let source = GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap().with_known_sizes(sizes);
+    ws.mount("/repo", Arc::new(source)).unwrap();
+    let root = ws.list("/repo").unwrap();
+    assert_eq!(root.iter().find(|e| e.name == "README.md").unwrap().size, Some(7));
+    assert_eq!(root.iter().find(|e| e.name == "run.sh").unwrap().size, None, "not among the known sizes");
+    assert_eq!(ws.stat("/repo/README.md").unwrap().size, 7);
+    assert_eq!(missing(clone.path()), before, "neither the listing nor the size fetched anything");
+    assert_eq!(ws.read_text("/repo/README.md").unwrap().len(), 7);
+}
+
+#[test]
 fn a_walk_fetches_only_once_it_reads() {
     let (_origin, clone) = partial_clone();
     let before = missing(clone.path());

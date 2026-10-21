@@ -22,6 +22,7 @@ use bytes::Bytes;
 use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey};
 use sandfs_git::{GitSource, ObjectIds};
 
+use crate::github;
 use crate::persist::PathState;
 use crate::store::expand;
 
@@ -108,7 +109,9 @@ pub fn open(
     home: &Path,
 ) -> Result<(Arc<dyn Source>, Arc<dyn Source>)> {
     // Sizes let FUSE answer `stat` without reading whole files.
-    let files = Arc::new(GitSource::open(repo, commit)?.with_sizes()?);
+    let files = GitSource::open(repo, commit)?.with_sizes()?;
+    let sizes = github::known_sizes(repo, files.tree_id());
+    let files = Arc::new(files.with_known_sizes(sizes));
     let dir = GitDir::new(repo, commit, branch, home, Some(Arc::clone(&files)))?;
     Ok((files, Arc::new(dir)))
 }
@@ -694,7 +697,7 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
     // to while another fetch is doing so ("shallow.lock: File exists", "shallow file has
     // changed since we read it"). Of two mounts fetching at once, one waits and retries.
     let mut waited = 0;
-    let fetch = loop {
+    let mut fetch = || loop {
         match git(&dest, &args) {
             Err(err) if waited < 300 && is_shallow_race(&format!("{err:#}")) => {
                 waited += 1;
@@ -703,6 +706,12 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
             result => break result,
         }
     };
+    // The host's list of file sizes (see `github`) takes a request of its own, so it
+    // runs while the commit is fetched.
+    let (fetch, sized) = std::thread::scope(|scope| {
+        let sizes = github::plain_rev(rev).then(|| scope.spawn(|| github::fetch_sizes(url, rev)));
+        (fetch(), sizes.and_then(|sizes| sizes.join().ok().flatten()))
+    });
     let commit = match fetch {
         Ok(_) => {
             // One local copy serves every URL that names the repository (https or ssh,
@@ -714,7 +723,18 @@ fn fetch_commit(repos: &Path, url: &str, rev: &str) -> Result<(PathBuf, String)>
             }
             let commit = commit_of(&dest, &fetched);
             let _ = git(&dest, &["update-ref", "-d", &fetched]);
-            commit?
+            let commit = commit?;
+            if let Ok(tree) = git(&dest, &["rev-parse", &format!("{commit}^{{tree}}")])
+                && !github::has_sizes(&dest, &tree)
+            {
+                // A revision that can't go in a request, or a branch that moved between
+                // the two requests: ask again, for the tree itself.
+                let sized = sized.filter(|(named, _)| *named == commit || *named == tree);
+                if let Some((_, sizes)) = sized.or_else(|| github::fetch_sizes(url, &tree)) {
+                    let _ = github::keep_sizes(&dest, &tree, &sizes);
+                }
+            }
+            commit
         }
         // Offline, or a revision the server can't name (`main~3`). A commit id mounted
         // before has already returned above, so only the server could answer this one.

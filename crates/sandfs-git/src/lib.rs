@@ -15,9 +15,11 @@
 //! local. A [`Source::prefetch`] fetches a folder's missing blobs in one request,
 //! so the workspace's next listing has every size, and a walk of a folder fetches
 //! everything below it in one request rather than one per file, or for a large tree,
-//! in the background a request at a time.
+//! in the background a request at a time. Sizes known from elsewhere, such as a
+//! hosting service that lists them, fill in the rest ([`GitSource::with_known_sizes`]),
+//! so a listing has every size without fetching anything.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -36,6 +38,8 @@ pub struct GitSource {
     readers: Readers,
     /// Set by [`GitSource::with_sizes`]: a `cat-file --batch-check` process for sizes.
     sizes: Option<Mutex<Batch>>,
+    /// Set by [`GitSource::with_known_sizes`]: blob sizes by blob id.
+    known_sizes: HashMap<SourceKey, u64>,
     /// The remote a partial clone fetches missing blobs from.
     promisor: Option<String>,
     /// Whether the partial clone has every tree, as a clone that leaves out only blobs
@@ -126,6 +130,7 @@ impl GitSource {
             hash_len,
             readers,
             sizes: None,
+            known_sizes: HashMap::new(),
             promisor,
             trees_local,
             local: Arc::default(),
@@ -146,6 +151,14 @@ impl GitSource {
     pub fn with_sizes(mut self) -> Result<Self> {
         self.sizes = Some(Mutex::new(Batch::spawn(&self.repo, "--batch-check")?));
         Ok(self)
+    }
+
+    /// Report these sizes, by blob id, for files whose blobs aren't local, as a
+    /// partial clone can't tell a blob's size without fetching it. They must be the
+    /// blobs' real sizes: a reader stops at the size it was given.
+    pub fn with_known_sizes(mut self, sizes: HashMap<SourceKey, u64>) -> Self {
+        self.known_sizes = sizes;
+        self
     }
 
     /// The id of the mounted tree.
@@ -408,6 +421,11 @@ impl Source for GitSource {
         let mut listing = parse_tree(&self.object(key, "tree")?, self.hash_len)?;
         if let Some(sizes) = &self.sizes {
             self.fill_sizes(key, &mut listing, sizes)?;
+        }
+        if !self.known_sizes.is_empty() {
+            for entry in listing.values_mut().filter(|entry| entry.size.is_none() && !entry.kind.is_dir()) {
+                entry.size = self.known_sizes.get(&entry.key).copied();
+            }
         }
         Ok(listing)
     }
