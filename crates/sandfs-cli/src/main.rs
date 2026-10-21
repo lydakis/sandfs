@@ -171,8 +171,10 @@ fn run(cli: Cli) -> Result<()> {
                 return mount(&home, &source, &dir, foreground);
             }
             let name = default_name(name, &dir)?;
+            let repos = home.repos_lock(false)?;
             let record = home.resolve(&source)?;
             home.create(&name, &record)?;
+            drop(repos);
             mount_new(&home, &name, &dir, foreground)
         }
         Cmd::Fork { from, dir, name, foreground } => {
@@ -183,12 +185,14 @@ fn run(cli: Cli) -> Result<()> {
                 (None, None) => bail!("name the snapshot with --name, or give a directory to mount the fork on"),
             };
             sync(&home, &from)?;
+            let repos = home.repos_lock(false)?;
             let record = home.record(&from)?;
             let target = home.create(&name, &record)?;
             if let Err(err) = Saved::new(home.workspace_dir(&from)).copy_to(&target) {
                 remove_unused(&home, &name);
                 return Err(err);
             }
+            drop(repos);
             match dir {
                 Some(dir) => mount_new(&home, &name, &dir, foreground),
                 None => {
@@ -283,9 +287,11 @@ fn run(cli: Cli) -> Result<()> {
                 return mcp::serve(&home, &workspace);
             }
             // Named after the resolved folder or repository, so `.` and `repo@v1` work.
+            let repos = home.repos_lock(false)?;
             let record = home.resolve(&workspace)?;
             let name = default_name(name, &source_dir(&record.base))?;
             home.create(&name, &record)?;
+            drop(repos);
             mcp::serve(&home, &name)
         }
         Cmd::Daemon { serve } => serve_mounts(home, serve),
@@ -400,6 +406,7 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
 /// `sandfs clean`: shrink each local copy of a remote repository to what its
 /// workspaces need, and delete those none uses.
 fn clean(home: &Home) -> Result<()> {
+    let _creating = home.repos_lock(true)?;
     let repos = home.root().join("repos");
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     // The workspaces over each local copy, and the commits they are of.

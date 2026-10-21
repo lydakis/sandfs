@@ -267,6 +267,26 @@ impl Home {
             .is_ok_and(|holder| holder.ends_with(&format!("(process {pid})")))
     }
 
+    /// Wait for the right to change which workspaces use sandfs's local copies of
+    /// repositories: shared to create a workspace, exclusive for `sandfs clean`, so a
+    /// copy is never shrunk or deleted between resolving a source and recording the
+    /// workspace over it. Held until the file is dropped.
+    pub fn repos_lock(&self, exclusive: bool) -> Result<File> {
+        let repos = self.root.join("repos");
+        std::fs::create_dir_all(&repos).with_context(|| format!("creating {}", repos.display()))?;
+        // Hidden, so it is never taken for a local copy.
+        let path = repos.join(".lock");
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        if exclusive { file.lock() } else { file.lock_shared() }
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
+    }
+
     /// Take the right to save `name`, or fail saying who holds it. `holder` describes
     /// this process to whoever is refused next.
     pub fn lock(&self, name: &str, holder: &str) -> Result<Writer> {
