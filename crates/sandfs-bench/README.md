@@ -109,7 +109,7 @@ The Rust API is what the Python package and the MCP server call, so its column s
 | blobless clone | `git clone --filter=blob:none`: all history without file contents, then a checkout of every file | `git worktree add` |
 | full clone | `git clone`, checked out | `git worktree add` |
 
-Each copy then has a day of work done in it: the first `git status`, a commit of one changed file, `git status` again, and `grep -r` over the whole copy (stopped and reported after 10 minutes).
+Each copy then has a day of work done in it: the first `git status`, a commit of one changed file, `git status` again, the first `git status` in the second copy, `find` over the whole copy, `grep -r` over it twice (each stopped and reported after 10 minutes), and removing the second copy.
 
 `--remote-folder` picks the folder to search (default: the largest folder of at most 1,000 files) and `--remote-methods` the methods (default: all). Each method runs once, in its own process, so its peak memory is the largest command it ran plus, for sandfs, its serving processes; "on disk" is everything it left in the scratch directory. Every method must read the same bytes and find the same matches. Timings depend on the network, so compare methods within one run rather than across runs.
 

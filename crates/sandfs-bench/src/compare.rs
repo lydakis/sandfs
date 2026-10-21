@@ -99,7 +99,11 @@ pub fn rows(report: &Value) -> Result<BTreeMap<String, Row>> {
             ("status_nanos", "first git status"),
             ("commit_nanos", "commit"),
             ("status_again_nanos", "git status again"),
+            ("status_fork_nanos", "git status in the second copy"),
+            ("find_nanos", "find"),
             ("grep_nanos", "grep -r"),
+            ("grep_again_nanos", "grep -r again"),
+            ("remove_nanos", "remove the second copy"),
         ] {
             let samples = row[field].as_u64().into_iter().collect();
             let reference = (method != "blobless").then(|| format!("remote {label} | blobless"));

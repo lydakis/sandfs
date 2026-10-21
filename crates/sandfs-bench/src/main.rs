@@ -515,8 +515,13 @@ fn remote_json(result: &remote::RemoteResult) -> serde_json::Value {
         "commit_nanos": result.commit.as_nanos() as u64,
         "status_again_nanos": result.status_again.as_nanos() as u64,
         "fork_nanos": result.fork.as_nanos() as u64,
+        "status_fork_nanos": result.status_fork.as_nanos() as u64,
+        "find_nanos": result.find.map(|find| find.as_nanos() as u64),
         "grep_nanos": result.grep.map(|grep| grep.map(|grep| grep.as_nanos() as u64)),
         "grep_stopped": result.grep.is_some_and(|grep| grep.is_none()),
+        "grep_again_nanos": result.grep_again.map(|grep| grep.map(|grep| grep.as_nanos() as u64)),
+        "grep_again_stopped": result.grep_again.is_some_and(|grep| grep.is_none()),
+        "remove_nanos": result.remove.as_nanos() as u64,
         "matches": result.matches,
         "bytes": result.bytes,
         "peak_rss_bytes": result.peak_rss,
@@ -537,15 +542,24 @@ fn remote_from_json(method: remote::Method, row: &serde_json::Value) -> Result<r
         commit: nanos("commit_nanos")?,
         status_again: nanos("status_again_nanos")?,
         fork: nanos("fork_nanos")?,
-        grep: match (&row["grep_nanos"], row["grep_stopped"].as_bool()) {
-            (_, Some(true)) => Some(None),
-            (nanos, _) => nanos.as_u64().map(|nanos| Some(Duration::from_nanos(nanos))),
-        },
+        status_fork: nanos("status_fork_nanos")?,
+        find: row["find_nanos"].as_u64().map(Duration::from_nanos),
+        grep: search(row, "grep"),
+        grep_again: search(row, "grep_again"),
+        remove: nanos("remove_nanos")?,
         matches: usize::try_from(number("matches")?)?,
         bytes: number("bytes")?,
         peak_rss: number("peak_rss_bytes")?,
         disk: number("disk_bytes")?,
     })
+}
+
+/// A whole-copy search from its JSON: not run, stopped, or how long it took.
+fn search(row: &serde_json::Value, key: &str) -> Option<Option<Duration>> {
+    match (&row[format!("{key}_nanos")], row[format!("{key}_stopped")].as_bool()) {
+        (_, Some(true)) => Some(None),
+        (nanos, _) => nanos.as_u64().map(|nanos| Some(Duration::from_nanos(nanos))),
+    }
 }
 
 fn print_remote(plan: &remote::Plan, results: &[remote::RemoteResult]) {
@@ -581,24 +595,31 @@ fn print_remote(plan: &remote::Plan, results: &[remote::RemoteResult]) {
     }
     println!();
     println!(
-        "Then, in the same copy: the first `git status`, committing one changed file in {}/, `git status` again, and `grep -r` over the whole copy for a word it doesn't hold. Memory and disk above include these steps, except the disk the search fills.",
+        "Then: the first `git status`, committing one changed file in {}/, `git status` again, the first `git status` in the second copy, `find` over the whole copy, `grep -r` over it for a word it doesn't hold, twice, and removing the second copy. Memory and disk above include these steps, except the disk the whole-copy steps fill.",
         plan.subtree
     );
     println!();
-    println!("| method | first git status | commit | git status again | grep -r everything |");
-    println!("|---|---:|---:|---:|---:|");
+    println!(
+        "| method | first git status | commit | git status again | git status in the second copy | find everything | grep -r everything | grep -r again | remove the second copy |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    let searched = |search: Option<Option<Duration>>| match search {
+        None => "not held".to_owned(),
+        Some(None) => format!("over {}", fmt_duration(remote::GREP_LIMIT)),
+        Some(Some(took)) => fmt_duration(took),
+    };
     for result in results {
         println!(
-            "| {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             result.method.name(),
             fmt_duration(result.status),
             fmt_duration(result.commit),
             fmt_duration(result.status_again),
-            match result.grep {
-                None => "not held".to_owned(),
-                Some(None) => format!("over {}", fmt_duration(remote::GREP_LIMIT)),
-                Some(Some(grep)) => fmt_duration(grep),
-            },
+            fmt_duration(result.status_fork),
+            result.find.map_or_else(|| "not held".to_owned(), fmt_duration),
+            searched(result.grep),
+            searched(result.grep_again),
+            fmt_duration(result.remove),
         );
     }
 }

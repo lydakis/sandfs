@@ -11,8 +11,12 @@
 //! 5. changes one file in that folder and commits it with `git commit -a`,
 //! 6. runs `git status` again,
 //! 7. makes a second independent copy to work in (a fork),
-//! 8. searches the whole copy with `grep -r`, as a person looking for a name does
-//!    (not the sparse checkout, which holds only the files it was told about).
+//! 8. runs `git status` in the fork for the first time,
+//! 9. walks the whole copy with `find`, as a person or a tool looking for a file does,
+//! 10. searches the whole copy with `grep -r`, as a person looking for a name does,
+//!     then again, as the next search finds the files already read (8 and 9 skip
+//!     the sparse checkout, which holds only the files it was told about),
+//! 11. removes the fork.
 //!
 //! The git methods are a full clone, a shallow clone (depth 1), a blobless partial
 //! clone (all history but no file contents until checkout) and a sparse checkout of a
@@ -207,9 +211,17 @@ pub struct RemoteResult {
     pub commit: Duration,
     pub status_again: Duration,
     pub fork: Duration,
+    /// The first `git status` in the fork.
+    pub status_fork: Duration,
+    /// `find` over the whole copy; `None` for the sparse checkout.
+    pub find: Option<Duration>,
     /// `grep -r` over the whole copy, which the sparse checkout doesn't hold; `None`
     /// inside when it was stopped at [`GREP_LIMIT`].
     pub grep: Option<Option<Duration>>,
+    /// The same search again.
+    pub grep_again: Option<Option<Duration>>,
+    /// Removing the fork: unmounting and deleting it, or `git worktree remove`.
+    pub remove: Duration,
     /// Files in the searched folder holding the needle, and the bytes read in all;
     /// every method must agree.
     pub matches: usize,
@@ -345,33 +357,53 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     }
     let fork = start.elapsed();
     ensure!(fork_dir.join(&plan.samples[0]).is_file(), "the fork has no {}", plan.samples[0]);
+    let start = Instant::now();
+    let listed = git_output(Some(&fork_dir), &["status", "--porcelain"])?;
+    let status_fork = start.elapsed();
+    warn_unless_clean(method, "the fork's first git status", &listed);
     // What the day's work left on disk, before the whole-copy search brings in the rest.
     let disk = disk_usage(root)?;
 
-    let grep = (method != Method::Sparse)
-        .then(|| -> Result<Option<Duration>> {
+    let whole = method != Method::Sparse;
+    let find = whole
+        .then(|| -> Result<Duration> {
             let start = Instant::now();
-            let mut grep = Command::new("grep")
-                .args(["-r", "-l", "-F", "--exclude-dir=.git", "-e", RARE, "."])
+            let output = Command::new("find")
+                .args([".", "-path", "./.git", "-prune", "-o", "-type", "f", "-print"])
                 .current_dir(&dir)
-                .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()?;
-            loop {
-                if let Some(status) = grep.try_wait()? {
-                    // 0: something matched, 1: nothing did; 2: an error.
-                    ensure!(matches!(status.code(), Some(0 | 1)), "grep -r over the copy failed ({status})");
-                    return Ok(Some(start.elapsed()));
-                }
-                if start.elapsed() > GREP_LIMIT {
-                    grep.kill()?;
-                    grep.wait()?;
-                    return Ok(None);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+                .output()?;
+            let elapsed = start.elapsed();
+            ensure!(output.status.success(), "find over the copy failed ({})", output.status);
+            let found = output.stdout.iter().filter(|&&byte| byte == b'\n').count();
+            ensure!(found >= plan.files, "find saw {found} files of {}", plan.files);
+            Ok(elapsed)
         })
         .transpose()?;
+    let search_all = || -> Result<Option<Duration>> {
+        let start = Instant::now();
+        let mut grep = Command::new("grep")
+            .args(["-r", "-l", "-F", "--exclude-dir=.git", "-e", RARE, "."])
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        loop {
+            if let Some(status) = grep.try_wait()? {
+                // 0: something matched, 1: nothing did; 2: an error.
+                ensure!(matches!(status.code(), Some(0 | 1)), "grep -r over the copy failed ({status})");
+                return Ok(Some(start.elapsed()));
+            }
+            if start.elapsed() > GREP_LIMIT {
+                grep.kill()?;
+                grep.wait()?;
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let grep = whole.then(search_all).transpose()?;
+    let grep_again = whole.then(search_all).transpose()?;
 
     // The serving processes' peaks, with the git helpers they keep running, read
     // before they exit.
@@ -387,8 +419,22 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         for pid in pids {
             serving += tree_peak_rss(pid)?;
         }
+    }
+    let start = Instant::now();
+    match method {
+        Method::Sandfs => {
+            sandfs(&["unmount".as_ref(), fork_dir.as_os_str()])?;
+            sandfs(&["rm".as_ref(), "fork".as_ref()])?;
+        }
+        _ => {
+            let fork_str = fork_dir.to_str().context("scratch path is not UTF-8")?;
+            git(Some(&copy), &["worktree", "remove", "--force", fork_str])?;
+        }
+    }
+    let remove = start.elapsed();
+    ensure!(!fork_dir.join(&plan.samples[0]).exists(), "the fork still holds {}", plan.samples[0]);
+    if method == Method::Sandfs {
         sandfs(&["unmount".as_ref(), dir.as_os_str()])?;
-        sandfs(&["unmount".as_ref(), fork_dir.as_os_str()])?;
         mounts.mounted = false;
     }
     drop(mounts);
@@ -404,7 +450,11 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
         commit,
         status_again,
         fork,
+        status_fork,
+        find,
         grep,
+        grep_again,
+        remove,
         matches,
         bytes,
         peak_rss: commands + serving,
