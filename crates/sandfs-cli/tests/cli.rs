@@ -122,7 +122,7 @@ fn a_url_is_a_repository_without_git_prefix() {
         assert!(Command::new("git").current_dir(&repo).args(args).status().unwrap().success());
     }
     let url = format!("file://{}", repo.display());
-    let served = sandfs(home.path(), &["serve", "--mcp", &url], "");
+    let served = sandfs(home.path(), &["serve", "--mcp", &url, "--name", "notes"], "");
     assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
     assert_eq!(stdout(home.path(), &["list"]), format!("notes\t{url}\t-\n"));
 }
@@ -147,15 +147,17 @@ fn clean_drops_downloaded_files_and_unused_copies() {
     }
     let read =
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"/mnt/a.txt"}}}"#;
-    for url in &urls {
-        let served = sandfs(home.path(), &["serve", "--mcp", url], &format!("{read}\n"));
+    for (url, name) in urls.iter().zip(["notes", "photos"]) {
+        let served = sandfs(home.path(), &["serve", "--mcp", url, "--name", name], &format!("{read}\n"));
         assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
     }
     assert!(stdout(home.path(), &["rm", "photos"]).is_empty());
 
     let copy = |name: &str| {
         let copies = home.path().join("repos");
-        let found = walkdir(&copies).into_iter().find(|path| path.ends_with(format!("{name}.git")));
+        // Named after the URL's path, which on Windows is one name with the drive's.
+        let named = |path: &std::path::PathBuf| path.to_string_lossy().ends_with(&format!("{name}.git"));
+        let found = walkdir(&copies).into_iter().find(named);
         found.unwrap_or_else(|| copies.join("missing"))
     };
     let blobs = |copy: &std::path::Path| {
