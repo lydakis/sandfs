@@ -1238,6 +1238,20 @@ fn a_file_linked_into_a_read_only_path_is_read_only_by_every_name() {
     let mut ws = read_only_books();
     ws.write("/books/notes.md", "draft\n").unwrap();
     ws.hard_link("/books/notes.md", "/books/shared.md").unwrap();
+    ws.hard_link("/books/notes.md", "/books/drafts/notes.md").unwrap();
     ws.set_read_only("/books/shared.md", true).unwrap();
     assert_eq!(refused(ws.write("/books/notes.md", "changed\n")), "/books/shared.md");
+    // Nor can a folder holding another of its names go.
+    refused(ws.remove("/books/drafts", true));
+    refused(ws.rename("/books/drafts", "/books/old-drafts"));
+}
+
+#[test]
+fn a_read_only_path_that_does_not_exist_yet_cannot_be_covered_by_a_file() {
+    let mut ws = read_only_books();
+    ws.set_read_only("/books/future/plan.md", true).unwrap();
+    refused(ws.write("/books/future", "x"));
+    refused(ws.symlink("/books/future", "budget.csv"));
+    refused(ws.hard_link("/books/budget.csv", "/books/future"));
+    ws.mkdir("/books/future", false).unwrap();
 }

@@ -345,16 +345,20 @@ impl Workspace {
 
     /// Refuse a change at `path`, and with `tree` to everything below it too, when it
     /// touches a read-only path. A file with several names is changed through all of
-    /// them, so each is checked.
+    /// them, so each is checked, including those of files below `path` with `tree`.
+    /// Pass `tree` for any new entry that isn't a folder too, since a file there would
+    /// stand in the way of a read-only path below it.
     fn check_writable(&self, path: &VPath, tree: bool) -> Result<()> {
         if self.read_only.is_empty() {
             return Ok(());
         }
-        let names = match self.overlay.get(path) {
-            Some(Overlay::Linked { id }) => self.links.get(id).map(|linked| linked.names.iter().cloned().collect()),
-            _ => None,
-        };
-        for name in names.unwrap_or_else(|| vec![path.clone()]) {
+        let mut names = vec![path.clone()];
+        for linked in self.links.values() {
+            if linked.names.iter().any(|name| name == path || (tree && name.starts_with(path))) {
+                names.extend(linked.names.iter().cloned());
+            }
+        }
+        for name in names {
             if self.read_only.iter().any(|ro| name.starts_with(ro) || (tree && ro.starts_with(&name))) {
                 return Err(Error::ReadOnly(name.to_string()));
             }
@@ -484,7 +488,7 @@ impl Workspace {
         if target.is_empty() || target.contains('\0') {
             return Err(Error::InvalidPath(target.to_owned()));
         }
-        self.check_writable(&path, false)?;
+        self.check_writable(&path, true)?;
         match self.resolve(&path) {
             Err(Error::NotFound(_)) => {}
             Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
@@ -509,7 +513,7 @@ impl Workspace {
         let to = VPath::parse(to)?;
         // Writes through the new name change the file under the old one too.
         self.check_writable(&from, false)?;
-        self.check_writable(&to, false)?;
+        self.check_writable(&to, true)?;
         let (content, kind, version) = match self.resolve(&from)? {
             Resolved::Dir { .. } => return Err(Error::IsADirectory(from.to_string())),
             Resolved::File { content, kind, version } => (content, kind, version),
@@ -666,7 +670,7 @@ impl Workspace {
 
     fn write_content(&mut self, path: &str, content: Content, expected: Option<u64>) -> Result<u64> {
         let path = VPath::parse(path)?;
-        self.check_writable(&path, false)?;
+        self.check_writable(&path, true)?;
         let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
         let (kind, version, exists) = match self.resolve(&path) {
             Ok(Resolved::Dir { .. }) => return Err(Error::IsADirectory(path.to_string())),
