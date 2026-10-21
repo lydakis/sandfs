@@ -236,7 +236,7 @@ fn run(cli: Cli) -> Result<()> {
             // one; reading again from the newer save works. A copy interrupted that way
             // starts over, writing what it already wrote again.
             let mut attempts = 0;
-            let Listed { changes, held_back } = loop {
+            let Listed { changes, held_back, settings } = loop {
                 match changes_and_copy(&home, &name, since.as_deref(), &wanted, copy_to.as_deref()) {
                     Ok(found) => break found,
                     Err(err) if is_object_gone(&err) && attempts < 10 => attempts += 1,
@@ -257,6 +257,9 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!(
                     "sandfs: left out {held_back} changes in .git, whose settings name programs git runs; copy them by hand if you mean to"
                 );
+            }
+            for rel in &settings {
+                eprintln!("sandfs: {rel} changed; git runs the programs it names, so read it before running git here");
             }
             Ok(())
         }
@@ -352,11 +355,12 @@ fn sync(home: &Home, name: &str) -> Result<()> {
     saved.with_context(|| format!("saving {name} before reading it"))
 }
 
-/// Changes as their kinds and paths relative to the workspace, and how many of them
-/// a copy left out.
+/// Changes as their kinds and paths relative to the workspace, how many of them a
+/// copy left out, and the git settings among them that name programs git runs.
 struct Listed {
     changes: Vec<(ChangeKind, String)>,
     held_back: usize,
+    settings: Vec<String>,
 }
 
 /// The changes of workspace `name` (against `since`, or its source) under any of
@@ -385,6 +389,16 @@ fn changes_and_copy(
     // What git keeps in a git mount's `.git` would drown out the files themselves.
     let git_dir = matches!(opened.record.base, Base::Git { .. }).then(|| VPath::parse(&format!("{ROOT}/.git")));
     let git_dir = git_dir.transpose()?;
+    // But git runs the programs `.git/config` and `.git/hooks` name, so a change
+    // there is shown, apart from the files, for whoever reviews the workspace.
+    let settings = changes
+        .iter()
+        .filter(|change| {
+            let rest = git_dir.as_ref().and_then(|dir| change.path.strip_prefix(dir));
+            rest.is_some_and(|rest| matches!(rest.first(), Some(&"config" | &"hooks")))
+        })
+        .map(|change| change.path.strip_prefix(&root).unwrap_or_default().join("/"))
+        .collect();
     let listed: Vec<_> = changes
         .iter()
         .filter(|change| !git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)))
@@ -397,7 +411,7 @@ fn changes_and_copy(
             listed.iter().map(|(change, rel)| copy::Item { path: &change.path, rel, kind: change.kind }).collect();
         held_back = copy::copy_to(&opened.ws, &items, dir)?;
     }
-    Ok(Listed { changes: listed.into_iter().map(|(change, rel)| (change.kind, rel)).collect(), held_back })
+    Ok(Listed { changes: listed.into_iter().map(|(change, rel)| (change.kind, rel)).collect(), held_back, settings })
 }
 
 /// Mount a workspace that was just created, removing it again if the mount fails so
