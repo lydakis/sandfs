@@ -107,6 +107,9 @@ pub trait Source: Send + Sync + fmt::Debug {
     /// may still be fetching the parent. A lookup, a single read (even in pieces), reads
     /// with pauses between them and a walk that only lists never call it.
     ///
+    /// Files the source has at hand ([`Source::is_local`]) never count: reading them is
+    /// no sign that the rest are about to be read.
+    ///
     /// A prefetch must not change any answer the source gives, only how quickly it
     /// arrives, except that a listing may now include sizes. A source may ignore it, and
     /// the default does. It may be called from any thread, concurrently with reads,
@@ -114,6 +117,16 @@ pub trait Source: Send + Sync + fmt::Debug {
     /// read.
     fn prefetch(&self, key: &str, recursive: bool) {
         let _ = (key, recursive);
+    }
+
+    /// Whether the file with this key is at hand, so reading it needs no slow trip: a
+    /// source that keeps what it fetched (a partial clone's local files) says so for
+    /// those. Such reads never lead to a [`Source::prefetch`], so a program reading only
+    /// files already fetched, as `git status` reads every `.gitignore`, fetches nothing
+    /// more. The default, `false`, counts every read.
+    fn is_local(&self, key: &str) -> bool {
+        let _ = key;
+        false
     }
 }
 

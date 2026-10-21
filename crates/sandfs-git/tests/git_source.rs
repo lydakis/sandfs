@@ -303,3 +303,31 @@ fn a_background_fetch_stops_once_reads_do() {
     std::thread::sleep(std::time::Duration::from_secs(7));
     assert_eq!(missing(clone.path()), 1500);
 }
+
+#[test]
+fn files_at_hand_are_told_from_those_on_the_server() {
+    let (origin, clone) = clone_with_many_files();
+    let id = |path: &str| git(clone.path(), &["rev-parse", &format!("HEAD:{path}")]).trim().to_owned();
+    let (had, lacked, by_git) = (id("d0/f0"), id("d0/f1"), id("d0/f2"));
+    git(clone.path(), &["cat-file", "-p", &had]);
+    let source = GitSource::open(clone.path(), "HEAD").unwrap().with_sizes().unwrap();
+    // Before the walk for missing files, only what was fetched since is known.
+    let early = id("d1/f0");
+    git(clone.path(), &["cat-file", "-p", &early]);
+    source.fetched_elsewhere([early.as_str()]);
+    assert!(sandfs_core::Source::is_local(&source, &early), "known before the walk");
+    assert_eq!(source.missing_files().unwrap().len(), 2498);
+    assert!(sandfs_core::Source::is_local(&source, &early));
+    assert!(sandfs_core::Source::is_local(&source, &had));
+    assert!(!sandfs_core::Source::is_local(&source, &lacked));
+    sandfs_core::Source::read_file(&source, &lacked).unwrap();
+    assert!(sandfs_core::Source::is_local(&source, &lacked), "fetched by the read");
+    // Fetched by git itself, which the source hears about.
+    git(clone.path(), &["cat-file", "-p", &by_git]);
+    assert!(!sandfs_core::Source::is_local(&source, &by_git));
+    source.fetched_elsewhere([by_git.as_str()]);
+    assert!(sandfs_core::Source::is_local(&source, &by_git));
+    // A repository that isn't a partial clone has every file.
+    let full = GitSource::open(origin.path(), "HEAD").unwrap();
+    assert!(sandfs_core::Source::is_local(&full, &lacked));
+}

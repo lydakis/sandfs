@@ -236,6 +236,12 @@ impl GitSource {
         self.absent.get()?.as_ref()
     }
 
+    /// Note blobs fetched into the repository some other way, such as by git itself,
+    /// which this source may still take for missing.
+    pub fn fetched_elsewhere<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        self.now_local(ids);
+    }
+
     /// Note blobs that are local now, which the walk may have found missing. Once its
     /// answer is in, only blobs it lists need remembering.
     fn now_local<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
@@ -447,6 +453,25 @@ impl Source for GitSource {
     /// background, a request at a time (see [`GitSource::fetch_behind`]); a larger
     /// folder is left to fetch file by file. Outside a partial clone every blob is
     /// local and this does nothing.
+    /// Every blob outside a partial clone; in one, those fetched since this source
+    /// opened, and once the walk of the tree is done, those it didn't find missing.
+    /// Without sizes (which keep track of fetches), none.
+    fn is_local(&self, key: &str) -> bool {
+        if self.promisor.is_none() {
+            return true;
+        }
+        if self.sizes.is_none() || !self.trees_local {
+            return false;
+        }
+        // Known fetched even before the walk is in, as rule files the index build fetched.
+        if self.fetched.lock().is_ok_and(|fetched| fetched.contains(key)) {
+            return true;
+        }
+        let Some(Some(absent)) = self.absent.get() else { return false };
+        let Some(index) = absent.index_of(key) else { return true };
+        self.behind.lock().is_ok_and(|behind| behind.blobs.get(index) == Some(&BROUGHT))
+    }
+
     fn prefetch(&self, key: &str, recursive: bool) {
         let Some(remote) = &self.promisor else { return };
         if self.local.lock().is_ok_and(|local| local.contains(key)) {

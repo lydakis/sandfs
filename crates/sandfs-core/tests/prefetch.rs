@@ -27,6 +27,8 @@ struct Remote {
     delay: Duration,
     /// How long each read takes.
     read_delay: Duration,
+    /// Files at hand ([`Source::is_local`]).
+    local: HashSet<String>,
 }
 
 impl Remote {
@@ -66,6 +68,10 @@ impl Source for Remote {
         self.reads.fetch_add(1, Ordering::SeqCst);
         thread::sleep(self.read_delay);
         self.inner.read_file(key)
+    }
+
+    fn is_local(&self, key: &str) -> bool {
+        self.local.contains(key)
     }
 
     fn prefetch(&self, key: &str, recursive: bool) {
@@ -134,6 +140,38 @@ fn reading_by_path_one_file_after_another_prefetches_like_a_walk() {
         ws.read(&format!("/data/{path}")).unwrap();
     }
     assert_eq!(source.prefetches(), vec![(String::new(), true), ("s".to_owned(), false)]);
+}
+
+#[test]
+fn files_the_source_has_at_hand_never_prefetch() {
+    // As `git status` reads each folder's `.gitignore`, already fetched.
+    let local = ["s/x.txt", "s/y.txt", "a/one.txt", "a/b/two.txt", "e/five.txt"];
+    let source = Arc::new(Remote { local: local.map(str::to_owned).into(), ..Remote::new(TREE) });
+    let ws = mounted(&source);
+    for path in local {
+        ws.read(&format!("/data/{path}")).unwrap();
+    }
+    walk(&ws, "/data/a/b", true);
+    // Their sizes are read too, as one file's would be.
+    ws.list("/data/s").unwrap();
+    assert_eq!(ws.stat("/data/s/x.txt").unwrap().size, 8);
+    assert_eq!(ws.stat("/data/s/y.txt").unwrap().size, 8);
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
+    // Two it lacks, one after another, still prefetch their folder.
+    ws.read("/data/s/z.txt").unwrap();
+    ws.read("/data/s/w.txt").unwrap();
+    assert_eq!(source.prefetches(), vec![("s".to_owned(), false)]);
+
+    // One it lacks, a pause, then one at hand: the next one it lacks doesn't come right
+    // after the last, as reading through the folder would.
+    let source = Arc::new(Remote { local: ["s/x.txt".to_owned()].into(), ..Remote::new(TREE) });
+    let ws = mounted(&source);
+    ws.read("/data/s/z.txt").unwrap();
+    thread::sleep(Duration::from_millis(2100));
+    ws.read("/data/s/x.txt").unwrap();
+    ws.read_range("/data/s/x.txt", 0, 1).unwrap();
+    ws.read("/data/s/w.txt").unwrap();
+    assert_eq!(source.prefetches(), Vec::<(String, bool)>::new());
 }
 
 #[test]
