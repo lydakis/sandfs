@@ -1449,9 +1449,18 @@ impl Shared {
                     return;
                 }
                 // Let a burst of writes settle so it costs one save, not one per write.
-                std::thread::sleep(SETTLE);
+                // A stop cuts the wait short: the final save after it does the work, and
+                // an unmount waits for that save.
                 let changed = {
-                    let mut inner = shared.lock();
+                    let inner = shared.lock();
+                    let stopping = || shared.stop.load(Ordering::SeqCst);
+                    let (mut inner, _) = shared
+                        .wake
+                        .wait_timeout_while(inner, SETTLE, |_| !stopping())
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if stopping() {
+                        return;
+                    }
                     inner.commit_written(SETTLE);
                     inner.unsaved
                 };
