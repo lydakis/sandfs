@@ -144,6 +144,7 @@ fn main() {
 
 fn run(args: Args) -> Result<()> {
     if let Some(paths) = &args.compare {
+        anyhow::ensure!(args.threshold > 0.0 && args.threshold < 1.0, "--threshold must be between 0 and 1");
         // Each side may name several runs, comma-separated, whose samples are pooled.
         let load = |paths: &PathBuf| -> Result<_> {
             let mut runs = Vec::new();

@@ -38,12 +38,12 @@ jobs:
           mkdir -p /tmp/before && cp target/release/sandfs target/release/sandfs-bench /tmp/before/
       - name: Run the quick suite
         run: |
-          # The build table takes minutes and measures cargo more than sandfs; leave it out.
-          # A main without --skip runs with this commit's suite against main's sandfs.
+          # The build table takes minutes and measures cargo more than sandfs; leave it out
+          # where the suite can. Each side runs its own suite, which holds its own library.
           run() {
-            bench="$1/sandfs-bench"
-            "$bench" --help | grep -q -- --skip || bench=/tmp/after/sandfs-bench
-            "$bench" --scale quick --scratch /dev/shm --skip build --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
+            skip=""
+            "$1/sandfs-bench" --help | grep -q -- --skip && skip="--skip build"
+            "$1/sandfs-bench" --scale quick --scratch /dev/shm $skip --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
           }
           for round in 1 2; do
             if [ "${{ github.event_name }}" = pull_request ]; then run /tmp/before /tmp/before-$round.json; fi

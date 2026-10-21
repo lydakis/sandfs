@@ -10,12 +10,15 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 /// One measured number: its samples (nanoseconds, or bytes for memory and disk), and
-/// the key of the row in the same run it is compared with, if any.
+/// the key of the row in the same run it is compared with, if any. A row of something
+/// sandfs doesn't change (the host folder, overlayfs, a clone) is a baseline: it is
+/// only there to compare with, and a move in it is the machine's.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub samples: Vec<u64>,
     pub unit: Unit,
     pub reference: Option<String>,
+    pub baseline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,12 +27,21 @@ pub enum Unit {
     Bytes,
 }
 
+/// The columns of things sandfs doesn't change.
+const BASELINES: &[&str] = &["host", "eager", "overlayfs", "sparse", "shallow", "blobless", "full", "host folder"];
+
+/// What a whole-copy search stopped at its time limit counts as: the limit itself, so a
+/// search that stops where it used to finish shows as slower.
+const STOPPED: u64 = crate::remote::GREP_LIMIT.as_nanos() as u64;
+
 /// Every number in a `--json` report, by a key naming its table, row and column.
 pub fn rows(report: &Value) -> Result<BTreeMap<String, Row>> {
     let mut rows = BTreeMap::new();
     let mut add = |key: String, samples: Vec<u64>, unit: Unit, reference: Option<String>| {
         if !samples.is_empty() {
-            rows.insert(key, Row { samples, unit, reference });
+            let column = key.rsplit(" | ").next().unwrap_or_default();
+            let baseline = BASELINES.contains(&column);
+            rows.insert(key, Row { samples, unit, reference, baseline });
         }
     };
     let list = |value: &Value| value.as_array().cloned().unwrap_or_default();
@@ -86,6 +98,13 @@ pub fn rows(report: &Value) -> Result<BTreeMap<String, Row>> {
             let reference = floor.filter(|floor| floor != target).map(|floor| format!("workflow {label} | {floor}"));
             add(format!("workflow {label} | {target}"), samples, unit, reference);
         }
+        // Each attempt's steps, every attempt a sample.
+        for (step, label) in ["search", "edit", "check", "changes"].into_iter().enumerate() {
+            let samples =
+                runs.iter().flat_map(|run| list(&run["steps_nanos"])).filter_map(|steps| steps[step].as_u64());
+            let reference = floor.filter(|floor| floor != target).map(|floor| format!("workflow {label} | {floor}"));
+            add(format!("workflow {label} | {target}"), samples.collect(), Unit::Nanos, reference);
+        }
     }
     // A remote repository, against a blobless clone.
     for row in list(&report["remote"]) {
@@ -105,12 +124,16 @@ pub fn rows(report: &Value) -> Result<BTreeMap<String, Row>> {
             ("grep_again_nanos", "grep -r again"),
             ("remove_nanos", "remove the second copy"),
         ] {
-            let samples = row[field].as_u64().into_iter().collect();
+            let stopped = field.strip_suffix("_nanos").is_some_and(|name| row[format!("{name}_stopped")] == true);
+            let samples = if stopped { vec![STOPPED] } else { row[field].as_u64().into_iter().collect() };
             let reference = (method != "blobless").then(|| format!("remote {label} | blobless"));
             add(format!("remote {label} | {method}"), samples, Unit::Nanos, reference);
         }
         let samples = row["peak_rss_bytes"].as_u64().into_iter().collect();
         add(format!("remote peak memory | {method}"), samples, Unit::Bytes, None);
+        let samples = row["disk_bytes"].as_u64().into_iter().collect();
+        let reference = (method != "blobless").then(|| "remote disk | blobless".to_owned());
+        add(format!("remote disk | {method}"), samples, Unit::Bytes, reference);
     }
     // A build or command, against the host folder.
     if let Some(build) = report["build"].as_object() {
@@ -144,8 +167,8 @@ pub enum Verdict {
     Same,
 }
 
-/// Slower or faster only when the medians differ by more than `threshold` (0.25 is
-/// 25%) and, for rows with several samples, every sample of one run is beyond every
+/// Slower or faster only when the median moved by more than `threshold` of the first
+/// run's (0.25 is 25%, so slower above 1.25 times and faster below 0.75 times) and, for rows with several samples, every sample of one run is beyond every
 /// sample of the other: shared machines swing from run to run, and a change that
 /// overlaps the old spread is more likely noise than a regression.
 pub fn verdict(base: &Row, head: &Row, threshold: f64) -> Verdict {
@@ -155,7 +178,7 @@ pub fn verdict(base: &Row, head: &Row, threshold: f64) -> Verdict {
     let several = base.samples.len() > 1 && head.samples.len() > 1;
     if ratio > 1.0 + threshold && (!several || head_min > base_max) {
         Verdict::Slower
-    } else if ratio < 1.0 / (1.0 + threshold) && (!several || head_max < base_min) {
+    } else if ratio < 1.0 - threshold && (!several || head_max < base_min) {
         Verdict::Faster
     } else {
         Verdict::Same
@@ -204,17 +227,14 @@ pub fn pool(runs: Vec<BTreeMap<String, Row>>) -> BTreeMap<String, Row> {
 }
 
 /// Print the comparison as a Markdown table, the moved rows first, and return how many
-/// rows got slower. The references themselves (the host folder, overlayfs, a clone)
-/// are left out: they don't change with sandfs, so a move there is the machine's.
+/// rows got slower. Baselines are left out.
 pub fn print(base: &BTreeMap<String, Row>, head: &BTreeMap<String, Row>, threshold: f64, all: bool) -> usize {
-    let references: std::collections::BTreeSet<&String> =
-        head.values().filter_map(|row| row.reference.as_ref()).collect();
     let mut lines = Vec::new();
     let mut slower = 0;
     let mut compared = 0;
     for (key, now) in head {
         let Some(before) = base.get(key) else { continue };
-        if references.contains(key) {
+        if now.baseline {
             continue;
         }
         compared += 1;
@@ -271,7 +291,7 @@ mod tests {
     use super::*;
 
     fn row(samples: &[u64]) -> Row {
-        Row { samples: samples.to_vec(), unit: Unit::Nanos, reference: None }
+        Row { samples: samples.to_vec(), unit: Unit::Nanos, reference: None, baseline: false }
     }
 
     #[test]
@@ -284,6 +304,9 @@ mod tests {
         assert_eq!(verdict(&row(&[100, 101, 102]), &row(&[110, 111, 112]), 0.25), Verdict::Same);
         // A single sample has no spread, so the threshold alone decides.
         assert_eq!(verdict(&row(&[100]), &row(&[130]), 0.25), Verdict::Slower);
+        // The threshold is a share of the first run's median both ways.
+        assert_eq!(verdict(&row(&[100]), &row(&[79]), 0.25), Verdict::Same);
+        assert_eq!(verdict(&row(&[100]), &row(&[74]), 0.25), Verdict::Faster);
     }
 
     #[test]
@@ -302,10 +325,16 @@ mod tests {
             "everyday": [{"source": "a folder", "rows": [{"operation": "ls", "what": "", "nanos": {"host": [1], "sandfs": [2]}}]}],
             "lazy": [{"workload": "lazy/read-1%", "what": "", "lazy": [{"nanos": 5, "calls": 1}], "eager": [{"nanos": 50, "calls": 9}]}],
             "workflow": [
+                {"target": "host", "wall_nanos": 30, "forks_nanos": 3, "peak_rss_bytes": 8, "disk_bytes": 9},
                 {"target": "overlayfs", "wall_nanos": 10, "forks_nanos": 1, "peak_rss_bytes": 7, "disk_bytes": 1},
-                {"target": "sandfs FUSE", "wall_nanos": 20, "forks_nanos": 2, "peak_rss_bytes": 70, "disk_bytes": 2}
+                {"target": "sandfs FUSE", "wall_nanos": 20, "forks_nanos": 2, "peak_rss_bytes": 70, "disk_bytes": 2,
+                 "steps_nanos": [[1, 2, 3, 4], [5, 6, 7, 8]]}
             ],
-            "remote": [{"method": "sandfs", "ready_nanos": 1, "grep_nanos": null, "peak_rss_bytes": 9}],
+            "remote": [
+                {"method": "sandfs", "ready_nanos": 1, "grep_nanos": null, "grep_again_nanos": null,
+                 "grep_again_stopped": true, "peak_rss_bytes": 9, "disk_bytes": 3},
+                {"method": "blobless", "ready_nanos": 2, "disk_bytes": 4}
+            ],
             "build": {"job": "", "parallel": 1, "columns": [
                 {"column": "host folder", "cold_nanos": 10, "rebuild_nanos": [1, 2], "server_rss": null},
                 {"column": "sandfs mount", "cold_nanos": 12, "rebuild_nanos": [3, 4], "server_rss": 5}
@@ -325,6 +354,16 @@ mod tests {
         assert_eq!(rows["workflow peak memory | sandfs FUSE"].unit, Unit::Bytes);
         assert_eq!(reference("remote ready | sandfs").as_deref(), Some("remote ready | blobless"));
         assert!(!rows.contains_key("remote grep -r | sandfs"), "a step that didn't run has no row");
+        assert_eq!(rows["remote grep -r again | sandfs"].samples, [STOPPED], "a stopped one counts as the limit");
+        assert_eq!(reference("remote disk | sandfs").as_deref(), Some("remote disk | blobless"));
+        assert_eq!(rows["workflow edit | sandfs FUSE"].samples, [2, 6], "each attempt's step is a sample");
+        assert_eq!(reference("workflow edit | sandfs FUSE").as_deref(), Some("workflow edit | overlayfs"));
+        // What sandfs doesn't change is only there to compare with.
+        for key in ["workflow wall | host", "workflow wall | overlayfs", "small/walk | host", "remote ready | blobless"]
+        {
+            assert!(rows[key].baseline, "{key}");
+        }
+        assert!(!rows["workflow wall | sandfs FUSE"].baseline && !rows["remote ready | sandfs"].baseline);
         assert_eq!(reference("build run again | sandfs mount").as_deref(), Some("build run again | host folder"));
         assert_eq!(rows["build server memory | sandfs mount"].samples, [5]);
         assert!(!rows.contains_key("build server memory | host folder"));
