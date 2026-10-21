@@ -10,6 +10,7 @@ use crate::nfsserve::nfs::*;
 pub struct DirEntrySimple {
     pub fileid: fileid3,
     pub name: filename3,
+    pub cookie: cookie3,
 }
 #[derive(Default, Debug)]
 pub struct ReadDirSimpleResult {
@@ -21,6 +22,9 @@ pub struct ReadDirSimpleResult {
 pub struct DirEntry {
     pub fileid: fileid3,
     pub name: filename3,
+    /// Where a listing resumes after this entry: any value but 0 that no other entry
+    /// of the folder has. Two names of one file (hard links) in a folder need two.
+    pub cookie: cookie3,
     /// Left out of READDIRPLUS when `None`, so the client asks for them when it needs them.
     pub attr: Option<fattr3>,
 }
@@ -32,8 +36,11 @@ pub struct ReadDirResult {
 
 impl ReadDirSimpleResult {
     fn from_readdir_result(result: &ReadDirResult) -> ReadDirSimpleResult {
-        let entries: Vec<DirEntrySimple> =
-            result.entries.iter().map(|e| DirEntrySimple { fileid: e.fileid, name: e.name.clone() }).collect();
+        let entries: Vec<DirEntrySimple> = result
+            .entries
+            .iter()
+            .map(|e| DirEntrySimple { fileid: e.fileid, name: e.name.clone(), cookie: e.cookie })
+            .collect();
         ReadDirSimpleResult { entries, end: result.end }
     }
 }
@@ -146,7 +153,8 @@ pub trait NFSFileSystem: Sync {
 
     /// Returns the contents of a directory with pagination.
     /// Directory listing should be deterministic.
-    /// Up to max_entries may be returned, and start_after is used
+    /// Up to max_entries may be returned, and start_after, the cookie of an entry
+    /// listed before (see [`DirEntry::cookie`]), is used
     /// to determine where to start returning entries from.
     ///
     /// For instance if the directory has entry with ids [1,6,2,11,8,9]
@@ -161,8 +169,13 @@ pub trait NFSFileSystem: Sync {
 
     /// Simple version of readdir.
     /// Only need to return filename and id
-    async fn readdir_simple(&self, dirid: fileid3, count: usize) -> Result<ReadDirSimpleResult, nfsstat3> {
-        Ok(ReadDirSimpleResult::from_readdir_result(&self.readdir(dirid, 0, count).await?))
+    async fn readdir_simple(
+        &self,
+        dirid: fileid3,
+        start_after: cookie3,
+        count: usize,
+    ) -> Result<ReadDirSimpleResult, nfsstat3> {
+        Ok(ReadDirSimpleResult::from_readdir_result(&self.readdir(dirid, start_after, count).await?))
     }
 
     /// Makes a symlink with the following attributes.
@@ -178,6 +191,12 @@ pub trait NFSFileSystem: Sync {
 
     /// Reads a symlink
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3>;
+
+    /// Gives the file `id` another name, `linkname` in `dirid`: a hard link. Returns
+    /// the file's attributes after.
+    async fn link(&self, _id: fileid3, _dirid: fileid3, _linkname: &filename3) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    }
 
     /// Get static file system Information
     async fn fsinfo(&self, root_fileid: fileid3) -> Result<fsinfo3, nfsstat3> {

@@ -7,8 +7,10 @@
 //! answered as already stable), so it saves nothing by itself; instead the server
 //! answers save requests on a second localhost port, which `sandfs changes`, `fork`
 //! and `unmount` use to have everything written so far saved first. And macOS's NFS
-//! client keeps extended attributes in `._name` files, which are kept out of saves and
-//! out of listings, so git, cargo and the like never see them.
+//! client keeps extended attributes in `._name` files. The server refuses to create
+//! them, so files in the mount have no extended attributes, and any that come by
+//! another way (a rename) are kept out of saves and out of listings, so git, cargo and
+//! the like never see them.
 //!
 //! The NFS server itself is [`crate::nfsserve`], a copy of the nfsserve crate.
 //!
@@ -33,8 +35,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(any(nfs, test))]
 use crate::nfsserve::context::{CallFilter, Verdict};
 use crate::nfsserve::nfs::{
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3, nfspath3,
-    nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
+    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3, ftype3, nfs_fh3,
+    nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, set_mode3, set_mtime, set_size3, specdata3,
 };
 #[cfg(any(nfs, test))]
 use crate::nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -57,18 +59,26 @@ const MOUNT_CHECK: Duration = Duration::from_millis(500);
 /// client resuming after one of those resumes by the entry's current name.
 const LISTED_NAMES: usize = 16384;
 
-/// Names handed out in listings, forgetting the oldest past [`LISTED_NAMES`].
+/// Set in the cookies of names of a file with another name in the same folder (a hard
+/// link), which can't be told apart by their file id; never set in a file id.
+const NAME_COOKIE: u64 = 1 << 63;
+
+/// Names handed out in listings, by folder and cookie, forgetting the oldest past
+/// [`LISTED_NAMES`]. A cookie is the entry's file id, or for a file with two names in
+/// the folder a number of its own ([`NAME_COOKIE`]).
 #[derive(Default)]
 struct Listed {
-    names: HashMap<(fileid3, fileid3), String>,
-    order: VecDeque<(fileid3, fileid3)>,
+    names: HashMap<(fileid3, u64), String>,
+    order: VecDeque<(fileid3, u64)>,
+    /// The last number handed out as a [`NAME_COOKIE`].
+    last: u64,
 }
 
 impl Listed {
     /// Note that `key` was listed as `name`. An entry listed again under a new name
     /// keeps whichever name sorts first, since an older page may still be resumed from
     /// it: resuming from the earlier name can list some entries twice, but never skips one.
-    fn insert(&mut self, key: (fileid3, fileid3), name: String) {
+    fn insert(&mut self, key: (fileid3, u64), name: String) {
         match self.names.entry(key) {
             Entry::Occupied(mut listed) => {
                 if name < *listed.get() {
@@ -190,6 +200,13 @@ impl SandNfs {
         exclusive: bool,
         empty: bool,
     ) -> Result<FileAttr, nfsstat3> {
+        // macOS tags every new file with extended attributes (`com.apple.provenance`),
+        // which over NFS each cost a `._name` file: a create, writes and setattrs for
+        // every file a build writes, which made rebuilds half again as slow. Refused as
+        // unsupported, macOS goes without; programs copying files skip the attributes.
+        if self.shared.lock().is_added_appledouble(dirid, &String::from_utf8_lossy(name), FileType::RegularFile) {
+            return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        }
         self.change(|inner| inner.create(dirid, os_name(name), mode, exclusive, empty))
     }
 }
@@ -323,7 +340,8 @@ impl NFSFileSystem for SandNfs {
         })
     }
 
-    /// Entries in name order, after the one with id `start_after` (0 for the first page).
+    /// Entries in name order, after the one with cookie `start_after` (0 for the first
+    /// page).
     async fn readdir(
         &self,
         dirid: fileid3,
@@ -343,6 +361,9 @@ impl NFSFileSystem for SandNfs {
             0
         } else if let Some(after) = listed_as {
             listing.partition_point(|(_, _, name)| *name <= after)
+        } else if start_after & NAME_COOKIE != 0 {
+            // A name of a linked file, forgotten: there is no telling where it was.
+            return Err(nfsstat3::NFS3ERR_BAD_COOKIE);
         } else if let Some(position) = listing.iter().position(|(ino, ..)| *ino == start_after) {
             position + 1
         } else {
@@ -351,6 +372,10 @@ impl NFSFileSystem for SandNfs {
             let after = inner.last_name_of(start_after).ok_or(nfsstat3::NFS3ERR_BAD_COOKIE)?;
             listing.partition_point(|(_, _, name)| *name <= after)
         };
+        // Files with more than one name here, whose names each need a cookie of their own.
+        let mut seen = std::collections::HashSet::new();
+        let linked: std::collections::HashSet<u64> =
+            listing.iter().filter(|(ino, ..)| !seen.insert(*ino)).map(|(ino, ..)| *ino).collect();
         let (mut entries, mut names) = (Vec::new(), Vec::new());
         let mut end = true;
         for (ino, _, name) in listing.iter().skip(start) {
@@ -369,14 +394,18 @@ impl NFSFileSystem for SandNfs {
                 Some(attributes(&attr))
             };
             inner.hold(*ino);
-            entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), attr });
+            entries.push(DirEntry { fileid: *ino, name: name.as_bytes().into(), cookie: *ino, attr });
             names.push(name.clone());
         }
         // The server may send only some of these and end the page early, so the client
         // can resume after any of them.
         let mut listed = self.listed.lock().unwrap();
-        for (entry, name) in entries.iter().zip(names) {
-            listed.insert((dirid, entry.fileid), name);
+        for (entry, name) in entries.iter_mut().zip(names) {
+            if linked.contains(&entry.fileid) {
+                listed.last += 1;
+                entry.cookie = NAME_COOKIE | listed.last;
+            }
+            listed.insert((dirid, entry.cookie), name);
         }
         Ok(ReadDirResult { entries, end })
     }
@@ -398,7 +427,7 @@ impl NFSFileSystem for SandNfs {
             dtpref: 1 << 20,
             maxfilesize: MAX_FILE_SIZE as u64,
             time_delta: nfstime3 { seconds: 0, nseconds: 1_000_000 },
-            properties: FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME,
+            properties: FSF_LINK | FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME,
         })
     }
 
@@ -416,6 +445,11 @@ impl NFSFileSystem for SandNfs {
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
         let target = self.shared.lock().readlink(id).nfs()?;
         Ok(target.into_bytes().into())
+    }
+
+    async fn link(&self, id: fileid3, dirid: fileid3, linkname: &filename3) -> Result<fattr3, nfsstat3> {
+        let attr = self.change(|inner| inner.link(id, dirid, os_name(linkname)))?;
+        Ok(attributes(&attr))
     }
 }
 
@@ -766,6 +800,52 @@ mod tests {
     }
 
     #[test]
+    fn hard_links_are_one_file_under_two_names() {
+        let (fs, _dir) = served();
+        block(async {
+            let (id, _) = fs.create(ROOT_INO, &name("a.o"), sattr3::default()).await.unwrap();
+            fs.write(id, 0, b"object").await.unwrap();
+            let attr = fs.link(id, ROOT_INO, &name("b.o")).await.unwrap();
+            assert_eq!(attr.nlink, 2);
+            let other = fs.lookup(ROOT_INO, &name("b.o")).await.unwrap();
+            assert_eq!(other, id, "one inode");
+            fs.write(other, 0, b"OB").await.unwrap();
+            assert_eq!(fs.read(id, 0, 100).await.unwrap().0, b"OBject");
+            fs.remove(ROOT_INO, &name("a.o")).await.unwrap();
+            assert_eq!(fs.read(other, 0, 100).await.unwrap().0, b"OBject", "the other name stays");
+            assert_eq!(fs.getattr(other).await.unwrap().nlink, 1);
+            assert!(matches!(fs.link(id, ROOT_INO, &name("b.o")).await, Err(nfsstat3::NFS3ERR_EXIST)));
+        });
+        let info = block(fs.fsinfo(ROOT_INO)).unwrap();
+        assert_ne!(info.properties & crate::nfsserve::nfs::FSF_LINK, 0, "hard links are supported");
+    }
+
+    #[test]
+    fn a_listing_in_pages_goes_past_every_name_of_a_linked_file() {
+        let (fs, _dir) = served();
+        block(async {
+            let (id, _) = fs.create(ROOT_INO, &name("a"), sattr3::default()).await.unwrap();
+            fs.create(ROOT_INO, &name("b"), sattr3::default()).await.unwrap();
+            fs.link(id, ROOT_INO, &name("c")).await.unwrap();
+            fs.create(ROOT_INO, &name("d"), sattr3::default()).await.unwrap();
+            fs.link(id, ROOT_INO, &name("e")).await.unwrap();
+            for page in [1, 2, 3] {
+                let (mut names, mut cookie) = (Vec::new(), 0);
+                for _ in 0..20 {
+                    let result = fs.readdir(ROOT_INO, cookie, page).await.unwrap();
+                    names.extend(result.entries.iter().map(|e| String::from_utf8_lossy(&e.name).into_owned()));
+                    match result.entries.last() {
+                        Some(last) if !result.end => cookie = last.cookie,
+                        _ => break,
+                    }
+                }
+                let listed: Vec<&str> = names.iter().map(String::as_str).filter(|n| n.len() == 1).collect();
+                assert_eq!(listed, ["a", "b", "c", "d", "e"], "pages of {page}");
+            }
+        });
+    }
+
+    #[test]
     fn finder_files_are_served_but_never_saved() {
         let (fs, dir) = served();
         let saved = || -> Vec<String> {
@@ -773,11 +853,14 @@ mod tests {
             Saved::new(dir.path()).paths().unwrap().into_iter().map(|(rel, _)| rel).collect()
         };
         block(async {
-            let (id, _) = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await.unwrap();
+            // macOS's own `._name` files are refused; one renamed into place is served.
+            let refused = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await;
+            assert!(matches!(refused, Err(nfsstat3::NFS3ERR_NOTSUPP)));
+            let (id, _) = fs.create(ROOT_INO, &name("notes.tmp"), sattr3::default()).await.unwrap();
             fs.write(id, 0, b"xattrs").await.unwrap();
+            fs.rename(ROOT_INO, &name("notes.tmp"), ROOT_INO, &name("._notes.txt")).await.unwrap();
             fs.create(ROOT_INO, &name(".DS_Store"), sattr3::default()).await.unwrap();
             let (sub, _) = fs.mkdir(ROOT_INO, &name("sub")).await.unwrap();
-            fs.create(sub, &name("._sub"), sattr3::default()).await.unwrap();
             fs.create(sub, &name("kept.txt"), sattr3::default()).await.unwrap();
             // A folder with such a name is someone's: macOS only makes files.
             fs.mkdir(ROOT_INO, &name("._cache")).await.unwrap();
@@ -787,7 +870,8 @@ mod tests {
         // A later save, which only looks at what changed since, leaves them out too.
         block(async {
             let sub = fs.lookup(ROOT_INO, &name("sub")).await.unwrap();
-            fs.create(sub, &name("._kept.txt"), sattr3::default()).await.unwrap();
+            fs.create(sub, &name("kept.tmp"), sattr3::default()).await.unwrap();
+            fs.rename(sub, &name("kept.tmp"), sub, &name("._kept.txt")).await.unwrap();
             fs.create(sub, &name("more.txt"), sattr3::default()).await.unwrap();
         });
         assert_eq!(saved(), ["._cache", "sub", "sub/kept.txt", "sub/more.txt"]);
@@ -842,10 +926,12 @@ mod tests {
             let names = |result: ReadDirResult| -> Vec<String> {
                 result.entries.iter().map(|e| String::from_utf8(e.name.0.clone()).unwrap()).collect()
             };
-            let (id, _) = fs.create(ROOT_INO, &name("._notes.txt"), sattr3::default()).await.unwrap();
+            let (id, _) = fs.create(ROOT_INO, &name("notes.tmp"), sattr3::default()).await.unwrap();
             fs.write(id, 0, b"xattrs").await.unwrap();
+            fs.rename(ROOT_INO, &name("notes.tmp"), ROOT_INO, &name("._notes.txt")).await.unwrap();
             let (sub, _) = fs.mkdir(ROOT_INO, &name("sub")).await.unwrap();
-            fs.create(sub, &name("._kept.txt"), sattr3::default()).await.unwrap();
+            fs.create(sub, &name("kept.tmp"), sattr3::default()).await.unwrap();
+            fs.rename(sub, &name("kept.tmp"), sub, &name("._kept.txt")).await.unwrap();
             fs.mkdir(ROOT_INO, &name("._cache")).await.unwrap();
             // Only the ones macOS made are left out, and they still open by name.
             assert_eq!(names(fs.readdir(ROOT_INO, 0, 100).await.unwrap()), ["._cache", "._data", "notes.txt", "sub"]);
