@@ -32,9 +32,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
-use nix::sys::resource::{UsageWho, getrusage};
 
-use crate::workflow::{disk_usage, tree_peak_rss};
+use crate::sys::{children_peak_rss, disk_usage, force_unmount, tree_peak_rss};
 
 /// Files read in step 2, besides the first one.
 pub const SAMPLES: usize = 20;
@@ -439,7 +438,7 @@ pub fn run(plan: &Plan, method: Method, root: &Path, sandfs_bin: &Path) -> Resul
     }
     drop(mounts);
     // Every command this process ran has exited; the largest one's peak counts.
-    let commands = u64::try_from(getrusage(UsageWho::RUSAGE_CHILDREN)?.max_rss())? * 1024;
+    let commands = children_peak_rss()?;
     Ok(RemoteResult {
         method,
         ready,
@@ -525,7 +524,7 @@ impl Drop for Mounts {
                 .status()
                 .is_ok_and(|status| status.success());
             if !unmounted {
-                let _ = Command::new("fusermount3").arg("-uz").arg(&mountpoint).stderr(Stdio::null()).status();
+                force_unmount(&mountpoint);
             }
         }
     }

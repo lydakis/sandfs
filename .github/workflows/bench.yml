@@ -78,3 +78,24 @@ jobs:
           name: bench-${{ github.sha }}
           path: /tmp/after-*.json
           retention-days: 90
+
+  # The same suite on a Mac, where the mount is served over NFS. Once per run, kept for
+  # a history of the Mac numbers; no comparison yet.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Build
+        run: cargo build --release -p sandfs-cli -p sandfs-bench
+      - name: Run the quick suite
+        run: |
+          ./target/release/sandfs-bench --scale quick --scratch /tmp --skip build --targets host,sandfs,fuse \
+            --sandfs-bin target/release/sandfs --json /tmp/macos.json > /tmp/macos.txt
+          { echo "## Benchmarks on macOS, ${{ github.sha }}"; echo; cat /tmp/macos.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-macos-${{ github.sha }}
+          path: /tmp/macos.json
+          retention-days: 90
