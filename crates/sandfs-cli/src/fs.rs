@@ -444,6 +444,15 @@ impl Inner {
     // Inodes and attributes
     // ------------------------------------------------------------------
 
+    /// Refuse to start changing `ino` where the workspace is read-only. Writes collect
+    /// in a buffer and reach the workspace only when saved, too late to refuse them.
+    fn check_writable(&self, ino: u64) -> FsResult<()> {
+        match self.nodes.get(&ino) {
+            Some(node) if node.linked && self.ws.is_read_only(node.path.as_str()) => Err(Errno::EROFS),
+            _ => Ok(()),
+        }
+    }
+
     fn path(&self, ino: u64) -> FsResult<VPath> {
         match self.nodes.get(&ino) {
             Some(node) if node.linked => Ok(node.path.clone()),
@@ -529,7 +538,10 @@ impl Inner {
             None if meta.kind.is_dir() => 0,
             None => meta.size,
         };
-        let (kind, perm) = file_type(meta.kind);
+        let (kind, mut perm) = file_type(meta.kind);
+        if kind != FileType::Symlink && self.ws.is_read_only(path) {
+            perm &= !0o222;
+        }
         // A file nobody wrote keeps its source's time, the same in every mount and fork,
         // so build and test caches that check times find it unchanged.
         let mtime = self.times.get(path).copied().or(meta.modified).unwrap_or(self.base_time);
@@ -691,6 +703,9 @@ impl Inner {
         size: Option<u64>,
         mtime: Option<TimeOrNow>,
     ) -> FsResult<FileAttr> {
+        if size.is_some() || mtime.is_some() {
+            self.check_writable(ino)?;
+        }
         if let Some(size) = size {
             if size > MAX_FILE_SIZE as u64 {
                 return Err(Errno::EFBIG);
@@ -940,6 +955,9 @@ impl Inner {
             Ok(meta) if truncate && meta.kind == Kind::Symlink => return Err(Errno::ELOOP),
             Ok(_) => {
                 if truncate {
+                    if self.ws.is_read_only(path.as_str()) {
+                        return Err(Errno::EROFS);
+                    }
                     let ino = self.ino_for(&path);
                     let empty = self.empty_buffer()?;
                     self.buffers.insert(ino, empty);
@@ -1030,6 +1048,7 @@ impl Inner {
     /// The write buffer for `ino`, filled from the workspace on first use.
     fn buffer(&mut self, ino: u64) -> FsResult<&mut Buffer> {
         if !self.buffers.contains_key(&ino) {
+            self.check_writable(ino)?;
             let (ws, path) = self.contents(ino)?;
             let size = ws.stat(path.as_str()).fs()?.size;
             let body = match &self.drafts {
@@ -1079,6 +1098,7 @@ impl Inner {
     /// chunks. Any other range is written a piece at a time, as a write would be.
     #[cfg_attr(not(fuse), allow(dead_code))]
     pub fn copy_range(&mut self, src: u64, offset_in: u64, dst: u64, offset_out: u64, len: u64) -> FsResult<u32> {
+        self.check_writable(dst)?;
         let size = match self.buffers.get(&src) {
             Some(buffer) => buffer.size,
             None => {

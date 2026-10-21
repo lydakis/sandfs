@@ -14,6 +14,7 @@ mod copy;
 #[cfg(mount)]
 mod fs;
 mod git;
+mod github;
 mod host;
 mod mcp;
 #[cfg(any(nfs, all(test, fuse)))]
@@ -69,6 +70,11 @@ enum Cmd {
         /// Name for the new workspace (default: DIR's last component).
         #[arg(long)]
         name: Option<String>,
+        /// A file or folder of the source, relative to it, that programs may read but
+        /// not change, even in the workspace: changes there fail as on a read-only file
+        /// system. Repeat for several; forks keep them.
+        #[arg(long, value_name = "PATH")]
+        read_only: Vec<String>,
         /// Serve in the foreground instead of in the background.
         #[arg(long, short)]
         foreground: bool,
@@ -138,6 +144,9 @@ enum Cmd {
         /// Name for a new workspace (default: the source's last component).
         #[arg(long)]
         name: Option<String>,
+        /// For a new workspace, a path the agent may read but not change, as for `mount`.
+        #[arg(long, value_name = "PATH")]
+        read_only: Vec<String>,
     },
     /// Start the process that serves every mount (run by `mount` and `fork`), or with
     /// `--serve`, be that process.
@@ -176,14 +185,16 @@ fn print_out(text: &str) -> Result<()> {
 fn run(cli: Cli) -> Result<()> {
     let home = Home::locate()?;
     match cli.command {
-        Cmd::Mount { source, dir, name, foreground } => {
+        Cmd::Mount { source, dir, name, read_only, foreground } => {
             // A bare word naming a workspace remounts it; anything else is a source.
             if home.exists(&source) && name.is_none() {
+                only_when_created(&read_only, &source)?;
                 return mount(&home, &source, &dir, foreground);
             }
             let name = default_name(name, &dir)?;
             let repos = home.repos_lock(false)?;
-            let record = home.resolve(&source)?;
+            let mut record = home.resolve(&source)?;
+            record.read_only = relative_paths(&read_only)?;
             home.create(&name, &record)?;
             drop(repos);
             mount_new(&home, &name, &dir, foreground)
@@ -286,18 +297,20 @@ fn run(cli: Cli) -> Result<()> {
             home.remove(&name)
         }
         Cmd::Clean => clean(&home),
-        Cmd::Serve { mcp, workspace, name } => {
+        Cmd::Serve { mcp, workspace, name, read_only } => {
             if !mcp {
                 bail!("say what to serve: sandfs serve --mcp {workspace}");
             }
             // As with `mount`, a bare word naming a workspace serves it; anything else
             // is a source. This is how workspaces are made where nothing mounts.
             if home.exists(&workspace) && name.is_none() {
+                only_when_created(&read_only, &workspace)?;
                 return mcp::serve(&home, &workspace);
             }
             // Named after the resolved folder or repository, so `.` and `repo@v1` work.
             let repos = home.repos_lock(false)?;
-            let record = home.resolve(&workspace)?;
+            let mut record = home.resolve(&workspace)?;
+            record.read_only = relative_paths(&read_only)?;
             let name = default_name(name, &source_dir(&record.base))?;
             home.create(&name, &record)?;
             drop(repos);
@@ -412,6 +425,30 @@ fn changes_and_copy(
         held_back = copy::copy_to(&opened.ws, &items, dir)?;
     }
     Ok(Listed { changes: listed.into_iter().map(|(change, rel)| (change.kind, rel)).collect(), held_back, settings })
+}
+
+/// `--read-only` paths as a workspace records them: relative to the source, checked.
+fn relative_paths(paths: &[String]) -> Result<Vec<String>> {
+    paths
+        .iter()
+        .map(|path| {
+            let rel = path.trim_start_matches("./").trim_matches('/');
+            let full = VPath::parse(&format!("{ROOT}/{rel}")).with_context(|| format!("--read-only {path}"))?;
+            match full.strip_prefix(&VPath::parse(ROOT)?) {
+                Some(parts) => Ok(parts.join("/")),
+                None => bail!("--read-only {path} is outside the source"),
+            }
+        })
+        .collect()
+}
+
+/// Read-only paths are part of a workspace from its start, so its changes never
+/// include any there.
+fn only_when_created(read_only: &[String], name: &str) -> Result<()> {
+    if !read_only.is_empty() {
+        bail!("--read-only applies when a workspace is created, and {name} already exists");
+    }
+    Ok(())
 }
 
 /// Mount a workspace that was just created, removing it again if the mount fails so

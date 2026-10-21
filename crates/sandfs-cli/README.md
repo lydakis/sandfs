@@ -6,6 +6,7 @@ It mounts on Linux with FUSE 3 (`fusermount3`, package `fuse3`). A mount answers
 
 ```bash
 sandfs mount ~/datasets/survey ~/ws/survey       # a host folder, never written to
+sandfs mount ~/finance ~/ws/finance --read-only contracts   # contracts/ can be read but not changed
 sandfs fork ~/ws/survey ~/ws/cleanup             # survey's changes so far, without copying the folder
 python clean.py ~/ws/cleanup                     # real files, any tool
 sandfs changes ~/ws/cleanup                      # A/M/D against the source
@@ -18,6 +19,8 @@ sandfs list                                      # workspaces and where they are
 sandfs rm cleanup                                # forget a workspace and its changes
 sandfs clean                                     # free the space downloaded repository files take
 ```
+
+`--read-only PATH` (repeatable, relative to the source) makes a file or folder read-only in a new workspace and its forks: programs can read it, but writing, deleting, renaming or creating there fails as on a read-only file system (`EROFS`), and its files show without write permission. It is how a container or an agent given the mount gets to look at a folder without changing it even in its own copy. `serve --mcp SOURCE --read-only PATH` does the same for an agent over MCP. It is set when a workspace is created; mounting an existing workspace with it is refused.
 
 `sandfs changes NAME [PATH...] --copy-to DIR` is how changes leave a workspace: it writes the files listed (all of them, or those under each PATH) into DIR, copying added and modified files and links with their executable bit and removing deleted ones, so a copy of the source kept in DIR comes to match the workspace. It writes nothing outside DIR and never writes through a link it finds there. DIR may be the source folder itself, which is how a host folder keeps an agent's work: name it on purpose, since that is the one time sandfs changes the source. It also leaves out changes in a `.git` folder, in any spelling a Mac or Windows disk would read as one, since git runs the programs named there; it says how many it left out, and you copy those by hand if you mean to.
 
