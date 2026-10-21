@@ -646,6 +646,14 @@ impl Inner {
         let unused = self.nodes.get(&ino).is_some_and(|node| node.lookups == 0) && !self.is_open(ino);
         if unused && ino != ROOT_INO {
             if let Some(node) = self.nodes.remove(&ino) {
+                // The kernel can forget a closed file well before its writes settle,
+                // as soon as memory runs short. Its writes belong to its path.
+                if node.linked
+                    && let Some(buffer) = self.buffers.remove(&ino)
+                {
+                    let _ = buffer.commit(&mut self.ws, node.path.as_str());
+                    self.unsaved = true;
+                }
                 let others = if node.linked { self.other_names(&node.path) } else { Vec::new() };
                 for name in others.iter().chain([&node.path]) {
                     if self.inos.get(name.as_str()) == Some(&ino) {
@@ -2557,6 +2565,20 @@ mod tests {
         assert!(!names.is_empty(), "the folder's entries are still listed");
         fs.releasedir(fh);
         assert!(!fs.nodes.contains_key(&src), "dropped once the handle is released");
+    }
+
+    #[test]
+    fn a_forgotten_file_keeps_its_writes() {
+        let mut fs = fs();
+        let ino = fs.create(ROOT_INO, name("index.lock"), 0o644, true, false).unwrap().ino.0;
+        fs.write(ino, 0, b"written").unwrap();
+        // Renamed into place and forgotten before its writes settle, as git's index is
+        // when the kernel is short of memory.
+        fs.rename(ROOT_INO, name("index.lock"), ROOT_INO, name("index"), RenameFlags::empty()).unwrap();
+        fs.forget(ino, 1);
+        assert!(!fs.nodes.contains_key(&ino));
+        assert_eq!(fs.ws.read_text("/mnt/index").unwrap(), "written");
+        assert!(fs.unsaved, "a save picks it up");
     }
 
     #[test]

@@ -794,6 +794,30 @@ fn names_and_sizes_stay_fresh_within_the_cache_ttl() {
     sandfs.unmount(&ws);
 }
 
+/// Files written and closed keep their contents when the kernel, short of memory,
+/// forgets them before their writes settle. Forgetting is forced by dropping the
+/// kernel's caches, which only root may do; elsewhere this has nothing to test.
+#[cfg(target_os = "linux")]
+#[test]
+fn written_files_survive_the_kernel_forgetting_them() {
+    if !fuse_available() || std::fs::OpenOptions::new().write(true).open("/proc/sys/vm/drop_caches").is_err() {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+    for i in 0..20 {
+        let content = format!("version {i}\n").repeat(100);
+        std::fs::write(ws.join("index.lock"), &content).unwrap();
+        std::fs::rename(ws.join("index.lock"), ws.join("index")).unwrap();
+        std::fs::write("/proc/sys/vm/drop_caches", "2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(ws.join("index")).unwrap(), content, "round {i}");
+    }
+    sandfs.unmount(&ws);
+}
+
 /// The kernel keeps each folder's listing once read, so every change made through the
 /// mount must show in the next listing of every folder it touched, including folders
 /// too big for one page and listings abandoned halfway.
