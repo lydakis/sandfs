@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::nfsserve::context::RPCContext;
+use crate::nfsserve::context::{CallFilter, RPCContext};
 use crate::nfsserve::rpcwire::*;
 use crate::nfsserve::transaction_tracker::TransactionTracker;
 use crate::nfsserve::vfs::NFSFileSystem;
@@ -23,6 +23,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
+    filter: Option<Arc<dyn CallFilter>>,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -52,7 +53,10 @@ async fn process_socket(mut socket: tokio::net::TcpStream, context: RPCContext) 
                         return Ok(());
                     }
                     Ok(n) => {
-                        let _ = socksend.write_all(&buf[..n]).await;
+                        // The reader stopped, on a message it refused: close the connection.
+                        if socksend.write_all(&buf[..n]).await.is_err() {
+                            return Ok(());
+                        }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         continue;
@@ -159,6 +163,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            filter: None,
         })
     }
 
@@ -170,6 +175,11 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     /// Default path is `/` if not set.
     pub fn with_export_name<S: AsRef<str>>(&mut self, export_name: S) {
         self.export_name = Arc::new(format!("/{}", export_name.as_ref().trim_end_matches('/').trim_start_matches('/')))
+    }
+
+    /// Pass every call through `filter` first.
+    pub fn with_filter(&mut self, filter: Arc<dyn CallFilter>) {
+        self.filter = Some(filter);
     }
 }
 
@@ -204,6 +214,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 mount_signal: self.mount_signal.clone(),
                 export_name: self.export_name.clone(),
                 transaction_tracker: self.transaction_tracker.clone(),
+                filter: self.filter.clone(),
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);

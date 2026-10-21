@@ -318,6 +318,17 @@ pub fn is_bookkeeping(name: &str) -> bool {
     name.starts_with("._") || name == ".DS_Store" || name.starts_with(".nfs.")
 }
 
+/// Remove the [`is_bookkeeping`] files `ws` added. A pass over every change, which a
+/// build's thousands of files make long, so it runs on a snapshot, never under the lock
+/// every request waits on.
+pub fn drop_bookkeeping(ws: &mut Workspace) {
+    for change in ws.changes().unwrap_or_default() {
+        if change.kind == ChangeKind::Added && change.path.name().is_some_and(is_bookkeeping) {
+            let _ = ws.remove(change.path.as_str(), true);
+        }
+    }
+}
+
 impl Inner {
     /// Serve `ws`, whose source is mounted at `root`, with saved times and directories.
     pub fn new(
@@ -362,20 +373,14 @@ impl Inner {
         inner
     }
 
-    /// A copy of what a save needs; the workspace part is an O(1) fork. Files written
+    /// A copy of what a save needs; the workspace part is an O(1) fork. With
+    /// [`Inner::skip_bookkeeping`], the save then takes macOS's files out of it
+    /// ([`drop_bookkeeping`]). Files written
     /// within `settle` stay out (see [`Inner::commit_written`]).
     pub fn snapshot(&mut self, settle: Duration) -> Snapshot {
         self.commit_written(settle);
         self.unsaved = false;
-        let mut ws = self.ws.fork();
-        if self.skip_bookkeeping {
-            for change in ws.changes().unwrap_or_default() {
-                if change.kind == ChangeKind::Added && change.path.name().is_some_and(is_bookkeeping) {
-                    let _ = ws.remove(change.path.as_str(), true);
-                }
-            }
-        }
-        Snapshot { ws, times: self.times.clone(), dirs: self.dirs.clone() }
+        Snapshot { ws: self.ws.fork(), times: self.times.clone(), dirs: self.dirs.clone() }
     }
 
     /// Whether the file `name` in folder `parent` is one macOS made to hold another
@@ -1385,7 +1390,7 @@ impl Shared {
     /// Save, leaving out files written within `settle`.
     fn save_settled(&self, settle: Duration, durable: bool) -> anyhow::Result<()> {
         let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = {
+        let (mut snapshot, skip_bookkeeping) = {
             let mut inner = self.lock();
             inner.commit_written(settle);
             // Nothing changed since the last save took its snapshot, and that save
@@ -1396,8 +1401,11 @@ impl Shared {
                 drop(inner);
                 return if durable { saved.flush() } else { Ok(()) };
             }
-            inner.snapshot(settle)
+            (inner.snapshot(settle), inner.skip_bookkeeping)
         };
+        if skip_bookkeeping {
+            drop_bookkeeping(&mut snapshot.ws);
+        }
         let result = saved.save(&snapshot, &self.root, durable);
         let mut inner = self.lock();
         // Saved files are read from disk from now on, unless written again meanwhile.
