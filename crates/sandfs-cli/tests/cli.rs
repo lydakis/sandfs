@@ -86,3 +86,24 @@ fn served_sources_are_named_after_their_folder() {
         stdout(home.path(), &["list"]).lines().map(|line| line.split('\t').next().unwrap().to_owned()).collect();
     assert_eq!(names, ["notes", "photos"]);
 }
+
+#[test]
+fn a_reader_that_stops_early_is_not_an_error() {
+    let (home, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for name in ["a", "b", "c"] {
+        let served = sandfs(home.path(), &["serve", "--mcp", data.path().to_str().unwrap(), "--name", name], "");
+        assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    }
+    // Like `sandfs list | head -0`: the reader is gone before the first line.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", home.path())
+        .arg("list")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+}
