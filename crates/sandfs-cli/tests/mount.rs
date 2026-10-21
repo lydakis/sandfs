@@ -1016,3 +1016,36 @@ fn changes_copy_to_brings_files_links_and_modes_out_of_a_mount() {
     assert_eq!(std::fs::read_link(kept.join("run")).unwrap(), Path::new("build.sh"));
     assert!(source.join("old/page.html").exists(), "the source is untouched");
 }
+
+#[test]
+fn changes_points_out_git_settings_that_run_programs() {
+    if !fuse_available() {
+        return;
+    }
+    let mut sandfs = Sandfs::new();
+    let data = tempfile::tempdir().unwrap();
+    let repo = data.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("notes.md"), "draft\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "first"]);
+    let dir = data.path().join("ws");
+    sandfs.mount(&["mount", &format!("git:{}", repo.display()), dir.to_str().unwrap()], &dir);
+
+    // An ordinary commit changes no settings, so there is nothing to point out.
+    std::fs::write(dir.join("notes.md"), "final\n").unwrap();
+    git(&dir, &["commit", "-qam", "second"]);
+    let quiet = sandfs.run(&["changes", "ws"]);
+    assert_eq!(String::from_utf8_lossy(&quiet.stdout), "M notes.md\n");
+    assert_eq!(String::from_utf8_lossy(&quiet.stderr), "");
+
+    let config = std::fs::read_to_string(dir.join(".git/config")).unwrap();
+    std::fs::write(dir.join(".git/config"), config + "[core]\n\tpager = touch /tmp/owned\n").unwrap();
+    std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+    std::fs::write(dir.join(".git/hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+    let loud = sandfs.run(&["changes", "ws"]);
+    assert_eq!(String::from_utf8_lossy(&loud.stdout), "M notes.md\n", "the listing itself still leaves .git out");
+    let warned = String::from_utf8_lossy(&loud.stderr);
+    assert!(warned.contains(".git/config changed") && warned.contains(".git/hooks/pre-commit changed"), "{warned}");
+}
