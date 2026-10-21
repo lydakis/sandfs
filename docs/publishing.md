@@ -27,12 +27,12 @@ cargo package --workspace --exclude sandfs-py  # builds the crates as crates.io 
 1. Tag and push:
 
    ```bash
-   git tag -a v0.4.0 -m "sandfs v0.4.0"
-   git push origin v0.4.0
+   git tag -a v0.5.0 -m "sandfs v0.5.0"
+   git push origin v0.5.0
    ```
 
-   The tag runs `release.yml`. It builds wheels for Linux (x86_64, aarch64, manylinux), macOS (x86_64, arm64) and Windows (x64) plus the sdist, smoke-tests the wheels, checks the tag matches the package version, and uploads to PyPI. In parallel it publishes every crate without `publish = false` to crates.io, dependencies first.
+   The tag runs `release.yml`. It builds wheels for Linux (x86_64, aarch64, manylinux), macOS (x86_64, arm64) and Windows (x64) plus the sdist, smoke-tests the wheels, checks the tag matches the package version, and uploads to PyPI. In parallel it publishes every crate without `publish = false` to crates.io, dependencies first, and builds the `sandfs` command for Linux and macOS. Once everything has built, it attaches those builds to the tag's GitHub release. If no release exists for the tag yet, it first creates one, using the changelog entry as its notes, after checking that the tag matches the version.
 
 2. If the crates job published nothing or stopped partway (no token yet, or a network error), run the workflow by hand on the tag (Actions → Release → Run workflow, with the tag selected). It skips crates that crates.io already has at that version.
 
-3. Create a GitHub release for the tag with the changelog entry as its notes.
+3. The release's notes come from the changelog. To change them afterwards, run `gh release edit vX.Y.Z --notes-file NOTES`. Push the tag with git as above, rather than letting `gh release create` make it: a tag made that way may not run the workflow.

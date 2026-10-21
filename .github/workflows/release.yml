@@ -60,6 +60,76 @@ jobs:
           name: sdist
           path: dist
 
+  # The `sandfs` command, ready to run, for people who'd rather not build it. Pull
+  # requests build it too; a tag attaches it to the GitHub release.
+  cli:
+    strategy:
+      matrix:
+        include:
+          # musl, so the Linux builds are static and run on any distribution.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - name: Build
+        run: cargo build --release --locked -p sandfs-cli --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="sandfs-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/sandfs" LICENSE crates/sandfs-cli/README.md "$name/"
+          cp crates/sandfs-cli/src/nfsserve/LICENSE "$name/LICENSE-nfsserve"
+          tar czf "$name.tar.gz" "$name"
+      # Run it where the runner can: every target but the Intel Mac build.
+      - if: matrix.target != 'x86_64-apple-darwin'
+        name: Smoke-test the command
+        run: |
+          "sandfs-${{ matrix.target }}/sandfs" --version
+          SANDFS_HOME="$RUNNER_TEMP/home" "sandfs-${{ matrix.target }}/sandfs" list
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-${{ matrix.target }}
+          path: sandfs-${{ matrix.target }}.tar.gz
+
+  github-release:
+    needs: [cli, wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cli-*
+          path: cli
+          merge-multiple: true
+      # Attach the commands to the tag's release, making it from the changelog's
+      # entry for this version when nobody has yet.
+      - name: Attach the commands to the release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The other jobs check this too, but they run alongside this one.
+          if [ "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sandfs-core") | .version')" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version"
+            exit 1
+          fi
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            awk -v heading="## $version" 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found' docs/changelog.md > notes.md
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "sandfs $version" --notes-file notes.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" cli/*.tar.gz --clobber
+
   publish:
     needs: [wheels, sdist]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
