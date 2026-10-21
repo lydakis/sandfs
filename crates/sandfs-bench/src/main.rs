@@ -12,6 +12,7 @@
 //! empty except the kernel's page cache, which is warm for every target alike.
 
 mod build;
+mod compare;
 mod data;
 mod everyday;
 mod lazy;
@@ -59,6 +60,9 @@ struct Args {
     /// Only run workloads whose name contains this.
     #[arg(long)]
     only: Option<String>,
+    /// Leave out workloads whose name contains this (repeatable), such as `build`.
+    #[arg(long)]
+    skip: Vec<String>,
     /// Timed runs per workload (default depends on the scale).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     iters: Option<u64>,
@@ -118,6 +122,17 @@ struct Args {
     remote_child: Option<PathBuf>,
     #[arg(long, hide = true, value_enum)]
     remote_child_method: Option<remote::Method>,
+    /// Compare runs saved with `--json` instead of running anything: each number of
+    /// AFTER against BEFORE, and against what it has to beat in its own run. Either side
+    /// may be several files, comma-separated, whose samples are pooled.
+    #[arg(long, num_args = 2, value_names = ["BEFORE", "AFTER"])]
+    compare: Option<Vec<PathBuf>>,
+    /// With `--compare`: how much a median must move to count, as a fraction.
+    #[arg(long, default_value_t = 0.25)]
+    threshold: f64,
+    /// With `--compare`: list the numbers that didn't move too.
+    #[arg(long)]
+    all: bool,
 }
 
 fn main() {
@@ -128,6 +143,20 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
+    if let Some(paths) = &args.compare {
+        anyhow::ensure!(args.threshold > 0.0 && args.threshold < 1.0, "--threshold must be between 0 and 1");
+        // Each side may name several runs, comma-separated, whose samples are pooled.
+        let load = |paths: &PathBuf| -> Result<_> {
+            let mut runs = Vec::new();
+            for path in paths.to_string_lossy().split(',') {
+                let report = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("reading {path}"))?)?;
+                runs.push(compare::rows(&report).with_context(|| format!("reading the numbers in {path}"))?);
+            }
+            Ok(compare::pool(runs))
+        };
+        compare::print(&load(&paths[0])?, &load(&paths[1])?, args.threshold, args.all);
+        return Ok(());
+    }
     let mut scale = match args.scale {
         ScaleArg::Full => Scale::FULL,
         ScaleArg::Quick => Scale::QUICK,
@@ -221,7 +250,10 @@ fn run(args: Args) -> Result<()> {
         }
     }
 
-    let selected = |name: &str| args.only.as_ref().is_none_or(|only| name.contains(only.as_str()));
+    let selected = |name: &str| {
+        args.only.as_ref().is_none_or(|only| name.contains(only.as_str()))
+            && !args.skip.iter().any(|skip| name.contains(skip.as_str()))
+    };
     let workloads: Vec<_> = workloads::all(&data).into_iter().filter(|w| selected(w.name)).collect();
     let run_workflow = selected(WORKFLOW);
     let run_everyday = everyday::Op::ALL.iter().any(|op| selected(&format!("everyday/{}", op.name())));
@@ -484,8 +516,13 @@ fn remote_json(result: &remote::RemoteResult) -> serde_json::Value {
         "commit_nanos": result.commit.as_nanos() as u64,
         "status_again_nanos": result.status_again.as_nanos() as u64,
         "fork_nanos": result.fork.as_nanos() as u64,
+        "status_fork_nanos": result.status_fork.as_nanos() as u64,
+        "find_nanos": result.find.map(|find| find.as_nanos() as u64),
         "grep_nanos": result.grep.map(|grep| grep.map(|grep| grep.as_nanos() as u64)),
         "grep_stopped": result.grep.is_some_and(|grep| grep.is_none()),
+        "grep_again_nanos": result.grep_again.map(|grep| grep.map(|grep| grep.as_nanos() as u64)),
+        "grep_again_stopped": result.grep_again.is_some_and(|grep| grep.is_none()),
+        "remove_nanos": result.remove.as_nanos() as u64,
         "matches": result.matches,
         "bytes": result.bytes,
         "peak_rss_bytes": result.peak_rss,
@@ -506,15 +543,24 @@ fn remote_from_json(method: remote::Method, row: &serde_json::Value) -> Result<r
         commit: nanos("commit_nanos")?,
         status_again: nanos("status_again_nanos")?,
         fork: nanos("fork_nanos")?,
-        grep: match (&row["grep_nanos"], row["grep_stopped"].as_bool()) {
-            (_, Some(true)) => Some(None),
-            (nanos, _) => nanos.as_u64().map(|nanos| Some(Duration::from_nanos(nanos))),
-        },
+        status_fork: nanos("status_fork_nanos")?,
+        find: row["find_nanos"].as_u64().map(Duration::from_nanos),
+        grep: search(row, "grep"),
+        grep_again: search(row, "grep_again"),
+        remove: nanos("remove_nanos")?,
         matches: usize::try_from(number("matches")?)?,
         bytes: number("bytes")?,
         peak_rss: number("peak_rss_bytes")?,
         disk: number("disk_bytes")?,
     })
+}
+
+/// A whole-copy search from its JSON: not run, stopped, or how long it took.
+fn search(row: &serde_json::Value, key: &str) -> Option<Option<Duration>> {
+    match (&row[format!("{key}_nanos")], row[format!("{key}_stopped")].as_bool()) {
+        (_, Some(true)) => Some(None),
+        (nanos, _) => nanos.as_u64().map(|nanos| Some(Duration::from_nanos(nanos))),
+    }
 }
 
 fn print_remote(plan: &remote::Plan, results: &[remote::RemoteResult]) {
@@ -550,24 +596,31 @@ fn print_remote(plan: &remote::Plan, results: &[remote::RemoteResult]) {
     }
     println!();
     println!(
-        "Then, in the same copy: the first `git status`, committing one changed file in {}/, `git status` again, and `grep -r` over the whole copy for a word it doesn't hold. Memory and disk above include these steps, except the disk the search fills.",
+        "Then: the first `git status`, committing one changed file in {}/, `git status` again, the first `git status` in the second copy, `find` over the whole copy, `grep -r` over it for a word it doesn't hold, twice, and removing the second copy. Memory and disk above include these steps, except the disk the whole-copy steps fill.",
         plan.subtree
     );
     println!();
-    println!("| method | first git status | commit | git status again | grep -r everything |");
-    println!("|---|---:|---:|---:|---:|");
+    println!(
+        "| method | first git status | commit | git status again | git status in the second copy | find everything | grep -r everything | grep -r again | remove the second copy |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    let searched = |search: Option<Option<Duration>>| match search {
+        None => "not held".to_owned(),
+        Some(None) => format!("over {}", fmt_duration(remote::GREP_LIMIT)),
+        Some(Some(took)) => fmt_duration(took),
+    };
     for result in results {
         println!(
-            "| {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             result.method.name(),
             fmt_duration(result.status),
             fmt_duration(result.commit),
             fmt_duration(result.status_again),
-            match result.grep {
-                None => "not held".to_owned(),
-                Some(None) => format!("over {}", fmt_duration(remote::GREP_LIMIT)),
-                Some(Some(grep)) => fmt_duration(grep),
-            },
+            fmt_duration(result.status_fork),
+            result.find.map_or_else(|| "not held".to_owned(), fmt_duration),
+            searched(result.grep),
+            searched(result.grep_again),
+            fmt_duration(result.remove),
         );
     }
 }

@@ -20,7 +20,19 @@ uv run python crates/sandfs-bench/python/bench.py --scratch /dev/shm   # the Pyt
 
 Put the scratch directory on tmpfs (`/dev/shm`) when comparing numbers. sandfs keeps its changes in memory, so a disk under the other targets mostly measures the disk, and writeback makes their write and copy timings swing by several times between runs.
 
-`--targets host,sandfs,overlayfs,fuse` picks targets (default: every one available), `--only` filters workloads by name, `--json FILE` keeps every sample, and `--scratch DIR` sets where the data set and mounts go (default: the system temp directory). Targets that cannot run here are listed as skipped.
+`--targets host,sandfs,overlayfs,fuse` picks targets (default: every one available), `--only` filters workloads by name and `--skip` leaves some out (`--skip build`), `--json FILE` keeps every sample, and `--scratch DIR` sets where the data set and mounts go (default: the system temp directory). Targets that cannot run here are listed as skipped.
+
+## Comparing runs
+
+```bash
+./target/release/sandfs-bench --scale quick --skip build --json before.json   # on main
+./target/release/sandfs-bench --scale quick --skip build --json after.json    # with a change
+./target/release/sandfs-bench --compare before.json after.json
+```
+
+`--compare BEFORE AFTER` runs nothing. It lists the numbers that moved, each with its change and with how far it is from what it has to beat in its own run: the host folder for file operations, overlayfs (or full copies) for parallel attempts, fetching everything for a slow source, a blobless clone for a remote repository, and the host folder for builds. What sandfs doesn't change (the host folder, overlayfs, the clones, fetching everything) is left out, since sandfs can't move it. A whole-copy search stopped at its time limit counts as taking the limit. A number counts as moved when its median changed by more than `--threshold` (default 0.25, so 25%) and, when both sides have several samples, every sample on one side is beyond every sample on the other. Either side can be several runs, comma-separated (`before-1.json,before-2.json`), whose samples are pooled. On a shared machine, alternate the runs (before, after, before, after) and pool them: one run against one run calls a few numbers in a hundred slower even with no change. `--all` lists the numbers that didn't move too.
+
+CI does this on every pull request that touches the Rust code (`.github/workflows/bench.yml`). It builds main and the PR on one machine, runs the quick suite without the build table twice on each, alternating, and puts the comparison in the run's summary, with a warning when a number got slower or went missing (a target that no longer ran, say). Each push to main keeps its results as an artifact for 90 days.
 
 ## Targets
 
@@ -97,7 +109,7 @@ The Rust API is what the Python package and the MCP server call, so its column s
 | blobless clone | `git clone --filter=blob:none`: all history without file contents, then a checkout of every file | `git worktree add` |
 | full clone | `git clone`, checked out | `git worktree add` |
 
-Each copy then has a day of work done in it: the first `git status`, a commit of one changed file, `git status` again, and `grep -r` over the whole copy (stopped and reported after 10 minutes).
+Each copy then has a day of work done in it: the first `git status`, a commit of one changed file, `git status` again, the first `git status` in the second copy, `find` over the whole copy, `grep -r` over it twice (each stopped and reported after 10 minutes), and removing the second copy.
 
 `--remote-folder` picks the folder to search (default: the largest folder of at most 1,000 files) and `--remote-methods` the methods (default: all). Each method runs once, in its own process, so its peak memory is the largest command it ran plus, for sandfs, its serving processes; "on disk" is everything it left in the scratch directory. Every method must read the same bytes and find the same matches. Timings depend on the network, so compare methods within one run rather than across runs.
 
