@@ -267,10 +267,11 @@ impl Home {
             .is_ok_and(|holder| holder.ends_with(&format!("(process {pid})")))
     }
 
-    /// Wait for the right to change which workspaces use sandfs's local copies of
-    /// repositories: shared to create a workspace, exclusive for `sandfs clean`, so a
-    /// copy is never shrunk or deleted between resolving a source and recording the
-    /// workspace over it. Held until the file is dropped.
+    /// Wait for the right to use sandfs's local copies of repositories without a
+    /// workspace's own lock: shared to create a workspace or read one unmounted,
+    /// exclusive for `sandfs clean`, so a copy is never shrunk or deleted between
+    /// resolving a source and recording the workspace over it, or while it is read.
+    /// Held until the file is dropped.
     pub fn repos_lock(&self, exclusive: bool) -> Result<File> {
         let repos = self.root.join("repos");
         std::fs::create_dir_all(&repos).with_context(|| format!("creating {}", repos.display()))?;

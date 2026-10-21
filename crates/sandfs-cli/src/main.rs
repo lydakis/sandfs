@@ -208,6 +208,8 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(since) = &since {
                 sync(&home, since)?;
             }
+            // Comparing reads the source, so `sandfs clean` waits until this is done.
+            let _reading = home.repos_lock(false)?;
             // Saved files are read as needed, and a mount saving meanwhile may replace
             // one; reading again from the newer save works.
             let mut attempts = 0;
