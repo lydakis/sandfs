@@ -984,3 +984,35 @@ fn saved_files_can_be_changed_moved_and_read_again() {
     assert_eq!(sandfs.stdout(&["changes", "work"]), "A copy.bin\nA done/big.bin\nA done/log.txt\n");
     sandfs.unmount(&work);
 }
+
+#[test]
+fn changes_copy_to_brings_files_links_and_modes_out_of_a_mount() {
+    if !fuse_available() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut sandfs = Sandfs::new();
+    let (data, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let source = data.path().join("site");
+    std::fs::create_dir_all(source.join("old")).unwrap();
+    std::fs::write(source.join("old/page.html"), "old\n").unwrap();
+    let dir = data.path().join("ws");
+    sandfs.mount(&["mount", source.to_str().unwrap(), dir.to_str().unwrap()], &dir);
+
+    std::fs::write(dir.join("build.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(dir.join("build.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("build.sh", dir.join("run")).unwrap();
+    std::fs::remove_dir_all(dir.join("old")).unwrap();
+    std::fs::write(dir.join("old"), "a file where a folder was\n").unwrap();
+
+    let kept = out.path().join("site");
+    std::fs::create_dir_all(kept.join("old")).unwrap();
+    std::fs::write(kept.join("old/page.html"), "old\n").unwrap();
+    let listed = sandfs.stdout(&["changes", "ws", "--copy-to", kept.to_str().unwrap()]);
+    assert_eq!(listed, "A build.sh\nA old\nD old/page.html\nA run\n");
+    assert_eq!(std::fs::read_to_string(kept.join("old")).unwrap(), "a file where a folder was\n");
+    assert_ne!(std::fs::metadata(kept.join("build.sh")).unwrap().permissions().mode() & 0o111, 0);
+    assert_eq!(std::fs::read_link(kept.join("run")).unwrap(), Path::new("build.sh"));
+    assert!(source.join("old/page.html").exists(), "the source is untouched");
+}
