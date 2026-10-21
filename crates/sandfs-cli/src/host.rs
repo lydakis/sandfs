@@ -102,6 +102,28 @@ pub fn mount_options(name: &str) -> Vec<fuser::MountOption> {
     vec![MountOption::FSName(format!("sandfs:{name}")), MountOption::Subtype("sandfs".to_owned())]
 }
 
+/// Who may use a mount besides the user who made it. Root may whenever FUSE lets
+/// the mount say so (always for root itself, otherwise only with `user_allow_other`
+/// in `/etc/fuse.conf`), so a container run by a root daemon can use the folder. Root
+/// can read the sources directly anyway, so this shows it nothing new.
+#[cfg(fuse)]
+pub fn mount_acl() -> fuser::SessionACL {
+    let conf = std::fs::read_to_string("/etc/fuse.conf").unwrap_or_default();
+    if nix::unistd::geteuid().is_root() || allows_other(&conf) {
+        fuser::SessionACL::RootAndOwner
+    } else {
+        fuser::SessionACL::Owner
+    }
+}
+
+/// Whether a `fuse.conf` lets users mount with `allow_other` (or `allow_root`), read
+/// as fusermount reads it: comments and surrounding whitespace don't count. Versions
+/// of fusermount differ, so a mount refused for asking falls back to owner-only.
+#[cfg(any(fuse, test))]
+fn allows_other(conf: &str) -> bool {
+    conf.lines().any(|line| line.split('#').next().unwrap_or("").trim() == "user_allow_other")
+}
+
 /// Commands that unmount a directory, tried in order, and what to do when none exists.
 #[cfg(nfs)]
 const UNMOUNT: (&[&[&str]], &str) = (&[&["/sbin/umount"]], "/sbin/umount is missing");
@@ -128,6 +150,16 @@ pub fn unmount(dir: &Path, served_by_nobody: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuse_conf_allows_other_only_when_uncommented() {
+        assert!(allows_other("# comment\nuser_allow_other\n"));
+        assert!(allows_other("user_allow_other"));
+        assert!(allows_other("  user_allow_other  # for containers\n"));
+        assert!(!allows_other("#user_allow_other\n"));
+        assert!(!allows_other("mount_max = 1000\n"));
+        assert!(!allows_other(""));
+    }
 
     #[test]
     fn mountinfo_escapes_decode() {

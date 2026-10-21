@@ -447,7 +447,18 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     let result = {
         let mut config = fuser::Config::default();
         config.mount_options = host::mount_options(name);
-        let session = fuser::Session::new(SandFs(shared.clone()), dir, &config).context("mounting with FUSE")?;
+        config.acl = host::mount_acl();
+        let session = match fuser::Session::new(SandFs(shared.clone()), dir, &config) {
+            Ok(session) => session,
+            // A fusermount that reads its settings differently refuses root's access;
+            // the mount is still worth having for its owner.
+            Err(err) if config.acl != fuser::SessionACL::Owner => {
+                eprintln!("sandfs: mounting {name} for root too failed ({err}); mounting it for its owner only");
+                config.acl = fuser::SessionACL::Owner;
+                fuser::Session::new(SandFs(shared.clone()), dir, &config).context("mounting with FUSE")?
+            }
+            Err(err) => return Err(err).context("mounting with FUSE"),
+        };
         mounted(None)?;
         session.run().map_err(anyhow::Error::from)
     };
