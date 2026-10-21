@@ -107,7 +107,7 @@ cargo install sandfs-mcp
 } } }
 ```
 
-Each `--dir` mounts a folder, read lazily and never written to. A harness that builds its own workspace can embed the server instead; see [sandfs-mcp](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-mcp/README.md).
+Each `--dir` mounts a folder, read lazily and never written to. `--read-only PATH` lets the agent read a path but not change it even in its own copy, and the server tells the agent so. A harness that builds its own workspace can embed the server instead; see [sandfs-mcp](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-mcp/README.md).
 
 ## A real folder on disk
 
@@ -140,6 +140,7 @@ On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there
 
 ## More features
 
+- **Read-only paths**: sources are never written, but an agent can still change their files in its own copy. `set_read_only(path)` (or `mount(..., read_only=True)`) stops that too: writes, deletes and moves at or below the path raise `OSError` with errno `EROFS`, as a read-only file system does, while reads work as before. Forks keep it.
 - **Large files**: `read(path, offset=..., length=...)` reads one range without caching the file. A folder source seeks on disk, so a multi-gigabyte data set or video is never held in memory whole. A Python source can define `read_range(path, offset, length)` to do the same; without it, and for a git commit, the whole file is read and then sliced.
 - **Safe concurrent writes**: `stat(path).version` and `write(...)` give a file's version, and `write(path, data, expected_version=v)` raises `sandfs.VersionMismatch` if the file changed since.
 - **Threads**: calls release the GIL, so a slow source never blocks other threads. Use one workspace per thread; forks are cheap.
@@ -149,7 +150,8 @@ On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there
 
 | Call | Does |
 | --- | --- |
-| `mount(path, source)` | Mount a `DirSource(root)`, `MemorySource({name: str or bytes})`, `GitSource(repo, rev)`, or any object with `list(path)` and `read(path)` |
+| `mount(path, source, *, read_only=False)` | Mount a `DirSource(root)`, `MemorySource({name: str or bytes})`, `GitSource(repo, rev)`, or any object with `list(path)` and `read(path)` |
+| `set_read_only(path, read_only=True)`, `is_read_only(path)` | Let a path and everything below it be read but not changed, in this workspace and its later forks |
 | `fork()` | A new workspace with the same mounts and changes, in constant time |
 | `read(path, *, offset=0, length=None)`, `read_text(path)` | File contents as bytes (all of it, or one range), or as UTF-8 text |
 | `list(path="/")`, `stat(path)`, `exists(path)` | Entries (name, kind, size), and kind, size and version; a kind is `"file"`, `"dir"` or `"symlink"` |

@@ -102,3 +102,33 @@ fn bad_arguments_exit_with_usage() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected MOUNT=PATH"));
 }
+
+#[test]
+fn read_only_paths_can_be_read_but_not_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("contracts")).unwrap();
+    std::fs::write(dir.path().join("contracts/lease.md"), "12 months\n").unwrap();
+    let mount = format!("/books={}", dir.path().display());
+    let call = |id: u32, name: &str, arguments: Value| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } });
+
+    let replies = exchange(
+        &["--dir", &mount, "--read-only", "/books/contracts"],
+        &[
+            json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "test", "version": "1" } } }),
+            call(1, "read", json!({ "path": "/books/contracts/lease.md" })),
+            call(2, "write", json!({ "path": "/books/contracts/lease.md", "content": "6 months\n" })),
+            call(3, "delete", json!({ "path": "/books/contracts/lease.md" })),
+            call(4, "write", json!({ "path": "/books/notes.md", "content": "fine\n" })),
+        ],
+    );
+    let instructions = replies[0]["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("You can read but not change anything in /books/contracts."), "{instructions}");
+    let replies = &replies[1..];
+    assert_eq!(replies[0]["result"]["isError"], false);
+    for reply in &replies[1..3] {
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(reply["result"]["content"][0]["text"], "/books/contracts/lease.md: read-only");
+    }
+    assert_eq!(replies[3]["result"]["isError"], false);
+}

@@ -1171,3 +1171,87 @@ fn large_files_written_back_unchanged_count_as_modified_without_being_read() {
     );
     assert_eq!(source.reads().1 - files_before, 1, "only small.txt was read");
 }
+
+fn read_only_books() -> Workspace {
+    let mut ws = Workspace::new();
+    let books =
+        MemorySource::from_files([("budget.csv", "jan,1200\n"), ("contracts/lease.md", "12 months\n")]).unwrap();
+    ws.mount("/books", Arc::new(books)).unwrap();
+    ws.set_read_only("/books/contracts", true).unwrap();
+    ws
+}
+
+fn refused<T: std::fmt::Debug>(result: sandfs_core::Result<T>) -> String {
+    match result {
+        Err(Error::ReadOnly(path)) => path,
+        other => panic!("expected a read-only refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn read_only_paths_refuse_every_change_and_allow_reads() {
+    let mut ws = read_only_books();
+    assert_eq!(ws.read_text("/books/contracts/lease.md").unwrap(), "12 months\n");
+    assert!(ws.is_read_only("/books/contracts/lease.md") && !ws.is_read_only("/books/budget.csv"));
+
+    let lease = "/books/contracts/lease.md";
+    assert_eq!(refused(ws.write(lease, "6 months\n")), lease);
+    refused(ws.write_versioned(lease, "6 months\n", 0));
+    refused(ws.set_executable(lease, true));
+    refused(ws.remove(lease, false));
+    refused(ws.write("/books/contracts/new.md", "x"));
+    refused(ws.mkdir("/books/contracts/drafts", false));
+    refused(ws.symlink("/books/contracts/link", "lease.md"));
+    refused(ws.rename(lease, "/books/lease.md"));
+    refused(ws.rename("/books/budget.csv", "/books/contracts/budget.csv"));
+    refused(ws.copy("/books/budget.csv", "/books/contracts/budget.csv", false));
+    refused(ws.hard_link(lease, "/books/lease.md"));
+    refused(ws.hard_link("/books/budget.csv", "/books/contracts/budget.csv"));
+    // A folder holding a read-only path can't go either, whole or moved.
+    assert_eq!(refused(ws.remove("/books/contracts", true)), "/books/contracts");
+    ws.mkdir("/books/archive", false).unwrap();
+    ws.write("/books/archive/old.md", "old\n").unwrap();
+    ws.set_read_only("/books/archive/old.md", true).unwrap();
+    refused(ws.remove("/books/archive", true));
+    refused(ws.rename("/books/archive", "/books/attic"));
+
+    // Everything else still works, and copying out of a read-only folder is a read.
+    ws.mkdir("/books/contracts", true).unwrap();
+    ws.copy(lease, "/books/lease-copy.md", false).unwrap();
+    ws.write("/books/budget.csv", "jan,1250\n").unwrap();
+    let changes: Vec<_> = ws.changes().unwrap().into_iter().map(|c| c.path.to_string()).collect();
+    assert_eq!(changes, ["/books/archive/old.md", "/books/budget.csv", "/books/lease-copy.md"]);
+}
+
+#[test]
+fn read_only_paths_carry_into_forks_and_can_be_lifted() {
+    let ws = read_only_books();
+    let mut fork = ws.fork();
+    refused(fork.write("/books/contracts/lease.md", "6 months\n"));
+    fork.set_read_only("/books/contracts", false).unwrap();
+    fork.write("/books/contracts/lease.md", "6 months\n").unwrap();
+    assert!(ws.is_read_only("/books/contracts"), "lifting it in a fork leaves the original alone");
+}
+
+#[test]
+fn a_file_linked_into_a_read_only_path_is_read_only_by_every_name() {
+    let mut ws = read_only_books();
+    ws.write("/books/notes.md", "draft\n").unwrap();
+    ws.hard_link("/books/notes.md", "/books/shared.md").unwrap();
+    ws.hard_link("/books/notes.md", "/books/drafts/notes.md").unwrap();
+    ws.set_read_only("/books/shared.md", true).unwrap();
+    assert_eq!(refused(ws.write("/books/notes.md", "changed\n")), "/books/shared.md");
+    // Nor can a folder holding another of its names go.
+    refused(ws.remove("/books/drafts", true));
+    refused(ws.rename("/books/drafts", "/books/old-drafts"));
+}
+
+#[test]
+fn a_read_only_path_that_does_not_exist_yet_cannot_be_covered_by_a_file() {
+    let mut ws = read_only_books();
+    ws.set_read_only("/books/future/plan.md", true).unwrap();
+    refused(ws.write("/books/future", "x"));
+    refused(ws.symlink("/books/future", "budget.csv"));
+    refused(ws.hard_link("/books/budget.csv", "/books/future"));
+    ws.mkdir("/books/future", false).unwrap();
+}

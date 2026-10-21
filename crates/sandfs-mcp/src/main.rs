@@ -7,13 +7,14 @@ use sandfs_core::{DirSource, Workspace};
 use sandfs_mcp::Server;
 
 const USAGE: &str = "\
-usage: sandfs-mcp [--dir MOUNT=PATH]...
+usage: sandfs-mcp [--dir MOUNT=PATH]... [--read-only PATH]...
 
 Serve a copy-on-write workspace to an MCP client over stdio. Each --dir mounts a
 host folder read-only and reads it lazily; the agent's changes live in memory for
 the session. To serve other data, embed the sandfs-mcp library with your own sources.
 
   --dir /data=./datasets   mount the host folder ./datasets at /data
+  --read-only /data/raw    let the agent read /data/raw but change nothing in it
 ";
 
 fn main() -> ExitCode {
@@ -42,6 +43,11 @@ fn configure(args: &[String]) -> Result<Workspace, String> {
     let mut workspace = Workspace::new();
     let mut args = args.iter();
     while let Some(flag) = args.next() {
+        if flag == "--read-only" {
+            let path = args.next().ok_or("--read-only needs a workspace path")?;
+            workspace.set_read_only(path, true).map_err(|e| e.to_string())?;
+            continue;
+        }
         if flag != "--dir" {
             return Err(format!("unknown argument {flag:?}"));
         }

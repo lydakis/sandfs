@@ -429,3 +429,29 @@ def test_a_failing_prefetch_does_not_fail_the_read(monkeypatch: pytest.MonkeyPat
     # The second file read asks to prefetch the folder, which fails.
     assert ws.read("/s/d/g.txt") == b"ok"
     assert [str(err) for err in reported] == ["store unavailable"]
+
+
+def test_read_only_paths_refuse_changes_with_erofs() -> None:
+    import errno
+
+    ws = Workspace()
+    ws.mount("/books", MemorySource({"budget.csv": "jan\n", "contracts/lease.md": "12 months\n"}))
+    ws.mount("/brief", MemorySource({"task.md": "summarise\n"}), read_only=True)
+    ws.set_read_only("/books/contracts")
+
+    assert ws.read_text("/books/contracts/lease.md") == "12 months\n"
+    assert ws.is_read_only("/brief/task.md") and not ws.is_read_only("/books/budget.csv")
+    for change in (
+        lambda: ws.write("/books/contracts/lease.md", "6 months\n"),
+        lambda: ws.remove("/brief/task.md"),
+        lambda: ws.move("/books/budget.csv", "/books/contracts/budget.csv"),
+    ):
+        with pytest.raises(OSError) as raised:
+            change()
+        assert raised.value.errno == errno.EROFS
+
+    ws.write("/books/budget.csv", "feb\n")
+    fork = ws.fork()
+    fork.set_read_only("/books/contracts", False)
+    fork.write("/books/contracts/lease.md", "6 months\n")
+    assert [change.path for change in ws.changes()] == ["/books/budget.csv"]

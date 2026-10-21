@@ -263,6 +263,8 @@ pub struct Workspace {
     overlay: OrdMap<VPath, Overlay>,
     /// Files with several names, by the id their [`Overlay::Linked`] entries share.
     links: OrdMap<u64, Linked>,
+    /// Paths nothing may change, with everything below them.
+    read_only: OrdSet<VPath>,
     cache: Arc<Cache>,
     walks: Arc<Mutex<Walks>>,
     /// The last version handed out.
@@ -308,6 +310,59 @@ impl Workspace {
         self.overlay.remove(&path);
         let mount = Mount { id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed), source, root };
         self.mounts.insert(path, Arc::new(mount));
+        Ok(())
+    }
+
+    /// Make `path`, and everything below it, read-only in this workspace and its later
+    /// forks, or (with `false`) writable again. Writes, deletes, moves and new
+    /// entries there fail with [`Error::ReadOnly`], as does removing or moving a
+    /// folder that holds the path. Reading is unaffected, and so are changes already
+    /// made, which stay listed by [`Workspace::changes`].
+    ///
+    /// Sources are never written either way; this keeps a path from changing even in
+    /// the workspace, so whoever is handed it (an agent, a mounted folder) can look but
+    /// not touch. The path needn't exist.
+    pub fn set_read_only(&mut self, path: &str, read_only: bool) -> Result<()> {
+        let path = VPath::parse(path)?;
+        if read_only {
+            self.read_only.insert(path);
+        } else {
+            self.read_only.remove(&path);
+        }
+        Ok(())
+    }
+
+    /// Whether `path` is read-only: at or below a path given to
+    /// [`Workspace::set_read_only`].
+    pub fn is_read_only(&self, path: &str) -> bool {
+        VPath::parse(path).is_ok_and(|path| self.read_only.iter().any(|ro| path.starts_with(ro)))
+    }
+
+    /// The paths given to [`Workspace::set_read_only`], sorted.
+    pub fn read_only_paths(&self) -> Vec<VPath> {
+        self.read_only.iter().cloned().collect()
+    }
+
+    /// Refuse a change at `path`, and with `tree` to everything below it too, when it
+    /// touches a read-only path. A file with several names is changed through all of
+    /// them, so each is checked, including those of files below `path` with `tree`.
+    /// Pass `tree` for any new entry that isn't a folder too, since a file there would
+    /// stand in the way of a read-only path below it.
+    fn check_writable(&self, path: &VPath, tree: bool) -> Result<()> {
+        if self.read_only.is_empty() {
+            return Ok(());
+        }
+        let mut names = vec![path.clone()];
+        for linked in self.links.values() {
+            if linked.names.iter().any(|name| name == path || (tree && name.starts_with(path))) {
+                names.extend(linked.names.iter().cloned());
+            }
+        }
+        for name in names {
+            if self.read_only.iter().any(|ro| name.starts_with(ro) || (tree && ro.starts_with(&name))) {
+                return Err(Error::ReadOnly(name.to_string()));
+            }
+        }
         Ok(())
     }
 
@@ -433,6 +488,7 @@ impl Workspace {
         if target.is_empty() || target.contains('\0') {
             return Err(Error::InvalidPath(target.to_owned()));
         }
+        self.check_writable(&path, true)?;
         match self.resolve(&path) {
             Err(Error::NotFound(_)) => {}
             Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
@@ -455,6 +511,9 @@ impl Workspace {
     pub fn hard_link(&mut self, from: &str, to: &str) -> Result<()> {
         let from = VPath::parse(from)?;
         let to = VPath::parse(to)?;
+        // Writes through the new name change the file under the old one too.
+        self.check_writable(&from, false)?;
+        self.check_writable(&to, true)?;
         let (content, kind, version) = match self.resolve(&from)? {
             Resolved::Dir { .. } => return Err(Error::IsADirectory(from.to_string())),
             Resolved::File { content, kind, version } => (content, kind, version),
@@ -611,6 +670,7 @@ impl Workspace {
 
     fn write_content(&mut self, path: &str, content: Content, expected: Option<u64>) -> Result<u64> {
         let path = VPath::parse(path)?;
+        self.check_writable(&path, true)?;
         let parent = path.parent().ok_or_else(|| Error::IsADirectory(path.to_string()))?;
         let (kind, version, exists) = match self.resolve(&path) {
             Ok(Resolved::Dir { .. }) => return Err(Error::IsADirectory(path.to_string())),
@@ -638,6 +698,7 @@ impl Workspace {
     /// only when the bit does.
     pub fn set_executable(&mut self, path: &str, executable: bool) -> Result<u64> {
         let path = VPath::parse(path)?;
+        self.check_writable(&path, false)?;
         match self.resolve(&path)? {
             Resolved::Dir { .. } => Err(Error::IsADirectory(path.to_string())),
             Resolved::File { kind: Kind::Symlink, .. } => Err(is_a_symlink(&path)),
@@ -654,6 +715,9 @@ impl Workspace {
     /// existing directory is not an error, like `mkdir -p`.
     pub fn mkdir(&mut self, path: &str, parents: bool) -> Result<()> {
         let path = VPath::parse(path)?;
+        if !(parents && self.resolve(&path).is_ok_and(|found| source_is_dir(&found))) {
+            self.check_writable(&path, false)?;
+        }
         match self.resolve(&path) {
             Ok(Resolved::Dir { .. }) if parents => return Ok(()),
             Ok(_) => return Err(Error::AlreadyExists(path.to_string())),
@@ -674,6 +738,7 @@ impl Workspace {
     pub fn remove(&mut self, path: &str, recursive: bool) -> Result<()> {
         let path = VPath::parse(path)?;
         self.check_removable(&path)?;
+        self.check_writable(&path, true)?;
         if let Resolved::Dir { .. } = self.resolve(&path)? {
             if !recursive && !self.list(path.as_str())?.is_empty() {
                 return Err(Error::DirectoryNotEmpty(path.to_string()));
@@ -692,6 +757,7 @@ impl Workspace {
         if source_is_dir(&source) && !recursive {
             return Err(Error::IsADirectory(from.to_string()));
         }
+        self.check_writable(&to, true)?;
         self.check_destination(&from, &to)?;
         self.atomically(|ws| ws.copy_tree(&from, &to, false))
     }
@@ -702,6 +768,8 @@ impl Workspace {
         let to_path = VPath::parse(to)?;
         self.check_removable(&from_path)?;
         self.resolve(&from_path)?;
+        self.check_writable(&from_path, true)?;
+        self.check_writable(&to_path, true)?;
         self.check_destination(&from_path, &to_path)?;
         self.atomically(|ws| {
             ws.copy_tree(&from_path, &to_path, true)?;

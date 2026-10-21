@@ -73,10 +73,17 @@ impl Tools {
         } else {
             format!("It contains {}.", top.join(", "))
         };
+        let read_only: Vec<String> =
+            self.workspace.read_only_paths().iter().map(|path| shown(path.as_str()).into_owned()).collect();
+        let read_only = if read_only.is_empty() {
+            String::new()
+        } else {
+            format!(" You can read but not change anything in {}.", read_only.join(", "))
+        };
         format!(
             "These tools are your filesystem: a private copy-on-write workspace. {layout} Paths are absolute. \
              Mounted sources are never modified; every write stays in this workspace, and `changes` shows what you \
-             changed. A path holding a control character or line separator, such as a newline, is shown as a quoted JSON string."
+             changed.{read_only} A path holding a control character or line separator, such as a newline, is shown as a quoted JSON string."
         )
     }
 
