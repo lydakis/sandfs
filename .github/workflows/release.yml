@@ -138,10 +138,17 @@ jobs:
       id-token: write
       contents: read
     steps:
+      # Only the Python packages: the run's other artifacts (the `sandfs` archives)
+      # aren't for PyPI, which refuses the whole upload over them.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdist
+          path: dist
       # The version comes from Cargo.toml; refuse to publish under a different tag.
       - name: Check the tag matches the package version
         run: test -f "dist/sandfs-${GITHUB_REF_NAME#v}.tar.gz"
