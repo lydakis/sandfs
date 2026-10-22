@@ -27,8 +27,8 @@ cargo package --workspace --exclude sandfs-py  # builds the crates as crates.io 
 1. Tag and push:
 
    ```bash
-   git tag -a v0.5.0 -m "sandfs v0.5.0"
-   git push origin v0.5.0
+   git tag -a vX.Y.Z -m "sandfs vX.Y.Z"   # X.Y.Z is the version in Cargo.toml
+   git push origin vX.Y.Z
    ```
 
    The tag runs `release.yml`. It builds wheels for Linux (x86_64, aarch64, manylinux), macOS (x86_64, arm64) and Windows (x64) plus the sdist, smoke-tests the wheels, checks the tag matches the package version, and uploads to PyPI. In parallel it publishes every crate without `publish = false` to crates.io, dependencies first, and builds the `sandfs` command for Linux and macOS. Once everything has built, it attaches those builds to the tag's GitHub release. If no release exists for the tag yet, it first creates one, using the changelog entry as its notes, after checking that the tag matches the version.

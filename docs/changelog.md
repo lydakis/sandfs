@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1 (2026-10-22)
+
+The same code as 0.5.0, released again so that it reaches PyPI. The 0.5.0 crates and GitHub release (with the `sandfs` downloads) came out, but the PyPI upload failed because the release workflow handed PyPI the `sandfs` archives along with the Python packages. It now uploads only the Python packages.
+
 ## 0.5.0 (2026-10-21)
 
 The main changes:

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/sandfs-bench", "crates/sandfs-cli", "crates/sandfs-core", "crates/sandfs-git", "crates/sandfs-mcp", "crates/sandfs-py"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -14,10 +14,10 @@ homepage = "https://github.com/lydakis/sandfs"
 bytes = "1.12"
 imbl = "7.0"
 thiserror = "2.0"
-sandfs-core = { path = "crates/sandfs-core", version = "0.5.0" }
-sandfs-git = { path = "crates/sandfs-git", version = "0.5.0" }
-sandfs-mcp = { path = "crates/sandfs-mcp", version = "0.5.0" }
-sandfs-cli = { path = "crates/sandfs-cli", version = "0.5.0" }
+sandfs-core = { path = "crates/sandfs-core", version = "0.5.1" }
+sandfs-git = { path = "crates/sandfs-git", version = "0.5.1" }
+sandfs-mcp = { path = "crates/sandfs-mcp", version = "0.5.1" }
+sandfs-cli = { path = "crates/sandfs-cli", version = "0.5.1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
