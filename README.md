@@ -147,6 +147,8 @@ sandfs shell finance -- my-agent      # sees ~/ws/finance and the system's progr
 sandfs changes finance                # then review what it did
 ```
 
+To let an agent reach some sites and not others, run it under Anthropic's [sandbox runtime](https://github.com/anthropic-experimental/sandbox-runtime) with the mount as the one folder it may write to; [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md) shows the settings.
+
 `sandfs serve --mcp NAME` hands a saved workspace to an agent as MCP file tools instead of mounting it.
 
 Every mount is served by one background process, started by the first `mount` or `fork` and gone once the last mount is. It detaches from whatever started it: it runs in a session of its own and is adopted by init (or launchd, or the nearest subreaper). So a job runner or shell that kills a job's process group or its process tree leaves other jobs' mounts alone; killing a whole container or cgroup still ends it. It keeps the starting command's environment, which carries what git needs to fetch, except the variables that point git at a repository (`GIT_DIR` and the like).
