@@ -25,6 +25,28 @@ sandfs clean                                     # free the space downloaded rep
 
 `sandfs shell NAME [-- COMMAND...]` runs your shell, or a command, in a mounted workspace with the rest of the machine's files out of its reach: it starts in the mount and can change what isn't read-only there, run the system's programs and use a temporary folder of its own, but can't read your home folder, other folders or the workspace's source. It gets no network unless `--network` is given, HOME is an empty folder outside the mount (so caches don't land among the changes), and only PATH, TERM, the locale, USER and SHELL pass through from your environment, so tokens and keys in it stay out; with `--network` the proxy variables do too. Git works in a git workspace (it reads the local copy's objects, nothing else of it), though without sandfs's file monitor, so `git status` reads the files it is asked about. Anything the command leaves running ends with it, except on macOS a process that moves itself into a session of its own; and descriptors sandfs was itself started with stay open in the command, so don't hand it any you mean to keep from it (#137). Its exit code is the command's. This is how an agent that works through a shell gets the mount as its only files. Sandfs still enforces nothing itself: on Linux the command runs under bubblewrap (package `bubblewrap`), on macOS under the system's own sandbox (`sandbox-exec`), with a profile sandfs writes for the mount. Ubuntu 23.10 and later restrict the user namespaces bubblewrap needs, so there it may need an AppArmor profile that allows them (or `sysctl kernel.apparmor_restrict_unprivileged_userns=0`).
 
+`sandfs shell` gives a program the whole network or none of it. To let one reach some sites and not others, run it under Anthropic's [sandbox runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`) instead, with the mount as the only folder it may write to. `srt` confines a program with the same tools (bubblewrap on Linux, the system's sandbox on macOS) and sends its network through a proxy that lets through only the sites listed. It lets a program read the whole machine unless told otherwise, so hide your home folder, and the workspace's source if it lives elsewhere, then allow the mount back:
+
+```json
+{
+  "network": { "allowedDomains": ["pypi.org", "files.pythonhosted.org"], "deniedDomains": [] },
+  "filesystem": {
+    "denyRead": ["~", "/srv/survey"],
+    "allowRead": ["~/ws/survey"],
+    "allowWrite": ["~/ws/survey"],
+    "denyWrite": []
+  }
+}
+```
+
+```bash
+sandfs mount /srv/survey ~/ws/survey --read-only raw
+cd ~/ws/survey && srt --settings ~/survey-srt.json -c 'my-agent'
+sandfs changes survey
+```
+
+Read-only paths stay read-only under `srt`, and `changes` lists what the program wrote as usual. Unlike `sandfs shell`, `srt` keeps HOME and the rest of your environment, so take tokens out of it yourself. Writes under a hidden home folder are refused on macOS and, on Linux, go to an empty folder that is thrown away when the command ends. Git in a `git:` workspace doesn't work this way: it reads objects from the repository the workspace came from (or sandfs's local copy of it under `$SANDFS_HOME`), which the settings above hide. Use `sandfs shell` for git workspaces, or add that repository's `.git/objects` to `allowRead` and allow writes to the mount; git then warns that its file monitor can't reach sandfs and reads the files itself instead.
+
 `sandfs changes NAME [PATH...] --copy-to DIR` is how changes leave a workspace: it writes the files listed (all of them, or those under each PATH) into DIR, copying added and modified files and links with their executable bit and removing deleted ones, so a copy of the source kept in DIR comes to match the workspace. It writes nothing outside DIR and never writes through a link it finds there. DIR may be the source folder itself, which is how a host folder keeps an agent's work: name it on purpose, since that is the one time sandfs changes the source. It also leaves out changes in a `.git` folder, in any spelling a Mac or Windows disk would read as one, since git runs the programs named there; it says how many it left out, and you copy those by hand if you mean to.
 
 `sandfs serve --mcp NAME` hands an unmounted workspace to an agent as MCP file tools over stdin and stdout (read, list, glob, grep, write, edit, move, delete, changes), with the source's files under `/mnt`. Each change is saved before its reply, so a later `mount` or `changes` sees it, and a change that can't be saved is undone and reported as an error.
