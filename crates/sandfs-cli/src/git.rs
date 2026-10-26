@@ -138,7 +138,7 @@ pub fn start(home: &Home, name: &str, uncommitted: bool, branch: Option<&str>) -
         None
     };
     if let Some(branch) = branch {
-        check_new_branch(repo, managed, branch)?;
+        check_new_branch(repo, branch)?;
     }
 
     let _writer = home.lock(name, "sandfs mount, preparing the workspace")?;
@@ -302,19 +302,22 @@ fn copy_changed(
     Ok(())
 }
 
-/// Refuse a name git wouldn't take for a new branch, or one the repository already has
-/// (the remote itself when `repo` is sandfs's own copy of one), which a push back would
-/// then overwrite or be refused.
-fn check_new_branch(repo: &Path, managed: bool, branch: &str) -> Result<()> {
+/// Refuse a name git wouldn't take for a new branch, or one the mount's `origin` already
+/// has, which a push back would then overwrite or be refused. That is the repository
+/// itself, or for a partial clone (sandfs's copy of a remote among them) the remote it
+/// borrows from, as [`GitDir`] sets it.
+fn check_new_branch(repo: &Path, branch: &str) -> Result<()> {
     let checked =
         (!branch.starts_with('-')).then(|| git(repo, &["check-ref-format", "--branch", branch]).ok()).flatten();
     if checked.as_deref() != Some(branch) {
         bail!("{branch:?} is not a name git takes for a branch");
     }
     let full = format!("refs/heads/{branch}");
-    if managed {
-        // The copy keeps the commits it fetched under refs of its own, not the remote's branches.
-        let url = origin(repo).context("sandfs's copy of the repository names no remote")?;
+    let promisor = git(repo, &["config", "--get", "remote.origin.promisor"]).is_ok_and(|value| value == "true");
+    if promisor {
+        // A partial clone's own branches needn't be the remote's: sandfs's copies keep
+        // what they fetched under refs of their own.
+        let url = origin(repo).context("the partial clone names no remote")?;
         if !git(repo, &["ls-remote", "origin", &full]).context("asking the remote for its branches")?.is_empty() {
             bail!("{url} already has a branch {branch}; pick another name");
         }

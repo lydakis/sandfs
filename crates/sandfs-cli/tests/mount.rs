@@ -536,6 +536,14 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     let url = format!("git:file://{}", repo.display());
     refused(&["mount", &url, other, "--uncommitted"], "is remote");
     refused(&["mount", &url, other, "--branch", "task/one"], "already has a branch task/one");
+    // A partial clone's pushes go to the remote it borrows from, which is what counts.
+    git(&repo, &["config", "uploadpack.allowFilter", "true"]);
+    let partial = data.path().join("partial");
+    git(data.path(), &["clone", "-q", "--filter=blob:none", &format!("file://{}", repo.display()), "partial"]);
+    refused(
+        &["mount", &format!("git:{}", partial.display()), other, "--branch", "task/one"],
+        "already has a branch task/one",
+    );
     refused(&["mount", repo.to_str().unwrap(), other, "--branch", "two"], "is a folder");
     refused(&["mount", "task", other, "--branch", "two"], "already exists");
     assert_eq!(sandfs.stdout(&["list"]).lines().count(), 1, "no workspace was left behind");
