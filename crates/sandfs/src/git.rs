@@ -84,9 +84,14 @@ pub fn resolve_branch(repos: &Path, spec: &str) -> Result<(PathBuf, String, Opti
 /// checked out there, taking `top` as a path, never as a source with an `@revision`.
 pub fn resolve_head(top: &Path) -> Result<(PathBuf, String, Option<String>)> {
     let repo = top.canonicalize().with_context(|| format!("no repository at {}", top.display()))?;
-    let commit = commit_of(&repo, "HEAD")?;
-    let branch = local_branch(&repo, "HEAD")
-        .filter(|branch| commit_of(&repo, &format!("refs/heads/{branch}")).is_ok_and(|tip| tip == commit));
+    // One git for both: the commit, then the full name `HEAD` points to, or `HEAD`
+    // itself when it is detached. (`--short` gives `heads/main` when a tag is also
+    // called `main`.)
+    let out = git(&repo, &["rev-parse", "HEAD^{commit}", "--symbolic-full-name", "HEAD"])
+        .with_context(|| format!("\"HEAD\" is not a commit in {}", repo.display()))?;
+    let mut lines = out.lines();
+    let commit = lines.next().filter(|id| is_commit_id(id)).context("git rev-parse printed no commit")?.to_owned();
+    let branch = lines.next().and_then(|head| head.strip_prefix("refs/heads/")).map(str::to_owned);
     Ok((repo, commit, branch))
 }
 
@@ -147,7 +152,8 @@ pub fn start(home: &Home, name: &str, branch: Option<&str>) -> Result<Workspace>
         bail!("{} is not a git repository", record.source);
     };
     // Checked before anything is written, so a refusal leaves nothing to undo.
-    let (top, changed) = changed_files(repo, commit)?;
+    // A fork of a checkout is over the repository at its working folder (see `fork`).
+    let (top, changed) = (repo.clone(), changed_files(repo, commit)?);
     if let Some(branch) = branch {
         check_new_branch(repo, branch)?;
     }
@@ -460,19 +466,12 @@ pub fn packed_branches(data: &[u8]) -> Vec<String> {
     packed_heads(&String::from_utf8_lossy(data)).map(|(_, name)| name.to_owned()).collect()
 }
 
-/// The working folder of local repository `repo`, and the files in it that differ from
-/// `commit`, its `HEAD`: changed, added or deleted, staged or not, and new files git
-/// doesn't ignore. Deleted files come first, so a folder that replaced a file is made
-/// after the file is gone.
-fn changed_files(repo: &Path, commit: &str) -> Result<(PathBuf, Vec<String>)> {
-    let top = git(repo, &["rev-parse", "--show-toplevel"])
-        .ok()
-        .filter(|top| !top.is_empty())
-        .with_context(|| format!("{} has no working folder to copy", repo.display()))?;
-    let top = PathBuf::from(top);
-    if commit_of(&top, "HEAD")? != commit {
-        bail!("{} moved to another commit while it was being copied; try again", top.display());
-    }
+/// The files in the working folder `top` that differ from `commit`, its `HEAD` when it
+/// was read: changed, added or deleted, staged or not, and new files git doesn't
+/// ignore. Should `HEAD` have moved since, these are still what makes `commit` the
+/// folder. Deleted files come first, so a folder that replaced a file is made after
+/// the file is gone.
+fn changed_files(top: &Path, commit: &str) -> Result<Vec<String>> {
     let split = |out: Vec<u8>| -> Result<Vec<String>> {
         out.split(|&byte| byte == 0)
             .filter(|path| !path.is_empty())
@@ -481,16 +480,16 @@ fn changed_files(repo: &Path, commit: &str) -> Result<(PathBuf, Vec<String>)> {
     };
     // Optional locks would let git refresh the repository's index: it is only read.
     let tracked = split(git_raw(
-        &top,
-        &["--no-optional-locks", "diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=all", "HEAD", "--"],
+        top,
+        &["--no-optional-locks", "diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=all", commit, "--"],
         None,
     )?)?;
     let untracked =
-        split(git_raw(&top, &["--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard"], None)?)?;
+        split(git_raw(top, &["--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard"], None)?)?;
     let (mut gone, mut present) = (Vec::new(), Vec::new());
     // A repository inside the folder is listed as its folder, which a mount doesn't show.
     for path in tracked.into_iter().chain(untracked.into_iter().filter(|path| !path.ends_with('/'))) {
-        match in_folder(&top, &path)? {
+        match in_folder(top, &path)? {
             Some(_) => present.push(path),
             None => gone.push(path),
         }
@@ -499,7 +498,7 @@ fn changed_files(repo: &Path, commit: &str) -> Result<(PathBuf, Vec<String>)> {
     present.sort();
     present.dedup();
     gone.append(&mut present);
-    Ok((top, gone))
+    Ok(gone)
 }
 
 /// What the file `rel` (`/`-separated) is in the folder `top`, without following links:
@@ -622,7 +621,7 @@ pub fn make_folder(
     private: &Path,
     index_from: Option<&Path>,
 ) -> Result<()> {
-    let settings = Settings::read(repo)?;
+    let settings = Settings::opened_or_read(repo)?;
     let git_root = VPath::parse(&format!("{ROOT}/.git"))?;
     let mut folders = vec![git_root.clone()];
     while let Some(at) = folders.pop() {
@@ -828,6 +827,7 @@ const TOUCHED: &str = ".git/sandfs-touched";
 
 /// What a checkout of a commit of a repository, a mount's or a folder's (see
 /// [`make_folder`]), takes from the repository's settings.
+#[derive(Clone)]
 struct Settings {
     /// Where the repository keeps its objects and settings.
     common: PathBuf,
@@ -839,7 +839,21 @@ struct Settings {
     promisor: Option<String>,
 }
 
+/// The settings each repository's `.git` was last made with in this process (see
+/// [`GitDir::new`]), so a folder made from the same workspace right after needn't
+/// start git twice to read them again.
+static OPENED: Mutex<Option<HashMap<PathBuf, Settings>>> = Mutex::new(None);
+
 impl Settings {
+    /// The settings of `repo`, as this process last read them, else read now.
+    fn opened_or_read(repo: &Path) -> Result<Self> {
+        let opened = OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match opened.as_ref().and_then(|opened| opened.get(repo)) {
+            Some(settings) => Ok(settings.clone()),
+            None => Self::read(repo),
+        }
+    }
+
     fn read(repo: &Path) -> Result<Self> {
         let info = git(repo, &["rev-parse", "--git-common-dir", "--show-object-format"])?;
         let mut lines = info.lines();
@@ -945,6 +959,9 @@ impl GitDir {
             Some(files) => Settings::of_source(repo, files)?,
             None => Settings::read(repo)?,
         };
+        let mut opened = OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        opened.get_or_insert_with(HashMap::new).insert(repo.to_path_buf(), settings.clone());
+        drop(opened);
         let Settings { common, promisor, .. } = &settings;
         let common = common.clone();
         let promisor = promisor.is_some();
