@@ -5,37 +5,50 @@
 //! process's NFS server with its own NFS client (see `nfs`). Elsewhere (Windows)
 //! nothing is ever mounted, so the lookups find nothing.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-/// The source of the topmost FUSE mount at `dir` (`sandfs:<name>` for a workspace).
-#[cfg(target_os = "linux")]
+/// The source of the topmost mount at `dir` that could be a workspace's
+/// (`sandfs:<name>` for one).
 pub fn mount_source(dir: &Path) -> Option<String> {
-    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    table.lines().rev().find_map(|line| {
-        let fields: Vec<&str> = line.split(' ').collect();
-        // Field 5 is the mount point; the type and source follow the " - " separator.
-        let sep = fields.iter().position(|f| *f == "-")?;
-        let (fstype, source) = (fields.get(sep + 1)?, fields.get(sep + 2)?);
-        (fields.get(4).is_some_and(|point| Path::new(&unescape(point)) == dir) && fstype.starts_with("fuse"))
-            .then(|| unescape(source))
-    })
+    mount_table().remove(dir)
 }
 
-/// The source of the topmost mount at `dir`, from `mount`'s table (`sandfs:<name>` for
-/// a workspace).
+/// [`mount_source`] for every mount point, read from the system's table once, for
+/// callers that look up many: with thousands of workspaces mounted, reading the table
+/// once per workspace made finding one cost as much as reading them all.
+#[cfg(target_os = "linux")]
+pub fn mount_table() -> HashMap<PathBuf, String> {
+    let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mut sources = HashMap::new();
+    // Later lines are mounted on top of earlier ones at the same point.
+    for line in table.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        // Field 5 is the mount point; the type and source follow the " - " separator.
+        let Some(sep) = fields.iter().position(|f| *f == "-") else { continue };
+        let (Some(point), Some(fstype), Some(source)) = (fields.get(4), fields.get(sep + 1), fields.get(sep + 2))
+        else {
+            continue;
+        };
+        if fstype.starts_with("fuse") {
+            sources.insert(PathBuf::from(unescape(point)), unescape(source));
+        }
+    }
+    sources
+}
+
+/// [`mount_source`] for every mount point, from `mount`'s table, run once.
 #[cfg(target_os = "macos")]
-pub fn mount_source(dir: &Path) -> Option<String> {
-    let output = std::process::Command::new("/sbin/mount").output().ok()?;
+pub fn mount_table() -> HashMap<PathBuf, String> {
+    let Ok(output) = std::process::Command::new("/sbin/mount").output() else { return HashMap::new() };
     let table = String::from_utf8_lossy(&output.stdout);
-    table
-        .lines()
-        .rev()
-        .find_map(|line| parse_mount_line(line).filter(|(_, point)| Path::new(point) == dir).map(|(source, _)| source))
+    // Later lines are mounted on top of earlier ones at the same point.
+    table.lines().filter_map(parse_mount_line).map(|(source, point)| (PathBuf::from(point), source)).collect()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn mount_source(_dir: &Path) -> Option<String> {
-    None
+pub fn mount_table() -> HashMap<PathBuf, String> {
+    HashMap::new()
 }
 
 /// A line of macOS `mount` output, `SOURCE on POINT (TYPE, OPTIONS...)`, as its source

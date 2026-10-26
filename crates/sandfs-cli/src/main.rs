@@ -400,9 +400,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::List => {
             let mut out = String::new();
+            let table = host::mount_table();
             for name in home.names()? {
                 let record = home.record(&name)?;
-                let mounted = home.mount_info(&name).map(|info| info.mountpoint.display().to_string());
+                let mounted = home.mount_info_in(&name, &table).map(|info| info.mountpoint.display().to_string());
                 writeln!(out, "{name}\t{}\t{}", record.source, mounted.as_deref().unwrap_or("-"))?;
             }
             print_out(&out)
