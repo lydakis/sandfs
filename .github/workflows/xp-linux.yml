@@ -1,8 +1,5 @@
 name: xp-linux
 on:
-  push:
-    branches: [claude/project-thread-jx4nw5]
-    paths: ["xp/**", ".github/workflows/xp-linux.yml"]
   workflow_dispatch:
 jobs:
   linux:

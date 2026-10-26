@@ -1962,6 +1962,10 @@ impl Filesystem for SandFs {
         let no_opendir = config.add_capabilities(InitFlags::FUSE_NO_OPENDIR_SUPPORT).is_ok();
         self.0.no_opendir.store(no_opendir, Ordering::SeqCst);
         self.0.lock().keep_listed = no_opendir;
+        // Experiment only: let the kernel cache writes and send them in batches.
+        if std::env::var_os("SANDFS_XP_WRITEBACK").is_some() {
+            let _ = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE);
+        }
         Ok(())
     }
 

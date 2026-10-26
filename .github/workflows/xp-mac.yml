@@ -1,8 +1,5 @@
 name: xp-mac
 on:
-  push:
-    branches: [claude/project-thread-jx4nw5]
-    paths: ["xp/**", ".github/workflows/xp-mac.yml"]
   workflow_dispatch:
 jobs:
   fuset:

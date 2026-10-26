@@ -74,6 +74,12 @@ copies() { # fs-label base-dir
   export SANDFS_HOME="$B/sandfs-home"
   make "sandfs fork" "$B/fork" "$S" fork "$B/clone" "$B/fork" --branch xp
   "$S" rm --unmount "$B/fork" > /dev/null 2>&1
+  if [ "$F" = ext4 ]; then
+    export SANDFS_XP_WRITEBACK=1
+    make "sandfs fork + writeback cache" "$B/fork" "$S" fork "$B/clone" "$B/fork" --branch xp2
+    "$S" rm --unmount "$B/fork" > /dev/null 2>&1
+    unset SANDFS_XP_WRITEBACK
+  fi
   rm -rf "$B/clone" "$SANDFS_HOME"
 }
 mkdir -p "$W/ext4"
