@@ -603,11 +603,8 @@ fn mount_options(port: u16) -> String {
         &format!("port={port},mountport={port}"),
         // Advisory locks stay on this machine, where every program using the mount is.
         "locallocks",
-        // Wait for the server however long it takes, as a first read waiting on a slow
-        // fetch must: a soft mount gives up after seconds with "Operation timed out".
-        // Should this process die without unmounting, a program waiting on the mount
-        // can still be interrupted, and `sandfs unmount` detaches it.
-        "hard",
+        // Fail instead of hanging forever if this process dies without unmounting.
+        "soft",
         "intr",
         // Send each write to the server before it returns, as FUSE does, instead of
         // keeping it in the client's cache, so a save sees every write that returned.
@@ -621,9 +618,6 @@ fn mount_options(port: u16) -> String {
         "acrootdirmax=1",
         "rsize=1048576",
         "wsize=1048576",
-        // A folder, not a disk: Finder leaves it out of its sidebar and the Desktop, and
-        // offers no Eject for it. It still works as any folder, and `mount` lists it.
-        "nobrowse",
     ]
     .join(",")
 }
@@ -1363,6 +1357,5 @@ mod tests {
         let options = mount_options(4049);
         assert!(options.contains("port=4049,mountport=4049") && options.contains("vers=3"), "{options}");
         assert!(options.split(',').any(|option| option == "sync"), "{options}");
-        assert!(options.split(',').any(|option| option == "nobrowse"), "{options}");
     }
 }
