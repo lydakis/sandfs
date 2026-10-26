@@ -1140,9 +1140,7 @@ pub fn object_folders(repo: &Path) -> Result<Vec<PathBuf>> {
 /// longer a change, but git may have recorded it while it was different. The paths
 /// reported before are kept in [`TOUCHED`], inside the mount.
 pub fn fsmonitor(saved: &[(String, PathState)], version: &str) -> Result<()> {
-    if version != "2" {
-        bail!("unsupported file monitor version {version}; set core.fsmonitorHookVersion = 2");
-    }
+    check_fsmonitor_version(version)?;
     let previous = std::fs::read(TOUCHED).unwrap_or_default();
     let mut touched: BTreeSet<&[u8]> = previous.split(|&b| b == 0).filter(|path| !path.is_empty()).collect();
     let before = touched.len();
@@ -1167,11 +1165,29 @@ pub fn fsmonitor(saved: &[(String, PathState)], version: &str) -> Result<()> {
         }
         std::fs::write(TOUCHED, &list).with_context(|| format!("writing {TOUCHED}"))?;
     }
+    fsmonitor_answer(touched)
+}
+
+/// Answer git's file monitor (hook version 2) that any file may have changed, as in a
+/// folder that is no mount, so git checks every file itself.
+pub fn fsmonitor_all(version: &str) -> Result<()> {
+    check_fsmonitor_version(version)?;
+    fsmonitor_answer([b"/".as_slice()])
+}
+
+fn check_fsmonitor_version(version: &str) -> Result<()> {
+    if version != "2" {
+        bail!("unsupported file monitor version {version}; set core.fsmonitorHookVersion = 2");
+    }
+    Ok(())
+}
+
+fn fsmonitor_answer<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> Result<()> {
     // Any new token will do: the answer never depends on it.
     let token = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let mut out = std::io::stdout().lock();
     write!(out, "sandfs:{token}\0")?;
-    for path in touched {
+    for path in paths {
         out.write_all(path)?;
         out.write_all(b"\0")?;
     }

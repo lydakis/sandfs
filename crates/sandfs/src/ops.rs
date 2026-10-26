@@ -267,7 +267,9 @@ pub(crate) fn shell(home: &Home, workspace: &str, network: bool, command: &[OsSt
 pub(crate) fn git_fsmonitor(home: &Home, version: &str) -> Result<()> {
     // Git runs its file monitor at the root of the checkout: the mount.
     let root = std::env::current_dir()?;
-    let name = home.find(root.to_str().context("non-UTF-8 mount path")?)?;
+    // A git worktree added from a mount shares the mount's config, this monitor
+    // included, but is a plain folder: there any file may have changed, and git looks.
+    let Some(name) = root.to_str().and_then(|root| home.mounted(root)) else { return git::fsmonitor_all(version) };
     sync(home, &name)?;
     git::fsmonitor(&Saved::new(home.workspace_dir(&name)).paths()?, version)
 }

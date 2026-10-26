@@ -425,6 +425,40 @@ fn git_works_inside_a_remote_git_mount() {
 }
 
 #[test]
+fn git_runs_quietly_in_a_worktree_added_from_a_git_mount() {
+    if !fuse_available() {
+        return;
+    }
+    let remote = tempfile::Builder::new().prefix("sandfs-remote").tempdir().unwrap();
+    let remote = remote.path();
+    git(remote, &["init", "-q"]);
+    git(remote, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::write(remote.join("README.md"), "hello\n").unwrap();
+    git(remote, &["add", "-A"]);
+    git(remote, &["commit", "-q", "-m", "first"]);
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let [work, tree] = ["work", "tree"].map(|name| dirs.path().join(name));
+    let source = format!("git:file://{}", remote.display());
+    sandfs.mount(&["mount", &source, work.to_str().unwrap()], &work);
+
+    // The worktree is a plain folder that shares the mount's config, file monitor
+    // included, so git runs the monitor where no workspace is mounted.
+    git_out(&work, &["worktree", "add", "-q", "-b", "side", tree.to_str().unwrap()]);
+    std::fs::write(tree.join("README.md"), "hello, worktree\n").unwrap();
+    std::fs::write(tree.join("notes.txt"), "notes\n").unwrap();
+    for dir in [&tree, &work] {
+        let output = Command::new("git").arg("-C").arg(dir).args(["status", "--porcelain"]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "git in {}", dir.display());
+        let expected = if dir == &tree { " M README.md\n?? notes.txt\n" } else { "" };
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "git in {}", dir.display());
+    }
+    sandfs.unmount(&work);
+}
+
+#[test]
 fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     if !fuse_available() {
         return;
