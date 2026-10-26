@@ -80,7 +80,7 @@ passthrough() { # label lib-flags backend-options...
 }
 if [ "${FUSET:-1}" = 1 ]; then
   LIB=fuset
-  cc -O2 -o "$W/pt-fuset" "$X/passthrough.c" $(pkg-config --cflags --libs fuse-t) 2>&1 | tail -5
+  cc -O2 -o "$W/pt-fuset" "$X/passthrough.c" -D_FILE_OFFSET_BITS=64 $(pkg-config --cflags --libs fuse-t) 2>&1 | tail -5
   passthrough "fuse-t nfs" "" -f -o backend=nfs
   passthrough "fuse-t smb" "" -f -o backend=smb
   passthrough "fuse-t fskit" "" -f -o backend=fskit
