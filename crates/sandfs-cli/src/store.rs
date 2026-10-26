@@ -68,6 +68,12 @@ pub struct Record {
     /// Paths, relative to the source, that the workspace can read but not change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only: Vec<String>,
+    /// Base files, relative to the source, that `update` found changed in a newer
+    /// source, with the time of that update since the Unix epoch, in seconds and
+    /// nanoseconds. They report it as their mtime, so builds that check times see them
+    /// as changed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub updated: BTreeMap<String, (u64, u32)>,
 }
 
 /// `mount.json`: the process serving a mounted workspace.
@@ -169,6 +175,15 @@ impl Home {
 
     pub fn exists(&self, name: &str) -> bool {
         check_name(name).is_ok() && self.workspace_dir(name).join("workspace.json").is_file()
+    }
+
+    /// Replace the record of the existing workspace `name`, all at once.
+    pub fn set_record(&self, name: &str, record: &Record) -> Result<()> {
+        check_name(name)?;
+        let dir = self.workspace_dir(name);
+        let tmp = dir.join("workspace.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(record)?).context("writing workspace.json")?;
+        std::fs::rename(&tmp, dir.join("workspace.json")).context("writing workspace.json")
     }
 
     pub fn record(&self, name: &str) -> Result<Record> {
@@ -466,7 +481,14 @@ impl Home {
         clone_tree(folder, copy.path(), &self.root)?;
         let path = copy.keep();
         let source = folder.display().to_string();
-        Ok(Record { source, base: Base::Dir { path }, created, read_only: Vec::new() })
+        Ok(Record { source, base: Base::Dir { path }, created, read_only: Vec::new(), updated: BTreeMap::new() })
+    }
+
+    /// Whether `path` is one of the copies of folders [`Home::freeze`] makes, however the
+    /// home was named when it was made.
+    pub fn holds_copy(&self, path: &Path) -> bool {
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        canonical(path).starts_with(canonical(&self.copies_dir()))
     }
 
     fn copies_dir(&self) -> PathBuf {
@@ -501,6 +523,7 @@ impl Home {
     pub fn resolve(&self, source: &str) -> Result<Record> {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let spec = source.strip_prefix("git:").or_else(|| source.contains("://").then_some(source));
+        let mut named = source.to_owned();
         let base = if let Some(spec) = spec {
             // Git would take that repository's settings, which whatever writes to the
             // mount can change to name programs to run; a fork copies it without git.
@@ -516,6 +539,9 @@ impl Home {
             let (repo, commit, branch) = crate::git::resolve_branch(&self.root.join("repos"), spec)?;
             Base::Git { repo, commit, branch }
         } else {
+            // Kept absolute but with its links, so `update` finds the folder the name
+            // stands for now from anywhere.
+            named = std::path::absolute(expand(source)).map_or(named, |path| path.display().to_string());
             let path = expand(source).canonicalize().with_context(|| format!("no folder at {source}"))?;
             if !path.is_dir() {
                 bail!("{} is not a folder", path.display());
@@ -530,7 +556,7 @@ impl Home {
             }
             Base::Dir { path }
         };
-        Ok(Record { source: source.to_owned(), base, created, read_only: Vec::new() })
+        Ok(Record { source: named, base, created, read_only: Vec::new(), updated: BTreeMap::new() })
     }
 
     /// The record for a new workspace over the `HEAD` of the repository whose working
@@ -539,7 +565,13 @@ impl Home {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let (repo, commit, branch) = crate::git::resolve_head(top)?;
         let source = format!("git:{}", repo.display());
-        Ok(Record { source, base: Base::Git { repo, commit, branch }, created, read_only: Vec::new() })
+        Ok(Record {
+            source,
+            base: Base::Git { repo, commit, branch },
+            created,
+            read_only: Vec::new(),
+            updated: BTreeMap::new(),
+        })
     }
 }
 
@@ -624,7 +656,7 @@ fn symlink(_target: &Path, path: &Path) -> Result<()> {
 }
 
 /// An empty workspace with `base` mounted at [`ROOT`], for the home at `home`.
-fn open_base(base: &Base, home: &Path) -> Result<Workspace> {
+pub fn open_base(base: &Base, home: &Path) -> Result<Workspace> {
     let mut ws = Workspace::new();
     match base {
         Base::Dir { path } => ws.mount(ROOT, Arc::new(DirSource::new(path)?))?,

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey, VPath, Workspace};
 use sandfs_git::{GitSource, ObjectIds};
@@ -220,6 +220,242 @@ fn ref_in(ws: &Workspace, full: &str) -> Result<Option<String>> {
         let (commit, name) = line.split_once(' ')?;
         (name == full && !commit.starts_with('#')).then(|| commit.to_owned())
     }))
+}
+
+/// The files that differ between commits `from` and `to` of `repo`: changed, added or
+/// deleted, as paths in the commits. Only folder listings are compared, so nothing is
+/// fetched for a partial clone.
+pub fn changed_between(repo: &Path, from: &str, to: &str) -> Result<BTreeSet<String>> {
+    let out =
+        git_raw(repo, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", "--end-of-options", from, to], None)?;
+    out.split(|&byte| byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8(path.to_vec()).context("a changed file's name is not UTF-8"))
+        .collect()
+}
+
+/// What `rel` is in `commit` of `repo`: its mode and object id as git lists them,
+/// or none when the commit has nothing there. Only folder listings are read.
+pub fn entry_at(repo: &Path, commit: &str, rel: &str) -> Result<Option<(String, String)>> {
+    let out = git_raw(repo, &["ls-tree", "-z", "--full-tree", "--end-of-options", commit, "--", rel], None)?;
+    // `<mode> <type> <id>\t<path>\0`, for the path itself only.
+    let line = out.split(|&byte| byte == 0).next().unwrap_or_default();
+    let line = String::from_utf8_lossy(line);
+    let Some((meta, path)) = line.split_once('\t') else { return Ok(None) };
+    let mut fields = meta.split(' ');
+    match (fields.next(), fields.nth(1)) {
+        (Some(mode), Some(id)) if path == rel => Ok(Some((mode.to_owned(), id.to_owned()))),
+        _ => Ok(None),
+    }
+}
+
+/// The id git gives `data` as the contents of a file of `repo`.
+pub fn blob_id(repo: &Path, data: &[u8]) -> Result<String> {
+    let out = git_raw(repo, &["hash-object", "--stdin"], Some(data))?;
+    Ok(String::from_utf8_lossy(&out).trim().to_owned())
+}
+
+/// The branches in a `packed-refs` file: each one's commit and name.
+fn packed_heads(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.lines().filter_map(|line| {
+        let (id, name) = line.split_once(' ')?;
+        let name = name.strip_prefix("refs/heads/")?;
+        (!id.starts_with(['#', '^'])).then_some((id, name))
+    })
+}
+
+/// Whether commit `id` comes before `to` in `repo`. A repository's local copy of a URL
+/// holds only the commits mounted, so when it can't tell and `may_fetch` says the
+/// copy is sandfs's own, it fetches more of the history before `to`: commits only, a
+/// few times deeper, before saying no. Someone's own repository is only read.
+fn comes_before(repo: &Path, id: &str, to: &str, may_fetch: bool) -> Result<bool> {
+    let before = || git(repo, &["merge-base", "--is-ancestor", "--end-of-options", id, to]).is_ok();
+    if !is_commit_id(id) {
+        return Ok(false);
+    }
+    if before() {
+        return Ok(true);
+    }
+    if !may_fetch || git(repo, &["rev-parse", "--is-shallow-repository"]).ok().as_deref() != Some("true") {
+        return Ok(false);
+    }
+    static FETCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    for depth in [100, 1000, 10000] {
+        let n = FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fetched = format!("refs/sandfs/deepen-{}-{n}", std::process::id());
+        let depth = format!("--depth={depth}");
+        let refspec = format!("+{to}:{fetched}");
+        let args =
+            ["fetch", "-q", &depth, "--filter=tree:0", "--no-tags", "--recurse-submodules=no", "origin", &refspec];
+        let mut waited = 0;
+        let fetch = loop {
+            match git(repo, &args) {
+                Err(err) if waited < 300 && is_shallow_race(&format!("{err:#}")) => {
+                    waited += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                result => break result,
+            }
+        };
+        let _ = git(repo, &["update-ref", "-d", &fetched]);
+        fetch.with_context(|| format!("fetching the history before {to} to see where {id} is in it"))?;
+        if before() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The revision a local repository source such as `git:../repo@main` names (none for
+/// its `HEAD`), or none at all for a URL.
+pub fn local_rev(source: &str) -> Option<Option<String>> {
+    let spec = source.strip_prefix("git:").unwrap_or(source);
+    let (location, rev) = split_rev(spec);
+    (!is_url(location)).then_some(rev)
+}
+
+/// A git workspace moving from commit `from` to `to` of `repo`. `branch` is the
+/// branch the new commit is mounted as, which the mount's `.git` serves. `may_fetch`:
+/// `repo` is sandfs's own copy of a URL, which may fetch history it lacks.
+pub struct Move<'a> {
+    pub repo: &'a Path,
+    pub from: &'a str,
+    pub to: &'a str,
+    pub branch: Option<&'a str>,
+    pub may_fetch: bool,
+}
+
+/// What happens to a file of the workspace's own `.git` (see [`Move::file`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Moved {
+    Keep,
+    /// The mount's `.git` serves it for the new commit, so the saved one goes.
+    Forget,
+    /// Write these contents instead: a branch that was at `from` follows to `to`.
+    Write(String),
+}
+
+/// Where a commit a branch or `HEAD` names stands, seen from the move.
+#[derive(Debug, PartialEq, Eq)]
+enum Place {
+    /// The old commit, the new one, or one between them, as after `git pull`.
+    Follows,
+    /// One before the old commit, as for a branch left behind long ago.
+    Older,
+    /// One the new commit doesn't come after: commits made in the workspace.
+    Own,
+}
+
+impl Move<'_> {
+    fn place(&self, id: &str) -> Result<Place> {
+        if id == self.from || id == self.to {
+            return Ok(Place::Follows);
+        }
+        if !comes_before(self.repo, id, self.to, self.may_fetch)? {
+            return Ok(Place::Own);
+        }
+        let older = git(self.repo, &["merge-base", "--is-ancestor", "--end-of-options", id, self.from]).is_ok();
+        Ok(if older { Place::Older } else { Place::Follows })
+    }
+
+    /// The commit between the old and the new one that `HEAD` in `ws` is at, as after
+    /// `git pull`: the files the pull checked out came from upstream, not the workspace.
+    /// Another branch at such a commit says nothing about the files in the workspace.
+    pub fn pulled(&self, ws: &Workspace) -> Result<Option<String>> {
+        let Ok(head) = ws.read_text(&format!("{ROOT}/.git/HEAD")) else { return Ok(None) };
+        let head = head.trim();
+        let id = match head.strip_prefix("ref: ") {
+            Some(full) => match ref_in(ws, full)? {
+                Some(id) => id,
+                None => return Ok(None),
+            },
+            None => head.to_owned(),
+        };
+        if id == self.from || id == self.to || self.place(&id)? != Place::Follows {
+            return Ok(None);
+        }
+        Ok(Some(id))
+    }
+
+    /// What becomes of the file `rel` of the workspace's `.git`, with `data` its
+    /// contents. The index goes, to be built again for the new commit. A `HEAD` or a
+    /// branch that follows, follows to the new commit; one before the old commit stays
+    /// where it is; one at commits made in the workspace, which moving would leave
+    /// behind, is refused. `loose` says whether a branch has a file of its own, which
+    /// git reads instead of its line in `packed-refs`.
+    pub fn file(&self, rel: &str, data: &[u8], loose: &dyn Fn(&str) -> bool) -> Result<Moved> {
+        let text = String::from_utf8_lossy(data).trim().to_owned();
+        let short = |id: &str| id[..id.len().min(12)].to_owned();
+        let own_branch = |name: &str, id: &str| {
+            anyhow!(
+                "branch {name} in the workspace has commits of its own (at {}), which moving would leave \
+                 behind; push them first, or move a fresh workspace",
+                short(id)
+            )
+        };
+        if rel == ".git/index" {
+            return Ok(Moved::Forget);
+        }
+        if rel == ".git/HEAD" {
+            if text.starts_with("ref: ") {
+                return Ok(Moved::Keep);
+            }
+            return match self.place(&text)? {
+                Place::Follows => Ok(Moved::Forget),
+                Place::Older => Ok(Moved::Keep),
+                Place::Own => bail!(
+                    "git in the workspace is at a commit of its own ({}), which moving would leave behind; \
+                     push it to a branch first",
+                    short(&text)
+                ),
+            };
+        }
+        if rel == ".git/packed-refs" {
+            // Branches packed by `git pack-refs` or `git gc`, held to the same rules,
+            // except one a file of its own has replaced since: git no longer reads it.
+            let text = String::from_utf8_lossy(data);
+            let (mut moved, mut lines) = (false, Vec::new());
+            for line in text.lines() {
+                match packed_heads(line).next().filter(|(_, name)| !loose(name)) {
+                    Some((id, name)) => match self.place(id)? {
+                        Place::Own => return Err(own_branch(name, id)),
+                        Place::Follows if id != self.to => {
+                            moved = true;
+                            lines.push(format!("{} refs/heads/{name}", self.to));
+                        }
+                        _ => lines.push(line.to_owned()),
+                    },
+                    None => lines.push(line.to_owned()),
+                }
+            }
+            return Ok(if moved {
+                Moved::Write(lines.iter().map(|line| format!("{line}\n")).collect())
+            } else {
+                Moved::Keep
+            });
+        }
+        let Some(name) = rel.strip_prefix(".git/refs/heads/") else { return Ok(Moved::Keep) };
+        match self.place(&text)? {
+            Place::Own => Err(own_branch(name, &text)),
+            Place::Older => Ok(Moved::Keep),
+            Place::Follows => Ok(match self.branch {
+                Some(branch) if branch == name => Moved::Forget,
+                _ if text == self.to => Moved::Keep,
+                _ => Moved::Write(format!("{}\n", self.to)),
+            }),
+        }
+    }
+}
+
+/// The branch a `HEAD` file `data` points to, if it points to one.
+pub fn head_branch(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    text.trim().strip_prefix("ref: refs/heads/").map(str::to_owned)
+}
+
+/// The names of the branches a `packed-refs` file `data` holds.
+pub fn packed_branches(data: &[u8]) -> Vec<String> {
+    packed_heads(&String::from_utf8_lossy(data)).map(|(_, name)| name.to_owned()).collect()
 }
 
 /// The working folder of local repository `repo`, and the files in it that differ from
@@ -1417,6 +1653,49 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn moving_keeps_only_git_state_the_new_commit_cannot_serve() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo = repo.path();
+        run(repo, &["init", "-q", "-b", "main"]);
+        let commit = |message: &str| {
+            run(repo, &["commit", "-q", "--allow-empty", "-m", message]);
+            run(repo, &["rev-parse", "HEAD"])
+        };
+        let (older, from, between, to) = (commit("zero"), commit("one"), commit("two"), commit("three"));
+        run(repo, &["checkout", "-q", "-b", "side", &from]);
+        let own = commit("side");
+        let mv = Move { repo, from: &from, to: &to, branch: Some("main"), may_fetch: false };
+        let moved = |rel: &str, data: &str| mv.file(rel, data.as_bytes(), &|_| false);
+
+        assert_eq!(moved(".git/index", "DIRC").unwrap(), Moved::Forget);
+        assert_eq!(moved(".git/HEAD", "ref: refs/heads/task\n").unwrap(), Moved::Keep);
+        assert_eq!(moved(".git/HEAD", &format!("{from}\n")).unwrap(), Moved::Forget);
+        // The branch the new commit is mounted as is served; another one follows.
+        assert_eq!(moved(".git/refs/heads/main", &between).unwrap(), Moved::Forget);
+        assert_eq!(moved(".git/refs/heads/task", &from).unwrap(), Moved::Write(format!("{to}\n")));
+        assert_eq!(moved(".git/refs/heads/task", &to).unwrap(), Moved::Keep);
+        assert_eq!(moved(".git/config", "[core]").unwrap(), Moved::Keep);
+        // A branch or HEAD left at an older commit stays there.
+        assert_eq!(moved(".git/refs/heads/old", &older).unwrap(), Moved::Keep);
+        assert_eq!(moved(".git/HEAD", &older).unwrap(), Moved::Keep);
+        // Packed branches go by the same rules.
+        let packed = format!("# pack-refs with: peeled\n{between} refs/heads/task\n{older} refs/heads/old\n");
+        let moved_packed = format!("# pack-refs with: peeled\n{to} refs/heads/task\n{older} refs/heads/old\n");
+        assert_eq!(moved(".git/packed-refs", &packed).unwrap(), Moved::Write(moved_packed));
+        // Commits the new one doesn't come after would be left behind.
+        let err = moved(".git/refs/heads/task", &own).unwrap_err().to_string();
+        assert!(err.contains("commits of its own"), "{err}");
+        assert!(moved(".git/HEAD", &own).is_err());
+        let packed_own = format!("{own} refs/heads/side\n");
+        assert!(moved(".git/packed-refs", &packed_own).is_err());
+        // Unless a file of the branch's own has replaced its packed line since.
+        assert_eq!(mv.file(".git/packed-refs", packed_own.as_bytes(), &|name| name == "side").unwrap(), Moved::Keep);
+
+        let changed = changed_between(repo, &from, &to).unwrap();
+        assert!(changed.is_empty(), "empty commits change no files: {changed:?}");
     }
 
     #[test]

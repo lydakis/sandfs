@@ -26,6 +26,7 @@ mod persist;
 mod server;
 mod shell;
 mod store;
+mod update;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -132,6 +133,22 @@ enum Cmd {
         /// With --copy-to, replace or remove such files too.
         #[arg(long, requires = "copy_to")]
         force: bool,
+    },
+    /// Move an unmounted workspace onto a newer version of its source, keeping its own
+    /// changes.
+    ///
+    /// Without SOURCE, the source is looked up again as it was given, so a git: source
+    /// or URL moves to the newest commit of its branch (a fixed @revision stays where it
+    /// is), and a fork of a plain folder takes a new copy of the folder as it is now.
+    /// SOURCE names another folder, or another commit of the same repository.
+    /// Files that changed there and not in the workspace now read as they are there.
+    /// The workspace's own changes stay, and one that matches the newer source stops
+    /// counting as a change. Paths changed in both are printed as `C path`; the
+    /// workspace's version of those stays. Forks of the workspace aren't moved.
+    Update {
+        /// A workspace name or the directory it was mounted on.
+        workspace: String,
+        source: Option<String>,
     },
     /// List workspaces and where they are mounted.
     List,
@@ -297,14 +314,23 @@ fn run(cli: Cli) -> Result<()> {
                 Origin::Workspace(from) => {
                     sync(&home, &from)?;
                     let repos = home.repos_lock(false)?;
-                    let mut record = home.record(&from)?;
-                    for path in read_only {
-                        if !record.read_only.contains(&path) {
-                            record.read_only.push(path);
+                    let with_read_only = |mut record: store::Record| {
+                        for path in &read_only {
+                            if !record.read_only.contains(path) {
+                                record.read_only.push(path.clone());
+                            }
                         }
-                    }
-                    let target = home.create(&name, &record)?;
-                    let made = Saved::new(home.workspace_dir(&from)).copy_to(&target).and_then(|()| match &branch {
+                        record
+                    };
+                    let target = home.create(&name, &with_read_only(home.record(&from)?))?;
+                    // `update` writes a new record before it drops the saved changes its
+                    // newer source has, so the record is read again after the changes
+                    // are copied: older changes over the newer record still read the
+                    // same, but newer changes over the older record would not.
+                    let made = Saved::new(home.workspace_dir(&from))
+                        .copy_to(&target)
+                        .and_then(|()| home.set_record(&name, &with_read_only(home.record(&from)?)));
+                    let made = made.and_then(|()| match &branch {
                         Some(branch) => git::switch_new(&home, &name, branch),
                         None => Ok(()),
                     });
@@ -408,6 +434,24 @@ fn run(cli: Cli) -> Result<()> {
             for rel in &settings {
                 eprintln!("sandfs: {rel} changed; git runs the programs it names, so read it before running git here");
             }
+            Ok(())
+        }
+        Cmd::Update { workspace, source } => {
+            let name = home.find(&workspace)?;
+            let updated = update::update(&home, &name, source.as_deref())?;
+            let mut out = String::new();
+            for rel in &updated.both {
+                writeln!(out, "C {rel}")?;
+            }
+            print_out(&out)?;
+            let upstream = updated.upstream.map(|n| format!(", {n} files changed there")).unwrap_or_default();
+            eprintln!(
+                "sandfs: moved {name} from {} to {}{upstream}; {} of its changes matched and are changes no longer, {} changed on both sides",
+                updated.from,
+                updated.to,
+                updated.matched,
+                updated.both.len()
+            );
             Ok(())
         }
         Cmd::List => {
@@ -787,8 +831,12 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     let group = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(dir)?);
     let base_time = UNIX_EPOCH + Duration::from_secs(opened.record.created);
     let root = VPath::parse(ROOT)?;
-    let mut inner =
-        Inner::new(opened.ws, &root, opened.restored.times, opened.restored.dirs, base_time, (owner, group));
+    let mut times = opened.restored.times;
+    // Base files a newer source changed report when the workspace moved onto it.
+    for (rel, (secs, nanos)) in &opened.record.updated {
+        times.entry(format!("{ROOT}/{rel}")).or_insert(UNIX_EPOCH + Duration::new(*secs, *nanos));
+    }
+    let mut inner = Inner::new(opened.ws, &root, times, opened.restored.dirs, base_time, (owner, group));
     inner.ranged_reads = matches!(opened.record.base, Base::Dir { .. });
     inner.drafts = Some(opened.saved.drafts());
     // NFS has no close to flush a file's writes, and macOS's NFS client adds files of

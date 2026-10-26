@@ -684,6 +684,24 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     sandfs.run(&["rm", "--unmount", "snap"]);
     sandfs.mounts.clear();
     assert_eq!(copies(), 0);
+
+    // Moving a fork of the folder takes a new copy of the folder as it is now, keeping
+    // the fork's own changes, and the old copy goes.
+    sandfs.run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    sandfs.mounts.push(task.clone());
+    std::fs::write(task.join("mine.md"), "mine\n").unwrap();
+    sandfs.unmount(&task);
+    std::fs::write(folder.join("todo.md"), "b\n").unwrap();
+    sandfs.run(&["update", "task"]);
+    assert_eq!(copies(), 1);
+    std::fs::write(folder.join("todo.md"), "c\n").unwrap();
+    sandfs.mount(&["mount", "task", task.to_str().unwrap()], &task);
+    assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "b\n");
+    assert_eq!(std::fs::read_to_string(task.join("mine.md")).unwrap(), "mine\n");
+    assert_eq!(sandfs.stdout(&["changes", "task"]), "A mine.md\n");
+    sandfs.run(&["rm", "--unmount", "task"]);
+    sandfs.mounts.clear();
+    assert_eq!(copies(), 0);
 }
 
 #[test]
@@ -1644,4 +1662,193 @@ fn a_shell_sees_its_mount_and_nothing_else() {
     sandfs.unmount(&dir);
     let unmounted = sandfs.try_run(&["shell", "ws", "--", "true"]);
     assert!(String::from_utf8_lossy(&unmounted.stderr).contains("ws is not mounted"));
+}
+
+#[test]
+fn update_moves_a_git_workspace_onto_a_newer_commit() {
+    if !fuse_available() {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    for (name, text) in [("a.txt", "a0\n"), ("b.txt", "b0\n"), ("keep.txt", "k\n")] {
+        std::fs::write(repo.path().join(name), text).unwrap();
+    }
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "first"]);
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let main = dirs.path().join("main");
+    let source = format!("git:{}", repo.path().display());
+    sandfs.mount(&["mount", &source, main.to_str().unwrap()], &main);
+    std::fs::write(main.join("a.txt"), "mine\n").unwrap();
+    assert_eq!(git_out(&main, &["status", "--porcelain"]), " M a.txt\n");
+
+    // A pull in the workspace brings upstream files into its own changes.
+    std::fs::write(repo.path().join("b.txt"), "b1\n").unwrap();
+    git(repo.path(), &["commit", "-q", "-am", "second"]);
+    git_out(&main, &["pull", "-q", "--ff-only", "origin", "main"]);
+    // Upstream moves on again, the pulled file among the rest.
+    std::fs::write(repo.path().join("b.txt"), "b2\n").unwrap();
+    std::fs::write(repo.path().join("c.txt"), "c\n").unwrap();
+    git(repo.path(), &["add", "b.txt", "c.txt"]);
+    git(repo.path(), &["commit", "-q", "-m", "third"]);
+    let third = git_out(repo.path(), &["rev-parse", "HEAD"]);
+
+    let refused = sandfs.try_run(&["update", "main"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("unmount it first"));
+    sandfs.unmount(&main);
+    // Seconds apart, so the times files report tell the move from the mount.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let moved = sandfs.run(&["update", "main"]);
+    assert_eq!(String::from_utf8_lossy(&moved.stdout), "", "nothing changed on both sides");
+    assert!(String::from_utf8_lossy(&moved.stderr).contains("1 of its changes matched"));
+    assert_eq!(sandfs.stdout(&["changes", "main"]), "M a.txt\n");
+
+    sandfs.mount(&["mount", "main", main.to_str().unwrap()], &main);
+    assert_eq!(git_out(&main, &["rev-parse", "HEAD"]), third);
+    assert_eq!(git_out(&main, &["status", "--porcelain"]), " M a.txt\n");
+    assert_eq!(std::fs::read_to_string(main.join("c.txt")).unwrap(), "c\n");
+    assert_eq!(std::fs::read_to_string(main.join("b.txt")).unwrap(), "b2\n", "what was pulled isn't the workspace's");
+    let mtime = |name: &str| std::fs::metadata(main.join(name)).unwrap().modified().unwrap();
+    assert!(mtime("c.txt") > mtime("keep.txt"), "files the move changed look changed to build tools");
+    assert_eq!(mtime("b.txt"), mtime("c.txt"));
+}
+
+#[test]
+fn update_follows_a_pull_in_a_mount_of_a_url() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::Builder::new().prefix("data").tempdir().unwrap();
+    let repo = data.path().join("site");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    for (name, text) in [("a.txt", "a0\n"), ("b.txt", "b0\n")] {
+        std::fs::write(repo.join(name), text).unwrap();
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "first"]);
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let main = dirs.path().join("main");
+    let url = format!("file://{}", repo.display());
+    sandfs.mount(&["mount", &url, main.to_str().unwrap(), "--name", "main"], &main);
+    std::fs::write(main.join("a.txt"), "mine\n").unwrap();
+
+    // A pull in the mount, its branches then packed as `git gc` would.
+    std::fs::write(repo.join("b.txt"), "b1\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "second"]);
+    git_out(&main, &["pull", "-q", "--ff-only", "origin", "main"]);
+    git_out(&main, &["pack-refs", "--all"]);
+    // Upstream undoes the pulled change and moves on; the local copy of the URL has
+    // only the commits mounted, so where the pulled one is comes from fetching more.
+    std::fs::write(repo.join("b.txt"), "b0\n").unwrap();
+    std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+    git(&repo, &["add", "b.txt", "c.txt"]);
+    git(&repo, &["commit", "-q", "-m", "third"]);
+    let third = git_out(&repo, &["rev-parse", "HEAD"]);
+
+    sandfs.unmount(&main);
+    let moved = sandfs.run(&["update", "main"]);
+    assert_eq!(String::from_utf8_lossy(&moved.stdout), "", "nothing changed on both sides");
+    assert_eq!(sandfs.stdout(&["changes", "main"]), "M a.txt\n");
+
+    sandfs.mount(&["mount", "main", main.to_str().unwrap()], &main);
+    assert_eq!(git_out(&main, &["rev-parse", "HEAD"]), third);
+    assert_eq!(git_out(&main, &["status", "--porcelain"]), " M a.txt\n");
+    assert_eq!(std::fs::read_to_string(main.join("b.txt")).unwrap(), "b0\n", "upstream undid what was pulled");
+    sandfs.unmount(&main);
+}
+
+#[test]
+fn update_takes_as_pulled_only_what_head_checked_out() {
+    if !fuse_available() {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    std::fs::write(repo.path().join("x.txt"), "a\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "first"]);
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let (one, two) = (dirs.path().join("one"), dirs.path().join("two"));
+    let source = format!("git:{}", repo.path().display());
+    sandfs.mount(&["mount", &source, one.to_str().unwrap()], &one);
+    sandfs.mount(&["mount", &source, two.to_str().unwrap()], &two);
+
+    // Upstream changes x.txt and adds a folder.
+    std::fs::write(repo.path().join("x.txt"), "b\n").unwrap();
+    std::fs::create_dir(repo.path().join("dir")).unwrap();
+    std::fs::write(repo.path().join("dir/f"), "f\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "second"]);
+    // One fetches it to a branch it doesn't check out, and makes x.txt the same by hand.
+    // A branch of its own, packed, is reset to the mounted commit since.
+    git_out(&one, &["fetch", "-q", "origin", "main"]);
+    git_out(&one, &["branch", "other", "FETCH_HEAD"]);
+    std::fs::write(one.join("x.txt"), "b\n").unwrap();
+    git_out(&one, &["checkout", "-q", "-b", "own"]);
+    git_out(&one, &["commit", "-q", "--allow-empty", "-m", "own"]);
+    git_out(&one, &["pack-refs", "--all"]);
+    git_out(&one, &["checkout", "-q", "main"]);
+    git_out(&one, &["branch", "-f", "own", "main"]);
+    // Two pulls it.
+    git_out(&two, &["pull", "-q", "--ff-only", "origin", "main"]);
+    // Upstream changes x.txt again, and makes the folder a file.
+    std::fs::write(repo.path().join("x.txt"), "c\n").unwrap();
+    std::fs::remove_dir_all(repo.path().join("dir")).unwrap();
+    std::fs::write(repo.path().join("dir"), "now a file\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "third"]);
+    sandfs.unmount(&one);
+    sandfs.unmount(&two);
+
+    // One's x.txt is its own edit, whatever another branch names.
+    let moved = sandfs.run(&["update", "one"]);
+    assert_eq!(String::from_utf8_lossy(&moved.stdout), "C x.txt\n");
+    assert_eq!(sandfs.stdout(&["changes", "one"]), "M x.txt\n");
+    // Everything two has over the old commit, the folder too, was pulled.
+    let moved = sandfs.run(&["update", "two"]);
+    assert_eq!(String::from_utf8_lossy(&moved.stdout), "", "nothing changed on both sides");
+    assert_eq!(sandfs.stdout(&["changes", "two"]), "");
+    sandfs.mount(&["mount", "two", two.to_str().unwrap()], &two);
+    assert_eq!(std::fs::read_to_string(two.join("dir")).unwrap(), "now a file\n");
+    assert_eq!(git_out(&two, &["status", "--porcelain"]), "");
+    sandfs.unmount(&two);
+}
+
+/// Hard links need the FUSE mount; the NFS server under the macOS mount has no LINK.
+#[cfg(target_os = "linux")]
+#[test]
+fn update_keeps_a_hard_link_the_newer_source_has_the_bytes_of() {
+    if !fuse_available() {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    std::fs::write(repo.path().join("a.txt"), "a0\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "first"]);
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let main = dirs.path().join("main");
+    let source = format!("git:{}", repo.path().display());
+    sandfs.mount(&["mount", &source, main.to_str().unwrap()], &main);
+    std::fs::hard_link(main.join("a.txt"), main.join("b.txt")).unwrap();
+    sandfs.unmount(&main);
+
+    // Upstream changes a.txt and adds a b.txt of its own with a.txt's old bytes.
+    std::fs::write(repo.path().join("a.txt"), "a1\n").unwrap();
+    std::fs::write(repo.path().join("b.txt"), "a0\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "second"]);
+    let refused = sandfs.try_run(&["update", "main"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("hard link"), "{refused:?}");
 }
