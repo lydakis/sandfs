@@ -494,7 +494,19 @@ pub fn run(
 
         // The gate keeps the client's unmount call from the server, since anyone could
         // send one, so the mount table says when the mount is gone (or replaced).
-        let _ = watch(dir, format!("sandfs:{name}")).await;
+        let ours = format!("sandfs:{name}");
+        match watch(dir, ours.clone()) {
+            Ok(gone) => {
+                let _ = gone.await;
+            }
+            // With no thread to check for it, the mount checks for itself.
+            Err(_) => {
+                let mut check = tokio::time::interval(MOUNT_CHECK);
+                while crate::host::mount_source(dir).is_some_and(|source| source == ours) {
+                    check.tick().await;
+                }
+            }
+        }
         Ok(())
     })
 }
@@ -507,38 +519,44 @@ pub fn run(
 type Watched = Mutex<Vec<(std::path::PathBuf, String, tokio::sync::oneshot::Sender<()>)>>;
 
 /// Wait until the mount at `dir` is no longer the one from `source`: unmounted, or
-/// replaced.
+/// replaced. Fails if the thread that checks couldn't be started; a later call tries again.
 #[cfg(nfs)]
-fn watch(dir: &Path, source: String) -> tokio::sync::oneshot::Receiver<()> {
-    static WATCHED: std::sync::OnceLock<Arc<Watched>> = std::sync::OnceLock::new();
-    let watched = WATCHED.get_or_init(|| {
-        let watched = Arc::new(Watched::default());
-        let checked = watched.clone();
-        let _ = std::thread::Builder::new().name("mount checks".to_owned()).spawn(move || {
-            loop {
-                std::thread::sleep(MOUNT_CHECK);
-                // Mounts are only added at the end, so the first `before` were watched
-                // before the table was read; one added since may be missing from it.
-                let before = checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
-                if before == 0 {
-                    continue;
+fn watch(dir: &Path, source: String) -> std::io::Result<tokio::sync::oneshot::Receiver<()>> {
+    static WATCHED: Mutex<Option<Arc<Watched>>> = Mutex::new(None);
+    let mut started = WATCHED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let watched = match &*started {
+        Some(watched) => watched.clone(),
+        None => {
+            let watched = Arc::new(Watched::default());
+            let checked = watched.clone();
+            std::thread::Builder::new().name("mount checks".to_owned()).spawn(move || {
+                loop {
+                    std::thread::sleep(MOUNT_CHECK);
+                    // Mounts are only added at the end, so the first `before` were watched
+                    // before the table was read; one added since may be missing from it.
+                    let before = checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
+                    if before == 0 {
+                        continue;
+                    }
+                    // A table that couldn't be read says nothing about what is mounted.
+                    let Some(table) = crate::host::read_mount_table() else { continue };
+                    // Dropping a mount's sender tells it its mount is gone.
+                    let mut index = 0;
+                    checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(dir, source, gone)| {
+                        let read = index < before;
+                        index += 1;
+                        !gone.is_closed() && (!read || table.get(dir) == Some(source))
+                    });
                 }
-                // A table that couldn't be read says nothing about what is mounted.
-                let Some(table) = crate::host::read_mount_table() else { continue };
-                // Dropping a mount's sender tells it its mount is gone.
-                let mut index = 0;
-                checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(dir, source, gone)| {
-                    let read = index < before;
-                    index += 1;
-                    !gone.is_closed() && (!read || table.get(dir) == Some(source))
-                });
-            }
-        });
-        watched
-    });
+            })?;
+            *started = Some(watched.clone());
+            watched
+        }
+    };
+    drop(started);
     let (gone, wait) = tokio::sync::oneshot::channel();
     watched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((dir.to_path_buf(), source, gone));
-    wait
+    Ok(wait)
 }
 
 /// `mount_nfs` options for a server on localhost `port`, which also answers the mount
