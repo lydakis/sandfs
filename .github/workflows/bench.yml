@@ -45,14 +45,24 @@ jobs:
             "$1/sandfs-bench" --help | grep -q -- --skip && skip="--skip build"
             "$1/sandfs-bench" --scale quick --scratch /dev/shm $skip --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
           }
+          # Copies of a clone, from a suite that has the table.
+          copies() {
+            "$1/sandfs-bench" --help | grep -q -- --copies-package || return 0
+            "$1/sandfs-bench" --only copies --scale quick --scratch /tmp --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
+          }
           for round in 1 2; do
-            if [ "${{ github.event_name }}" = pull_request ]; then run /tmp/before /tmp/before-$round.json; fi
+            if [ "${{ github.event_name }}" = pull_request ]; then
+              run /tmp/before /tmp/before-$round.json
+              copies /tmp/before /tmp/before-copies-$round.json
+            fi
             run /tmp/after /tmp/after-$round.json
+            copies /tmp/after /tmp/after-copies-$round.json
           done
       - name: Compare with main
         if: github.event_name == 'pull_request'
         run: |
-          /tmp/after/sandfs-bench --compare /tmp/before-1.json,/tmp/before-2.json /tmp/after-1.json,/tmp/after-2.json | tee /tmp/compare.md
+          runs() { ls /tmp/$1-*.json | paste -sd, -; }
+          /tmp/after/sandfs-bench --compare "$(runs before)" "$(runs after)" | tee /tmp/compare.md
           {
             echo "## Benchmarks: this PR against main"
             echo
@@ -60,7 +70,7 @@ jobs:
             echo
             echo "<details><summary>This PR's full results</summary>"
             echo
-            cat /tmp/after-1.json.txt
+            cat /tmp/after-1.json.txt /tmp/after-copies-1.json.txt
             echo
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -72,7 +82,7 @@ jobs:
       - name: Summarize
         if: github.event_name == 'push'
         run: |
-          { echo "## Benchmarks on ${{ github.sha }}"; echo; cat /tmp/after-1.json.txt; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## Benchmarks on ${{ github.sha }}"; echo; cat /tmp/after-1.json.txt /tmp/after-copies-1.json.txt; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-${{ github.sha }}
@@ -80,7 +90,7 @@ jobs:
           retention-days: 90
 
   # The same suite on a Mac, where the mount is served over NFS. Once per run, kept for
-  # a history of the Mac numbers; no comparison yet.
+  # a history of the Mac numbers, with the copies table; no comparison yet.
   macos:
     runs-on: macos-latest
     steps:
@@ -93,9 +103,11 @@ jobs:
         run: |
           ./target/release/sandfs-bench --scale quick --scratch /tmp --skip build --targets host,sandfs,fuse \
             --sandfs-bin target/release/sandfs --json /tmp/macos.json > /tmp/macos.txt
-          { echo "## Benchmarks on macOS, ${{ github.sha }}"; echo; cat /tmp/macos.txt; } >> "$GITHUB_STEP_SUMMARY"
+          ./target/release/sandfs-bench --only copies --scale quick --scratch /tmp \
+            --sandfs-bin target/release/sandfs --json /tmp/macos-copies.json > /tmp/macos-copies.txt
+          { echo "## Benchmarks on macOS, ${{ github.sha }}"; echo; cat /tmp/macos.txt /tmp/macos-copies.txt; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-macos-${{ github.sha }}
-          path: /tmp/macos.json
+          path: /tmp/macos*.json
           retention-days: 90

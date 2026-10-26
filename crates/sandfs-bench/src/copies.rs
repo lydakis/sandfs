@@ -66,6 +66,10 @@ pub struct CopiesResult {
 /// time each step on them.
 pub fn run(scratch: &Path, bin: &Path, package: &str, iters: usize, methods: &[Method]) -> Result<CopiesResult> {
     let scratch = scratch.canonicalize()?.join(NAME);
+    // Left by an earlier run; each run starts from a fresh clone.
+    if scratch.exists() {
+        fs::remove_dir_all(&scratch)?;
+    }
     fs::create_dir_all(&scratch)?;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
     let src = scratch.join("clone");
@@ -132,6 +136,7 @@ pub fn run(scratch: &Path, bin: &Path, package: &str, iters: usize, methods: &[M
         }
         out.push((method, steps));
     }
+    fs::remove_dir_all(&scratch)?;
     Ok(CopiesResult { package: package.to_owned(), methods: out })
 }
 
