@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **sandfs-cli, task copies**: `sandfs fork` makes the copy to hand one task, wherever it starts. FROM can now be a folder of a git repository on this machine, such as a clone: the fork is its `HEAD` plus what its folder has changed since (changed, staged, new and deleted files, links and modes, but not ignored files), copied once, so the copy keeps its starting point while work goes on in the folder, and `changes` lists them from the start; what was staged shows as unstaged in the copy, and the repository is only read. FROM can also be any folder inside a mount. `--branch NAME` starts git in the fork on a new branch at FROM's commit, keeping its files and index, so its commits go back with `git push origin NAME`; a name the repository or FROM already has is refused. `--read-only PATH` adds read-only paths. `sandfs rm --unmount NAME` (or the mount's directory) unmounts a workspace and deletes it in one step. README gains a git-to-sandfs table.
+- **sandfs-cli, `changes --copy-to` keeps work done where it copies**: a file in DIR that differs from both what the workspace started from and what the copy would write, such as one edited there since, now refuses the copy before anything is written, naming each such file; `--force` overwrites as before. A deleted file below a link, or replaced by a folder, in DIR is left alone instead of failing the copy.
 
 ## 0.5.1 (2026-10-22)
 

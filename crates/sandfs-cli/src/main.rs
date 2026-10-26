@@ -124,9 +124,14 @@ enum Cmd {
         /// Also write the changes listed into DIR: added and modified files are copied
         /// there and deleted ones removed, so a copy of the source in DIR (or of the
         /// --since workspace) comes to match the workspace. Nothing else is written,
-        /// and never through a link in DIR.
+        /// and never through a link in DIR. A file in DIR that differs both from what
+        /// the workspace started from and from what it would become, as one edited
+        /// there since, is never replaced or removed: the copy is refused, naming it.
         #[arg(long, value_name = "DIR")]
         copy_to: Option<PathBuf>,
+        /// With --copy-to, replace or remove such files too.
+        #[arg(long, requires = "copy_to")]
+        force: bool,
     },
     /// List workspaces and where they are mounted.
     List,
@@ -312,6 +317,7 @@ fn run(cli: Cli) -> Result<()> {
                         Some(branch) => git::switch_new(&home, &name, branch),
                         None => Ok(()),
                     });
+                    let made = made.and_then(|()| home.copy_start(&from, &name));
                     if let Err(err) = made {
                         remove_unused(&home, &name);
                         return Err(err);
@@ -340,7 +346,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Changes { workspace, paths, since, copy_to } => {
+        Cmd::Changes { workspace, paths, since, copy_to, force } => {
             let name = home.find(&workspace)?;
             sync(&home, &name)?;
             let since = since.map(|since| home.find(&since)).transpose()?;
@@ -365,7 +371,8 @@ fn run(cli: Cli) -> Result<()> {
             // starts over, writing what it already wrote again.
             let mut attempts = 0;
             let Listed { changes, held_back, settings } = loop {
-                match changes_and_copy(&home, &name, since.as_deref(), &wanted, copy_to.as_deref()) {
+                let copy = copy_to.as_deref().map(|dir| (dir, force));
+                match changes_and_copy(&home, &name, since.as_deref(), &wanted, copy) {
                     Ok(found) => break found,
                     Err(err) if is_object_gone(&err) && attempts < 10 => attempts += 1,
                     Err(err) => return Err(err),
@@ -516,24 +523,26 @@ struct Listed {
 
 /// The changes of workspace `name` (against `since`, or its source) under any of
 /// `wanted`, as their kinds and paths relative to the workspace, after writing them
-/// into `copy_to` if given.
+/// into the folder of `copy_to` if given (forcing over files changed there with its flag).
 fn changes_and_copy(
     home: &Home,
     name: &str,
     since: Option<&str>,
     wanted: &[VPath],
-    copy_to: Option<&Path>,
+    copy_to: Option<(&Path, bool)>,
 ) -> Result<Listed> {
-    let (opened, changes) = match since {
+    // What the changes are made to, which a file where they are copied may differ from
+    // only where it was changed there since.
+    let (opened, start, changes) = match since {
         Some(since) => {
             let (opened, base) = home.open_pair(name, since)?;
             let changes = opened.ws.changes_since(&base.ws)?;
-            (opened, changes)
+            (opened, base.ws, changes)
         }
         None => {
-            let opened = home.open(name)?;
+            let (opened, start) = home.open_with_start(name)?;
             let changes = opened.ws.changes()?;
-            (opened, changes)
+            (opened, start, changes)
         }
     };
     let root = VPath::parse(ROOT)?;
@@ -557,10 +566,11 @@ fn changes_and_copy(
         .map(|change| (change, change.path.strip_prefix(&root).unwrap_or_default().join("/")))
         .collect();
     let mut held_back = 0;
-    if let Some(dir) = copy_to {
+    if let Some((dir, force)) = copy_to {
         let items: Vec<_> =
             listed.iter().map(|(change, rel)| copy::Item { path: &change.path, rel, kind: change.kind }).collect();
-        held_back = copy::copy_to(&opened.ws, &items, dir)?;
+        let start = (!force).then_some(&start);
+        held_back = copy::copy_to(&opened.ws, start, &items, dir)?;
     }
     Ok(Listed { changes: listed.into_iter().map(|(change, rel)| (change.kind, rel)).collect(), held_back, settings })
 }

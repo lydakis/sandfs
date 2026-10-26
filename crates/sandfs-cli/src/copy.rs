@@ -23,13 +23,37 @@ pub struct Item<'a> {
 /// while reading (a save replacing what the copy reads, after which the caller
 /// retries) leaves `dir` as it was.
 ///
+/// With `start`, what the changes were made to, nothing in `dir` that differs from
+/// both its state there and its state in `ws` is replaced or removed: that is a file
+/// changed in `dir` since, which the copy would lose. Such files refuse the whole copy
+/// before anything is written. A file `dir` lacks is always written.
+///
 /// Nothing is written through a link in `dir`: the items come from whoever wrote the
 /// workspace, and a link they made earlier in the copy must not carry a later write
 /// out of `dir`. Nor is anything written into a `.git` folder, where git keeps
 /// settings that name programs it runs; those items are left out, and their number
 /// returned.
-pub fn copy_to(ws: &Workspace, items: &[Item], dir: &Path) -> Result<usize> {
+pub fn copy_to(ws: &Workspace, start: Option<&Workspace>, items: &[Item], dir: &Path) -> Result<usize> {
     let (git, items): (Vec<&Item>, Vec<&Item>) = items.iter().partition(|item| item.rel.split('/').any(is_git_dir));
+    if let Some(start) = start {
+        let mut changed = Vec::new();
+        for item in &items {
+            let Some(target) = target(dir, item)? else { continue };
+            let kept = |from: &Workspace| same(from, item.path, &target);
+            if !matches!(on_disk(&target)?, OnDisk::Absent) && !kept(start)? && !kept(ws)? {
+                changed.push(item.rel);
+            }
+        }
+        if !changed.is_empty() {
+            bail!(
+                "not copying: {} changed in {} since the workspace started, and the copy would lose that: {}; \
+                 pass --force to copy anyway",
+                if changed.len() == 1 { "this file was" } else { "these files were" },
+                dir.display(),
+                changed.join(", ")
+            );
+        }
+    }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let staging = tempfile::Builder::new()
         .prefix(".sandfs-copy-")
@@ -37,7 +61,7 @@ pub fn copy_to(ws: &Workspace, items: &[Item], dir: &Path) -> Result<usize> {
         .with_context(|| format!("making room in {}", dir.display()))?;
     let mut staged = Vec::new();
     for item in &items {
-        inside(dir, item.rel)?;
+        target(dir, item)?;
         if item.kind == ChangeKind::Deleted {
             continue;
         }
@@ -56,7 +80,12 @@ pub fn copy_to(ws: &Workspace, items: &[Item], dir: &Path) -> Result<usize> {
         staged.push((item, file));
     }
     for item in items.iter().filter(|item| item.kind == ChangeKind::Deleted) {
-        let target = inside(dir, item.rel)?;
+        let Some(target) = target(dir, item)? else { continue };
+        // A folder in place of the deleted file replaced it, as in the workspace (the
+        // check above made sure), and stays.
+        if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
         match std::fs::remove_file(&target) {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -98,6 +127,77 @@ fn is_ignored_by_hfs(c: char) -> bool {
     matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}')
 }
 
+/// What is at a path on disk, without following a link there.
+enum OnDisk {
+    Absent,
+    File(std::fs::Metadata),
+    Link(PathBuf),
+    /// A folder, which only a change that replaces it with a file finds.
+    Dir,
+    /// Anything else, which is never what a workspace holds.
+    Other,
+}
+
+fn on_disk(path: &Path) -> Result<OnDisk> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Ok(OnDisk::Link(std::fs::read_link(path)?)),
+        Ok(meta) if meta.is_file() => Ok(OnDisk::File(meta)),
+        Ok(meta) if meta.is_dir() => Ok(OnDisk::Dir),
+        Ok(_) => Ok(OnDisk::Other),
+        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(OnDisk::Absent),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Whether `target` on disk holds what `ws` holds at `path`: nothing, the same link,
+/// a folder holding nothing `ws` lacks there (each file the change deletes from it is
+/// checked on its own), or a file with the same bytes. Modes don't count.
+fn same(ws: &Workspace, path: &VPath, target: &Path) -> Result<bool> {
+    let meta = match ws.stat(path.as_str()) {
+        Ok(meta) => meta,
+        Err(sandfs_core::Error::NotFound(_) | sandfs_core::Error::NotADirectory(_)) => {
+            return Ok(matches!(on_disk(target)?, OnDisk::Absent));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    Ok(match (meta.kind, on_disk(target)?) {
+        (Kind::Dir, OnDisk::Dir) => nothing_more(ws, path, target)?,
+        (Kind::Symlink, OnDisk::Link(link)) => link.to_str() == Some(ws.read_link(path.as_str())?.as_str()),
+        (Kind::File { .. }, OnDisk::File(disk)) if disk.len() == meta.size => {
+            let mut file = std::io::BufReader::new(std::fs::File::open(target)?);
+            let mut offset = 0;
+            while offset < meta.size {
+                let chunk = ws.read_range(path.as_str(), offset, CHUNK.min(meta.size - offset))?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let mut ours = vec![0; chunk.len()];
+                std::io::Read::read_exact(&mut file, &mut ours)?;
+                if ours != chunk {
+                    return Ok(false);
+                }
+                offset += chunk.len() as u64;
+            }
+            true
+        }
+        _ => false,
+    })
+}
+
+/// Whether everything in the folder `dir` on disk is also in `ws` at `path`.
+fn nothing_more(ws: &Workspace, path: &VPath, dir: &Path) -> Result<bool> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { return Ok(false) };
+        let Ok(inner) = path.join(&name) else { return Ok(false) };
+        let Ok(meta) = ws.stat(inner.as_str()) else { return Ok(false) };
+        if entry.file_type()?.is_dir() && (!meta.kind.is_dir() || !nothing_more(ws, &inner, &entry.path())?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// How much of a file is read at once, so a large one is never held whole.
 const CHUNK: u64 = 8 << 20;
 
@@ -116,20 +216,38 @@ fn write_file(ws: &Workspace, path: &str, size: u64, target: &Path) -> Result<()
     Ok(())
 }
 
-/// `dir` joined with `rel`, refused when a folder on the way is a link.
-fn inside(dir: &Path, rel: &str) -> Result<PathBuf> {
+/// Where `item` goes in `dir` (see [`inside`]). A file to delete below a link or a file
+/// in `dir` is already gone from there, and has none.
+fn target(dir: &Path, item: &Item) -> Result<Option<PathBuf>> {
+    if item.kind != ChangeKind::Deleted {
+        return inside(dir, item.rel).map(Some);
+    }
+    let path = inside_names(dir, item.rel)?;
+    let mut below = path.ancestors().skip(1).take_while(|folder| *folder != dir);
+    let blocked = below.any(|folder| std::fs::symlink_metadata(folder).is_ok_and(|meta| !meta.is_dir()));
+    Ok((!blocked).then_some(path))
+}
+
+/// `dir` joined with `rel`, refused when a part isn't a plain file name.
+fn inside_names(dir: &Path, rel: &str) -> Result<PathBuf> {
     let mut path = dir.to_path_buf();
-    let parts: Vec<&str> = rel.split('/').collect();
-    for (i, part) in parts.iter().enumerate() {
+    for part in rel.split('/') {
         // A name this system would read as more than one name (`a\b` or `C:` on
         // Windows) could lead out of `dir`.
-        if !matches!(Path::new(part).components().collect::<Vec<_>>()[..], [Component::Normal(name)] if name == *part) {
+        if !matches!(Path::new(part).components().collect::<Vec<_>>()[..], [Component::Normal(name)] if name == part) {
             bail!("not copying {rel}: {part:?} isn't a file name here");
         }
         path.push(part);
-        let last = i + 1 == parts.len();
-        if !last && std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            bail!("not copying {rel}: {} is a link", path.display());
+    }
+    Ok(path)
+}
+
+/// `dir` joined with `rel`, refused when a folder on the way is a link.
+fn inside(dir: &Path, rel: &str) -> Result<PathBuf> {
+    let path = inside_names(dir, rel)?;
+    for folder in path.ancestors().skip(1).take_while(|folder| *folder != dir) {
+        if std::fs::symlink_metadata(folder).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            bail!("not copying {rel}: {} is a link", folder.display());
         }
     }
     Ok(path)
@@ -189,6 +307,71 @@ mod tests {
     }
 
     #[test]
+    fn files_changed_where_they_are_copied_are_never_lost() {
+        let source =
+            MemorySource::from_files([("notes.md", "draft\n"), ("todo.md", "a\n"), ("old/a.md", "a\n")]).unwrap();
+        let mut start = Workspace::new();
+        start.mount("/mnt", Arc::new(source)).unwrap();
+        let mut ws = start.fork();
+        ws.write("/mnt/notes.md", "final\n").unwrap();
+        ws.write("/mnt/todo.md", "b\n").unwrap();
+        ws.write("/mnt/new.md", "new\n").unwrap();
+        ws.remove("/mnt/old", true).unwrap();
+        ws.write("/mnt/old", "a file now\n").unwrap();
+        let paths = ["/mnt/new.md", "/mnt/notes.md", "/mnt/old", "/mnt/old/a.md", "/mnt/todo.md"]
+            .map(|path| VPath::parse(path).unwrap());
+        let kinds =
+            [ChangeKind::Added, ChangeKind::Modified, ChangeKind::Added, ChangeKind::Deleted, ChangeKind::Modified];
+        let items: Vec<_> = paths
+            .iter()
+            .zip(kinds)
+            .map(|(path, kind)| Item { path, rel: path.as_str().strip_prefix("/mnt/").unwrap(), kind })
+            .collect();
+        let folder = |notes: &str, extra: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("old")).unwrap();
+            std::fs::write(dir.path().join("old/a.md"), "a\n").unwrap();
+            std::fs::write(dir.path().join("notes.md"), notes).unwrap();
+            // Already what the copy makes it.
+            std::fs::write(dir.path().join("todo.md"), "b\n").unwrap();
+            if extra {
+                std::fs::write(dir.path().join("old/mine.md"), "mine\n").unwrap();
+            }
+            dir
+        };
+
+        // Untouched since the start: copied.
+        let dir = folder("draft\n", false);
+        copy_to(&ws, Some(&start), &items, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("notes.md")).unwrap(), "final\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("old")).unwrap(), "a file now\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("new.md")).unwrap(), "new\n");
+
+        // Edited there since, or given a file of its own in a folder the copy replaces:
+        // refused, with nothing written.
+        for (notes, extra, named) in [("mine\n", false, "notes.md"), ("draft\n", true, "old")] {
+            let dir = folder(notes, extra);
+            let err = copy_to(&ws, Some(&start), &items, dir.path()).unwrap_err().to_string();
+            assert!(
+                err.ends_with(&format!(
+                    "since the workspace started, and the copy would lose that: {named}; pass --force to copy anyway"
+                )),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(dir.path().join("notes.md")).unwrap(), notes);
+            assert!(!dir.path().join("new.md").exists());
+        }
+
+        // A deleted file edited there is refused too, and forcing copies anyway.
+        let dir = folder("draft\n", false);
+        std::fs::write(dir.path().join("old/a.md"), "edited\n").unwrap();
+        assert!(copy_to(&ws, Some(&start), &items, dir.path()).unwrap_err().to_string().contains(": old/a.md;"));
+        let dir = folder("mine\n", false);
+        copy_to(&ws, None, &items, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("notes.md")).unwrap(), "final\n");
+    }
+
+    #[test]
     fn a_file_larger_than_a_chunk_is_copied_whole() {
         let mut ws = Workspace::new();
         ws.mount("/mnt", Arc::new(MemorySource::from_files(Vec::<(&str, &str)>::new()).unwrap())).unwrap();
@@ -196,7 +379,7 @@ mod tests {
         ws.write("/mnt/big.bin", data.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = VPath::parse("/mnt/big.bin").unwrap();
-        copy_to(&ws, &[Item { path: &path, rel: "big.bin", kind: ChangeKind::Added }], dir.path()).unwrap();
+        copy_to(&ws, None, &[Item { path: &path, rel: "big.bin", kind: ChangeKind::Added }], dir.path()).unwrap();
         assert!(std::fs::read(dir.path().join("big.bin")).unwrap() == data);
     }
 }
