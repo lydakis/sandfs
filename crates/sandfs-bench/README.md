@@ -131,6 +131,7 @@ Each copy then has a day of work done in it: the first `git status`, a commit of
 - make the copy;
 - create 1,000 small files in a new folder, rewrite them, save them the way editors do (write a temporary file, rename it over the file), and delete them;
 - `git status`, after one untimed run;
+- list what changed, as a harness does after an attempt: `git status --porcelain --untracked-files=all` in a worktree or a copy, `sandfs changes` in a fork;
 - search the whole tree with `grep -r`, leaving out `.git` and `target`;
 - in the first copy only, `cargo build` of one package (`--copies-package`, default `sandfs-core`) with the output inside the copy, then a build with nothing changed and a build after appending a comment to the package's `lib.rs`, once per iteration;
 - remove the copy (`git worktree remove`, `rm -rf`, or `sandfs unmount` and `sandfs rm`).

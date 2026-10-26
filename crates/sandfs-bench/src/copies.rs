@@ -43,13 +43,14 @@ impl Method {
 }
 
 /// The steps, in the order they run on each copy.
-pub const STEPS: [&str; 11] = [
+pub const STEPS: [&str; 12] = [
     "make a copy",
     "create 1,000 files",
     "rewrite them",
     "save them as editors do",
     "delete them",
     "git status",
+    "list the changes",
     "search the tree",
     "first build",
     "build, nothing changed",
@@ -103,7 +104,8 @@ pub fn run(scratch: &Path, bin: &Path, package: &str, iters: usize, methods: &[M
             fs::remove_dir(&files)?;
             run_cmd(Command::new("git").args(["status", "--porcelain"]).current_dir(&dir))?;
             steps[5].push(time(|| run_cmd(Command::new("git").args(["status", "--porcelain"]).current_dir(&dir)))?);
-            steps[6].push(time(|| {
+            steps[6].push(time(|| changes(method, &dir, bin, &home))?);
+            steps[7].push(time(|| {
                 // grep exits 1 when nothing matches, which this pattern always does.
                 let status = Command::new("grep")
                     .args(["-rl", "--exclude-dir=.git", "--exclude-dir=target", "fn main"])
@@ -120,19 +122,19 @@ pub fn run(scratch: &Path, bin: &Path, package: &str, iters: usize, methods: &[M
                     let target = target.to_str().context("a non-UTF-8 folder")?.to_owned();
                     cargo(&dir, &["build", "--offline", "--quiet", "-p", package, "--target-dir", &target])
                 };
-                steps[7].push(time(build)?);
+                steps[8].push(time(build)?);
                 for round in 0..iters {
-                    steps[8].push(time(build)?);
+                    steps[9].push(time(build)?);
                     let mut file = fs::File::options().append(true).open(dir.join(&change))?;
                     writeln!(file, "// edit {round}")?;
                     drop(file);
-                    steps[9].push(time(build)?);
+                    steps[10].push(time(build)?);
                 }
             }
         }
         for i in 0..iters {
             let dir = scratch.join(format!("{}-{i}", method.name().replace(' ', "-")));
-            steps[10].push(time(|| remove(method, &src, &dir, bin, &home))?);
+            steps[11].push(time(|| remove(method, &src, &dir, bin, &home))?);
         }
         out.push((method, steps));
     }
@@ -159,6 +161,17 @@ fn make(method: Method, src: &Path, dir: &Path, branch: &str, bin: &Path, home: 
         Method::Fork => {
             run_cmd(Command::new(bin).arg("fork").arg(src).arg(dir).args(["--branch", branch]).env("SANDFS_HOME", home))
         }
+    }
+}
+
+/// List what changed in the copy `dir`, as a harness does after an attempt: git's
+/// short status in a copy git keeps, `sandfs changes` in a fork.
+fn changes(method: Method, dir: &Path, bin: &Path, home: &Path) -> Result<()> {
+    match method {
+        Method::Worktree | Method::Cloned => {
+            run_cmd(Command::new("git").args(["status", "--porcelain", "--untracked-files=all"]).current_dir(dir))
+        }
+        Method::Fork => run_cmd(Command::new(bin).arg("changes").arg(dir).env("SANDFS_HOME", home)),
     }
 }
 
