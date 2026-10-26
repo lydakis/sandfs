@@ -394,15 +394,31 @@ impl Home {
 
     /// Open `name`, and beside it what it started from: its source, with what was written
     /// into it when it was made (see [`Home::keep_start`]).
-    pub fn open_with_start(&self, name: &str) -> Result<(Opened, Workspace)> {
+    /// `base` is `name`'s base as [`Home::base`] opened it, if it is open already.
+    pub fn open_with_start(&self, name: &str, base: Option<Workspace>) -> Result<(Opened, Workspace)> {
         let record = self.record(name)?;
-        let base = open_base(&record.base, &self.root)?;
+        let base = match base {
+            Some(base) => base,
+            None => open_base(&record.base, &self.root)?,
+        };
         let mut start = base.fork();
         let dir = self.start_dir(name);
         if dir.join("changes.json").exists() {
             Saved::new(dir).load(&mut start, &VPath::parse(ROOT)?)?;
         }
         Ok((self.load(name, record, &base)?, start))
+    }
+
+    /// The source `name` is a fork of, opened as an empty workspace to open `name` over
+    /// (see [`Home::open_over`]).
+    pub fn base(&self, name: &str) -> Result<Workspace> {
+        open_base(&self.record(name)?.base, &self.root)
+    }
+
+    /// Open `name` over `base`, its base as [`Home::base`] opened it.
+    pub fn open_over(&self, name: &str, base: &Workspace) -> Result<Opened> {
+        let record = self.record(name)?;
+        self.load(name, record, base)
     }
 
     /// Keep `name`'s saved changes as what it started from, for `changes --copy-to` to
