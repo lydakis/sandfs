@@ -128,56 +128,7 @@ pub async fn handle_nfs(
         return Ok(());
     }
     let prog = NFSProgram::from_u32(call.proc).unwrap_or(NFSProgram::INVALID);
-    let started = std::time::Instant::now();
-    let proc_ = call.proc;
-    handle_prog(xid, prog, input, output, context).await?;
-    bench_stats::record(proc_, started.elapsed());
-    Ok(())
-}
 
-/// Bench-only call counts and server time by procedure, written to `SANDFS_NFS_STATS`.
-pub mod bench_stats {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    static COUNT: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
-    static NANOS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
-
-    pub fn record(proc_: u32, took: Duration) {
-        let i = (proc_ as usize).min(31);
-        COUNT[i].fetch_add(1, Ordering::Relaxed);
-        NANOS[i].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-        static STARTED: std::sync::Once = std::sync::Once::new();
-        STARTED.call_once(|| {
-            if let Some(path) = std::env::var_os("SANDFS_NFS_STATS") {
-                std::thread::spawn(move || {
-                    loop {
-                        std::thread::sleep(Duration::from_millis(200));
-                        let mut out = String::new();
-                        for i in 0..32 {
-                            let n = COUNT[i].load(Ordering::Relaxed);
-                            if n > 0 {
-                                out += &format!("{i} {n} {}\n", NANOS[i].load(Ordering::Relaxed) / 1000);
-                            }
-                        }
-                        let tmp = format!("{}.tmp", path.to_string_lossy());
-                        if std::fs::write(&tmp, out).is_ok() {
-                            let _ = std::fs::rename(&tmp, &path);
-                        }
-                    }
-                });
-            }
-        });
-    }
-}
-
-async fn handle_prog(
-    xid: u32,
-    prog: NFSProgram,
-    input: &mut impl Read,
-    output: &mut impl Write,
-    context: &RPCContext,
-) -> Result<(), anyhow::Error> {
     match prog {
         NFSProgram::NFSPROC3_NULL => nfsproc3_null(xid, input, output)?,
         NFSProgram::NFSPROC3_GETATTR => nfsproc3_getattr(xid, input, output, context).await?,

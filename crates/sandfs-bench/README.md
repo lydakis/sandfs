@@ -136,4 +136,4 @@ Each copy then has a day of work done in it: the first `git status`, a commit of
 - in the first copy only, `cargo build` of one package (`--copies-package`, default `sandfs-core`) with the output inside the copy, then a build with nothing changed and a build after appending a comment to the package's `lib.rs`, once per iteration;
 - remove the copy (`git worktree remove`, `rm -rf`, or `sandfs unmount` and `sandfs rm`).
 
-The table shows the median of each step and how many times a worktree's it took. It needs the network once, to fetch the build's dependencies, so it runs only when asked for. CI runs it on every pull request on Linux, alternating with main as for the quick suite, and once on macOS.
+The table shows the median of each step and how many times a worktree's it took. It needs the network once, to fetch the build's dependencies, so it runs only when asked for. CI runs it on every pull request on Linux and on macOS, twice with the pull request's `sandfs` and twice with main's, alternating, and puts the comparison in the run's summary.

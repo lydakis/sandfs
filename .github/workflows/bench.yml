@@ -45,10 +45,10 @@ jobs:
             "$1/sandfs-bench" --help | grep -q -- --skip && skip="--skip build"
             "$1/sandfs-bench" --scale quick --scratch /dev/shm $skip --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
           }
-          # Copies of a clone, from a suite that has the table.
+          # Copies of a clone: what this table measures is the sandfs program, so both
+          # sides run this commit's table with their own program.
           copies() {
-            "$1/sandfs-bench" --help | grep -q -- --copies-package || return 0
-            "$1/sandfs-bench" --only copies --scale quick --scratch /tmp --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
+            /tmp/after/sandfs-bench --only copies --scale quick --scratch /tmp --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
           }
           for round in 1 2; do
             if [ "${{ github.event_name }}" = pull_request ]; then
@@ -89,23 +89,50 @@ jobs:
           path: /tmp/after-*.json
           retention-days: 90
 
-  # The same suite on a Mac, where the mount is served over NFS. Once per run, kept for
-  # a history of the Mac numbers, with the copies table; no comparison yet.
+  # The same suite on a Mac, where the mount is served over NFS, kept for a history of
+  # the Mac numbers. On pull requests the copies table also runs against main's
+  # program, alternating as above, and the comparison goes in the summary.
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build
-        run: cargo build --release -p sandfs-cli -p sandfs-bench
+        run: |
+          cargo build --release -p sandfs-cli -p sandfs-bench
+          mkdir -p /tmp/after && cp target/release/sandfs target/release/sandfs-bench /tmp/after/
+      - name: Build main
+        if: github.event_name == 'pull_request'
+        run: |
+          git worktree add /tmp/main-src ${{ github.event.pull_request.base.sha }}
+          CARGO_TARGET_DIR=$PWD/target cargo build --release --manifest-path /tmp/main-src/Cargo.toml -p sandfs-cli
+          mkdir -p /tmp/before && cp target/release/sandfs /tmp/before/
       - name: Run the quick suite
         run: |
-          ./target/release/sandfs-bench --scale quick --scratch /tmp --skip build --targets host,sandfs,fuse \
-            --sandfs-bin target/release/sandfs --json /tmp/macos.json > /tmp/macos.txt
-          ./target/release/sandfs-bench --only copies --scale quick --scratch /tmp \
-            --sandfs-bin target/release/sandfs --json /tmp/macos-copies.json > /tmp/macos-copies.txt
-          { echo "## Benchmarks on macOS, ${{ github.sha }}"; echo; cat /tmp/macos.txt /tmp/macos-copies.txt; } >> "$GITHUB_STEP_SUMMARY"
+          /tmp/after/sandfs-bench --scale quick --scratch /tmp --skip build --targets host,sandfs,fuse \
+            --sandfs-bin /tmp/after/sandfs --json /tmp/macos.json > /tmp/macos.txt
+          copies() {
+            /tmp/after/sandfs-bench --only copies --scale quick --scratch /tmp --sandfs-bin "$1/sandfs" --json "$2" > "$2.txt"
+          }
+          for round in 1 2; do
+            if [ "${{ github.event_name }}" = pull_request ]; then copies /tmp/before /tmp/macos-before-copies-$round.json; fi
+            copies /tmp/after /tmp/macos-copies-$round.json
+          done
+          {
+            echo "## Benchmarks on macOS, ${{ github.sha }}"
+            echo
+            if [ "${{ github.event_name }}" = pull_request ]; then
+              echo "### Copies of a clone: this PR against main"
+              echo
+              /tmp/after/sandfs-bench --compare /tmp/macos-before-copies-1.json,/tmp/macos-before-copies-2.json \
+                /tmp/macos-copies-1.json,/tmp/macos-copies-2.json
+              echo
+            fi
+            cat /tmp/macos.txt /tmp/macos-copies-1.json.txt
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-macos-${{ github.sha }}
