@@ -356,3 +356,181 @@ fn read_only_paths_outside_the_source_are_refused() {
     assert!(String::from_utf8_lossy(&served.stderr).contains("--read-only ../contracts is outside the source"));
     assert!(!home.path().join("workspaces/books").exists(), "no workspace was made");
 }
+
+/// Run the MCP tools `calls` (name and arguments) against the workspace or source `what`.
+fn mcp(home: &std::path::Path, what: &str, calls: &[(&str, serde_json::Value)]) -> String {
+    let input: String = calls
+        .iter()
+        .enumerate()
+        .map(|(id, (name, arguments))| {
+            let call = serde_json::json!({"jsonrpc": "2.0", "id": id + 1, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}});
+            format!("{call}\n")
+        })
+        .collect();
+    let served = sandfs(home, &["serve", "--mcp", what], &input);
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    let out = String::from_utf8(served.stdout).unwrap();
+    assert!(!out.contains(r#""isError":true"#), "{out}");
+    out
+}
+
+fn commit_all(repo: &std::path::Path, message: &str) {
+    for args in [&["add", "-A"][..], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]] {
+        assert!(Command::new("git").current_dir(repo).args(args).status().unwrap().success());
+    }
+}
+
+#[test]
+fn update_moves_a_workspace_onto_a_newer_commit() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::Builder::new().prefix("data").tempdir().unwrap();
+    let repo = data.path().join("site");
+    std::fs::create_dir(&repo).unwrap();
+    for (name, text) in [("both.txt", "b0\n"), ("up.txt", "u0\n"), ("same.txt", "s0\n"), ("gone.txt", "g\n")] {
+        std::fs::write(repo.join(name), text).unwrap();
+    }
+    assert!(Command::new("git").current_dir(&repo).args(["init", "-q", "-b", "main"]).status().unwrap().success());
+    commit_all(&repo, "first");
+    let url = format!("file://{}", repo.display());
+    let served = sandfs(home.path(), &["serve", "--mcp", &url, "--name", "site"], "");
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    mcp(
+        home.path(),
+        "site",
+        &[
+            ("write", serde_json::json!({"path": "/mnt/mine.txt", "content": "m\n"})),
+            ("write", serde_json::json!({"path": "/mnt/both.txt", "content": "mine\n"})),
+            ("write", serde_json::json!({"path": "/mnt/same.txt", "content": "s1\n"})),
+            ("delete", serde_json::json!({"path": "/mnt/gone.txt"})),
+        ],
+    );
+    let fork = sandfs(home.path(), &["fork", "site", "--name", "before"], "");
+    assert!(fork.status.success(), "{}", String::from_utf8_lossy(&fork.stderr));
+
+    // Upstream: one file changed on both sides, one the same way, one only there.
+    std::fs::write(repo.join("both.txt"), "theirs\n").unwrap();
+    std::fs::write(repo.join("up.txt"), "u1\n").unwrap();
+    std::fs::write(repo.join("same.txt"), "s1\n").unwrap();
+    std::fs::remove_file(repo.join("gone.txt")).unwrap();
+    std::fs::write(repo.join("new.txt"), "n\n").unwrap();
+    commit_all(&repo, "second");
+
+    let moved = sandfs(home.path(), &["update", "site"], "");
+    assert!(moved.status.success(), "{}", String::from_utf8_lossy(&moved.stderr));
+    assert_eq!(String::from_utf8_lossy(&moved.stdout), "C both.txt\n");
+    let said = String::from_utf8_lossy(&moved.stderr);
+    assert!(said.contains("5 files changed there") && said.contains("2 of its changes matched"), "{said}");
+
+    // Only the workspace's own changes are left, over the newer commit's files.
+    assert_eq!(stdout(home.path(), &["changes", "site"]), "M both.txt\nA mine.txt\n");
+    let read = mcp(
+        home.path(),
+        "site",
+        &[
+            ("read", serde_json::json!({"path": "/mnt/up.txt"})),
+            ("read", serde_json::json!({"path": "/mnt/new.txt"})),
+            ("read", serde_json::json!({"path": "/mnt/both.txt"})),
+        ],
+    );
+    assert!(read.contains("u1") && read.contains(r#"n\n"#) && read.contains("mine"), "{read}");
+    // Files the newer commit changed report the time of the move, for build tools.
+    let record = std::fs::read_to_string(home.path().join("workspaces/site/workspace.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    let updated: Vec<&String> = record["updated"].as_object().unwrap().keys().collect();
+    assert_eq!(updated, ["both.txt", "new.txt", "same.txt", "up.txt"]);
+
+    // The fork stays on the commit it had.
+    assert_eq!(stdout(home.path(), &["changes", "before"]), "M both.txt\nD gone.txt\nA mine.txt\nM same.txt\n");
+    // Nothing newer: nothing moves, and nothing is reported again.
+    let again = sandfs(home.path(), &["update", "site"], "");
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    assert_eq!(String::from_utf8_lossy(&again.stdout), "");
+    assert_eq!(stdout(home.path(), &["changes", "site"]), "M both.txt\nA mine.txt\n");
+
+    // Another repository is refused.
+    let other = data.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::write(other.join("a.txt"), "a\n").unwrap();
+    assert!(Command::new("git").current_dir(&other).args(["init", "-q"]).status().unwrap().success());
+    commit_all(&other, "a");
+    let refused = sandfs(home.path(), &["update", "site", &format!("git:{}", other.display())], "");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("another repository"));
+}
+
+#[test]
+fn update_reads_a_relative_source_where_it_was_made_and_refuses_what_it_cannot_lay_over() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let repo = data.path().join("site");
+    std::fs::create_dir_all(repo.join("dir")).unwrap();
+    std::fs::write(repo.join("dir/file.txt"), "f0\n").unwrap();
+    std::fs::write(repo.join("other.txt"), "o0\n").unwrap();
+    assert!(Command::new("git").current_dir(&repo).args(["init", "-q", "-b", "main"]).status().unwrap().success());
+    commit_all(&repo, "first");
+    let input = format!(
+        "{}\n",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "write", "arguments": {"path": "/mnt/dir/file.txt", "content": "mine\n"}}})
+    );
+    let served = sandfs_in(home.path(), data.path(), &["serve", "--mcp", "git:site@main", "--name", "site"], &input);
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+
+    // Run from elsewhere, the update still finds the repository it was made from.
+    std::fs::write(repo.join("other.txt"), "o1\n").unwrap();
+    commit_all(&repo, "second");
+    let moved = sandfs_in(home.path(), home.path(), &["update", "site"], "");
+    assert!(moved.status.success(), "{}", String::from_utf8_lossy(&moved.stderr));
+    assert_eq!(stdout(home.path(), &["changes", "site"]), "M dir/file.txt\n");
+
+    // A file where the folder holding the workspace's change was is refused, and the
+    // workspace stays as it was. A save names the folders above a change; one that
+    // didn't, as a save may, couldn't be laid over the file at all.
+    let index = home.path().join("workspaces/site/changes.json");
+    let mut saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index).unwrap()).unwrap();
+    assert!(saved["entries"].as_object_mut().unwrap().remove("dir").is_some());
+    std::fs::write(&index, saved.to_string()).unwrap();
+    std::fs::remove_dir_all(repo.join("dir")).unwrap();
+    std::fs::write(repo.join("dir"), "now a file\n").unwrap();
+    commit_all(&repo, "third");
+    let refused = sandfs(home.path(), &["update", "site"], "");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("dir is a file in the newer source"), "{refused:?}");
+    assert_eq!(stdout(home.path(), &["changes", "site"]), "M dir/file.txt\n");
+}
+
+#[test]
+fn update_moves_a_workspace_onto_another_folder() {
+    let (home, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (v1, v2) = (data.path().join("v1"), data.path().join("v2"));
+    for (dir, survey, notes) in [(&v1, "old\n", "n\n"), (&v2, "new\n", "n\n")] {
+        std::fs::create_dir_all(dir.join("raw")).unwrap();
+        std::fs::write(dir.join("survey.csv"), survey).unwrap();
+        std::fs::write(dir.join("notes.txt"), notes).unwrap();
+        std::fs::write(dir.join("raw/a.csv"), "a\n").unwrap();
+    }
+    std::fs::write(v2.join("raw/b.csv"), "b\n").unwrap();
+    let served = sandfs(home.path(), &["serve", "--mcp", v1.to_str().unwrap(), "--name", "data"], "");
+    assert!(served.status.success(), "{}", String::from_utf8_lossy(&served.stderr));
+    mcp(
+        home.path(),
+        "data",
+        &[
+            ("write", serde_json::json!({"path": "/mnt/survey.csv", "content": "mine\n"})),
+            ("write", serde_json::json!({"path": "/mnt/notes.txt", "content": "edited\n"})),
+            ("delete", serde_json::json!({"path": "/mnt/raw", "recursive": true})),
+        ],
+    );
+
+    let same = sandfs(home.path(), &["update", "data"], "");
+    assert!(!same.status.success());
+    assert!(String::from_utf8_lossy(&same.stderr).contains("nothing newer"));
+
+    let moved = sandfs(home.path(), &["update", "data", v2.to_str().unwrap()], "");
+    assert!(moved.status.success(), "{}", String::from_utf8_lossy(&moved.stderr));
+    // The folder deleted here got a new file there.
+    assert_eq!(String::from_utf8_lossy(&moved.stdout), "C raw\nC survey.csv\n");
+    assert_eq!(stdout(home.path(), &["changes", "data"]), "M notes.txt\nD raw/a.csv\nD raw/b.csv\nM survey.csv\n");
+    assert!(stdout(home.path(), &["list"]).starts_with(&format!("data\t{}\t", v2.display())));
+}

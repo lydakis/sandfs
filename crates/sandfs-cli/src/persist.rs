@@ -638,6 +638,32 @@ impl Saved {
         Ok(changes.entries.iter().map(|(rel, entry)| (rel.clone(), state(entry))).collect())
     }
 
+    /// The saved paths that are other names of another path (hard links), with that
+    /// path: an earlier saved one, or one unchanged in the source.
+    pub fn links(&self) -> Result<Vec<(String, String)>> {
+        let changes = self.read_index()?;
+        let link = |entry: &Entry| match entry {
+            Entry::File { link, .. } | Entry::Symlink { link, .. } => link.clone(),
+            _ => None,
+        };
+        Ok(changes.entries.iter().filter_map(|(rel, entry)| Some((rel.clone(), link(entry)?))).collect())
+    }
+
+    /// Forget the saved changes of the paths `drop` names, so they read as the source
+    /// does again. Their objects go once nothing uses them, as replaced ones do.
+    ///
+    /// Only the holder of the workspace's writer lock may do this, with nothing serving it.
+    pub fn forget(&mut self, drop: &BTreeSet<String>) -> Result<()> {
+        let mut changes = self.read_index()?;
+        changes.entries.retain(|rel, _| !drop.contains(rel));
+        let tmp = self.dir.join("changes.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&changes)?).context("writing changes.json")?;
+        sync_path(&tmp)?;
+        std::fs::rename(&tmp, self.index_path()).context("writing changes.json")?;
+        self.last = None;
+        sync_path(&self.dir).map_err(|err| err.context(NotDurable))
+    }
+
     /// Replay the saved changes onto `ws`, whose source is mounted at `root`.
     ///
     /// Loading only reads, so any process may load a workspace, even while another
