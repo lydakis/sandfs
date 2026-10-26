@@ -440,6 +440,9 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     std::fs::write(repo.join("old/notes.md"), "old\n").unwrap();
     std::fs::write(repo.join("docs/guide"), "guide\n").unwrap();
+    std::fs::create_dir_all(repo.join("lib")).unwrap();
+    std::fs::write(repo.join("lib/one.rs"), "one\n").unwrap();
+    std::fs::write(repo.join("queue"), "queue\n").unwrap();
     std::fs::write(repo.join("run.sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(repo.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
@@ -447,8 +450,8 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     git(&repo, &["commit", "-q", "-m", "first"]);
 
     // Uncommitted work of every kind: an edit, a staged new file, a new one, a link, a
-    // deletion that empties a folder, a mode change, a folder in place of a file and an
-    // ignored file.
+    // deletion that empties a folder, a mode change, a folder in place of a file, a file
+    // in place of a folder, an ignored file, and a pipe, which is left out.
     std::fs::write(repo.join("README.md"), "hello, edited\n").unwrap();
     std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
     git(&repo, &["add", "staged.txt"]);
@@ -459,31 +462,41 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     std::fs::remove_file(repo.join("docs/guide")).unwrap();
     std::fs::create_dir(repo.join("docs/guide")).unwrap();
     std::fs::write(repo.join("docs/guide/intro.md"), "intro\n").unwrap();
+    std::fs::remove_dir_all(repo.join("lib")).unwrap();
+    std::fs::write(repo.join("lib"), "lib\n").unwrap();
     std::fs::write(repo.join("build.log"), "ignored\n").unwrap();
+    std::fs::remove_file(repo.join("queue")).unwrap();
+    assert!(Command::new("mkfifo").arg(repo.join("queue")).status().unwrap().success());
     let before = git_out(&repo, &["status", "--porcelain"]);
 
     let mut sandfs = Sandfs::new();
     let task = data.path().join("task");
     let source = format!("git:{}", repo.display());
-    sandfs.mount(&["mount", &source, task.to_str().unwrap(), "--uncommitted", "--branch", "task/one"], &task);
+    let args =
+        ["mount", &source, task.to_str().unwrap(), "--uncommitted", "--branch", "task/one", "--read-only", "docs"];
+    sandfs.mount(&args, &task);
 
     // The copy looks like the folder to git, on its own branch, though nothing is staged in it.
     assert_eq!(git_out(&task, &["status", "--porcelain", "-b"]).lines().next(), Some("## task/one"));
     let unstaged = |status: &str| {
-        let mut lines: Vec<String> = status.lines().map(|line| line.replace("A  ", "?? ")).collect();
+        let mut lines: Vec<String> =
+            status.lines().filter(|line| !line.ends_with(" queue")).map(|line| line.replace("A  ", "?? ")).collect();
         lines.sort();
         lines
     };
     assert_eq!(unstaged(&git_out(&task, &["status", "--porcelain"])), unstaged(&before));
     assert!(before.contains("A  staged.txt\n"), "{before}");
     assert_eq!(std::fs::read_to_string(task.join("docs/guide/intro.md")).unwrap(), "intro\n");
+    assert!(std::fs::write(task.join("docs/guide/intro.md"), "changed\n").is_err(), "docs stays read-only");
+    assert_eq!(std::fs::read_to_string(task.join("lib")).unwrap(), "lib\n");
+    assert_eq!(std::fs::read_to_string(task.join("queue")).unwrap(), "queue\n", "the pipe was left out");
     assert_eq!(std::fs::read_link(task.join("readme")).unwrap(), Path::new("README.md"));
     assert!(!task.join("old").exists(), "a folder git emptied is gone");
     assert!(!task.join("build.log").exists(), "ignored files stay out");
     assert_eq!(std::fs::metadata(task.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
     assert_eq!(
         sandfs.stdout(&["changes", "task"]),
-        "M README.md\nD docs/guide\nA docs/guide/intro.md\nA draft.txt\nD old/notes.md\nA readme\nM run.sh\nA staged.txt\n"
+        "M README.md\nD docs/guide\nA docs/guide/intro.md\nA draft.txt\nA lib\nD lib/one.rs\nD old/notes.md\nA readme\nM run.sh\nA staged.txt\n"
     );
 
     // Later edits in the folder stay out of the copy, and the copy's commits come back
@@ -512,7 +525,9 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     refused(&["mount", &source, other, "--branch", "task/one"], "already has a branch task/one");
     refused(&["mount", &source, other, "--branch", "bad..name"], "not a name git takes");
     refused(&["mount", &format!("{source}@task/one"), other, "--uncommitted"], "mount the repository at HEAD");
-    refused(&["mount", &format!("git:file://{}", repo.display()), other, "--uncommitted"], "is remote");
+    let url = format!("git:file://{}", repo.display());
+    refused(&["mount", &url, other, "--uncommitted"], "is remote");
+    refused(&["mount", &url, other, "--branch", "task/one"], "already has a branch task/one");
     refused(&["mount", repo.to_str().unwrap(), other, "--branch", "two"], "is a folder");
     refused(&["mount", "task", other, "--branch", "two"], "already exists");
     assert_eq!(sandfs.stdout(&["list"]).lines().count(), 1, "no workspace was left behind");

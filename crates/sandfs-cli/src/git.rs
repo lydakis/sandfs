@@ -138,12 +138,17 @@ pub fn start(home: &Home, name: &str, uncommitted: bool, branch: Option<&str>) -
         None
     };
     if let Some(branch) = branch {
-        check_new_branch(repo, branch)?;
+        check_new_branch(repo, managed, branch)?;
     }
 
     let _writer = home.lock(name, "sandfs mount, preparing the workspace")?;
     let mut opened = home.open(name)?;
     let ws = &mut opened.ws;
+    // Read-only paths keep programs from changing the copy, not the copy from being
+    // made; the mount applies them again from the record.
+    for path in &record.read_only {
+        ws.set_read_only(&format!("{ROOT}/{path}"), false)?;
+    }
     let (mut times, mut dirs) = (BTreeMap::new(), BTreeSet::new());
     if let Some(branch) = branch {
         // The branch the commit was mounted as stays, as it is in the repository.
@@ -218,7 +223,8 @@ fn copy_changed(
                 continue;
             }
             Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Gone, or below a file that replaced one of its folders.
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
                 if ws.exists(at) {
                     ws.remove(at, true)?;
                 }
@@ -237,6 +243,11 @@ fn copy_changed(
             }
             Err(err) => return Err(err).with_context(|| format!("reading {}", host.display())),
         };
+        if !meta.is_file() && !meta.file_type().is_symlink() {
+            // Reading a pipe would wait for a writer, and a device has no contents to copy.
+            eprintln!("sandfs: left out {rel}, which is not a file, folder or link");
+            continue;
+        }
         // Made afresh, so nothing of what was there (a folder, a link, a mode) stays.
         if ws.exists(at) {
             ws.remove(at, true)?;
@@ -265,15 +276,23 @@ fn copy_changed(
     Ok(())
 }
 
-/// Refuse a name git wouldn't take for a new branch, or one `repo` already has, which a
-/// push back would then overwrite or be refused.
-fn check_new_branch(repo: &Path, branch: &str) -> Result<()> {
+/// Refuse a name git wouldn't take for a new branch, or one the repository already has
+/// (the remote itself when `repo` is sandfs's own copy of one), which a push back would
+/// then overwrite or be refused.
+fn check_new_branch(repo: &Path, managed: bool, branch: &str) -> Result<()> {
     let checked =
         (!branch.starts_with('-')).then(|| git(repo, &["check-ref-format", "--branch", branch]).ok()).flatten();
     if checked.as_deref() != Some(branch) {
         bail!("{branch:?} is not a name git takes for a branch");
     }
-    if git(repo, &["show-ref", "--verify", "-q", &format!("refs/heads/{branch}")]).is_ok() {
+    let full = format!("refs/heads/{branch}");
+    if managed {
+        // The copy keeps the commits it fetched under refs of its own, not the remote's branches.
+        let url = origin(repo).context("sandfs's copy of the repository names no remote")?;
+        if !git(repo, &["ls-remote", "origin", &full]).context("asking the remote for its branches")?.is_empty() {
+            bail!("{url} already has a branch {branch}; pick another name");
+        }
+    } else if git(repo, &["show-ref", "--verify", "-q", &full]).is_ok() {
         bail!("{} already has a branch {branch}; pick another name", repo.display());
     }
     Ok(())
