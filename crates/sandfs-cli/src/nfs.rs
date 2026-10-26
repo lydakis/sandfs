@@ -517,16 +517,21 @@ fn watch(dir: &Path, source: String) -> tokio::sync::oneshot::Receiver<()> {
         let _ = std::thread::Builder::new().name("mount checks".to_owned()).spawn(move || {
             loop {
                 std::thread::sleep(MOUNT_CHECK);
-                if checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty() {
+                // Mounts are only added at the end, so the first `before` were watched
+                // before the table was read; one added since may be missing from it.
+                let before = checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
+                if before == 0 {
                     continue;
                 }
                 // A table that couldn't be read says nothing about what is mounted.
                 let Some(table) = crate::host::read_mount_table() else { continue };
                 // Dropping a mount's sender tells it its mount is gone.
-                checked
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|(dir, source, gone)| !gone.is_closed() && table.get(dir) == Some(source));
+                let mut index = 0;
+                checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(dir, source, gone)| {
+                    let read = index < before;
+                    index += 1;
+                    !gone.is_closed() && (!read || table.get(dir) == Some(source))
+                });
             }
         });
         watched
