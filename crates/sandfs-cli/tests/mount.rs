@@ -425,7 +425,7 @@ fn git_works_inside_a_remote_git_mount() {
 }
 
 #[test]
-fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
+fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     if !fuse_available() {
         return;
     }
@@ -478,9 +478,9 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
 
     let mut sandfs = Sandfs::new();
     let task = data.path().join("task");
-    let source = format!("git:{}", repo.display());
-    let args =
-        ["mount", &source, task.to_str().unwrap(), "--uncommitted", "--branch", "task/one", "--read-only", "docs"];
+    // From a folder inside the repository, as from `cd repo/docs; sandfs fork . DIR`.
+    let docs = repo.join("docs");
+    let args = ["fork", docs.to_str().unwrap(), task.to_str().unwrap(), "--branch", "task/one", "--read-only", "docs"];
     sandfs.mount(&args, &task);
 
     // The copy looks like the folder to git, on its own branch, though nothing is staged in it.
@@ -519,10 +519,27 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     std::fs::write(repo.join("README.md"), "hello, edited\n").unwrap();
     assert_eq!(git_out(&repo, &["status", "--porcelain"]), before);
 
-    // Refused before anything is made: a branch the repository has, a name git won't
-    // take, a commit other than HEAD, a remote repository, a folder source, and a
+    // A fork of the copy, made from a folder in its mount, starts a branch of its own
+    // at the copy's commit, with the copy's files and what it has staged.
+    std::fs::write(task.join("draft.txt"), "draft, staged\n").unwrap();
+    git_out(&task, &["add", "draft.txt"]);
+    let second = data.path().join("second");
+    let art = task.join("art");
+    let args = ["fork", art.to_str().unwrap(), second.to_str().unwrap(), "--branch", "task/two"];
+    sandfs.mount(&args, &second);
+    assert_eq!(git_out(&second, &["status", "--porcelain", "-b"]), "## task/two\nM  draft.txt\n");
+    assert_eq!(git_out(&second, &["log", "--format=%s"]), "task\nfirst\n");
+    assert_eq!(
+        git_out(&task, &["status", "--porcelain", "-b"]),
+        "## task/one\nM  draft.txt\n",
+        "the copy is as it was"
+    );
+    assert!(std::fs::write(second.join("docs/guide/intro.md"), "changed\n").is_err(), "forks keep read-only paths");
+
+    // Refused before anything is made: a branch the repository or a copy has, a name git
+    // won't take, a remote repository's branch, a folder source, a plain folder, and a
     // workspace that exists.
-    let refused = |args: &[&str], message: &str| {
+    let refused = |sandfs: &Sandfs, args: &[&str], message: &str| {
         let output = sandfs.try_run(args);
         assert!(!output.status.success(), "sandfs {args:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -530,29 +547,41 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     };
     let other = data.path().join("other");
     let other = other.to_str().unwrap();
-    refused(&["mount", &source, other, "--branch", "task/one"], "already has a branch task/one");
-    refused(&["mount", &source, other, "--branch", "bad..name"], "not a name git takes");
-    refused(&["mount", &format!("{source}@task/one"), other, "--uncommitted"], "mount the repository at HEAD");
+    let repo_path = repo.to_str().unwrap();
+    refused(&sandfs, &["fork", repo_path, other, "--branch", "task/one"], "already has a branch task/one");
+    refused(&sandfs, &["fork", "second", other, "--branch", "task/two"], "already has a branch task/two");
+    refused(&sandfs, &["fork", repo_path, other, "--branch", "bad..name"], "not a name git takes");
+    sandfs.run(&["fork", "second", "--name", "keep"]);
     let url = format!("git:file://{}", repo.display());
-    refused(&["mount", &url, other, "--uncommitted"], "is remote");
-    refused(&["mount", &url, other, "--branch", "task/one"], "already has a branch task/one");
+    let remote = data.path().join("remote");
+    sandfs.mount(&["mount", &url, remote.to_str().unwrap()], &remote);
+    refused(&sandfs, &["fork", "remote", other, "--branch", "task/one"], "already has a branch task/one");
     // A partial clone's pushes go to the remote it borrows from, which is what counts.
     git(&repo, &["config", "uploadpack.allowFilter", "true"]);
     let partial = data.path().join("partial");
     git(data.path(), &["clone", "-q", "--filter=blob:none", &format!("file://{}", repo.display()), "partial"]);
     refused(
-        &["mount", &format!("git:{}", partial.display()), other, "--branch", "task/one"],
+        &sandfs,
+        &["fork", partial.to_str().unwrap(), other, "--branch", "task/one"],
         "already has a branch task/one",
     );
-    refused(&["mount", repo.to_str().unwrap(), other, "--branch", "two"], "is a folder");
-    refused(&["mount", "task", other, "--branch", "two"], "already exists");
-    assert_eq!(sandfs.stdout(&["list"]).lines().count(), 1, "no workspace was left behind");
+    let plain = data.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let folder = data.path().join("folder");
+    sandfs.mount(&["mount", plain.to_str().unwrap(), folder.to_str().unwrap()], &folder);
+    refused(&sandfs, &["fork", "folder", other, "--branch", "two"], "is a folder");
+    refused(&sandfs, &["fork", plain.to_str().unwrap(), other], "forking a plain folder isn't supported");
+    refused(&sandfs, &["fork", repo_path, other, "--name", "task"], "already exists");
+    assert_eq!(sandfs.stdout(&["list"]).lines().count(), 5, "no workspace was left behind");
+    for dir in [&second, &remote, &folder] {
+        sandfs.unmount(dir);
+    }
 
     // Removing a mounted copy unmounts it first only when asked.
-    refused(&["rm", "task"], "pass --unmount");
+    refused(&sandfs, &["rm", "task"], "pass --unmount");
     sandfs.run(&["rm", "--unmount", task.to_str().unwrap()]);
     sandfs.mounts.clear();
-    assert_eq!(sandfs.stdout(&["list"]), "");
+    assert!(!sandfs.stdout(&["list"]).lines().any(|line| line.starts_with("task\t")));
 }
 
 #[test]

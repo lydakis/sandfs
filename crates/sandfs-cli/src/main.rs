@@ -76,17 +76,6 @@ enum Cmd {
         /// system. Repeat for several; forks keep them.
         #[arg(long, value_name = "PATH")]
         read_only: Vec<String>,
-        /// With git:<path>, a repository on this machine at HEAD: also bring in the files
-        /// its folder has changed since, as `git status` lists them (changed, new or
-        /// deleted; ignored files stay out). They are copied once, now, so later edits
-        /// there don't reach the workspace.
-        #[arg(long)]
-        uncommitted: bool,
-        /// With a git: source: start git in the workspace on a new branch NAME at the
-        /// mounted commit, so its commits can be pushed back to the repository with
-        /// `git push origin NAME` without touching the branches there.
-        #[arg(long, value_name = "NAME")]
-        branch: Option<String>,
         /// Serve in the foreground instead of in the background.
         #[arg(long, short)]
         foreground: bool,
@@ -94,15 +83,30 @@ enum Cmd {
     /// Fork a workspace, with its changes so far, and mount the fork at DIR. The source
     /// is never copied; each saved change is linked into the fork.
     ///
+    /// FROM can also be a git repository's folder that sandfs doesn't serve, such as a
+    /// clone: the fork is then its HEAD commit plus the files the folder has changed
+    /// since (changed, new or deleted; ignored files stay out). Either way the fork is a
+    /// copy of FROM as it is now, and later changes to FROM don't reach it.
+    ///
     /// Without DIR the fork is only kept, not mounted: a snapshot of the workspace as it
     /// is now, which `mount NAME DIR` or `fork NAME DIR` brings back later.
     Fork {
-        /// The workspace to fork: its name or the directory it is mounted on.
+        /// The workspace to fork (its name, or the directory it is mounted on or a folder
+        /// in it), or a git repository's folder.
         from: String,
         dir: Option<PathBuf>,
         /// Name for the fork (default: DIR's last component; required without DIR).
         #[arg(long)]
         name: Option<String>,
+        /// A file or folder, relative to the workspace, that programs may read but not
+        /// change, as for `mount`; added to those FROM already has. Repeat for several.
+        #[arg(long, value_name = "PATH")]
+        read_only: Vec<String>,
+        /// With a git source: start git in the fork on a new branch NAME at the commit
+        /// FROM is on, as `git switch -c NAME` would, keeping its files and staged
+        /// changes, so the fork's commits can be pushed with `git push origin NAME`.
+        #[arg(long, value_name = "NAME")]
+        branch: Option<String>,
         /// Serve in the foreground instead of in the background.
         #[arg(long, short)]
         foreground: bool,
@@ -230,16 +234,51 @@ fn print_out(text: &str) -> Result<()> {
     }
 }
 
+/// What `fork` copies.
+enum Origin {
+    /// A workspace, by name.
+    Workspace(String),
+    /// The working folder of a git repository sandfs doesn't serve.
+    Checkout(PathBuf),
+}
+
+/// What `fork FROM` copies: the workspace FROM names, or is mounted on, or that holds the
+/// folder FROM; else the git repository whose working folder holds FROM.
+fn fork_origin(home: &Home, from: &str) -> Result<Origin> {
+    let not_found = match home.find(from) {
+        Ok(name) => return Ok(Origin::Workspace(name)),
+        Err(err) => err,
+    };
+    let Ok(path) = Path::new(from).canonicalize() else { return Err(not_found) };
+    if !path.is_dir() {
+        return Err(not_found);
+    }
+    let mounts: Vec<(String, PathBuf)> = home
+        .names()?
+        .into_iter()
+        .filter_map(|name| home.attached_mount(&name).map(|info| (name, info.mountpoint)))
+        .collect();
+    for dir in path.ancestors() {
+        if let Some((name, _)) = mounts.iter().find(|(_, mountpoint)| mountpoint == dir) {
+            return Ok(Origin::Workspace(name.clone()));
+        }
+    }
+    match git::working_folder(&path) {
+        Some(top) => Ok(Origin::Checkout(top)),
+        None => bail!(
+            "{from} is neither in a workspace nor in a git repository, and forking a plain folder isn't \
+             supported yet; `sandfs mount {from} DIR` mounts it, showing its later changes too"
+        ),
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     let home = Home::locate()?;
     match cli.command {
-        Cmd::Mount { source, dir, name, read_only, uncommitted, branch, foreground } => {
+        Cmd::Mount { source, dir, name, read_only, foreground } => {
             // A bare word naming a workspace remounts it; anything else is a source.
             if home.exists(&source) && name.is_none() {
                 only_when_created(&read_only, &source)?;
-                if uncommitted || branch.is_some() {
-                    bail!("--uncommitted and --branch apply when a workspace is created, and {source} already exists");
-                }
                 return mount(&home, &source, &dir, foreground);
             }
             let name = default_name(name, &dir)?;
@@ -247,31 +286,53 @@ fn run(cli: Cli) -> Result<()> {
             let mut record = home.resolve(&source)?;
             record.read_only = relative_paths(&read_only)?;
             home.create(&name, &record)?;
-            if (uncommitted || branch.is_some())
-                && let Err(err) = git::start(&home, &name, uncommitted, branch.as_deref())
-            {
-                remove_unused(&home, &name);
-                return Err(err);
-            }
             drop(repos);
             mount_new(&home, &name, &dir, foreground)
         }
-        Cmd::Fork { from, dir, name, foreground } => {
-            let from = home.find(&from)?;
+        Cmd::Fork { from, dir, name, read_only, branch, foreground } => {
+            let origin = fork_origin(&home, &from)?;
+            let read_only = relative_paths(&read_only)?;
             let name = match (&dir, name) {
                 (Some(dir), name) => default_name(name, dir)?,
                 (None, Some(name)) => default_name(Some(name), Path::new(""))?,
                 (None, None) => bail!("name the snapshot with --name, or give a directory to mount the fork on"),
             };
-            sync(&home, &from)?;
-            let repos = home.repos_lock(false)?;
-            let record = home.record(&from)?;
-            let target = home.create(&name, &record)?;
-            if let Err(err) = Saved::new(home.workspace_dir(&from)).copy_to(&target) {
-                remove_unused(&home, &name);
-                return Err(err);
-            }
-            drop(repos);
+            let from = match origin {
+                Origin::Workspace(from) => {
+                    sync(&home, &from)?;
+                    let repos = home.repos_lock(false)?;
+                    let mut record = home.record(&from)?;
+                    for path in read_only {
+                        if !record.read_only.contains(&path) {
+                            record.read_only.push(path);
+                        }
+                    }
+                    let target = home.create(&name, &record)?;
+                    let made = Saved::new(home.workspace_dir(&from)).copy_to(&target).and_then(|()| match &branch {
+                        Some(branch) => git::switch_new(&home, &name, branch),
+                        None => Ok(()),
+                    });
+                    if let Err(err) = made {
+                        remove_unused(&home, &name);
+                        return Err(err);
+                    }
+                    drop(repos);
+                    from
+                }
+                Origin::Checkout(top) => {
+                    let source = format!("git:{}", top.to_str().context("the repository's path is not UTF-8")?);
+                    let repos = home.repos_lock(false)?;
+                    let mut record = home.resolve(&source)?;
+                    record.read_only = read_only;
+                    home.create(&name, &record)?;
+                    if let Err(err) = git::start(&home, &name, branch.as_deref()) {
+                        remove_unused(&home, &name);
+                        return Err(err);
+                    }
+                    drop(repos);
+                    top.display().to_string()
+                }
+            };
             match dir {
                 Some(dir) => mount_new(&home, &name, &dir, foreground),
                 None => {

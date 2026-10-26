@@ -139,14 +139,24 @@ sandfs mount https://github.com/pallets/flask@3.1.0 ~/ws/flask
 
 The mounted folder has a `.git`, so git itself works in it: `status`, `add`, `commit`, branches and `push`, with commits kept in the workspace and its forks. A mount of a remote repository holds only the mounted commit, not the history before it; a local repository's history is all there. `git status` doesn't read your files, because sandfs tells git which ones changed; on VS Code it takes 0.07 s once the first run (about 10 s on a fresh mount, which lists every folder) is done. A `commit` fetches only the files git compares: the others in each folder that holds a change, or holds a folder that does. On VS Code, a first commit changing two files takes 2.3 s and fetches 0.5 MiB, and later ones take 0.2 s.
 
-A mount of a repository on your machine is also a quick copy to hand one task, or one agent, in place of a second checkout. It costs nothing until something is written, and its `origin` is that repository, so a branch pushed from the copy lands there. `--branch NAME` starts git in the copy on a new branch, and `--uncommitted` brings in the files the repository's folder has changed and not yet committed (new and deleted ones too, ignored ones not), copied once, so later edits there stay out of the copy:
+`sandfs fork` is also the quick copy to hand one task, or one agent, in place of a second checkout. Run in a folder sandfs mounts, it forks that workspace; run in a repository on your machine, such as a clone, it makes a workspace of its `HEAD` plus the files its folder has changed and not yet committed (new and deleted ones too, ignored ones not). Either way the copy is taken once, so later edits where it came from stay out of it, and it costs nothing until something is written. `--branch NAME` starts git in the copy on a new branch, and its `origin` is where it came from, so a pushed branch lands there:
 
 ```bash
-sandfs mount git:~/proj ~/tasks/fix-login --uncommitted --branch fix-login
+cd ~/proj                                  # a clone, or a folder sandfs mounts
+sandfs fork . ~/tasks/fix-login --branch fix-login
 cd ~/tasks/fix-login                       # ...work and commit...
 git push origin fix-login                  # the branch is now in ~/proj
 sandfs rm --unmount fix-login              # done with the copy
 ```
+
+If you know git, the rest maps one to one:
+
+| git | sandfs |
+| --- | --- |
+| `git clone URL DIR` | `sandfs mount URL DIR` |
+| `git worktree add ../x -b x` | `sandfs fork . ../x --branch x` |
+| `git worktree list` | `sandfs list` |
+| `git worktree remove ../x` | `sandfs rm --unmount ../x` |
 
 An agent that works through a shell can have the mount as its only files. `sandfs shell NAME` starts a shell, or `sandfs shell NAME -- COMMAND` a command, in the mount with the rest of the machine out of reach: no home folder, no other folders, no network unless `--network` is given, and none of your environment's tokens. The operating system does the confining (bubblewrap on Linux, the built-in sandbox on macOS); sandfs only sets it up.
 
