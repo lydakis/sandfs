@@ -442,6 +442,8 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     std::fs::write(repo.join("docs/guide"), "guide\n").unwrap();
     std::fs::create_dir_all(repo.join("lib")).unwrap();
     std::fs::write(repo.join("lib/one.rs"), "one\n").unwrap();
+    std::fs::create_dir_all(repo.join("assets")).unwrap();
+    std::fs::write(repo.join("assets/logo.txt"), "logo\n").unwrap();
     std::fs::write(repo.join("queue"), "queue\n").unwrap();
     std::fs::write(repo.join("run.sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(repo.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -451,7 +453,8 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
 
     // Uncommitted work of every kind: an edit, a staged new file, a new one, a link, a
     // deletion that empties a folder, a mode change, a folder in place of a file, a file
-    // in place of a folder, an ignored file, and a pipe, which is left out.
+    // in place of a folder, a link in place of a folder, an ignored file, and a pipe,
+    // which is left out.
     std::fs::write(repo.join("README.md"), "hello, edited\n").unwrap();
     std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
     git(&repo, &["add", "staged.txt"]);
@@ -464,6 +467,10 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     std::fs::write(repo.join("docs/guide/intro.md"), "intro\n").unwrap();
     std::fs::remove_dir_all(repo.join("lib")).unwrap();
     std::fs::write(repo.join("lib"), "lib\n").unwrap();
+    std::fs::remove_dir_all(repo.join("assets")).unwrap();
+    std::fs::create_dir(repo.join("art")).unwrap();
+    std::fs::write(repo.join("art/logo.txt"), "new logo\n").unwrap();
+    std::os::unix::fs::symlink("art", repo.join("assets")).unwrap();
     std::fs::write(repo.join("build.log"), "ignored\n").unwrap();
     std::fs::remove_file(repo.join("queue")).unwrap();
     assert!(Command::new("mkfifo").arg(repo.join("queue")).status().unwrap().success());
@@ -489,6 +496,7 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     assert_eq!(std::fs::read_to_string(task.join("docs/guide/intro.md")).unwrap(), "intro\n");
     assert!(std::fs::write(task.join("docs/guide/intro.md"), "changed\n").is_err(), "docs stays read-only");
     assert_eq!(std::fs::read_to_string(task.join("lib")).unwrap(), "lib\n");
+    assert_eq!(std::fs::read_link(task.join("assets")).unwrap(), Path::new("art"));
     assert_eq!(std::fs::read_to_string(task.join("queue")).unwrap(), "queue\n", "the pipe was left out");
     assert_eq!(std::fs::read_link(task.join("readme")).unwrap(), Path::new("README.md"));
     assert!(!task.join("old").exists(), "a folder git emptied is gone");
@@ -496,7 +504,7 @@ fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
     assert_eq!(std::fs::metadata(task.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
     assert_eq!(
         sandfs.stdout(&["changes", "task"]),
-        "M README.md\nD docs/guide\nA docs/guide/intro.md\nA draft.txt\nA lib\nD lib/one.rs\nD old/notes.md\nA readme\nM run.sh\nA staged.txt\n"
+        "M README.md\nA art/logo.txt\nA assets\nD assets/logo.txt\nD docs/guide\nA docs/guide/intro.md\nA draft.txt\nA lib\nD lib/one.rs\nD old/notes.md\nA readme\nM run.sh\nA staged.txt\n"
     );
 
     // Later edits in the folder stay out of the copy, and the copy's commits come back

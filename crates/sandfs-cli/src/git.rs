@@ -188,16 +188,44 @@ fn changed_files(repo: &Path, commit: &str) -> Result<(PathBuf, Vec<String>)> {
     )?)?;
     let untracked =
         split(git_raw(&top, &["--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard"], None)?)?;
-    let (mut gone, mut present): (Vec<String>, Vec<String>) = tracked
-        .into_iter()
-        // A repository inside the folder is listed as its folder, which a mount doesn't show.
-        .chain(untracked.into_iter().filter(|path| !path.ends_with('/')))
-        .partition(|path| std::fs::symlink_metadata(top.join(path)).is_err());
+    let (mut gone, mut present) = (Vec::new(), Vec::new());
+    // A repository inside the folder is listed as its folder, which a mount doesn't show.
+    for path in tracked.into_iter().chain(untracked.into_iter().filter(|path| !path.ends_with('/'))) {
+        match in_folder(&top, &path)? {
+            Some(_) => present.push(path),
+            None => gone.push(path),
+        }
+    }
     gone.sort();
     present.sort();
     present.dedup();
     gone.append(&mut present);
     Ok((top, gone))
+}
+
+/// What the file `rel` (`/`-separated) is in the folder `top`, without following links:
+/// none when it is gone, or when one of the folders on the way to it is gone or was
+/// replaced by a file or a link, which git also counts as the file's deletion.
+fn in_folder(top: &Path, rel: &str) -> Result<Option<std::fs::Metadata>> {
+    let mut at = top.to_path_buf();
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        at.push(part);
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(meta) => meta,
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err).with_context(|| format!("reading {}", at.display())),
+        };
+        if parts.peek().is_none() {
+            return Ok(Some(meta));
+        }
+        if !meta.is_dir() {
+            return Ok(None);
+        }
+    }
+    Ok(None)
 }
 
 /// Make each of `changed` in `ws` what it is in the folder `top`, recording the times
@@ -214,17 +242,16 @@ fn copy_changed(
         let path = VPath::parse(&format!("{ROOT}/{rel}")).with_context(|| format!("copying {rel}"))?;
         let at = path.as_str();
         let host = top.join(rel);
-        let meta = match std::fs::symlink_metadata(&host) {
+        let meta = match in_folder(top, rel)? {
             // A folder that replaced a file, which the files listed inside it go into.
-            Ok(meta) if meta.is_dir() => {
+            Some(meta) if meta.is_dir() => {
                 if ws.stat(at).is_ok_and(|existing| !existing.kind.is_dir()) {
                     ws.remove(at, false)?;
                 }
                 continue;
             }
-            Ok(meta) => meta,
-            // Gone, or below a file that replaced one of its folders.
-            Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
+            Some(meta) => meta,
+            None => {
                 if ws.exists(at) {
                     ws.remove(at, true)?;
                 }
@@ -241,7 +268,6 @@ fn copy_changed(
                 }
                 continue;
             }
-            Err(err) => return Err(err).with_context(|| format!("reading {}", host.display())),
         };
         if !meta.is_file() && !meta.file_type().is_symlink() {
             // Reading a pipe would wait for a writer, and a device has no contents to copy.
