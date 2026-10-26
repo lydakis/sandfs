@@ -726,7 +726,13 @@ impl GitDir {
         let common = common.canonicalize().with_context(|| format!("no repository at {}", common.display()))?;
         let common = without_verbatim_prefix(common);
         let format = lines.next().unwrap_or("sha1");
-        let get = |key: &str| git(&common, &["config", "--get", key]).ok();
+        // One git for every setting read here, since starting it costs the most.
+        let settings =
+            git(&common, &["config", "--get-regexp", r"^remote\.origin\.(promisor|url|partialclonefilter)$"])
+                .unwrap_or_default();
+        let get = |key: &str| {
+            settings.lines().rev().find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')).map(str::to_owned)
+        };
         // A partial clone (every remote's local copy) borrows its origin; a local
         // repository is the origin itself.
         let promisor = get("remote.origin.promisor").is_some_and(|value| value == "true");

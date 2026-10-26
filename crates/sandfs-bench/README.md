@@ -13,6 +13,7 @@ uv run python crates/sandfs-bench/python/bench.py --scratch /dev/shm   # the Pyt
 ./target/release/sandfs-bench --only remote --remote https://github.com/microsoft/vscode --scratch /dev/shm
 ./target/release/sandfs-bench --only everyday --remote https://github.com/microsoft/vscode --scratch /dev/shm
 ./target/release/sandfs-bench --only build --scratch /dev/shm
+./target/release/sandfs-bench --only copies --scale quick --scratch /tmp
 ./target/release/sandfs-bench --only build --scratch /dev/shm --build-dir ~/kubernetes \
     --build-command 'go vet ./pkg/util/parsers && go test -count=1 ./pkg/util/parsers ./pkg/kubelet/images/...' \
     --build-change pkg/kubelet/images/image_manager.go
@@ -122,3 +123,17 @@ Each copy then has a day of work done in it: the first `git status`, a commit of
 `--build-dir DIR --build-command COMMAND` runs any command instead (`sh -c COMMAND`), such as a test suite or another language's build, in copies of `DIR` (all of it but `.git`, symbolic links and file times included). `--build-change FILE` names a file inside `DIR` that gets a blank line added before each run after the first; without it the runs change nothing in between. The two columns add different blank lines and each copy runs with its own empty `XDG_CACHE_HOME`, so neither reuses work the other cached; a cache kept elsewhere and shared by both (as `GOCACHE` below) only holds what both start from. The command must succeed. On the second example above (Kubernetes 1.34.1 without `.git`, 27,560 files, `GOCACHE` warm, median of 5), the first run took 12.2 s in a host folder and 13.1 s in a mount, a run after the change 12.3 s and 13.3 s, and the mount's process held 15 MiB.
 
 `--build-parallel N` runs the command N times at once, the way a harness runs attempts branched from one prepared folder: in N copies of the folder on the host, and in N forks of one mount, timing until the last run finishes. Each copy gets its own blank lines before each run and its own empty `XDG_CACHE_HOME`, so no copy finds another's results there; a cache kept elsewhere and shared (as `GOCACHE` above) holds what they all start from, as it would for attempts on one machine. On the Kubernetes example with three at once, the first run took 18.4 s in host folders and 19.7 s in forks, and a run after the change 17.2 s and 18.2 s. Without `-count=1` and `--build-change`, so that every run after the first finds its test results cached, the first run took 10.7 s and 11.0 s and the next ones 4.0 s and 5.5 s.
+
+## Copies of a clone
+
+`--only copies` gives each task its own copy of a git clone already on the machine, the way an agent harness gives each attempt a folder, three ways: a git worktree, a copy-on-write copy of the clone (`cp -c` on macOS, `cp --reflink=auto` elsewhere, which is a full copy where the disk can't share blocks) on a new branch, and a `sandfs fork` of the clone on a new branch. The clone is a local clone of this repository. Each copy is then used the way an agent uses it, one step at a time:
+
+- make the copy;
+- create 1,000 small files in a new folder, rewrite them, save them the way editors do (write a temporary file, rename it over the file), and delete them;
+- `git status`, after one untimed run;
+- list what changed, as a harness does after an attempt: `git status --porcelain --untracked-files=all` in a worktree or a copy, `sandfs changes` in a fork;
+- search the whole tree with `grep -r`, leaving out `.git` and `target`;
+- in the first copy only, `cargo build` of one package (`--copies-package`, default `sandfs-core`) with the output inside the copy, then a build with nothing changed and a build after appending a comment to the package's `lib.rs`, once per iteration;
+- remove the copy (`git worktree remove`, `rm -rf`, or `sandfs unmount` and `sandfs rm`).
+
+The table shows the median of each step and how many times a worktree's it took. It needs the network once, to fetch the build's dependencies, so it runs only when asked for. CI runs it on every pull request on Linux and on macOS, twice with the pull request's `sandfs` and twice with main's, alternating, and puts the comparison in the run's summary.

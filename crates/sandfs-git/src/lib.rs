@@ -36,8 +36,9 @@ pub struct GitSource {
     tree: SourceKey,
     hash_len: usize,
     readers: Readers,
-    /// Set by [`GitSource::with_sizes`]: a `cat-file --batch-check` process for sizes.
-    sizes: Option<Mutex<Batch>>,
+    /// Set by [`GitSource::with_sizes`]: a `cat-file --batch-check` process for sizes,
+    /// started by the first listing that needs one.
+    sizes: Option<Mutex<Option<Batch>>>,
     /// Set by [`GitSource::with_known_sizes`]: blob sizes by blob id.
     known_sizes: HashMap<SourceKey, u64>,
     /// The remote a partial clone fetches missing blobs from.
@@ -112,21 +113,25 @@ impl GitSource {
         if rev.starts_with('-') {
             return Err(Error::Source(format!("invalid revision {rev:?}")));
         }
-        let tree = git_output(&repo, &["rev-parse", "--verify", "--end-of-options", &format!("{rev}^{{tree}}")])?;
-        let hash_len = match git_output(&repo, &["rev-parse", "--show-object-format"])?.as_str() {
+        // Starting git is most of what opening costs, so each question is asked once.
+        let resolved = git_output(
+            &repo,
+            &["rev-parse", "--show-object-format", "--verify", "--end-of-options", &format!("{rev}^{{tree}}")],
+        )?;
+        let (format, tree) = resolved.split_once('\n').ok_or_else(|| Error::Source(format!("git: {resolved}")))?;
+        let hash_len = match format {
             "sha1" => 20,
             "sha256" => 32,
             other => return Err(Error::Source(format!("unsupported object format {other:?}"))),
         };
-        let readers = Readers::new(&repo)?;
-        let promisor = promisor_remote(&repo);
-        let trees_local = promisor.as_ref().is_some_and(|remote| {
-            let key = format!("remote.{remote}.partialclonefilter");
-            git_output(&repo, &["config", "--get", &key]).is_ok_and(|filter| filter.starts_with("blob:"))
-        });
+        let readers = Readers::new(&repo);
+        let (promisor, trees_local) = match promisor_remote(&repo) {
+            Some((remote, filter)) => (Some(remote), filter.is_some_and(|filter| filter.starts_with("blob:"))),
+            None => (None, false),
+        };
         Ok(GitSource {
             repo,
-            tree: tree.as_str().into(),
+            tree: tree.into(),
             hash_len,
             readers,
             sizes: None,
@@ -149,7 +154,7 @@ impl GitSource {
     /// [`Source::prefetch`] when it needs a size the listing left out, which fetches
     /// the folder's missing blobs in one request, and lists the folder again.
     pub fn with_sizes(mut self) -> Result<Self> {
-        self.sizes = Some(Mutex::new(Batch::spawn(&self.repo, "--batch-check")?));
+        self.sizes = Some(Mutex::new(None));
         Ok(self)
     }
 
@@ -172,7 +177,7 @@ impl GitSource {
     }
 
     /// Fill in sizes for the files of the tree `id` whose blobs are local.
-    fn fill_sizes(&self, id: &str, listing: &mut Listing, sizes: &Mutex<Batch>) -> Result<()> {
+    fn fill_sizes(&self, id: &str, listing: &mut Listing, sizes: &Mutex<Option<Batch>>) -> Result<()> {
         if listing.values().all(|entry| entry.kind.is_dir()) {
             return Ok(());
         }
@@ -197,6 +202,10 @@ impl GitSource {
             }),
         };
         let mut sizes = sizes.lock().map_err(|_| Error::Source("git reader poisoned".into()))?;
+        let sizes = match &mut *sizes {
+            Some(sizes) => sizes,
+            empty => empty.insert(Batch::spawn(&self.repo, "--batch-check")?),
+        };
         for entry in listing.values_mut().filter(|entry| !entry.kind.is_dir()) {
             if !missing.contains(&*entry.key) {
                 entry.size = Some(sizes.header(&entry.key)?.1 as u64);
@@ -800,13 +809,16 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// The remote a partial clone was made from, if `repo` is one.
-fn promisor_remote(repo: &Path) -> Option<String> {
-    let config = git_output(repo, &["config", "--get-regexp", r"^remote\..*\.promisor$"]).ok()?;
-    config.lines().find_map(|line| {
-        let (key, value) = line.split_once(' ')?;
-        (value == "true").then(|| key.strip_prefix("remote.")?.strip_suffix(".promisor").map(str::to_owned))?
-    })
+/// The remote a partial clone was made from, if `repo` is one, and its filter.
+fn promisor_remote(repo: &Path) -> Option<(String, Option<String>)> {
+    let config = git_output(repo, &["config", "--get-regexp", r"^remote\..*\.(promisor|partialclonefilter)$"]).ok()?;
+    let values: Vec<(&str, &str)> = config.lines().filter_map(|line| line.split_once(' ')).collect();
+    let remote = values.iter().find_map(|&(key, value)| {
+        (value == "true").then(|| key.strip_prefix("remote.")?.strip_suffix(".promisor"))?
+    })?;
+    let filter_key = format!("remote.{remote}.partialclonefilter");
+    let filter = values.iter().rev().find(|(key, _)| *key == filter_key).map(|(_, value)| (*value).to_owned());
+    Some((remote.to_owned(), filter))
 }
 
 fn git(repo: &Path) -> Command {
@@ -836,14 +848,14 @@ struct Readers {
 }
 
 impl Readers {
-    fn new(repo: &Path) -> Result<Self> {
-        let first = Batch::spawn(repo, "--batch")?;
-        Ok(Readers {
+    /// Readers for `repo`, the first started by the first read.
+    fn new(repo: &Path) -> Self {
+        Readers {
             repo: repo.to_path_buf(),
             limit: std::thread::available_parallelism().map_or(1, usize::from),
-            idle: Mutex::new((vec![first], 1)),
+            idle: Mutex::new((Vec::new(), 0)),
             returned: Condvar::new(),
-        })
+        }
     }
 
     fn read(&self, id: &str) -> Result<(String, Bytes)> {

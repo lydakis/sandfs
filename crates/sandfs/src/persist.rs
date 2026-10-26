@@ -199,14 +199,22 @@ impl Source for Objects {
     }
 }
 
-/// Where a mount writes files: each into a new object of the workspace, a [`Draft`].
+/// Where a mount writes files: each into a new object of the workspace, a [`Draft`],
+/// unless it is small enough that a save packs it (see [`Drafts::in_memory`]).
 #[derive(Clone, Debug)]
-pub struct Drafts(Arc<Objects>);
+pub struct Drafts(Arc<Objects>, Option<u64>);
 
 /// Bytes read into a draft at a time, from a file that cannot be copied on disk.
 const CHUNK: u64 = 8 << 20;
 
 impl Drafts {
+    /// Whether a file of `size` bytes is written in memory instead of into a draft: a
+    /// save packs it, reading it back, so a draft of its own would only cost making and
+    /// deleting a file on disk for each one written.
+    pub fn in_memory(&self, size: u64) -> bool {
+        self.1.is_some_and(|limit| size <= limit)
+    }
+
     /// A new, empty draft.
     pub fn empty(&self) -> Result<Draft> {
         let key = self.0.new_name();
@@ -609,7 +617,7 @@ impl Saved {
 
     /// Where the serving process writes files, as drafts of new objects.
     pub fn drafts(&self) -> Drafts {
-        Drafts(self.store.clone())
+        Drafts(self.store.clone(), self.pack_limit)
     }
 
     /// Whether `stored` is one of this workspace's objects.
