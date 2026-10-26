@@ -60,10 +60,15 @@ pub fn make(
         let private = home.workspace_dir(name).join(PRIVATE);
         git::make_folder(ws, (&repo, &commit, branch.as_deref()), &dir, &private, index_from)?;
         std::fs::write(dir.join(MARKER), name).context("marking the folder")?;
-        // The workspace is what the folder now holds, so reading it can start from there.
+        // Reading the folder can start from here if it holds what the workspace does:
+        // a file of the clone changed while it was copied may not.
         let mut paths = changed_paths(ws)?;
         paths.extend(git::folder_changes(&private, &dir)?);
-        write_synced(&home.workspace_dir(name).join(SYNCED), signature(&dir, &paths), &paths)
+        let before = signature(&dir, &paths);
+        if holds(ws, &dir, &paths)? && signature(&dir, &paths) == before {
+            write_synced(&home.workspace_dir(name).join(SYNCED), before, &paths)?;
+        }
+        Ok(())
     })();
     if let Err(err) = made {
         let _ = store::remove_copy(&dir);
@@ -221,6 +226,21 @@ fn signature(dir: &Path, paths: &BTreeSet<String>) -> String {
         }
     }
     format!("{:016x}", hasher.finish())
+}
+
+/// Whether the files `paths` of the folder `dir` are as they are in `ws`.
+fn holds(ws: &Workspace, dir: &Path, paths: &BTreeSet<String>) -> Result<bool> {
+    for rel in paths {
+        let at = format!("{ROOT}/{rel}");
+        let held = match git::in_folder(dir, rel)? {
+            None => !ws.exists(&at),
+            Some(meta) => same(ws, &at, &meta, &dir.join(rel))?,
+        };
+        if !held {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether `at` in `ws` is what `host`, of metadata `meta`, is.
