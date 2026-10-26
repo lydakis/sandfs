@@ -1,0 +1,33 @@
+name: xp-mac
+on:
+  push:
+    branches: [claude/project-thread-jx4nw5]
+    paths: ["xp/**", ".github/workflows/xp-mac.yml"]
+  workflow_dispatch:
+jobs:
+  fuset:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install fuse-t
+        run: brew install --cask macos-fuse-t/homebrew-cask/fuse-t && pkg-config --modversion fuse-t
+      - name: Probe FSKit
+        run: xp/probe-fskit.sh fuset
+      - name: Build sandfs
+        run: rustup toolchain install stable --profile minimal && rustup default stable && cargo build --release -p sandfs-cli
+      - name: Experiment
+        run: xp/mac.sh
+  macfuse:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install macFUSE
+        run: brew install --cask macfuse
+      - name: Probe FSKit
+        run: xp/probe-fskit.sh macfuse
+      - name: Experiment
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          FUSET=0 MACFUSE=1 SANDFS_BIN=/usr/bin/false xp/mac.sh
