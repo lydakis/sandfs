@@ -536,6 +536,23 @@ fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch
     );
     assert!(std::fs::write(second.join("docs/guide/intro.md"), "changed\n").is_err(), "forks keep read-only paths");
 
+    // Copied back as files instead: what the folder held when the copy was made, its
+    // uncommitted edits included, is replaced, but a file edited there since is not.
+    std::fs::write(task.join("draft.txt"), "draft, finished\n").unwrap();
+    std::fs::write(task.join("README.md"), "hello, from the task\n").unwrap();
+    std::fs::write(repo.join("draft.txt"), "draft, mine\n").unwrap();
+    let output = sandfs.try_run(&["changes", "task", "--copy-to", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && stderr.contains("would lose that: draft.txt;"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(repo.join("README.md")).unwrap(), "hello, edited\n", "nothing was written");
+    std::fs::write(repo.join("draft.txt"), "draft\n").unwrap();
+    sandfs.run(&["changes", "task", "--copy-to", repo.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(repo.join("README.md")).unwrap(), "hello, from the task\n");
+    assert_eq!(std::fs::read_to_string(repo.join("draft.txt")).unwrap(), "draft, finished\n");
+    std::fs::write(repo.join("draft.txt"), "draft, mine again\n").unwrap();
+    sandfs.run(&["changes", "task", "draft.txt", "--copy-to", repo.to_str().unwrap(), "--force"]);
+    assert_eq!(std::fs::read_to_string(repo.join("draft.txt")).unwrap(), "draft, finished\n");
+
     // Refused before anything is made: a branch the repository or a copy has, a name git
     // won't take, a remote repository's branch, a folder source, a plain folder, and a
     // workspace that exists.

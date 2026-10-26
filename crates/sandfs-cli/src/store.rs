@@ -8,6 +8,7 @@
 //! workspaces/<name>/workspace.json  what the workspace is based on
 //! workspaces/<name>/changes.json    its saved changes (see `persist`)
 //! workspaces/<name>/objects/        bodies of saved files
+//! workspaces/<name>/start/           the changes it was made with, if any (a fork of a clone)
 //! workspaces/<name>/mount.json      present while it is mounted
 //! workspaces/<name>/lock            held by the one process that may save it
 //! workspaces/<name>/holder          who holds the lock, for whoever it refuses
@@ -340,6 +341,37 @@ impl Home {
         let record = self.record(name)?;
         let base = open_base(&record.base, &self.root)?;
         self.load(name, record, &base)
+    }
+
+    /// Open `name`, and beside it what it started from: its source, with what was written
+    /// into it when it was made (see [`Home::keep_start`]).
+    pub fn open_with_start(&self, name: &str) -> Result<(Opened, Workspace)> {
+        let record = self.record(name)?;
+        let base = open_base(&record.base, &self.root)?;
+        let mut start = base.fork();
+        let dir = self.start_dir(name);
+        if dir.join("changes.json").exists() {
+            Saved::new(dir).load(&mut start, &VPath::parse(ROOT)?)?;
+        }
+        Ok((self.load(name, record, &base)?, start))
+    }
+
+    /// Keep `name`'s saved changes as what it started from, for `changes --copy-to` to
+    /// tell its changes from the ones made where they are copied to since.
+    pub fn keep_start(&self, name: &str) -> Result<()> {
+        Saved::new(self.workspace_dir(name)).copy_to(&self.start_dir(name))
+    }
+
+    /// Copy what `from` started from to `to`, a fork of it.
+    pub fn copy_start(&self, from: &str, to: &str) -> Result<()> {
+        if !self.start_dir(from).join("changes.json").exists() {
+            return Ok(());
+        }
+        Saved::new(self.start_dir(from)).copy_to(&self.start_dir(to))
+    }
+
+    fn start_dir(&self, name: &str) -> PathBuf {
+        self.workspace_dir(name).join("start")
     }
 
     /// Open `name` and `other` over one base, so comparing them skips the source

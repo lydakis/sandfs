@@ -160,7 +160,8 @@ pub fn start(home: &Home, name: &str, branch: Option<&str>) -> Result<()> {
     }
     copy_changed(ws, &top, &changed, &mut times, &mut dirs)?;
     let snapshot = Snapshot { ws: ws.fork(), times, dirs };
-    opened.saved.save(&snapshot, &VPath::parse(ROOT)?, true)
+    opened.saved.save(&snapshot, &VPath::parse(ROOT)?, true)?;
+    home.keep_start(name)
 }
 
 /// The top of the git working folder that holds `folder`, if any.
