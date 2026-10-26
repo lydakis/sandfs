@@ -599,6 +599,13 @@ fn a_fork_of_a_clone_can_be_kept_as_a_real_folder() {
     );
     std::fs::write(task.join("README.md"), "hello\n").unwrap();
     assert_eq!(stdout(home, &["changes", "task", "docs", "README.md"]), "D docs/guide.md\n");
+    // A file ignored after it was read is still followed.
+    std::fs::write(task.join(".gitignore"), "*.log\ndraft.txt\n").unwrap();
+    assert_eq!(stdout(home, &["changes", "task", "draft.txt"]), "A draft.txt\n");
+    std::fs::remove_file(task.join("draft.txt")).unwrap();
+    assert_eq!(stdout(home, &["changes", "task", "draft.txt"]), "");
+    std::fs::write(task.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(task.join("draft.txt"), "draft\n").unwrap();
 
     // Its commits go back as a branch, and the clone's own work is left alone.
     git_in(&task, &["add", "-A"]);

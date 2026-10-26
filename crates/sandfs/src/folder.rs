@@ -61,9 +61,9 @@ pub fn make(
         git::make_folder(ws, (&repo, &commit, branch.as_deref()), &dir, &private, index_from)?;
         std::fs::write(dir.join(MARKER), name).context("marking the folder")?;
         // The workspace is what the folder now holds, so reading it can start from there.
-        let listed = git::folder_changes(&private, &dir)?;
-        std::fs::write(home.workspace_dir(name).join(SYNCED), signature(&dir, &listed))
-            .context("writing what the folder holds")
+        let mut paths = changed_paths(ws)?;
+        paths.extend(git::folder_changes(&private, &dir)?);
+        write_synced(&home.workspace_dir(name).join(SYNCED), &dir, &paths)
     })();
     if let Err(err) = made {
         let _ = store::remove_copy(&dir);
@@ -124,27 +124,24 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
     }
     let _writer = home.lock(name, &format!("sandfs, reading the changes in {}", dir.display()))?;
     let listed = git::folder_changes(&home.workspace_dir(name).join(PRIVATE), dir)?;
-    // The workspace already holds the folder's files that differ from the commit, and
-    // matches the commit elsewhere, as it did when it last read them.
+    // Nothing to read if those files, and the ones the workspace had changed when it
+    // last read the folder, are as they were then.
     let synced = home.workspace_dir(name).join(SYNCED);
-    let signature = signature(dir, &listed);
-    if std::fs::read_to_string(&synced).is_ok_and(|last| last == signature) {
-        return Ok(());
+    if let Some((signature, mut paths)) = read_synced(&synced) {
+        paths.extend(listed.iter().cloned());
+        if self::signature(dir, &paths) == signature {
+            return Ok(());
+        }
     }
     let mut opened = home.open(name)?;
     let root = VPath::parse(ROOT)?;
-    let git_dir = VPath::parse(&format!("{ROOT}/.git"))?;
-    // The workspace's own changes too, so a file changed back is noticed.
-    let mut candidates: BTreeSet<String> = listed.into_iter().collect();
-    for change in opened.ws.changes()? {
-        if !change.path.starts_with(&git_dir) {
-            candidates.insert(change.path.strip_prefix(&root).unwrap_or_default().join("/"));
-        }
-    }
+    // The workspace's own changes too, so a file changed back, or ignored since, is noticed.
+    let mut candidates = changed_paths(&opened.ws)?;
+    candidates.extend(listed);
     // Deleted files first, so a folder that replaced a file is made after the file is gone.
     let (mut gone, mut changed) = (Vec::new(), Vec::new());
-    for rel in candidates {
-        let at = format!("{ROOT}/{rel}");
+    for rel in &candidates {
+        let (rel, at) = (rel.clone(), format!("{ROOT}/{rel}"));
         match git::in_folder(dir, &rel)? {
             None if opened.ws.exists(&at) => gone.push(rel),
             None => {}
@@ -160,17 +157,49 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
         git::copy_changed(&mut opened.ws, dir, &gone, &mut times, &mut dirs)?;
         opened.saved.save(&Snapshot { ws: opened.ws.fork(), times, dirs }, &root, true)?;
     }
-    std::fs::write(&synced, signature).context("writing what the folder holds")
+    write_synced(&synced, dir, &candidates)
 }
 
-/// What the files `listed` in the folder `dir` are now, as far as their metadata says:
+/// The paths, relative to the root, that the workspace `ws` has changed outside `.git`.
+fn changed_paths(ws: &Workspace) -> Result<BTreeSet<String>> {
+    let root = VPath::parse(ROOT)?;
+    let git_dir = VPath::parse(&format!("{ROOT}/.git"))?;
+    Ok(ws
+        .changes()?
+        .into_iter()
+        .filter(|change| !change.path.starts_with(&git_dir))
+        .map(|change| change.path.strip_prefix(&root).unwrap_or_default().join("/"))
+        .collect())
+}
+
+/// Keep at `synced` what the files `paths` of the folder `dir` are now (see
+/// [`signature`]), and the paths: the workspace has read them all, and every other file
+/// is the commit's in both.
+fn write_synced(synced: &Path, dir: &Path, paths: &BTreeSet<String>) -> Result<()> {
+    let mut data = signature(dir, paths);
+    for path in paths {
+        data.push('\0');
+        data.push_str(path);
+    }
+    std::fs::write(synced, data).context("writing what the folder holds")
+}
+
+/// What [`write_synced`] kept at `synced`, if anything.
+fn read_synced(synced: &Path) -> Option<(String, BTreeSet<String>)> {
+    let data = std::fs::read_to_string(synced).ok()?;
+    let mut parts = data.split('\0');
+    let signature = parts.next()?.to_owned();
+    Some((signature, parts.map(str::to_owned).collect()))
+}
+
+/// What the files `paths` in the folder `dir` are now, as far as their metadata says:
 /// which files, and each one's size, times, inode and mode, hashed. A file changes all
 /// of them but its name when it is written, and its change time even when it is
 /// written back as it was.
-fn signature(dir: &Path, listed: &[String]) -> String {
+fn signature(dir: &Path, paths: &BTreeSet<String>) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for rel in listed {
+    for rel in paths {
         rel.hash(&mut hasher);
         let Ok(meta) = std::fs::symlink_metadata(dir.join(rel)) else {
             0u8.hash(&mut hasher);
