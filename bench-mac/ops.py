@@ -14,13 +14,23 @@ def rd():
                 a, b, c = map(int, l.split()); out[a] = (b, c)
         except FileNotFoundError: pass
     return out
+pid = os.environ.get("DAEMON_PID")
+def cpu():
+    if not pid: return 0.0
+    import subprocess
+    out = subprocess.run(["ps", "-o", "cputime=", "-p", pid], capture_output=True, text=True).stdout.strip()
+    if not out: return 0.0
+    parts = out.replace("-", ":").split(":")
+    secs = 0.0
+    for part in parts: secs = secs * 60 + float(part)
+    return secs
 res = {}
 calls = {}
 def t(name, f):
-    before = rd()
+    before = rd(); c0 = cpu()
     s = time.perf_counter(); f(); res[name] = round(time.perf_counter() - s, 3)
-    after = rd()
-    parts = []
+    c1 = cpu(); after = rd()
+    parts = [f"daemon-cpu={c1 - c0:.2f}s"] if pid else []
     for k, (c, us) in sorted(after.items()):
         c0, us0 = before.get(k, (0, 0))
         if c - c0: parts.append(f"{names.get(k, k)}={c - c0}({(us - us0) / (c - c0):.0f}us)")

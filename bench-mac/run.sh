@@ -54,14 +54,31 @@ variant() { # name, DROP, ADD
   mkdir -p "$W/m-$1"
   if ! "$S" fork "$W/local" "$W/m-$1" --branch "b-$1"; then log "$1: fork failed"; return; fi
   log "== $1: $(mount | grep "m-$1" | sed 's/.*(//')"
+  export DAEMON_PID=$(pgrep -x sandfs | head -1)
   suite "$W/m-$1" "$1"
+  unset DAEMON_PID
   phase "$1 unmount" "$S" unmount "$W/m-$1"
   phase "$1 rm" "$S" rm "m-$1"
 }
 variant base "" ""
-variant nonegnamecache "" "nonegnamecache"
-variant async "sync" ""
-variant noacc "" "nonegnamecache,noacl"
+
+# The floor: Apple's own NFS server, exporting a local folder to this machine.
+mkdir -p "$HOME/exp"
+echo "$HOME/exp -alldirs -maproot=root 127.0.0.1" | sudo tee /etc/exports
+sudo nfsd enable; sudo nfsd restart || sudo nfsd start
+sleep 5
+showmount -e 127.0.0.1 || true
+mkdir -p "$W/apple"
+if sudo mount -t nfs -o vers=3,tcp,locallocks,soft,intr,sync,nobrowse 127.0.0.1:"$HOME/exp" "$W/apple"; then
+  sudo chmod 777 "$W/apple"
+  export DAEMON_PID=$(pgrep -x nfsd | head -1)
+  log "== apple nfsd: $(mount | grep "$W/apple")"
+  python3 "$OPS" "$W/apple/smallfiles" 1000 | sed "s/^/apple nfsd smallfiles: /" | tee -a "$W/results.txt"
+  unset DAEMON_PID
+  sudo umount "$W/apple"
+else
+  log "apple nfsd: mount failed"
+fi
 log "done"
 cat "$W/results.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 exit 0
