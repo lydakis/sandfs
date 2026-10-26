@@ -63,7 +63,7 @@ pub fn make(
         // The workspace is what the folder now holds, so reading it can start from there.
         let mut paths = changed_paths(ws)?;
         paths.extend(git::folder_changes(&private, &dir)?);
-        write_synced(&home.workspace_dir(name).join(SYNCED), &dir, &paths)
+        write_synced(&home.workspace_dir(name).join(SYNCED), signature(&dir, &paths), &paths)
     })();
     if let Err(err) = made {
         let _ = store::remove_copy(&dir);
@@ -138,6 +138,9 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
     // The workspace's own changes too, so a file changed back, or ignored since, is noticed.
     let mut candidates = changed_paths(&opened.ws)?;
     candidates.extend(listed);
+    // Taken before the files are read: if one changes while they are, the next read
+    // must not take this one's for current.
+    let before = signature(dir, &candidates);
     // Deleted files first, so a folder that replaced a file is made after the file is gone.
     let (mut gone, mut changed) = (Vec::new(), Vec::new());
     for rel in &candidates {
@@ -157,7 +160,11 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
         git::copy_changed(&mut opened.ws, dir, &gone, &mut times, &mut dirs)?;
         opened.saved.save(&Snapshot { ws: opened.ws.fork(), times, dirs }, &root, true)?;
     }
-    write_synced(&synced, dir, &candidates)
+    if signature(dir, &candidates) != before {
+        let _ = std::fs::remove_file(&synced);
+        return Ok(());
+    }
+    write_synced(&synced, before, &candidates)
 }
 
 /// The paths, relative to the root, that the workspace `ws` has changed outside `.git`.
@@ -172,11 +179,11 @@ fn changed_paths(ws: &Workspace) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// Keep at `synced` what the files `paths` of the folder `dir` are now (see
-/// [`signature`]), and the paths: the workspace has read them all, and every other file
-/// is the commit's in both.
-fn write_synced(synced: &Path, dir: &Path, paths: &BTreeSet<String>) -> Result<()> {
-    let mut data = signature(dir, paths);
+/// Keep at `synced` the `signature` of the files `paths` of the folder as the workspace
+/// read them (see [`signature`]), and the paths: every other file is the commit's in
+/// both.
+fn write_synced(synced: &Path, signature: String, paths: &BTreeSet<String>) -> Result<()> {
+    let mut data = signature;
     for path in paths {
         data.push('\0');
         data.push_str(path);
