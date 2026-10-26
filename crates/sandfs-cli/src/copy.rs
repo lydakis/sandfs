@@ -184,14 +184,22 @@ fn same(ws: &Workspace, path: &VPath, target: &Path) -> Result<bool> {
     })
 }
 
-/// Whether everything in the folder `dir` on disk is also in `ws` at `path`.
+/// Whether everything in the folder `dir` on disk is also in `ws` at `path`, as the
+/// same kind of thing: a link in place of a folder, which no deletion names, is a
+/// change too.
 fn nothing_more(ws: &Workspace, path: &VPath, dir: &Path) -> Result<bool> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else { return Ok(false) };
         let Ok(inner) = path.join(&name) else { return Ok(false) };
         let Ok(meta) = ws.stat(inner.as_str()) else { return Ok(false) };
-        if entry.file_type()?.is_dir() && (!meta.kind.is_dir() || !nothing_more(ws, &inner, &entry.path())?) {
+        let kind = entry.file_type()?;
+        let fits = match meta.kind {
+            Kind::Dir => kind.is_dir() && nothing_more(ws, &inner, &entry.path())?,
+            Kind::Symlink => kind.is_symlink(),
+            Kind::File { .. } => kind.is_file(),
+        };
+        if !fits {
             return Ok(false);
         }
     }
@@ -308,8 +316,13 @@ mod tests {
 
     #[test]
     fn files_changed_where_they_are_copied_are_never_lost() {
-        let source =
-            MemorySource::from_files([("notes.md", "draft\n"), ("todo.md", "a\n"), ("old/a.md", "a\n")]).unwrap();
+        let source = MemorySource::from_files([
+            ("notes.md", "draft\n"),
+            ("todo.md", "a\n"),
+            ("old/a.md", "a\n"),
+            ("old/sub/b.md", "b\n"),
+        ])
+        .unwrap();
         let mut start = Workspace::new();
         start.mount("/mnt", Arc::new(source)).unwrap();
         let mut ws = start.fork();
@@ -318,10 +331,16 @@ mod tests {
         ws.write("/mnt/new.md", "new\n").unwrap();
         ws.remove("/mnt/old", true).unwrap();
         ws.write("/mnt/old", "a file now\n").unwrap();
-        let paths = ["/mnt/new.md", "/mnt/notes.md", "/mnt/old", "/mnt/old/a.md", "/mnt/todo.md"]
+        let paths = ["/mnt/new.md", "/mnt/notes.md", "/mnt/old", "/mnt/old/a.md", "/mnt/old/sub/b.md", "/mnt/todo.md"]
             .map(|path| VPath::parse(path).unwrap());
-        let kinds =
-            [ChangeKind::Added, ChangeKind::Modified, ChangeKind::Added, ChangeKind::Deleted, ChangeKind::Modified];
+        let kinds = [
+            ChangeKind::Added,
+            ChangeKind::Modified,
+            ChangeKind::Added,
+            ChangeKind::Deleted,
+            ChangeKind::Deleted,
+            ChangeKind::Modified,
+        ];
         let items: Vec<_> = paths
             .iter()
             .zip(kinds)
@@ -331,6 +350,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("old")).unwrap();
             std::fs::write(dir.path().join("old/a.md"), "a\n").unwrap();
+            std::fs::create_dir(dir.path().join("old/sub")).unwrap();
+            std::fs::write(dir.path().join("old/sub/b.md"), "b\n").unwrap();
             std::fs::write(dir.path().join("notes.md"), notes).unwrap();
             // Already what the copy makes it.
             std::fs::write(dir.path().join("todo.md"), "b\n").unwrap();
@@ -359,6 +380,22 @@ mod tests {
                 "{err}"
             );
             assert_eq!(std::fs::read_to_string(dir.path().join("notes.md")).unwrap(), notes);
+            assert!(!dir.path().join("new.md").exists());
+        }
+
+        // So is a link put there in place of a folder the copy replaces.
+        #[cfg(unix)]
+        {
+            let dir = folder("draft\n", false);
+            std::fs::remove_dir_all(dir.path().join("old/sub")).unwrap();
+            std::os::unix::fs::symlink("elsewhere", dir.path().join("old/sub")).unwrap();
+            assert!(
+                copy_to(&ws, Some(&start), &items, dir.path())
+                    .unwrap_err()
+                    .to_string()
+                    .ends_with(": old; pass --force to copy anyway")
+            );
+            assert!(std::fs::symlink_metadata(dir.path().join("old/sub")).unwrap().file_type().is_symlink());
             assert!(!dir.path().join("new.md").exists());
         }
 
