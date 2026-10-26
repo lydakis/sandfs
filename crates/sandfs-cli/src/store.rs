@@ -12,6 +12,7 @@
 //! workspaces/<name>/mount.json      present while it is mounted
 //! workspaces/<name>/lock            held by the one process that may save it
 //! workspaces/<name>/holder          who holds the lock, for whoever it refuses
+//! copies/<id>/                      a plain folder as `fork` found it, cloned (see `Home::freeze`)
 //! run/                              the process serving every mount (see `server`)
 //! ```
 //!
@@ -436,6 +437,55 @@ impl Home {
         std::fs::remove_dir_all(self.workspace_dir(name)).with_context(|| format!("removing workspace {name:?}"))
     }
 
+    /// The record for a new workspace over the plain folder `folder` as it is now (see
+    /// `fork`): its files are cloned into `copies/`, which costs no time or space for
+    /// their contents on a disk that clones files (APFS, btrfs, XFS). Where the disk
+    /// can't, or `folder` is on another disk than the home, it is refused rather than
+    /// copied in full. Pipes, sockets and devices are left out.
+    pub fn freeze(&self, folder: &Path) -> Result<Record> {
+        let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        if crate::resolve_new(&self.root)?.starts_with(folder) {
+            bail!(
+                "{} contains sandfs's own state ({}); set SANDFS_HOME to a folder outside it",
+                folder.display(),
+                self.root.display()
+            );
+        }
+        let copies = self.copies_dir();
+        std::fs::create_dir_all(&copies).with_context(|| format!("creating {}", copies.display()))?;
+        let copy = tempfile::Builder::new()
+            .prefix("copy-")
+            .tempdir_in(&copies)
+            .with_context(|| format!("making room in {}", copies.display()))?;
+        clone_tree(folder, copy.path(), &self.root)?;
+        let path = copy.keep();
+        let source = folder.display().to_string();
+        Ok(Record { source, base: Base::Dir { path }, created, read_only: Vec::new() })
+    }
+
+    fn copies_dir(&self) -> PathBuf {
+        self.root.join("copies")
+    }
+
+    /// Delete the copies of folders that no workspace is over any more. The caller holds
+    /// [`Home::repos_lock`] exclusively, so no workspace over one is being made.
+    pub fn remove_unused_copies(&self) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(self.copies_dir()) else { return Ok(()) };
+        let mut used = Vec::new();
+        for name in self.names()? {
+            if let Ok(Record { base: Base::Dir { path }, .. }) = self.record(&name) {
+                used.push(path);
+            }
+        }
+        for entry in entries {
+            let path = entry?.path();
+            if !used.contains(&path) {
+                remove_copy(&path)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Turn a source into a record: a host folder, or `git:<path or url>[@rev]`. A URL
     /// needs no `git:`, since it can't name a folder.
     pub fn resolve(&self, source: &str) -> Result<Record> {
@@ -470,6 +520,86 @@ impl Home {
         let source = format!("git:{}", repo.display());
         Ok(Record { source, base: Base::Git { repo, commit, branch }, created, read_only: Vec::new() })
     }
+}
+
+/// Clone every file, link and folder in `top` into the empty folder `to`, keeping
+/// modes and modification times, so a build sees the files as it left them.
+fn clone_tree(top: &Path, to: &Path, home: &Path) -> Result<()> {
+    let mut folders = vec![(top.to_path_buf(), to.to_path_buf())];
+    let mut made = Vec::new();
+    while let Some((from, to)) = folders.pop() {
+        for entry in std::fs::read_dir(&from).with_context(|| format!("reading {}", from.display()))? {
+            let entry = entry?;
+            let (path, copy) = (entry.path(), to.join(entry.file_name()));
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                std::fs::create_dir(&copy).with_context(|| format!("creating {}", copy.display()))?;
+                folders.push((path, copy));
+            } else if kind.is_symlink() {
+                symlink(&std::fs::read_link(&path)?, &copy)?;
+            } else if kind.is_file() {
+                reflink_copy::reflink(&path, &copy).map_err(|err| {
+                    anyhow::anyhow!(
+                        "can't clone {} into {}: {err}. Forking a plain folder clones its files, which \
+                         needs the folder and sandfs's home on one disk that clones files, such as APFS, \
+                         btrfs or XFS (ext4 doesn't); `sandfs mount {} DIR` mounts the folder itself \
+                         instead, showing its later changes too",
+                        path.display(),
+                        home.display(),
+                        top.display()
+                    )
+                })?;
+                keep_times(&path, &copy)?;
+            } else {
+                eprintln!("sandfs: leaving out {}, which is neither a file, a link nor a folder", path.display());
+            }
+        }
+        made.push((from, to));
+    }
+    // Last, since making what is in a folder changes its time.
+    for (folder, copy) in made {
+        keep_times(&folder, &copy)?;
+    }
+    Ok(())
+}
+
+/// Delete a copy of a folder, along with folders in it that were cloned read-only.
+pub fn remove_copy(path: &Path) -> Result<()> {
+    if std::fs::remove_dir_all(path).is_err() {
+        let mut folders = vec![path.to_path_buf()];
+        while let Some(folder) = folders.pop() {
+            let mut perms = std::fs::metadata(&folder)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(&folder, perms)?;
+            for entry in std::fs::read_dir(&folder)?.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    folders.push(entry.path());
+                }
+            }
+        }
+        std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Give `copy` the mode and modification time of `path`.
+fn keep_times(path: &Path, copy: &Path) -> Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let file = File::open(copy)?;
+    file.set_modified(meta.modified()?).with_context(|| format!("setting the time of {}", copy.display()))?;
+    std::fs::set_permissions(copy, meta.permissions())
+        .with_context(|| format!("setting the mode of {}", copy.display()))
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, path: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, path).with_context(|| format!("linking {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn symlink(_target: &Path, path: &Path) -> Result<()> {
+    bail!("{} is a symbolic link, which this system can't copy", path.display())
 }
 
 /// An empty workspace with `base` mounted at [`ROOT`], for the home at `home`.

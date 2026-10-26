@@ -27,6 +27,7 @@ mount = ["dep:fuser", "dep:tokio", "dep:async-trait", "dep:byteorder", "dep:num-
 anyhow = "1"
 bytes.workspace = true
 clap = { version = "4.5", features = ["derive"] }
+reflink-copy = "0.1"
 sandfs-core.workspace = true
 sandfs-git.workspace = true
 sandfs-mcp.workspace = true
