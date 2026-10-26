@@ -176,6 +176,9 @@ fn move_onto(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
     };
     // Folders the workspace saved; what becomes of them waits on what is inside them.
     let mut dirs = Vec::new();
+    // Files a pull changed that the newer commit has as the older one did: forgotten,
+    // they change back, though the newer commit didn't change them.
+    let mut reverted = BTreeSet::new();
 
     for (rel, state) in paths.iter().filter(|(rel, _)| !is_git(rel)) {
         let path = full(rel);
@@ -192,6 +195,7 @@ fn move_onto(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
             };
             if pulled.is_some() && from_pull(rel, mine.as_ref())? {
                 forget.insert(rel.clone());
+                reverted.insert(rel.clone());
             }
             continue;
         }
@@ -280,7 +284,8 @@ fn move_onto(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
                 kept.remove(&rel);
             }
         }
-        for rel in changed {
+        let reverted = reverted.iter().filter(|rel| forget.contains(*rel));
+        for rel in changed.iter().chain(reverted) {
             if is_file(rel)? {
                 kept.insert(rel.clone(), now);
             } else {

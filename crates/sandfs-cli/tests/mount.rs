@@ -1760,6 +1760,9 @@ fn update_follows_a_pull_in_a_mount_of_a_url() {
     assert_eq!(git_out(&main, &["rev-parse", "HEAD"]), third);
     assert_eq!(git_out(&main, &["status", "--porcelain"]), " M a.txt\n");
     assert_eq!(std::fs::read_to_string(main.join("b.txt")).unwrap(), "b0\n", "upstream undid what was pulled");
+    // It changed back, so build tools see it as changed, as the files the move brought.
+    let mtime = |name: &str| std::fs::metadata(main.join(name)).unwrap().modified().unwrap();
+    assert_eq!(mtime("b.txt"), mtime("c.txt"));
     sandfs.unmount(&main);
 }
 
