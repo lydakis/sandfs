@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
@@ -165,7 +165,7 @@ fn ask(mut stream: UnixStream, request: &str) -> Result<Option<Reply>> {
 fn start(home: &Home) -> Result<Pid> {
     run_dir(home)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path(home))?;
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = crate::relaunch::command()?;
     for (name, _) in std::env::vars_os() {
         if name.to_str().is_some_and(names_a_repository) {
             command.env_remove(name);
@@ -228,7 +228,7 @@ pub fn detach() -> Result<()> {
     // Not a process group leader, since `start` gives this process none of its own,
     // so this cannot fail with EPERM.
     setsid().context("leaving the caller's session")?;
-    let server = Command::new(std::env::current_exe()?)
+    let server = crate::relaunch::command()?
         .args(["daemon", "--serve"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

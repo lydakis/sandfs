@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sandfs-bench", "crates/sandfs-cli", "crates/sandfs-core", "crates/sandfs-git", "crates/sandfs-mcp", "crates/sandfs-py"]
+members = ["crates/sandfs", "crates/sandfs-bench", "crates/sandfs-cli", "crates/sandfs-core", "crates/sandfs-git", "crates/sandfs-mcp", "crates/sandfs-py"]
 
 [workspace.package]
 version = "0.6.0"
@@ -17,6 +17,7 @@ thiserror = "2.0"
 sandfs-core = { path = "crates/sandfs-core", version = "0.6.0" }
 sandfs-git = { path = "crates/sandfs-git", version = "0.6.0" }
 sandfs-mcp = { path = "crates/sandfs-mcp", version = "0.6.0" }
+sandfs = { path = "crates/sandfs", version = "0.6.0", default-features = false }
 sandfs-cli = { path = "crates/sandfs-cli", version = "0.6.0" }
 
 [workspace.lints.rust]

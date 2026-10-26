@@ -106,8 +106,8 @@ pub struct Writer {
     _file: File,
 }
 
-/// The CLI's home directory.
-#[derive(Clone)]
+/// A folder of workspaces (see [`crate::Home`]).
+#[derive(Clone, Debug)]
 pub struct Home {
     root: PathBuf,
 }
@@ -134,7 +134,6 @@ impl Home {
     }
 
     /// A home directory at an explicit path.
-    #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Home {
         Home { root: root.into() }
     }

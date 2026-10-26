@@ -6,10 +6,8 @@ keywords = ["fuse", "nfs", "filesystem", "sandbox", "copy-on-write"]
 categories = ["filesystem", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
-# `File::try_lock`, which keeps one process saving each workspace, is 1.89+.
 rust-version = "1.89"
-# The NFS server in src/nfsserve is nfsserve's, under BSD-3-Clause.
-license = "MIT AND BSD-3-Clause"
+license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
@@ -21,48 +19,19 @@ path = "src/main.rs"
 default = ["mount"]
 # The mount: FUSE on Linux, and on macOS an NFS server on localhost that macOS's own
 # NFS client mounts, so nothing needs installing.
-mount = ["dep:fuser", "dep:tokio", "dep:async-trait", "dep:byteorder", "dep:num-derive", "dep:num-traits", "dep:tracing"]
+mount = ["sandfs/mount"]
 
 [dependencies]
 anyhow = "1"
-bytes.workspace = true
 clap = { version = "4.5", features = ["derive"] }
-reflink-copy = "0.1"
-sandfs-core.workspace = true
-sandfs-git.workspace = true
-sandfs-mcp.workspace = true
-serde = { version = "1", features = ["derive"] }
+sandfs = { workspace = true, default-features = false }
+
+[dev-dependencies]
 serde_json = "1"
 tempfile = "3"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-nix = { version = "0.31", features = ["fs", "process", "resource", "signal", "user"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.18", optional = true }
-
-# On macOS fuser only lends the NFS mount its types; it never mounts. The NFS server
-# (src/nfsserve) needs the rest.
-[target.'cfg(target_os = "macos")'.dependencies]
-async-trait = { version = "0.1", optional = true }
-byteorder = { version = "1.4", optional = true }
-fuser = { version = "0.18", optional = true, features = ["macos-no-mount"] }
-num-derive = { version = "0.5", optional = true }
-num-traits = { version = "0.2", optional = true }
-tracing = { version = "0.1.31", optional = true }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
-
-[dev-dependencies]
-
-# The NFS server's unit tests also run on Linux, where it isn't used.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-async-trait = "0.1"
-byteorder = "1.4"
-num-derive = "0.5"
-num-traits = "0.2"
-tracing = "0.1.31"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["user"] }
 
 [lints]
 workspace = true

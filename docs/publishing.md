@@ -1,6 +1,6 @@
 # Publishing sandfs
 
-A release ships the `sandfs` Python package to PyPI and the `sandfs-core`, `sandfs-git`, `sandfs-mcp` and `sandfs-cli` crates to crates.io, all at one version number. `sandfs-py` is the extension crate inside the Python package and is not published on its own.
+A release ships the `sandfs` Python package to PyPI and the `sandfs-core`, `sandfs-git`, `sandfs-mcp`, `sandfs` and `sandfs-cli` crates to crates.io, all at one version number. `sandfs-py` is the extension crate inside the Python package and is not published on its own.
 
 The Python package is built with [maturin](https://www.maturin.rs): one abi3 wheel per platform covers every Python from 3.11 up, plus an sdist that builds from source when a Rust toolchain is installed.
 

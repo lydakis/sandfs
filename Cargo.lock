@@ -683,6 +683,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandfs"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "byteorder",
+ "bytes",
+ "fuser",
+ "libc",
+ "nix",
+ "num-derive",
+ "num-traits",
+ "reflink-copy",
+ "sandfs-core",
+ "sandfs-git",
+ "sandfs-mcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sandfs-bench"
 version = "0.6.0"
 dependencies = [
@@ -701,24 +725,11 @@ name = "sandfs-cli"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "byteorder",
- "bytes",
  "clap",
- "fuser",
- "libc",
  "nix",
- "num-derive",
- "num-traits",
- "reflink-copy",
- "sandfs-core",
- "sandfs-git",
- "sandfs-mcp",
- "serde",
+ "sandfs",
  "serde_json",
  "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]
