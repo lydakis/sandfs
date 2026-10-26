@@ -238,11 +238,19 @@ impl NFSFileSystem for SandNfs {
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let mut inner = self.shared.lock();
-        match &filename.0[..] {
+        let found = match &filename.0[..] {
             b"." => Ok(dirid),
             b".." => inner.parent_of(dirid).ok_or(nfsstat3::NFS3ERR_NOENT),
-            _ => Ok(inner.lookup(dirid, os_name(filename)).nfs()?.ino.0),
+            _ => inner.lookup(dirid, os_name(filename)).nfs().map(|attr| attr.ino.0),
+        };
+        // Experiment only: which names the client looks up.
+        if let Some(trace) = std::env::var_os("SANDFS_XP_TRACE") {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(trace) {
+                let _ = writeln!(file, "LOOKUP {} {}", String::from_utf8_lossy(&filename.0), if found.is_ok() { "ok" } else { "missing" });
+            }
         }
+        found
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {

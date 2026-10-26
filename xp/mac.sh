@@ -61,6 +61,41 @@ else
   log "sandfs fork failed: $(tail -3 "$W/out")"
 fi
 
+# 2b. Which names the macOS NFS client looks up, per small-file operation (20 files each).
+export SANDFS_XP_TRACE="$W/trace.txt"
+mkdir -p "$W/m-trace"
+if "$S" fork "$W/rg-src" "$W/m-trace" --mount --branch trace > /dev/null 2>&1; then
+  python3 - "$W/m-trace/sf" "$W/trace.txt" <<'PY' | tee -a "$R"
+import os, re, sys, collections
+d, trace = sys.argv[1], sys.argv[2]
+os.makedirs(d)
+def mark(name):
+    try: os.stat(f"{d}/__{name}")
+    except FileNotFoundError: pass
+ops = {
+  "create": lambda i: open(f"{d}/f{i}.txt", "w").write("x"),
+  "rewrite": lambda i: open(f"{d}/f{i}.txt", "w").write("y"),
+  "atomic": lambda i: (open(f"{d}/.f{i}.tmp", "w").write("z"), os.replace(f"{d}/.f{i}.tmp", f"{d}/f{i}.txt")),
+  "stat": lambda i: os.stat(f"{d}/f{i}.txt"),
+  "delete": lambda i: os.unlink(f"{d}/f{i}.txt"),
+}
+for name, op in ops.items():
+    mark(name)
+    for i in range(20): op(i)
+mark("end")
+phase, counts = None, collections.defaultdict(collections.Counter)
+for line in open(trace):
+    _, n, res = line.split()
+    m = re.match(r"__(\w+)$", n)
+    if m: phase = m.group(1); continue
+    if phase: counts[phase][re.sub(r"\d+", "N", n) + " " + res] += 1
+for name in ops:
+    print(f"lookups per {name}: " + ", ".join(f"{k} x{v/20:g}" for k, v in counts[name].most_common()))
+PY
+  "$S" rm --unmount "$W/m-trace" > /dev/null 2>&1
+fi
+unset SANDFS_XP_TRACE
+
 # 3. The passthrough file system over each fuse-t backend.
 passthrough() { # label lib-flags backend-options...
   local label=$1 flags=$2; shift 2
