@@ -164,7 +164,11 @@ fn is_executable(meta: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     return std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
     #[cfg(not(unix))]
-    false
+    {
+        // Windows keeps no executable bit.
+        let _ = meta;
+        false
+    }
 }
 
 /// The git index of the folder of workspace `name`, which a fork of it starts from.

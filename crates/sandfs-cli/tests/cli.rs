@@ -536,6 +536,7 @@ fn update_moves_a_workspace_onto_another_folder() {
 }
 
 /// Git's output in `dir`, which must succeed.
+#[cfg(unix)]
 fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(dir)
