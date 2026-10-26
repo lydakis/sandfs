@@ -773,7 +773,6 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     inner.keep_removed = !cfg!(nfs);
     inner.skip_bookkeeping = cfg!(nfs);
     let shared = Shared::new(inner, opened.saved, root);
-    let saver = shared.spawn_saver();
 
     // A mount that never came up has nothing to save, and saving would make a new
     // workspace look used to the `mount_new` that removes it again.
@@ -814,7 +813,6 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     let result = nfs::run(name, dir, &shared, |port, secret| mounted(Some((port, secret))));
 
     shared.stop();
-    let _ = saver.join();
     if !was_mounted.get() {
         return result.context("mounting");
     }

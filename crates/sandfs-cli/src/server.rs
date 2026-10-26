@@ -28,6 +28,11 @@ const LINGER: Duration = Duration::from_secs(2);
 const START: Duration = Duration::from_secs(10);
 /// How long a mount may take, which includes fetching a remote commit's folders.
 const MOUNT: Duration = Duration::from_secs(120);
+/// The memory maps kept free when taking another mount, for what mounts already served
+/// need: threads that answer requests, large reads (each read of a large file maps
+/// memory of its own) and git helpers. A mount takes about 10.
+#[cfg(target_os = "linux")]
+const MAPS_KEPT: usize = 1024;
 
 /// A request to mount the workspace `name` at `dir`, which exists and is canonical.
 /// The directory goes as its bytes, since a path needn't be UTF-8.
@@ -216,6 +221,7 @@ pub fn run(home: Home) -> Result<()> {
     let socket = socket_path(&home);
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).context("listening for mounts")?;
+    crate::host::raise_open_files();
     let state = Arc::new(State::default());
     let bases = Arc::new(Bases::default());
     let accepting = state.clone();
@@ -266,6 +272,19 @@ fn read_request(stream: &UnixStream) -> Result<Request> {
 /// Serve the requested mount on a thread of its own, which keeps `ticket` for as long
 /// as it serves, and wait until the mount is up or has failed.
 fn start_mount(home: &Home, bases: &Arc<Bases>, request: Request, ticket: Ticket) -> Result<()> {
+    // Each mount's threads take memory maps, and a process that runs out of them when
+    // starting a thread aborts, taking every mount it serves with it. A mount it has no
+    // room for is refused instead.
+    #[cfg(target_os = "linux")]
+    if let Some((left, max)) = crate::host::memory_maps_left(MAPS_KEPT)
+        && left < MAPS_KEPT
+    {
+        bail!(
+            "this process serves as many mounts as its memory maps allow (vm.max_map_count = {max}); \
+             unmount some, or raise the limit, such as with `sysctl -w vm.max_map_count={}`",
+            max * 4
+        );
+    }
     let (done, outcome) = mpsc::channel();
     let up = done.clone();
     let (home, bases) = (home.clone(), bases.clone());

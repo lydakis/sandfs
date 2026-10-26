@@ -16,11 +16,11 @@
 //! but never mounts there.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -1389,12 +1389,15 @@ impl Inner {
     }
 }
 
-/// The filesystem state plus what saving needs, shared with the saver thread.
+/// The filesystem state plus what saving needs, shared with the threads that save.
 pub struct Shared {
     inner: Mutex<Inner>,
     saved: Mutex<Saved>,
     root: VPath,
-    wake: Condvar,
+    /// This mount, for handing to the threads that save (see [`Savers`]).
+    me: Weak<Shared>,
+    /// Whether a background save of this mount is waiting in [`Savers`].
+    scheduled: AtomicBool,
     stop: AtomicBool,
     /// Whether the kernel took no-open mode, so opens and flushes can be refused.
     #[cfg(fuse)]
@@ -1402,26 +1405,26 @@ pub struct Shared {
     /// Whether the kernel lists folders without opening them, and keeps their listings.
     #[cfg(fuse)]
     no_opendir: AtomicBool,
-    /// Where folders whose kept listings went stale are sent, for a thread to tell the
-    /// kernel; telling it from a request could wait on the kernel while it waits on us.
+    /// How to tell the kernel that kept listings went stale, until [`Shared::stop`].
     #[cfg(fuse)]
-    stale_listings: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
+    notifier: Mutex<Option<fuser::Notifier>>,
 }
 
 impl Shared {
     pub fn new(inner: Inner, saved: Saved, root: VPath) -> Arc<Self> {
-        Arc::new(Shared {
+        Arc::new_cyclic(|me| Shared {
             inner: Mutex::new(inner),
             saved: Mutex::new(saved),
             root,
-            wake: Condvar::new(),
+            me: me.clone(),
+            scheduled: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             #[cfg(fuse)]
             no_open: AtomicBool::new(false),
             #[cfg(fuse)]
             no_opendir: AtomicBool::new(false),
             #[cfg(fuse)]
-            stale_listings: Mutex::new(None),
+            notifier: Mutex::new(None),
         })
     }
 
@@ -1438,6 +1441,11 @@ impl Shared {
     /// Save, leaving out files written within `settle`.
     fn save_settled(&self, settle: Duration, durable: bool) -> anyhow::Result<()> {
         let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
+        self.save_locked(&mut saved, settle, durable)
+    }
+
+    /// [`Shared::save_settled`], with the saved state already locked.
+    fn save_locked(&self, saved: &mut Saved, settle: Duration, durable: bool) -> anyhow::Result<()> {
         let (snapshot, skip_bookkeeping) = {
             let mut inner = self.lock();
             inner.commit_written(settle);
@@ -1464,76 +1472,54 @@ impl Shared {
         result
     }
 
-    /// Start a thread that commits and saves shortly after each burst of changes,
-    /// until [`Shared::stop`].
-    pub fn spawn_saver(self: &Arc<Self>) -> JoinHandle<()> {
-        let shared = self.clone();
-        std::thread::spawn(move || {
-            loop {
-                {
-                    let mut inner = shared.lock();
-                    while !inner.unsaved && !inner.writing && !shared.stop.load(Ordering::SeqCst) {
-                        inner = shared.wake.wait(inner).unwrap_or_else(PoisonError::into_inner);
-                    }
-                }
-                if shared.stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                // Let a burst of writes settle so it costs one save, not one per write.
-                // A stop cuts the wait short: the final save after it does the work, and
-                // an unmount waits for that save.
-                let changed = {
-                    let inner = shared.lock();
-                    let stopping = || shared.stop.load(Ordering::SeqCst);
-                    let (mut inner, _) = shared
-                        .wake
-                        .wait_timeout_while(inner, SETTLE, |_| !stopping())
-                        .unwrap_or_else(PoisonError::into_inner);
-                    if stopping() {
-                        return;
-                    }
-                    inner.commit_written(SETTLE);
-                    inner.unsaved
-                };
-                // Only files still being written: the next pass commits them.
-                if !changed {
-                    continue;
-                }
-                if let Err(err) = shared.save_settled(SETTLE, false) {
-                    eprintln!("sandfs: saving changes failed: {err:#}");
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            }
-        })
+    /// One background save, run by [`Savers`] once the changes it was queued for had
+    /// [`SETTLE`] to settle: commit the writes that settled and save them, and queue
+    /// another if something is still unsaved or being written.
+    fn save_in_background(&self) {
+        // Holding the saved state for the whole step means a step either finishes before
+        // the final save at unmount or, starting after it, sees the stop and does nothing.
+        let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
+        // Cleared first, so a change from here on queues the next save.
+        self.scheduled.store(false, Ordering::SeqCst);
+        if self.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let changed = {
+            let mut inner = self.lock();
+            inner.commit_written(SETTLE);
+            inner.unsaved
+        };
+        // Only files still being written: the next pass commits them.
+        if changed && let Err(err) = self.save_locked(&mut saved, SETTLE, false) {
+            eprintln!("sandfs: saving changes failed: {err:#}");
+            self.schedule(Instant::now() + Duration::from_secs(1));
+            return;
+        }
+        drop(saved);
+        self.changed();
     }
 
+    /// Queue a background save for `at`, unless one is queued already.
+    fn schedule(&self, at: Instant) {
+        if !self.scheduled.swap(true, Ordering::SeqCst) {
+            savers().schedule(at, self.me.clone());
+        }
+    }
+
+    /// Stop saving in the background, once a background save under way is done: the
+    /// final save, at unmount, saves the rest.
     pub fn stop(&self) {
-        let _guard = self.lock();
+        let _saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
         self.stop.store(true, Ordering::SeqCst);
-        self.wake.notify_all();
         #[cfg(fuse)]
-        self.stale_listings.lock().unwrap_or_else(PoisonError::into_inner).take();
+        self.notifier.lock().unwrap_or_else(PoisonError::into_inner).take();
     }
 
     /// Tell the kernel through `notifier` to let go of folder listings that went stale,
-    /// from a thread of its own, until [`Shared::stop`].
+    /// until [`Shared::stop`].
     #[cfg(fuse)]
     pub fn notify_stale_listings(&self, notifier: fuser::Notifier) {
-        let (send, folders) = std::sync::mpsc::channel::<u64>();
-        std::thread::spawn(move || {
-            while let Ok(folder) = folders.recv() {
-                // The kernel forgets in batches, often several entries of one folder:
-                // each folder waiting is told once.
-                let mut waiting = BTreeSet::from([folder]);
-                waiting.extend(folders.try_iter());
-                for folder in waiting {
-                    // Dropping a folder's cached pages drops its kept listing. A folder
-                    // the kernel has meanwhile forgotten too has nothing kept to drop.
-                    let _ = notifier.inval_inode(INodeNo(folder), 0, 0);
-                }
-            }
-        });
-        *self.stale_listings.lock().unwrap_or_else(PoisonError::into_inner) = Some(send);
+        *self.notifier.lock().unwrap_or_else(PoisonError::into_inner) = Some(notifier);
     }
 
     /// Hand the folders whose kept listings went stale to the notifying thread.
@@ -1543,23 +1529,143 @@ impl Shared {
         if folders.is_empty() {
             return;
         }
-        if let Some(send) = &*self.stale_listings.lock().unwrap_or_else(PoisonError::into_inner) {
-            for folder in folders {
-                let _ = send.send(folder);
-            }
+        if let Some(notifier) = &*self.notifier.lock().unwrap_or_else(PoisonError::into_inner) {
+            stale_listings().send((notifier.clone(), folders));
         }
     }
 
-    /// Wake the saver if the last request left something unsaved. Most requests
-    /// change nothing, and waking a thread costs more than the request itself.
+    /// Queue a background save if the last request left something unsaved. Most
+    /// requests change nothing, and queueing costs more than the request itself.
     pub fn changed(&self) {
         let pending = {
             let inner = self.lock();
             inner.unsaved || inner.writing
         };
-        if pending {
-            self.wake.notify_one();
+        if pending && !self.scheduled.load(Ordering::SeqCst) {
+            // A burst of writes settles first, so it costs one save, not one per write.
+            self.schedule(Instant::now() + SETTLE);
         }
+    }
+}
+
+/// The threads that save every mount of the process in the background, shortly after
+/// each burst of changes. A few threads for all mounts rather than one per mount, so
+/// thousands of mounts don't cost thousands of threads: each holds memory maps, of
+/// which a process may have only so many. The final save at unmount is the mount's own.
+struct Savers {
+    /// Mounts to save, soonest first.
+    due: Mutex<BinaryHeap<Reverse<Due>>>,
+    wake: Condvar,
+}
+
+/// A mount to save at `at`; `seq` keeps mounts due at once in the order they came.
+struct Due {
+    at: Instant,
+    seq: u64,
+    mount: Weak<Shared>,
+}
+
+impl PartialEq for Due {
+    fn eq(&self, other: &Self) -> bool {
+        (self.at, self.seq) == (other.at, other.seq)
+    }
+}
+
+impl Eq for Due {}
+
+impl PartialOrd for Due {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Due {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.at, self.seq).cmp(&(other.at, other.seq))
+    }
+}
+
+/// How many threads save in the background. Saves of different mounts run side by
+/// side on them; most take milliseconds.
+const SAVERS: usize = 4;
+
+/// The process's [`Savers`], started on first use.
+fn savers() -> &'static Savers {
+    static STARTED: OnceLock<&'static Savers> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let savers: &'static Savers = Box::leak(Box::new(Savers { due: Mutex::default(), wake: Condvar::new() }));
+        for i in 0..SAVERS {
+            let _ = std::thread::Builder::new().name(format!("saver {i}")).spawn(move || savers.run());
+        }
+        savers
+    })
+}
+
+impl Savers {
+    fn schedule(&self, at: Instant, mount: Weak<Shared>) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        self.due.lock().unwrap_or_else(PoisonError::into_inner).push(Reverse(Due { at, seq, mount }));
+        self.wake.notify_one();
+    }
+
+    /// Save each mount as it comes due, for as long as the process runs.
+    fn run(&self) {
+        loop {
+            let mount = {
+                let mut due = self.due.lock().unwrap_or_else(PoisonError::into_inner);
+                loop {
+                    let now = Instant::now();
+                    let Some(Reverse(next)) = due.peek() else {
+                        due = self.wake.wait(due).unwrap_or_else(PoisonError::into_inner);
+                        continue;
+                    };
+                    if next.at <= now {
+                        break due.pop().map(|Reverse(next)| next.mount);
+                    }
+                    let wait = next.at - now;
+                    due = self.wake.wait_timeout(due, wait).unwrap_or_else(PoisonError::into_inner).0;
+                }
+            };
+            // A mount that has ended since has nothing left to save here.
+            if let Some(mount) = mount.and_then(|mount| mount.upgrade()) {
+                mount.save_in_background();
+            }
+        }
+    }
+}
+
+/// Folders whose kept listings went stale, with the notifier of their mount, sent to
+/// one thread that tells the kernel for every mount of the process: telling it from a
+/// request could wait on the kernel while it waits on us.
+#[cfg(fuse)]
+struct StaleListings(Mutex<std::sync::mpsc::Sender<(fuser::Notifier, Vec<u64>)>>);
+
+/// The process's [`StaleListings`], whose thread starts on first use.
+#[cfg(fuse)]
+fn stale_listings() -> &'static StaleListings {
+    static STARTED: OnceLock<StaleListings> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let (send, stale) = std::sync::mpsc::channel::<(fuser::Notifier, Vec<u64>)>();
+        let _ = std::thread::Builder::new().name("stale listings".to_owned()).spawn(move || {
+            while let Ok((notifier, folders)) = stale.recv() {
+                // The kernel forgets in batches, often several entries of one folder:
+                // each folder is told once.
+                for folder in folders.into_iter().collect::<BTreeSet<_>>() {
+                    // Dropping a folder's cached pages drops its kept listing. A folder
+                    // the kernel has meanwhile forgotten too has nothing kept to drop.
+                    let _ = notifier.inval_inode(INodeNo(folder), 0, 0);
+                }
+            }
+        });
+        StaleListings(Mutex::new(send))
+    })
+}
+
+#[cfg(fuse)]
+impl StaleListings {
+    fn send(&self, stale: (fuser::Notifier, Vec<u64>)) {
+        let _ = self.0.lock().unwrap_or_else(PoisonError::into_inner).send(stale);
     }
 }
 
@@ -2305,27 +2411,35 @@ mod tests {
     }
 
     #[test]
-    fn stopping_cuts_the_savers_settle_wait_short() {
+    fn writes_are_saved_in_the_background_until_the_mount_stops() {
         let state = tempfile::tempdir().unwrap();
         let saved = Saved::new(state.path());
         let mut inner = fs();
         inner.drafts = Some(saved.drafts());
         let shared = Shared::new(inner, saved, VPath::parse("/mnt").unwrap());
-        let saver = shared.spawn_saver();
         let readme = shared.lock().lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let restored = || {
+            let mut restored = fs().ws;
+            Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
+            restored.read_text("/mnt/README.md").unwrap()
+        };
         shared.lock().write(readme, 0, b"HE").unwrap();
         shared.changed();
-        // Long enough for the saver to be waiting for the write to settle.
-        std::thread::sleep(SETTLE / 5);
-        let stopped = std::time::Instant::now();
+        // Saved once the write has settled, with nothing asking for it.
+        let deadline = Instant::now() + SETTLE * 20;
+        while restored() != "HEllo\n" {
+            assert!(Instant::now() < deadline, "the write was never saved in the background");
+            std::thread::sleep(SETTLE / 5);
+        }
+        // Once the mount stops, its queued save does nothing: the final save at unmount
+        // is the last word, and keeps the write.
+        shared.lock().write(readme, 0, b"HEL").unwrap();
+        shared.changed();
         shared.stop();
-        saver.join().unwrap();
-        assert!(stopped.elapsed() < SETTLE / 2, "the saver took {:?} to stop", stopped.elapsed());
-        // The final save, as at unmount, keeps the write.
+        std::thread::sleep(SETTLE * 2);
+        assert_eq!(restored(), "HEllo\n", "no background save after the stop");
         shared.save(true).unwrap();
-        let mut restored = fs().ws;
-        Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
-        assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");
+        assert_eq!(restored(), "HELlo\n");
     }
 
     #[test]

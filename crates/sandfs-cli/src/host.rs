@@ -106,6 +106,45 @@ pub fn alive(_pid: u32) -> bool {
     false
 }
 
+/// Let this process keep as many files open as the system lets it, for the mounts it
+/// serves each hold a few (with FUSE: the device and two locks). Most systems start a
+/// process with a limit of 1,024 (Linux) or 256 (macOS), which stopped one process at
+/// a few hundred mounts.
+#[cfg(mount)]
+pub fn raise_open_files() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else { return };
+    // macOS refuses more than its per-process maximum, below its unlimited hard limit,
+    // so smaller limits are tried until one is taken.
+    for wanted in [hard, 1 << 20, 1 << 16, 10_240] {
+        if wanted <= soft {
+            return;
+        }
+        if setrlimit(Resource::RLIMIT_NOFILE, wanted, hard).is_ok() {
+            return;
+        }
+    }
+}
+
+/// How many more memory maps this process may make, and how many it may have in all
+/// (`vm.max_map_count`). Every thread takes four (its stack, its signal stack and
+/// their guard pages), and a process that runs out when starting a thread aborts.
+///
+/// Counting them reads a line per map, 12 ms at 60,000, so while the threads leave
+/// plenty to spare this counts each thread as 5 and reads no further.
+#[cfg(target_os = "linux")]
+pub fn memory_maps_left(spare: usize) -> Option<(usize, usize)> {
+    let max: usize = std::fs::read_to_string("/proc/sys/vm/max_map_count").ok()?.trim().parse().ok()?;
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let threads: usize = status.lines().find_map(|line| line.strip_prefix("Threads:"))?.trim().parse().ok()?;
+    if threads * 5 + spare * 2 < max {
+        return Some((max - threads * 5, max));
+    }
+    let used = std::fs::read("/proc/self/maps").ok()?.iter().filter(|&&byte| byte == b'\n').count();
+    Some((max.saturating_sub(used), max))
+}
+
 /// The options a workspace is mounted with. The source name `sandfs:<name>` is how
 /// [`mount_source`] recognizes the workspace's mount later.
 #[cfg(fuse)]
