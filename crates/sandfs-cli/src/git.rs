@@ -19,12 +19,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey};
+use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey, VPath, Workspace};
 use sandfs_git::{GitSource, ObjectIds};
 
 use crate::github;
-use crate::persist::PathState;
-use crate::store::expand;
+use crate::persist::{PathState, Snapshot};
+use crate::store::{Base, Home, ROOT, expand};
 
 /// Resolve `spec` (what follows `git:`) to a local repository and a commit id,
 /// cloning or fetching remote repositories into `repos`.
@@ -114,6 +114,169 @@ pub fn open(
     let files = Arc::new(files.with_known_sizes(sizes));
     let dir = GitDir::new(repo, commit, branch, home, Some(Arc::clone(&files)))?;
     Ok((files, Arc::new(dir)))
+}
+
+/// Give the new git workspace `name` what `mount --branch` and `--uncommitted` ask for
+/// before it is first mounted: git on a branch of its own at the mounted commit, and
+/// the files the repository's folder has changed since that commit, copied in once.
+///
+/// Both are written into the workspace like any change, so the repository is only
+/// read, and `changes` lists the copied files from the start.
+pub fn start(home: &Home, name: &str, uncommitted: bool, branch: Option<&str>) -> Result<()> {
+    let record = home.record(name)?;
+    let Base::Git { repo, commit, .. } = &record.base else {
+        bail!("--uncommitted and --branch work with a git: source, and {} is a folder", record.source);
+    };
+    let managed = repo.starts_with(home.root().join("repos"));
+    // Checked before anything is written, so a refusal leaves nothing to undo.
+    let folder = if uncommitted {
+        if managed {
+            bail!("--uncommitted copies changes from a folder on this machine, and {} is remote", record.source);
+        }
+        Some(changed_files(repo, commit)?)
+    } else {
+        None
+    };
+    if let Some(branch) = branch {
+        check_new_branch(repo, branch)?;
+    }
+
+    let _writer = home.lock(name, "sandfs mount, preparing the workspace")?;
+    let mut opened = home.open(name)?;
+    let ws = &mut opened.ws;
+    let (mut times, mut dirs) = (BTreeMap::new(), BTreeSet::new());
+    if let Some(branch) = branch {
+        // The branch the commit was mounted as stays, as it is in the repository.
+        ws.write(&format!("{ROOT}/.git/HEAD"), format!("ref: refs/heads/{branch}\n"))?;
+        ws.write(&format!("{ROOT}/.git/refs/heads/{branch}"), format!("{commit}\n"))?;
+    }
+    if let Some((top, changed)) = folder {
+        copy_changed(ws, &top, &changed, &mut times, &mut dirs)?;
+    }
+    let snapshot = Snapshot { ws: ws.fork(), times, dirs };
+    opened.saved.save(&snapshot, &VPath::parse(ROOT)?, true)
+}
+
+/// The working folder of local repository `repo`, and the files in it that differ from
+/// `commit`, its `HEAD`: changed, added or deleted, staged or not, and new files git
+/// doesn't ignore. Deleted files come first, so a folder that replaced a file is made
+/// after the file is gone.
+fn changed_files(repo: &Path, commit: &str) -> Result<(PathBuf, Vec<String>)> {
+    let top = git(repo, &["rev-parse", "--show-toplevel"]).ok().filter(|top| !top.is_empty()).with_context(|| {
+        format!("--uncommitted needs a repository with a working folder, and {} has none", repo.display())
+    })?;
+    let top = PathBuf::from(top);
+    if commit_of(&top, "HEAD")? != commit {
+        bail!("--uncommitted brings in changes made since HEAD, so mount the repository at HEAD (no @revision)");
+    }
+    let split = |out: Vec<u8>| -> Result<Vec<String>> {
+        out.split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8(path.to_vec()).context("a changed file's name is not UTF-8"))
+            .collect()
+    };
+    // Optional locks would let git refresh the repository's index: it is only read.
+    let tracked = split(git_raw(
+        &top,
+        &["--no-optional-locks", "diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=all", "HEAD", "--"],
+        None,
+    )?)?;
+    let untracked =
+        split(git_raw(&top, &["--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard"], None)?)?;
+    let (mut gone, mut present): (Vec<String>, Vec<String>) = tracked
+        .into_iter()
+        // A repository inside the folder is listed as its folder, which a mount doesn't show.
+        .chain(untracked.into_iter().filter(|path| !path.ends_with('/')))
+        .partition(|path| std::fs::symlink_metadata(top.join(path)).is_err());
+    gone.sort();
+    present.sort();
+    present.dedup();
+    gone.append(&mut present);
+    Ok((top, gone))
+}
+
+/// Make each of `changed` in `ws` what it is in the folder `top`, recording the times
+/// and folders a save needs.
+fn copy_changed(
+    ws: &mut Workspace,
+    top: &Path,
+    changed: &[String],
+    times: &mut BTreeMap<String, std::time::SystemTime>,
+    dirs: &mut BTreeSet<String>,
+) -> Result<()> {
+    let root = VPath::parse(ROOT)?;
+    for rel in changed {
+        let path = VPath::parse(&format!("{ROOT}/{rel}")).with_context(|| format!("copying {rel}"))?;
+        let at = path.as_str();
+        let host = top.join(rel);
+        let meta = match std::fs::symlink_metadata(&host) {
+            // A folder that replaced a file, which the files listed inside it go into.
+            Ok(meta) if meta.is_dir() => {
+                if ws.stat(at).is_ok_and(|existing| !existing.kind.is_dir()) {
+                    ws.remove(at, false)?;
+                }
+                continue;
+            }
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if ws.exists(at) {
+                    ws.remove(at, true)?;
+                }
+                // Git keeps no folders, so one left empty in the repository's folder is gone there.
+                let mut parent = path.parent();
+                while let Some(dir) = parent.filter(|dir| *dir != root) {
+                    let rel = dir.strip_prefix(&root).unwrap_or_default().join("/");
+                    if top.join(&rel).exists() || !ws.list(dir.as_str()).is_ok_and(|entries| entries.is_empty()) {
+                        break;
+                    }
+                    ws.remove(dir.as_str(), false)?;
+                    dirs.insert(dir.to_string());
+                    parent = dir.parent();
+                }
+                continue;
+            }
+            Err(err) => return Err(err).with_context(|| format!("reading {}", host.display())),
+        };
+        // Made afresh, so nothing of what was there (a folder, a link, a mode) stays.
+        if ws.exists(at) {
+            ws.remove(at, true)?;
+        }
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&host)?;
+            let target = target.to_str().with_context(|| format!("{} points to a non-UTF-8 path", host.display()))?;
+            ws.symlink(at, target)?;
+        } else {
+            ws.write(at, std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 != 0 {
+                    ws.set_executable(at, true)?;
+                }
+            }
+        }
+        if let Ok(modified) = meta.modified() {
+            times.insert(at.to_owned(), modified);
+        }
+        for dir in path.ancestors().into_iter().filter(|dir| dir.starts_with(&root) && *dir != root) {
+            dirs.insert(dir.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a name git wouldn't take for a new branch, or one `repo` already has, which a
+/// push back would then overwrite or be refused.
+fn check_new_branch(repo: &Path, branch: &str) -> Result<()> {
+    let checked =
+        (!branch.starts_with('-')).then(|| git(repo, &["check-ref-format", "--branch", branch]).ok()).flatten();
+    if checked.as_deref() != Some(branch) {
+        bail!("{branch:?} is not a name git takes for a branch");
+    }
+    if git(repo, &["show-ref", "--verify", "-q", &format!("refs/heads/{branch}")]).is_ok() {
+        bail!("{} already has a branch {branch}; pick another name", repo.display());
+    }
+    Ok(())
 }
 
 /// The `.git` folder of a git mount: a repository whose checkout is the mount itself.
