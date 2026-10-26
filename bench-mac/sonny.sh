@@ -7,7 +7,7 @@ W=${RUNNER_TEMP:-/tmp}/b; rm -rf "$W"; mkdir -p "$W"
 TIMEFORMAT=%R
 log() { echo "$*" | tee -a "$W/results.txt"; }
 secs() { local s=$(python3 -c 'import time;print(time.time())'); "$@" >"$W/out" 2>&1; python3 -c "import time;print(round(time.time()-$s,3))"; }
-stats() { cat "$SANDFS_NFS_STATS" 2>/dev/null || true; }
+stats() { cat "${SANDFS_NFS_STATS:-/nonexistent}" 2>/dev/null || true; }
 diffstats() { # before-file after-file: proc count us per call
   python3 - "$1" "$2" <<'PY'
 import sys
