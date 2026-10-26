@@ -8,7 +8,7 @@
 //! workspaces/<name>/workspace.json  what the workspace is based on
 //! workspaces/<name>/changes.json    its saved changes (see `persist`)
 //! workspaces/<name>/objects/        bodies of saved files
-//! workspaces/<name>/start/           the changes it was made with, if any (`mount --uncommitted`)
+//! workspaces/<name>/start/           the changes it was made with, if any (a fork of a clone)
 //! workspaces/<name>/mount.json      present while it is mounted
 //! workspaces/<name>/lock            held by the one process that may save it
 //! workspaces/<name>/holder          who holds the lock, for whoever it refuses
