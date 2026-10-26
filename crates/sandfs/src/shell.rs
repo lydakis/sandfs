@@ -231,7 +231,7 @@ fn confining(places: &Places, network: bool, command: &[OsString]) -> Result<Com
     let profile = places.tmp.join("confine.sb");
     std::fs::write(&profile, macos_profile(places, network)?)?;
     // `sandfs shell-exec` starts a new session, then becomes sandbox-exec.
-    let mut cmd = Command::new(std::env::current_exe()?);
+    let mut cmd = crate::relaunch::command()?;
     cmd.args(["shell-exec", "--", "/usr/bin/sandbox-exec", "-f"]).arg(profile).args(command);
     Ok(cmd)
 }

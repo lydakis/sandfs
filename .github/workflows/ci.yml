@@ -80,14 +80,14 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
       - name: Run Clippy
-        run: cargo clippy -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-py -p sandfs-cli --all-targets -- -D warnings
+        run: cargo clippy -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-py -p sandfs -p sandfs-cli --all-targets -- -D warnings
       - name: Run Rust tests
-        run: cargo test -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs-cli
+        run: cargo test -p sandfs-core -p sandfs-git -p sandfs-mcp -p sandfs -p sandfs-cli
         env:
           SANDFS_REQUIRE_FUSE: ${{ runner.os == 'macOS' && '1' || '' }}
       - name: Build the CLI without the mount
         if: runner.os == 'macOS'
-        run: cargo clippy -p sandfs-cli --no-default-features --all-targets -- -D warnings
+        run: cargo clippy -p sandfs -p sandfs-cli --no-default-features --all-targets -- -D warnings
       - name: Check and test the benchmarks
         if: runner.os == 'macOS'
         run: |

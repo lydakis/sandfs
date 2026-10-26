@@ -18,11 +18,12 @@ use crate::git;
 use crate::persist::{PathState, Snapshot};
 use crate::store::{Base, Home, ROOT, Record, open_base};
 
-/// What [`update`] did.
-#[derive(Debug, Serialize, Deserialize)]
+/// What [`crate::Home::update`] did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Updated {
-    /// The base before and after, for display.
+    /// The base before, for display: a commit or a folder.
     pub from: String,
+    /// The base after, for display.
     pub to: String,
     /// Paths, relative to the source, that both the workspace and the newer source
     /// changed. The workspace's version stays.
@@ -35,7 +36,7 @@ pub struct Updated {
     /// source can say: what it changed, and the workspace's changes that went. A mount
     /// tells the kernel to forget what it holds of them.
     #[serde(skip)]
-    pub changed: Option<BTreeSet<String>>,
+    pub(crate) changed: Option<BTreeSet<String>>,
 }
 
 /// Move the workspace `name` onto `source`, or onto the newest version of the source it

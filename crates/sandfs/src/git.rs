@@ -743,16 +743,16 @@ impl GitDir {
 
         // Git runs the monitor with the environment of whoever runs git, which may not
         // name the same home.
-        let exe = std::env::current_exe().context("finding the sandfs binary")?;
-        let exe = exe.to_str().context("non-UTF-8 path to the sandfs binary")?;
-        // Linux names a binary replaced since it started, as by `cargo install`, with
-        // this suffix; its replacement at the same path is the one git should run.
-        let exe = exe.strip_suffix(" (deleted)").unwrap_or(exe);
-        let hook = format!(
+        let exe = crate::relaunch::program()?;
+        let mut hook = format!(
             "SANDFS_HOME={} {}",
             shell_quote(home.to_str().context("non-UTF-8 home directory")?),
-            shell_quote(exe)
+            shell_quote(exe.to_str().context("non-UTF-8 path to this program")?)
         );
+        for word in crate::relaunch::prefix() {
+            hook.push(' ');
+            hook.push_str(&shell_quote(word.to_str().context("non-UTF-8 relaunch prefix")?));
+        }
         // Newer git turns its file monitor off on network and FUSE file systems, a
         // mount among them, unless `fsmonitor.allowRemote` says otherwise. And it starts
         // a maintenance process after commits and fetches, to pack loose objects, which

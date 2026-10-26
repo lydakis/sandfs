@@ -85,7 +85,7 @@ jobs:
           name="sandfs-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/sandfs" LICENSE crates/sandfs-cli/README.md "$name/"
-          cp crates/sandfs-cli/src/nfsserve/LICENSE "$name/LICENSE-nfsserve"
+          cp crates/sandfs/src/nfsserve/LICENSE "$name/LICENSE-nfsserve"
           tar czf "$name.tar.gz" "$name"
       # Run it where the runner can: every target but the Intel Mac build.
       - if: matrix.target != 'x86_64-apple-darwin'

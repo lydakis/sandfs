@@ -189,7 +189,7 @@ On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there
 - **Large files**: `read(path, offset=..., length=...)` reads one range without caching the file. A folder source seeks on disk, so a multi-gigabyte data set or video is never held in memory whole. A Python source can define `read_range(path, offset, length)` to do the same; without it, and for a git commit, the whole file is read and then sliced.
 - **Safe concurrent writes**: `stat(path).version` and `write(...)` give a file's version, and `write(path, data, expected_version=v)` raises `sandfs.VersionMismatch` if the file changed since.
 - **Threads**: calls release the GIL, so a slow source never blocks other threads. Use one workspace per thread; forks are cheap.
-- **Rust**: the same calls are in the `sandfs-core` crate (`cargo add sandfs-core`), with git in `sandfs-git`.
+- **Rust**: the same calls are in the `sandfs-core` crate (`cargo add sandfs-core`), with git in `sandfs-git`. Everything the `sandfs` command does (workspaces saved on disk, mounting, `fork`, `update`, `changes --copy-to`) is in the `sandfs` crate (`cargo add sandfs`), as methods of `sandfs::Home`, for a program that builds on workspaces without running the command.
 
 ### Python API
 
