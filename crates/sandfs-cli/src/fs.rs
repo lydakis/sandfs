@@ -349,6 +349,12 @@ pub struct Inner {
     /// renames a file that is still open instead of removing it, so keeping removed
     /// files would only pin their contents in memory.
     pub keep_removed: bool,
+    /// Give a file or link that may have changed a new inode when [`Inner::replace`]
+    /// serves a newer workspace, as if replaced. An NFS client can't be told to forget
+    /// what it holds, and on macOS keeps a file's attributes and pages for up to a
+    /// minute without asking, opens included; it does look a name up again once the
+    /// folder's time changes, and a new inode then has nothing cached.
+    pub renumber_changed: bool,
     /// Keep files macOS makes for its own bookkeeping out of saves, so they never
     /// show up among the changes, and the `._name` ones out of listings too. See
     /// [`crate::persist::is_bookkeeping`].
@@ -397,6 +403,7 @@ impl Inner {
             ranged_reads: false,
             recent: RefCell::default(),
             keep_removed: true,
+            renumber_changed: false,
             skip_bookkeeping: false,
         };
         inner.inos.insert(root.to_string(), ROOT_INO);
@@ -418,7 +425,8 @@ impl Inner {
     /// Serve `ws`, a newer version of the workspace served so far, with its saved
     /// times and folders. Only the paths of `changed` may differ, and anything below
     /// the folders of `whole`; with no `changed`, anything may. An inode stays with its
-    /// path, unless the name went or now names another kind of thing: then it is
+    /// path, unless the name went or now names another kind of thing (or, with
+    /// [`Inner::renumber_changed`], is a file that may have changed): then it is
     /// removed, as if unlinked, and still reads as it was through handles left open.
     /// Returns what the kernel must forget, since it holds names, attributes and pages
     /// for as long as it likes, and their folders get a new time, for NFS clients
@@ -472,7 +480,12 @@ impl Inner {
                 let went = match looked.get(&name) {
                     Some(went) => *went,
                     None => {
-                        let went = shape(&old, &name) != shape(&self.ws, &name);
+                        let (before, now_is) = (shape(&old, &name), shape(&self.ws, &name));
+                        let renumbered = self.renumber_changed
+                            && name == path
+                            && before.is_some_and(|kind| kind != FileType::Directory)
+                            && self.inos.contains_key(name.as_str());
+                        let went = before != now_is || renumbered;
                         looked.insert(name.clone(), went);
                         if went {
                             stale.push(Stale::Entry(parent, name.name().unwrap_or_default().to_owned()));
@@ -2714,6 +2727,23 @@ mod tests {
         assert!(stale.contains(&Stale::Entry(ROOT_INO, "new.txt".into())));
         assert_eq!(names(&mut fs, ROOT_INO), ["README.md", "new.txt", "src"]);
         assert!(fs.times.contains_key("/mnt"), "the folder's time changed with its names");
+    }
+
+    #[test]
+    fn a_newer_workspace_renumbers_files_that_may_have_changed_where_asked() {
+        let mut fs = fs();
+        fs.renumber_changed = true;
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let newer = MemorySource::from_files([("README.md", "hello again\n"), ("src/lib.rs", "")]).unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(newer)).unwrap();
+        let changed: BTreeSet<String> = ["/mnt/README.md", "/mnt/src/util.rs"].map(str::to_owned).into();
+        let stale = fs.replace(ws, BTreeMap::new(), BTreeSet::new(), Some(&changed), &[]);
+        assert!(stale.contains(&Stale::Entry(ROOT_INO, "README.md".into())));
+        assert_ne!(fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0, readme, "a new inode has nothing cached");
+        assert_eq!(fs.lookup(ROOT_INO, name("src")).unwrap().ino.0, src, "a folder keeps its inode");
+        assert!(fs.times.contains_key("/mnt") && fs.times.contains_key("/mnt/src"));
     }
 
     #[test]

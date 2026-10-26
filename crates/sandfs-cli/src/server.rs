@@ -357,6 +357,9 @@ pub struct Served {
     lease: Mutex<Lease>,
     /// Held while the workspace moves, so it moves once at a time.
     moving: Mutex<()>,
+    /// The copies of folders it moved off, held for files it may still have open there
+    /// (see [`Home::hold_copy`]).
+    retired: Mutex<Vec<File>>,
 }
 
 /// A mount listed among the ones this process serves, until dropped.
@@ -367,7 +370,8 @@ pub struct Serving {
 
 /// List the mount of `name`, served through `shared` over the base of `lease`.
 pub fn serving(name: &str, shared: Arc<Shared>, lease: Lease) -> Serving {
-    let served = Arc::new(Served { shared, lease: Mutex::new(lease), moving: Mutex::new(()) });
+    let served =
+        Arc::new(Served { shared, lease: Mutex::new(lease), moving: Mutex::new(()), retired: Mutex::default() });
     let mut all = served_list();
     all.insert(name.to_owned(), Arc::downgrade(&served));
     Serving { name: name.to_owned(), served }
@@ -378,6 +382,26 @@ pub fn serving(name: &str, shared: Arc<Shared>, lease: Lease) -> Serving {
 fn served_list() -> std::sync::MutexGuard<'static, HashMap<String, Weak<Served>>> {
     static SERVED: OnceLock<Mutex<HashMap<String, Weak<Served>>>> = OnceLock::new();
     SERVED.get_or_init(Mutex::default).lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Serving {
+    /// Stop listing the mount, which has ended, and delete the copies of folders it
+    /// moved off that nothing else uses, now that it reads none of their files.
+    pub fn end(self, home: &Home) {
+        let retired = std::mem::take(&mut *self.served.retired.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(self);
+        if retired.is_empty() {
+            return;
+        }
+        drop(retired);
+        // Not waited for: deleting waits on whoever is making a workspace.
+        let home = home.clone();
+        std::thread::spawn(move || {
+            if let Ok(_creating) = home.repos_lock(true) {
+                let _ = home.remove_unused_copies();
+            }
+        });
+    }
 }
 
 impl Drop for Serving {
@@ -401,7 +425,8 @@ fn move_served(home: &Home, bases: &Arc<Bases>, name: &str, next: &Move) -> Resu
     let _moving = served.moving.lock().unwrap_or_else(PoisonError::into_inner);
     // Reading the sources: `sandfs clean` waits.
     let _repos = home.repos_lock(false)?;
-    let before = serde_json::to_value(home.record(name)?)?;
+    let record = home.record(name)?;
+    let before = serde_json::to_value(&record)?;
     let mut updated = None;
     served.shared.replace(|| {
         let moved = update::apply(home, name, next.next.clone(), next.given);
@@ -412,8 +437,16 @@ fn move_served(home: &Home, bases: &Arc<Bases>, name: &str, next: &Move) -> Resu
         if failed && serde_json::to_value(home.record(name)?)? == before {
             return Ok(None);
         }
+        // A copy of a folder moved off stays while files of it may be open here.
+        let moved_off = match &record.base {
+            Base::Dir { path } if home.holds_copy(path) && home.record(name)?.base != record.base => {
+                Some(home.hold_copy(path)?)
+            }
+            _ => None,
+        };
         let (opened, lease) = home.open_shared(name, bases)?;
         *served.lease.lock().unwrap_or_else(PoisonError::into_inner) = lease;
+        served.retired.lock().unwrap_or_else(PoisonError::into_inner).extend(moved_off);
         let full = |rel: &str| format!("{ROOT}/{rel}");
         let git = matches!(opened.record.base, Base::Git { .. });
         Ok(Some(Replacement {

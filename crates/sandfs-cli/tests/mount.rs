@@ -621,7 +621,15 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     std::fs::set_permissions(folder.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink("todo.md", folder.join("todo")).unwrap();
     let copies_dir = sandfs.home.path().join("copies");
-    let copies = || std::fs::read_dir(&copies_dir).map_or(0, Iterator::count);
+    // The copies themselves, not the files that hold one for a mount.
+    let copies = || {
+        let entries = std::fs::read_dir(&copies_dir).map(|entries| entries.flatten().collect::<Vec<_>>());
+        entries
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry.path().extension().is_none_or(|ext| ext != "held"))
+            .count()
+    };
 
     let task = data.path().join("task");
     let output = sandfs.try_run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
@@ -692,17 +700,26 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     std::fs::write(task.join("mine.md"), "mine\n").unwrap();
     sandfs.unmount(&task);
     std::fs::write(folder.join("todo.md"), "b\n").unwrap();
+    std::fs::write(folder.join("gone.md"), "going\n").unwrap();
     sandfs.run(&["update", "task"]);
     assert_eq!(copies(), 1);
     std::fs::write(folder.join("todo.md"), "c\n").unwrap();
+    std::fs::remove_file(folder.join("gone.md")).unwrap();
     sandfs.mount(&["mount", "task", task.to_str().unwrap()], &task);
     assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "b\n");
     assert_eq!(std::fs::read_to_string(task.join("mine.md")).unwrap(), "mine\n");
     assert_eq!(sandfs.stdout(&["changes", "task"]), "A mine.md\n");
-    // Mounted, it moves in place onto another new copy.
+    // Mounted, it moves in place onto another new copy. The old one stays while the
+    // mount may read files of it left open, until the mount ends.
+    let held = std::fs::File::open(task.join("gone.md")).unwrap();
     sandfs.run(&["update", "task"]);
-    assert_eq!(copies(), 1);
+    assert_eq!(copies(), 2);
     assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "c\n");
+    assert!(!task.join("gone.md").exists());
+    let mut was = String::new();
+    std::io::Read::read_to_string(&mut &held, &mut was).unwrap();
+    assert_eq!(was, "going\n");
+    drop(held);
     assert_eq!(sandfs.stdout(&["changes", "task"]), "A mine.md\n");
     sandfs.run(&["rm", "--unmount", "task"]);
     sandfs.mounts.clear();

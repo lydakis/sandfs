@@ -841,10 +841,11 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     // NFS has no close to flush a file's writes, and macOS's NFS client adds files of
     // its own next to the ones people write.
     inner.keep_removed = !cfg!(nfs);
+    inner.renumber_changed = cfg!(nfs);
     inner.skip_bookkeeping = cfg!(nfs);
     let shared = Shared::new(inner, opened.saved, root);
     // Listed for `update`, which moves the workspace while it stays mounted.
-    let _serving = server::serving(name, shared.clone(), base);
+    let serving = server::serving(name, shared.clone(), base);
 
     // A mount that never came up has nothing to save, and saving would make a new
     // workspace look used to the `mount_new` that removes it again.
@@ -899,6 +900,7 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
             let _ = std::fs::write(&save_error, format!("{err:#}"));
         }
     }
+    serving.end(home);
     result.context("serving the mount")?;
     saved.context("saving changes at unmount")
 }

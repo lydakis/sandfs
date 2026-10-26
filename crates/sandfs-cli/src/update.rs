@@ -49,7 +49,8 @@ pub fn update(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> 
         None => move_onto(home, name, source),
     };
     // The copy of the folder the workspace was over goes once nothing is over it, as
-    // does a new one a failed move made.
+    // does a new one a failed move made. A mount that moved keeps the old copy until
+    // it ends, for files it still has open (see `Home::hold_copy`).
     if frozen && let Ok(_creating) = home.repos_lock(true) {
         let _ = home.remove_unused_copies();
     }
@@ -73,9 +74,16 @@ fn move_onto(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
 /// process serving the mount move the workspace onto it.
 #[cfg(mount)]
 fn move_mounted(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
-    let _repos = home.repos_lock(false)?;
-    let next = next_source(home, &home.record(name)?, source)?;
-    crate::server::update(home, name, &next, source.is_some())
+    let next = {
+        let _repos = home.repos_lock(false)?;
+        next_source(home, &home.record(name)?, source)?
+    };
+    let updated = crate::server::update(home, name, &next, source.is_some())?;
+    // macOS's NFS client asks for a folder's attributes again only once a second has
+    // passed since it last did, and only then sees the names that changed.
+    #[cfg(nfs)]
+    std::thread::sleep(std::time::Duration::from_millis(1050));
+    Ok(updated)
 }
 
 #[cfg(not(mount))]
