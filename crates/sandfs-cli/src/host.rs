@@ -40,10 +40,16 @@ pub fn mount_table() -> HashMap<PathBuf, String> {
 /// [`mount_source`] for every mount point, from `mount`'s table, run once.
 #[cfg(target_os = "macos")]
 pub fn mount_table() -> HashMap<PathBuf, String> {
-    let Ok(output) = std::process::Command::new("/sbin/mount").output() else { return HashMap::new() };
+    read_mount_table().unwrap_or_default()
+}
+
+/// [`mount_table`], or `None` if `mount` couldn't be run.
+#[cfg(target_os = "macos")]
+pub fn read_mount_table() -> Option<HashMap<PathBuf, String>> {
+    let output = std::process::Command::new("/sbin/mount").output().ok().filter(|output| output.status.success())?;
     let table = String::from_utf8_lossy(&output.stdout);
     // Later lines are mounted on top of earlier ones at the same point.
-    table.lines().filter_map(parse_mount_line).map(|(source, point)| (PathBuf::from(point), source)).collect()
+    Some(table.lines().filter_map(parse_mount_line).map(|(source, point)| (PathBuf::from(point), source)).collect())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
