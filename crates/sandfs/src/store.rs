@@ -277,11 +277,19 @@ impl Home {
         if self.exists(what) {
             return Ok(what.to_owned());
         }
+        match self.mounted(what) {
+            Some(name) => Ok(name),
+            None => bail!("{what:?} is neither a workspace name nor a mounted workspace"),
+        }
+    }
+
+    /// The workspace mounted on the directory `dir`, as [`Home::find`] resolves it.
+    pub fn mounted(&self, dir: &str) -> Option<String> {
         // A mount whose process died cannot be canonicalized (ENOTCONN), but its parent
         // can, which turns aliases such as macOS's `/tmp` into the path the mount was
         // recorded under, so `unmount DIR` can detach it.
-        let dir = Path::new(what).canonicalize().or_else(|_| {
-            let dir = std::path::absolute(what)?;
+        let dir = Path::new(dir).canonicalize().or_else(|_| {
+            let dir = std::path::absolute(dir)?;
             Ok::<_, std::io::Error>(match (dir.parent().map(Path::canonicalize), dir.file_name()) {
                 (Some(Ok(parent)), Some(name)) => parent.join(name),
                 _ => dir,
@@ -290,10 +298,7 @@ impl Home {
         // The mount table names the workspace mounted at `dir`, so this costs the same
         // with ten workspaces mounted or ten thousand. Git asks it on every command run
         // in a mount (see `sandfs git-fsmonitor`).
-        if let Some(name) = dir.ok().and_then(|dir| self.mounted_at(&dir, &mount_table())) {
-            return Ok(name);
-        }
-        bail!("{what:?} is neither a workspace name nor a mounted workspace")
+        dir.ok().and_then(|dir| self.mounted_at(&dir, &mount_table()))
     }
 
     /// Whether process `pid` holds `name` (see [`Home::lock`]): the lock is held, checked
