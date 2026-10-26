@@ -12,3 +12,12 @@ jobs:
         run: rustup toolchain install stable --profile minimal && rustup default stable && cargo build --release -p sandfs-cli
       - name: Bench
         run: bench-mac/run.sh
+  sonny:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: rustup toolchain install stable --profile minimal && rustup default stable && cargo build --release -p sandfs-cli
+      - name: Bench
+        run: bench-mac/sonny.sh
