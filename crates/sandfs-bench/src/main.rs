@@ -13,6 +13,7 @@
 
 mod build;
 mod compare;
+mod copies;
 mod data;
 mod everyday;
 mod lazy;
@@ -117,6 +118,9 @@ struct Args {
     /// How many copies (or forks of one mount) the build table runs the job in at once.
     #[arg(long, default_value_t = 1)]
     build_parallel: usize,
+    /// The package of this repository the copies table builds in each copy.
+    #[arg(long, default_value = "sandfs-core")]
+    copies_package: String,
     /// Run one remote method against listings already fetched to this directory and
     /// report it as JSON, so its memory peak is its own.
     #[arg(long, hide = true, requires = "remote_child_method")]
@@ -210,6 +214,15 @@ fn run(args: Args) -> Result<()> {
         build::print(&built);
         if let Some(path) = &args.json {
             std::fs::write(path, serde_json::to_string_pretty(&json!({ "build": build::json(&built) }))?)?;
+        }
+        return Ok(());
+    }
+    // So does the copies table, which makes copies of a clone of this repository.
+    if args.only.as_deref() == Some(copies::NAME) {
+        let copied = copies::run(&scratch, &bin, &args.copies_package, scale.iters, &copies::Method::ALL)?;
+        copies::print(&copied);
+        if let Some(path) = &args.json {
+            std::fs::write(path, serde_json::to_string_pretty(&json!({ "copies": copies::json(&copied) }))?)?;
         }
         return Ok(());
     }

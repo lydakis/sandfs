@@ -30,8 +30,19 @@ pub enum Unit {
 }
 
 /// The columns of things sandfs doesn't change.
-const BASELINES: &[&str] =
-    &["host", "eager", "overlayfs", "sparse", "shallow", "blobless", "full", "host folder", "host folders"];
+const BASELINES: &[&str] = &[
+    "host",
+    "eager",
+    "overlayfs",
+    "sparse",
+    "shallow",
+    "blobless",
+    "full",
+    "host folder",
+    "host folders",
+    "worktree",
+    "cloned copy",
+];
 
 /// What a whole-copy search stopped at its time limit counts as: the limit itself, so a
 /// search that stops where it used to finish shows as slower.
@@ -110,6 +121,14 @@ pub fn rows(report: &Value) -> Result<BTreeMap<String, Row>> {
                 runs.iter().flat_map(|run| list(&run["steps_nanos"])).filter_map(|steps| steps[step].as_u64());
             let reference = floor.filter(|floor| floor != target).map(|floor| format!("workflow {label} | {floor}"));
             add(format!("workflow {label} | {target}"), samples.collect(), Unit::Nanos, reference);
+        }
+    }
+    // Copies of a clone for each task, against a git worktree.
+    for row in list(&report["copies"]["rows"]) {
+        let step = text(&row, "step")?;
+        for (column, samples) in row["nanos"].as_object().into_iter().flatten() {
+            let reference = (column != "worktree").then(|| format!("copies {step} | worktree"));
+            add(format!("copies {step} | {column}"), numbers(samples), Unit::Nanos, reference);
         }
     }
     // A remote repository, against a blobless clone.
