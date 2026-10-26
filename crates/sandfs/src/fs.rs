@@ -193,18 +193,35 @@ struct Buffer {
     body: Body,
     size: u64,
     written: Instant,
+    /// Where a buffer in memory moves once it outgrows [`Drafts::in_memory`].
+    drafts: Option<Drafts>,
 }
 
-/// Where a buffer's bytes are: a draft on disk, or memory for a mount with no saved
-/// state to keep drafts in.
+/// Where a buffer's bytes are: a draft on disk, or memory for a small file or a mount
+/// with no saved state to keep drafts in.
 enum Body {
     Memory(Vec<u8>),
     Draft(Draft),
 }
 
 impl Buffer {
-    fn new(body: Body, size: u64) -> Self {
-        Buffer { body, size, written: Instant::now() }
+    fn new(body: Body, size: u64, drafts: Option<&Drafts>) -> Self {
+        Buffer { body, size, written: Instant::now(), drafts: drafts.cloned() }
+    }
+
+    /// Move a buffer in memory into a draft before it grows to `size`, if a file that
+    /// big is no longer kept in memory.
+    fn make_room(&mut self, size: u64) -> FsResult<()> {
+        let Some(drafts) = self.drafts.as_ref().filter(|drafts| !drafts.in_memory(size)) else { return Ok(()) };
+        if let Body::Memory(data) = &self.body {
+            let mut draft = drafts.empty().map_err(draft_errno)?;
+            let written = draft.write_at(0, data).map_err(io_errno)?;
+            if written < data.len() {
+                return Err(Errno::ENOSPC);
+            }
+            self.body = Body::Draft(draft);
+        }
+        Ok(())
     }
 
     fn read(&self, offset: u64, len: u64) -> FsResult<Bytes> {
@@ -222,6 +239,7 @@ impl Buffer {
     /// `data` when the disk filled up partway.
     fn write(&mut self, offset: u64, data: &[u8]) -> FsResult<usize> {
         let end = offset.checked_add(data.len() as u64).ok_or(Errno::EFBIG)?;
+        self.make_room(end)?;
         let written = match &mut self.body {
             Body::Memory(buffer) => {
                 let end = usize::try_from(end).ok().filter(|end| *end as u64 <= MAX_MEMORY_FILE).ok_or(Errno::EFBIG)?;
@@ -238,6 +256,7 @@ impl Buffer {
     }
 
     fn set_len(&mut self, size: u64) -> FsResult<()> {
+        self.make_room(size)?;
         match &mut self.body {
             Body::Memory(data) => {
                 let size = usize::try_from(size).ok().filter(|size| *size as u64 <= MAX_MEMORY_FILE);
@@ -1246,10 +1265,10 @@ impl Inner {
     /// A new, empty buffer.
     fn empty_buffer(&self) -> FsResult<Buffer> {
         let body = match &self.drafts {
-            Some(drafts) => Body::Draft(drafts.empty().map_err(draft_errno)?),
-            None => Body::Memory(Vec::new()),
+            Some(drafts) if !drafts.in_memory(0) => Body::Draft(drafts.empty().map_err(draft_errno)?),
+            _ => Body::Memory(Vec::new()),
         };
-        Ok(Buffer::new(body, 0))
+        Ok(Buffer::new(body, 0, self.drafts.as_ref()))
     }
 
     /// The write buffer for `ino`, filled from the workspace on first use.
@@ -1261,13 +1280,17 @@ impl Inner {
             let body = match &self.drafts {
                 // On disk: a saved file is copied there, which the disk may do without
                 // copying a byte, and anything else is read in chunks.
-                Some(drafts) => Body::Draft(drafts.copy(ws, path.as_str(), self.ranged_reads).map_err(draft_errno)?),
+                Some(drafts) if !drafts.in_memory(size) => {
+                    Body::Draft(drafts.copy(ws, path.as_str(), self.ranged_reads).map_err(draft_errno)?)
+                }
+                // A small file, which a save packs, is written in memory.
+                Some(_) => Body::Memory(ws.read_range(path.as_str(), 0, size).fs()?.to_vec()),
                 // Check before reading: a large source file would otherwise be read whole.
                 None if size > MAX_MEMORY_FILE => return Err(Errno::EFBIG),
                 // A ranged read keeps no copy of a base file in the workspace's cache.
                 None => Body::Memory(ws.read_range(path.as_str(), 0, size).fs()?.to_vec()),
             };
-            self.buffers.insert(ino, Buffer::new(body, size));
+            self.buffers.insert(ino, Buffer::new(body, size, self.drafts.as_ref()));
         }
         self.writing = true;
         let buffer = self.buffers.get_mut(&ino).ok_or(Errno::EIO)?;
@@ -1326,7 +1349,8 @@ impl Inner {
             // chunks, as a first write would copy it: shared, the next save would read it
             // whole into memory to write it out.
             let stored = match (&self.drafts, self.ws.stored(from.as_str()).fs()?) {
-                (Some(drafts), None) => {
+                // A small file is shared in memory until a save packs it.
+                (Some(drafts), None) if !drafts.in_memory(size) => {
                     let draft = drafts.copy(&self.ws, from.as_str(), self.ranged_reads).map_err(draft_errno)?;
                     Some(draft.finish().map_err(io_errno)?)
                 }
@@ -2367,6 +2391,30 @@ mod tests {
     }
 
     #[test]
+    fn small_files_are_written_in_memory_until_they_outgrow_a_pack() {
+        let state = tempfile::tempdir().unwrap();
+        let mut saved = Saved::new(state.path());
+        saved.pack_limit = Some(8);
+        let mut fs = fs();
+        fs.drafts = Some(saved.drafts());
+        let objects = || std::fs::read_dir(state.path().join("objects")).map_or(0, |dir| dir.count());
+        let ino = fs.create(ROOT_INO, name("small.txt"), 0o644, true, false).unwrap().ino.0;
+        fs.write(ino, 0, b"tiny\n").unwrap();
+        fs.commit_written(Duration::ZERO);
+        assert_eq!(fs.ws.read_text("/mnt/small.txt").unwrap(), "tiny\n");
+        assert_eq!(objects(), 0, "no file on disk for a file a save packs");
+        saved.save(&fs.snapshot(Duration::ZERO), &VPath::parse("/mnt").unwrap(), false).unwrap();
+        assert_eq!(objects(), 1, "the save packs it");
+
+        // Past the limit, what is written so far moves into a draft.
+        fs.write(ino, 5, b"and more\n").unwrap();
+        assert_eq!(objects(), 2);
+        fs.commit_written(Duration::ZERO);
+        let stored = fs.ws.stored("/mnt/small.txt").unwrap().expect("committed as the draft on disk");
+        assert_eq!(std::fs::read(state.path().join("objects").join(&*stored.key)).unwrap(), b"tiny\nand more\n");
+    }
+
+    #[test]
     fn a_snapshot_leaves_out_files_still_being_written() {
         let mut fs = fs();
         let ino = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
@@ -2653,7 +2701,10 @@ mod tests {
     fn a_failed_copy_keeps_the_destination_emptied() {
         let state = tempfile::tempdir().unwrap();
         let mut fs = fs();
-        fs.drafts = Some(Saved::new(state.path()).drafts());
+        let mut saved = Saved::new(state.path());
+        // Files big enough to be copied into a draft; small ones are copied in memory.
+        saved.pack_limit = None;
+        fs.drafts = Some(saved.drafts());
         fs.ws.write("/mnt/out.md", "old\n").unwrap();
         let out = fs.lookup(ROOT_INO, name("out.md")).unwrap().ino.0;
         // O_TRUNC, which only the buffer knows about so far.
