@@ -74,9 +74,15 @@ pub struct Home {
 
 impl Home {
     /// The home in `$SANDFS_HOME`, else `$XDG_DATA_HOME/sandfs`, else
-    /// `~/.local/share/sandfs`, created if missing.
+    /// `~/.local/share/sandfs`, which needn't exist yet.
     pub fn locate() -> Result<Home> {
         Ok(Home { inner: store::Home::locate()? })
+    }
+
+    /// The home in `root`, which needn't exist yet. Mounts started from it are served
+    /// with `SANDFS_HOME` set to it.
+    pub fn at(root: impl AsRef<Path>) -> Result<Home> {
+        Ok(Home { inner: store::Home::at(std::path::absolute(root)?) })
     }
 
     /// The home's folder.

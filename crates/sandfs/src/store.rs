@@ -134,7 +134,6 @@ impl Home {
     }
 
     /// A home directory at an explicit path.
-    #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Home {
         Home { root: root.into() }
     }
