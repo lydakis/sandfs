@@ -54,7 +54,8 @@ enum Cmd {
     /// FROM can also be a git repository's folder that sandfs doesn't serve, such as a
     /// clone: the fork is then its HEAD commit plus the files the folder has changed
     /// since (changed, new or deleted; ignored files stay out). Either way the fork is a
-    /// copy of FROM as it is now, and later changes to FROM don't reach it.
+    /// copy of FROM as it is now, and later changes to FROM don't reach it. On macOS such
+    /// a fork is kept at DIR as a real folder rather than mounted (see --real-folder).
     ///
     /// Without DIR the fork is only kept, not mounted: a snapshot of the workspace as it
     /// is now, which `mount NAME DIR` or `fork NAME DIR` brings back later.
@@ -75,6 +76,17 @@ enum Cmd {
         /// changes, so the fork's commits can be pushed with `git push origin NAME`.
         #[arg(long, value_name = "NAME")]
         branch: Option<String>,
+        /// Keep the fork at DIR as a real folder instead of a mount: the default on
+        /// macOS for a fork of a git repository's folder (or of such a fork), without
+        /// --read-only. Its files are clones of the folder's, which take no space on a
+        /// disk that clones files (APFS, btrfs, XFS), and programs and git work in it at
+        /// the disk's own speed. `changes` and `fork` read it as they read a mount, and
+        /// `rm --unmount` deletes it; it can't be mounted, updated, served or confined.
+        #[arg(long, conflicts_with = "mount")]
+        real_folder: bool,
+        /// Mount the fork at DIR even where it would be kept as a real folder.
+        #[arg(long)]
+        mount: bool,
         /// Serve in the foreground instead of in the background.
         #[arg(long, short)]
         foreground: bool,
@@ -129,9 +141,11 @@ enum Cmd {
     },
     /// Delete an unmounted workspace and its changes.
     Rm {
-        /// The workspace's name, or with --unmount the directory it is mounted on.
+        /// The workspace's name, or with --unmount the directory it is mounted on or
+        /// kept in.
         name: String,
-        /// Unmount the workspace first if it is mounted.
+        /// Unmount the workspace first if it is mounted, and delete the folder of one
+        /// kept as a real folder (see `fork`).
         #[arg(long)]
         unmount: bool,
     },
@@ -215,9 +229,12 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Fork { from, dir, name, read_only, branch, foreground } => {
-            let forked = home.fork(&from, dir.as_deref(), &ForkOptions { name, read_only, branch, foreground })?;
+        Cmd::Fork { from, dir, name, read_only, branch, real_folder, mount, foreground } => {
+            let real_folder = (real_folder || mount).then_some(real_folder);
+            let options = ForkOptions { name, read_only, branch, foreground, real_folder };
+            let forked = home.fork(&from, dir.as_deref(), &options)?;
             match forked.dir {
+                Some(dir) if forked.real_folder => println!("{} kept at {}", forked.name, dir.display()),
                 Some(_) if foreground => {}
                 Some(dir) => println!("{} mounted at {}", forked.name, dir.display()),
                 None => println!("{} forked from {}", forked.name, forked.from),

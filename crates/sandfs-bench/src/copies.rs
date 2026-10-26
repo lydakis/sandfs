@@ -1,7 +1,7 @@
 //! Copies of a git clone already on this machine, one per task, the way an agent
 //! harness gives each attempt its own folder: a git worktree, a copy-on-write copy of
 //! the clone (APFS clones on macOS, reflinks where Linux has them, else a full copy),
-//! and a `sandfs fork` of the clone. Each is made, then used the way an agent uses it:
+//! and a `sandfs fork` of the clone (on macOS a real folder). Each is made, then used the way an agent uses it:
 //! small files written, rewritten, saved the way editors save and deleted, git status,
 //! a search of the whole tree, and a build (first, unchanged, after an edit).
 //!
@@ -182,10 +182,12 @@ fn remove(method: Method, src: &Path, dir: &Path, bin: &Path, home: &Path) -> Re
         }
         Method::Cloned => Ok(fs::remove_dir_all(dir)?),
         Method::Fork => {
-            let name = dir.file_name().context("a copy has a name")?;
-            run_cmd(Command::new(bin).arg("unmount").arg(dir).env("SANDFS_HOME", home))?;
-            run_cmd(Command::new(bin).arg("rm").arg(name).env("SANDFS_HOME", home))?;
-            Ok(fs::remove_dir(dir)?)
+            // A mount leaves its empty folder behind; a fork kept as a folder takes it along.
+            run_cmd(Command::new(bin).args(["rm", "--unmount"]).arg(dir).env("SANDFS_HOME", home))?;
+            if dir.exists() {
+                fs::remove_dir(dir)?;
+            }
+            Ok(())
         }
     }
 }

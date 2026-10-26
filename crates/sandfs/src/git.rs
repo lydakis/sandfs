@@ -503,7 +503,7 @@ fn changed_files(repo: &Path, commit: &str) -> Result<(PathBuf, Vec<String>)> {
 /// What the file `rel` (`/`-separated) is in the folder `top`, without following links:
 /// none when it is gone, or when one of the folders on the way to it is gone or was
 /// replaced by a file or a link, which git also counts as the file's deletion.
-fn in_folder(top: &Path, rel: &str) -> Result<Option<std::fs::Metadata>> {
+pub(crate) fn in_folder(top: &Path, rel: &str) -> Result<Option<std::fs::Metadata>> {
     let mut at = top.to_path_buf();
     let mut parts = rel.split('/').peekable();
     while let Some(part) = parts.next() {
@@ -527,7 +527,7 @@ fn in_folder(top: &Path, rel: &str) -> Result<Option<std::fs::Metadata>> {
 
 /// Make each of `changed` in `ws` what it is in the folder `top`, recording the times
 /// and folders a save needs.
-fn copy_changed(
+pub(crate) fn copy_changed(
     ws: &mut Workspace,
     top: &Path,
     changed: &[String],
@@ -597,6 +597,117 @@ fn copy_changed(
         }
     }
     Ok(())
+}
+
+/// Give the fork kept as the real folder `dir` (see `folder`) its `.git`, from the
+/// workspace `ws` over `commit` of `repo`, whose files `dir` already holds: the files
+/// of the `.git` a mount shows, the same commit, branches and origin, but settings
+/// without sandfs's file monitor, and an index of the commit's files that knows them
+/// as they are in `dir`, so git reads none of them.
+///
+/// The index starts from `index_from`, the index of the folder the files were cloned
+/// from, keeping what it knows of each file that is the same in the commit. Git then
+/// only reads the files that are new to it or changed since.
+///
+/// Also makes `private`, a repository of sandfs's own over the same files, which
+/// [`folder_changes`] asks git in. Git runs programs the settings of a repository name
+/// (a file monitor, filters), and whatever works in `dir` can change those of its
+/// `.git`, but not these.
+pub fn make_folder(
+    ws: &Workspace,
+    (repo, commit, branch): (&Path, &str, Option<&str>),
+    dir: &Path,
+    private: &Path,
+    index_from: Option<&Path>,
+) -> Result<()> {
+    let settings = Settings::read(repo)?;
+    let git_root = VPath::parse(&format!("{ROOT}/.git"))?;
+    let mut folders = vec![git_root.clone()];
+    while let Some(at) = folders.pop() {
+        let rel = at.strip_prefix(&git_root).unwrap_or_default().join("/");
+        std::fs::create_dir_all(dir.join(".git").join(&rel))?;
+        for entry in ws.list(at.as_str())? {
+            let path = at.join(&entry.name)?;
+            let rel = path.strip_prefix(&git_root).unwrap_or_default().join("/");
+            match entry.kind {
+                Kind::Dir if rel != OBJECTS => folders.push(path),
+                Kind::File { .. } if rel != INDEX && rel != "config" => {
+                    std::fs::write(dir.join(".git").join(&rel), ws.read(path.as_str())?)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    let config = settings.config(branch, None);
+    std::fs::write(dir.join(".git/config"), &config)?;
+
+    std::fs::create_dir_all(private.join("objects/info"))?;
+    std::fs::create_dir_all(private.join("refs"))?;
+    let objects = settings.common.join("objects");
+    let objects = objects.to_str().context("non-UTF-8 repository path")?;
+    std::fs::write(private.join("objects/info/alternates"), format!("{objects}\n"))?;
+    std::fs::write(private.join("HEAD"), format!("{commit}\n"))?;
+    let mut own =
+        "[core]\n\trepositoryformatversion = 1\n\tbare = false\n\tcheckStat = minimal\n\ttrustctime = false\n"
+            .to_owned();
+    if settings.format != "sha1" {
+        own.push_str(&format!("[extensions]\n\tobjectFormat = {}\n", config_value(&settings.format)));
+    }
+    std::fs::write(private.join("config"), own)?;
+    std::fs::write(private.join(CHECKOUT_CONFIG), &config)?;
+
+    let index = private.join(INDEX);
+    let kept = index_from.is_some_and(|from| {
+        std::fs::copy(from, &index).is_ok() && private_git(private, dir, &["read-tree", "-m", commit], None).is_ok()
+    });
+    if !kept {
+        let _ = std::fs::remove_file(&index);
+        private_git(private, dir, &["read-tree", commit], None)?;
+    }
+    std::fs::copy(&index, dir.join(".git").join(INDEX)).context("writing the folder's git index")?;
+    Ok(())
+}
+
+/// The file in the private repository of a fork kept as a folder holding the settings
+/// its `.git` was made with, to tell when they change (see [`make_folder`]).
+pub const CHECKOUT_CONFIG: &str = "checkout-config";
+
+/// The files in the folder `dir` of a fork kept as a folder that differ from the commit
+/// it is over: changed, deleted or new, ignored files left out, as git finds them with
+/// the repository [`make_folder`] made at `private`.
+pub fn folder_changes(private: &Path, dir: &Path) -> Result<Vec<String>> {
+    let args = ["status", "--porcelain", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=all"];
+    let out = private_git(private, dir, &args, None)?;
+    // `XY path`, with nothing staged.
+    out.split(|&byte| byte == 0)
+        .filter_map(|record| record.get(3..))
+        // A repository inside the folder is listed as its folder.
+        .filter(|path| !path.is_empty() && !path.ends_with(b"/"))
+        .map(|path| String::from_utf8(path.to_vec()).context("a changed file's name is not UTF-8"))
+        .collect()
+}
+
+/// The index file of the git working folder `top`, for [`make_folder`].
+pub fn index_of(top: &Path) -> Option<PathBuf> {
+    git(top, &["rev-parse", "--git-path", INDEX]).ok().map(|path| top.join(path))
+}
+
+/// Run git in the private repository `private` of the fork kept as the folder `dir`.
+fn private_git(private: &Path, dir: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--git-dir").arg(private).arg("--work-tree").arg(dir);
+    for name in
+        ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]
+    {
+        cmd.env_remove(name);
+    }
+    // Whatever settings the user's own may hold: no monitor, and an index git reads whole.
+    cmd.args(["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.splitIndex=false"])
+        .args(["-c", "index.sparse=false", "-c", "core.sparseCheckout=false", "-c", "maintenance.auto=false"])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(dir);
+    run_with_input(cmd, input).with_context(|| format!("git {}", args.join(" ")))
 }
 
 /// Refuse a name git wouldn't take for a new branch, or one the mount's `origin` already
@@ -709,6 +820,94 @@ const INDEX: &str = "index";
 /// Where `sandfs git-fsmonitor` keeps every path it has reported (see [`fsmonitor`]).
 const TOUCHED: &str = ".git/sandfs-touched";
 
+/// What a checkout of a commit of a repository, a mount's or a folder's (see
+/// [`make_folder`]), takes from the repository's settings.
+struct Settings {
+    /// Where the repository keeps its objects and settings.
+    common: PathBuf,
+    /// `sha1` or `sha256`.
+    format: String,
+    /// The repository's origin, which pushes from the checkout go to.
+    origin: String,
+    /// For a partial clone, the filter it fetches with.
+    promisor: Option<String>,
+}
+
+impl Settings {
+    fn read(repo: &Path) -> Result<Self> {
+        let info = git(repo, &["rev-parse", "--git-common-dir", "--show-object-format"])?;
+        let mut lines = info.lines();
+        let common = repo.join(lines.next().context("git rev-parse printed nothing")?);
+        let common = common.canonicalize().with_context(|| format!("no repository at {}", common.display()))?;
+        let common = without_verbatim_prefix(common);
+        let format = lines.next().unwrap_or("sha1").to_owned();
+        // One git for every setting read here, since starting it costs the most.
+        let settings =
+            git(&common, &["config", "--get-regexp", r"^remote\.origin\.(promisor|url|partialclonefilter)$"])
+                .unwrap_or_default();
+        let get = |key: &str| {
+            settings.lines().rev().find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')).map(str::to_owned)
+        };
+        // A partial clone (every remote's local copy) borrows its origin; a local
+        // repository is the origin itself.
+        let promisor = get("remote.origin.promisor")
+            .filter(|value| value == "true")
+            .map(|_| get("remote.origin.partialclonefilter").unwrap_or_else(|| "blob:none".to_owned()));
+        let origin = match get("remote.origin.url") {
+            Some(url) if promisor.is_some() => url,
+            _ => repo.to_str().context("non-UTF-8 repository path")?.to_owned(),
+        };
+        Ok(Settings { common, format, origin, promisor })
+    }
+
+    /// The checkout's `.git/config`, on `branch` if any, with `monitor` as git's file
+    /// monitor.
+    fn config(&self, branch: Option<&str>, monitor: Option<&str>) -> String {
+        let mut config = "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\
+                          \tlogallrefupdates = true\n"
+            .to_owned();
+        match monitor {
+            // Newer git turns its file monitor off on network and FUSE file systems, a
+            // mount among them, unless `fsmonitor.allowRemote` says otherwise. And it
+            // starts a maintenance process after commits and fetches, to pack loose
+            // objects, which a workspace's few aren't worth.
+            Some(monitor) => config.push_str(&format!(
+                "\tfsmonitor = {}\n\tfsmonitorHookVersion = 2\n\tuntrackedCache = true\n\
+                 [fsmonitor]\n\tallowRemote = true\n\
+                 [maintenance]\n\tauto = false\n",
+                config_value(monitor)
+            )),
+            // The folder's files are clones, with the times and sizes of the files the
+            // index was made for but not their inode numbers or change times, which git
+            // would otherwise take for changes and read every file over.
+            None => config.push_str("\tcheckStat = minimal\n\ttrustctime = false\n"),
+        }
+        config.push_str(&format!(
+            "[remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+            config_value(&self.origin)
+        ));
+        if let Some(filter) = &self.promisor {
+            config.push_str(&format!("\tpromisor = true\n\tpartialclonefilter = {}\n", config_value(filter)));
+        }
+        if let Some(branch) = branch {
+            config.push_str(&format!(
+                "[branch {}]\n\tremote = origin\n\tmerge = refs/heads/{branch}\n",
+                config_value(branch)
+            ));
+        }
+        if self.promisor.is_some() || self.format != "sha1" {
+            config.push_str("[extensions]\n");
+            if self.promisor.is_some() {
+                config.push_str("\tpartialClone = origin\n");
+            }
+            if self.format != "sha1" {
+                config.push_str(&format!("\tobjectFormat = {}\n", config_value(&self.format)));
+            }
+        }
+        config
+    }
+}
+
 impl GitDir {
     /// The `.git` folder for `commit` of `repo`, for workspaces kept in the home at
     /// `home`. With `files`, the source of the commit's files, it serves the files the
@@ -720,26 +919,10 @@ impl GitDir {
         home: &Path,
         files: Option<Arc<GitSource>>,
     ) -> Result<Self> {
-        let info = git(repo, &["rev-parse", "--git-common-dir", "--show-object-format"])?;
-        let mut lines = info.lines();
-        let common = repo.join(lines.next().context("git rev-parse printed nothing")?);
-        let common = common.canonicalize().with_context(|| format!("no repository at {}", common.display()))?;
-        let common = without_verbatim_prefix(common);
-        let format = lines.next().unwrap_or("sha1");
-        // One git for every setting read here, since starting it costs the most.
-        let settings =
-            git(&common, &["config", "--get-regexp", r"^remote\.origin\.(promisor|url|partialclonefilter)$"])
-                .unwrap_or_default();
-        let get = |key: &str| {
-            settings.lines().rev().find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')).map(str::to_owned)
-        };
-        // A partial clone (every remote's local copy) borrows its origin; a local
-        // repository is the origin itself.
-        let promisor = get("remote.origin.promisor").is_some_and(|value| value == "true");
-        let origin = match get("remote.origin.url") {
-            Some(url) if promisor => url,
-            _ => repo.to_str().context("non-UTF-8 repository path")?.to_owned(),
-        };
+        let settings = Settings::read(repo)?;
+        let Settings { common, promisor, .. } = &settings;
+        let common = common.clone();
+        let promisor = promisor.is_some();
         let managed = repo.starts_with(home.join("repos"));
         let objects = files.filter(|_| promisor && managed).map(|source| Objects {
             source,
@@ -759,32 +942,7 @@ impl GitDir {
             hook.push(' ');
             hook.push_str(&shell_quote(word.to_str().context("non-UTF-8 relaunch prefix")?));
         }
-        // Newer git turns its file monitor off on network and FUSE file systems, a
-        // mount among them, unless `fsmonitor.allowRemote` says otherwise. And it starts
-        // a maintenance process after commits and fetches, to pack loose objects, which
-        // a workspace's few aren't worth.
-        let mut config = format!(
-            "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\
-             \tfsmonitor = {}\n\tfsmonitorHookVersion = 2\n\tuntrackedCache = true\n\
-             [fsmonitor]\n\tallowRemote = true\n\
-             [maintenance]\n\tauto = false\n\
-             [remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-            config_value(&format!("{hook} git-fsmonitor")),
-            config_value(&origin),
-        );
-        if promisor {
-            let filter = get("remote.origin.partialclonefilter").unwrap_or_else(|| "blob:none".to_owned());
-            config.push_str(&format!("\tpromisor = true\n\tpartialclonefilter = {}\n", config_value(&filter)));
-        }
-        if promisor || format != "sha1" {
-            config.push_str("[extensions]\n");
-            if promisor {
-                config.push_str("\tpartialClone = origin\n");
-            }
-            if format != "sha1" {
-                config.push_str(&format!("\tobjectFormat = {}\n", config_value(format)));
-            }
-        }
+        let config = settings.config(branch, Some(&format!("{hook} git-fsmonitor")));
 
         let mut files: Vec<(String, Bytes)> = Vec::new();
         let mut dirs: Vec<String> =
@@ -794,10 +952,6 @@ impl GitDir {
                 files.push(("HEAD".into(), format!("ref: refs/heads/{branch}\n").into()));
                 files.push((format!("refs/heads/{branch}"), format!("{commit}\n").into()));
                 files.push((format!("refs/remotes/origin/{branch}"), format!("{commit}\n").into()));
-                config.push_str(&format!(
-                    "[branch {}]\n\tremote = origin\n\tmerge = refs/heads/{branch}\n",
-                    config_value(branch)
-                ));
             }
             None => files.push(("HEAD".into(), format!("{commit}\n").into())),
         }

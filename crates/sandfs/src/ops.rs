@@ -25,7 +25,7 @@ use crate::store::Bases;
 use crate::store::{self, Base, Home, MountInfo, ROOT, check_name, is_mounted};
 use crate::{
     Change, Changes, ChangesOptions, CleanOutcome, Cleaned, ForkOptions, Forked, MountOptions, Mounted, ServeOptions,
-    WorkspaceInfo, copy, git, host, mcp, shell,
+    WorkspaceInfo, copy, folder, git, host, mcp, shell,
 };
 
 /// What `fork` copies.
@@ -38,8 +38,8 @@ enum Origin {
     Folder(PathBuf),
 }
 
-/// What `fork FROM` copies: the workspace FROM names, or is mounted on, or that holds the
-/// folder FROM; else the git repository whose working folder holds FROM; else the
+/// What `fork FROM` copies: the workspace FROM names, or is mounted on or kept in, or
+/// that holds the folder FROM; else the git repository whose working folder holds FROM; else the
 /// folder itself.
 fn fork_origin(home: &Home, from: &str) -> Result<Origin> {
     let not_found = match home.find(from) {
@@ -51,7 +51,9 @@ fn fork_origin(home: &Home, from: &str) -> Result<Origin> {
         return Err(not_found);
     }
     let table = host::mount_table();
-    if let Some(name) = path.ancestors().find_map(|dir| home.mounted_at(dir, &table)) {
+    if let Some(name) =
+        path.ancestors().find_map(|dir| home.mounted_at(dir, &table).or_else(|| folder::find(home, dir)))
+    {
         return Ok(Origin::Workspace(name));
     }
     Ok(git::working_folder(&path).map_or(Origin::Folder(path), Origin::Checkout))
@@ -76,9 +78,29 @@ pub(crate) fn mount_source(home: &Home, source: &str, dir: &Path, options: &Moun
 }
 
 pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOptions) -> Result<Forked> {
-    let ForkOptions { name, read_only, branch, foreground } = options;
+    let ForkOptions { name, read_only, branch, foreground, real_folder } = options;
     let origin = fork_origin(home, from)?;
     let read_only = relative_paths(read_only)?;
+    // Where the files of a fork kept as a folder are cloned from, and the git index
+    // that knows them: a clone, or another such fork.
+    let clone_of = match &origin {
+        Origin::Checkout(top) => Some((top.clone(), git::index_of(top))),
+        Origin::Workspace(from) => home.record(from)?.folder.map(|top| (top, Some(folder::private_index(home, from)))),
+        Origin::Folder(_) => None,
+    };
+    // By default only on macOS, where the mount is slowest, and only where nothing
+    // needs a mount.
+    let real = match real_folder {
+        Some(true) if dir.is_none() => bail!("a fork kept as a folder needs the folder: give DIR"),
+        Some(true) if clone_of.is_none() => {
+            bail!("only a fork of a git repository's folder, or of such a fork, can be kept as a folder")
+        }
+        Some(true) if !read_only.is_empty() => {
+            bail!("--read-only needs a mount, and a fork kept as a folder isn't one")
+        }
+        Some(real) => *real,
+        None => cfg!(target_os = "macos") && dir.is_some() && clone_of.is_some() && read_only.is_empty(),
+    };
     let name = match (dir, name.clone()) {
         (Some(dir), name) => default_name(name, dir)?,
         (None, Some(name)) => default_name(Some(name), Path::new(""))?,
@@ -89,6 +111,8 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
             sync(home, &from)?;
             let repos = home.repos_lock(false)?;
             let with_read_only = |mut record: store::Record| {
+                // Its own folder, if any, is made below.
+                record.folder = None;
                 for path in &read_only {
                     if !record.read_only.contains(path) {
                         record.read_only.push(path.clone());
@@ -145,16 +169,20 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
             record.source
         }
     };
-    let dir = match dir {
-        Some(dir) => Some(mount_new(home, &name, dir, *foreground).inspect_err(|_| {
+    let real_folder = real && dir.is_some();
+    let dir = match (dir, clone_of) {
+        (Some(dir), Some((top, index))) if real => {
+            Some(folder::make(home, &name, &top, dir, index.as_deref()).inspect_err(|_| remove_unused(home, &name))?)
+        }
+        (Some(dir), _) => Some(mount_new(home, &name, dir, *foreground).inspect_err(|_| {
             // A failed mount takes the workspace with it, and so its copy of a folder.
             if let Ok(_creating) = home.repos_lock(true) {
                 let _ = home.remove_unused_copies();
             }
         })?),
-        None => None,
+        (None, _) => None,
     };
-    Ok(Forked { name, from, dir })
+    Ok(Forked { name, from, dir, real_folder })
 }
 
 pub(crate) fn changes(home: &Home, workspace: &str, options: &ChangesOptions) -> Result<Changes> {
@@ -197,7 +225,7 @@ pub(crate) fn workspaces(home: &Home) -> Result<Vec<WorkspaceInfo>> {
     let mut found = Vec::new();
     for name in home.names()? {
         let record = home.record(&name)?;
-        let mounted = home.mount_info_in(&name, &table).map(|info| info.mountpoint);
+        let mounted = home.mount_info_in(&name, &table).map(|info| info.mountpoint).or(record.folder);
         found.push(WorkspaceInfo { name, source: record.source, mounted });
     }
     Ok(found)
@@ -205,6 +233,9 @@ pub(crate) fn workspaces(home: &Home) -> Result<Vec<WorkspaceInfo>> {
 
 pub(crate) fn unmount_workspace(home: &Home, workspace: &str) -> Result<()> {
     let name = home.find(workspace)?;
+    if let Some(dir) = home.record(&name)?.folder {
+        bail!("{name} is kept as the folder {}, not mounted; `sandfs rm --unmount {name}` deletes it", dir.display());
+    }
     let info = home.attached_mount(&name).with_context(|| format!("{name} is not mounted"))?;
     unmount(home, &name, &info)
 }
@@ -217,8 +248,16 @@ pub(crate) fn remove(home: &Home, name: &str, first: bool) -> Result<()> {
         }
         unmount(home, &name, &info)?;
     }
-    home.record(&name)?;
+    let record = home.record(&name)?;
+    if let Some(dir) = &record.folder
+        && !first
+    {
+        bail!("{name} is kept as the folder {}; pass --unmount to delete the folder too", dir.display());
+    }
     let writer = home.lock(&name, "sandfs rm")?;
+    if let Some(dir) = &record.folder {
+        folder::remove(home, &name, dir)?;
+    }
     home.remove(&name)?;
     drop(writer);
     // A copy of a folder goes with the last workspace over it.
@@ -232,6 +271,7 @@ pub(crate) fn serve_mcp(home: &Home, workspace: &str, options: &ServeOptions) ->
     // is a source. This is how workspaces are made where nothing mounts.
     if home.exists(workspace) && name.is_none() {
         only_when_created(read_only, workspace)?;
+        not_a_folder(home, workspace)?;
         return mcp::serve(home, workspace);
     }
     // Named after the resolved folder or repository, so `.` and `repo@v1` work.
@@ -246,6 +286,9 @@ pub(crate) fn serve_mcp(home: &Home, workspace: &str, options: &ServeOptions) ->
 
 pub(crate) fn shell(home: &Home, workspace: &str, network: bool, command: &[OsString]) -> Result<i32> {
     let name = home.find(workspace)?;
+    if home.record(&name)?.folder.is_some() {
+        bail!("{name} is kept as a folder, which can't be confined; a fork made with --mount can");
+    }
     let info = home
         .attached_mount(&name)
         .with_context(|| format!("{name} is not mounted; mount it first with sandfs mount {name} DIR"))?;
@@ -296,10 +339,14 @@ fn default_name(name: Option<String>, dir: &Path) -> Result<String> {
     Ok(name)
 }
 
-/// Ask a mounted workspace to save everything written so far. `fsync` on a FUSE
+/// Ask a mounted workspace to save everything written so far, or bring one kept as a
+/// folder up to date with it. `fsync` on a FUSE
 /// mount's root directory makes the serving process save before it returns; an NFS
 /// mount's process saves when asked on its save port, since `fsync` never reaches it.
 fn sync(home: &Home, name: &str) -> Result<()> {
+    if let Some(dir) = home.record(name)?.folder {
+        return folder::sync(home, name, &dir);
+    }
     let Some(info) = home.mount_info(name) else { return Ok(()) };
     // A dead server's pid may belong to another process by now. Only the process holding
     // the workspace serves it; without one, the last save is all there is to read.
@@ -345,14 +392,17 @@ fn changes_and_copy(
     let git_dir = git_dir.transpose()?;
     // But git runs the programs `.git/config` and `.git/hooks` name, so a change
     // there is shown, apart from the files, for whoever reviews the workspace.
-    let settings = changes
-        .iter()
-        .filter(|change| {
-            let rest = git_dir.as_ref().and_then(|dir| change.path.strip_prefix(dir));
-            rest.is_some_and(|rest| matches!(rest.first(), Some(&"config" | &"hooks")))
-        })
-        .map(|change| change.path.strip_prefix(&root).unwrap_or_default().join("/"))
-        .collect();
+    let settings = match &opened.record.folder {
+        Some(dir) => folder::git_settings(home, name, dir),
+        None => changes
+            .iter()
+            .filter(|change| {
+                let rest = git_dir.as_ref().and_then(|dir| change.path.strip_prefix(dir));
+                rest.is_some_and(|rest| matches!(rest.first(), Some(&"config" | &"hooks")))
+            })
+            .map(|change| change.path.strip_prefix(&root).unwrap_or_default().join("/"))
+            .collect(),
+    };
     let listed: Vec<_> = changes
         .iter()
         .filter(|change| !git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)))
@@ -394,6 +444,14 @@ fn only_when_created(read_only: &[String], name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a workspace kept as a folder (see `folder`), whose files are only there.
+pub(crate) fn not_a_folder(home: &Home, name: &str) -> Result<()> {
+    if let Some(dir) = home.record(name)?.folder {
+        bail!("{name} is kept as the folder {}; work there, or fork it with --mount for a mount", dir.display());
+    }
+    Ok(())
+}
+
 /// Mount a workspace that was just created, removing it again if the mount fails so
 /// the same command can simply be retried.
 fn mount_new(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<PathBuf> {
@@ -420,6 +478,7 @@ fn remove_unused(home: &Home, name: &str) {
 /// background process and wait until the mount is up.
 #[cfg(mount)]
 fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<PathBuf> {
+    not_a_folder(home, name)?;
     if let Some(info) = home.attached_mount(name) {
         let at = info.mountpoint.display();
         if host::alive(info.pid) {
