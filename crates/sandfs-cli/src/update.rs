@@ -74,11 +74,12 @@ fn move_onto(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
 /// process serving the mount move the workspace onto it.
 #[cfg(mount)]
 fn move_mounted(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
-    let next = {
-        let _repos = home.repos_lock(false)?;
-        next_source(home, &home.record(name)?, source)?
-    };
+    // Held until the mount's record names the new source, so `sandfs clean` can't
+    // delete a copy just frozen for it in between.
+    let repos = home.repos_lock(false)?;
+    let next = next_source(home, &home.record(name)?, source)?;
     let updated = crate::server::update(home, name, &next, source.is_some())?;
+    drop(repos);
     // macOS's NFS client asks for a folder's attributes again only once a second has
     // passed since it last did, and only then sees the names that changed.
     #[cfg(nfs)]

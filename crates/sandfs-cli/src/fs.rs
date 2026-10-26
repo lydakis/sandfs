@@ -17,7 +17,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -480,6 +480,8 @@ impl Inner {
         let mut stale = Vec::new();
         // Each name looked at, and whether it went or changed kind.
         let mut looked: HashMap<VPath, bool> = HashMap::new();
+        // The inodes taken off a name here.
+        let mut moved: HashSet<u64> = HashSet::new();
         for path in paths.iter().filter_map(|path| VPath::parse(path).ok()) {
             if !path.starts_with(&root) || path == root {
                 continue;
@@ -506,11 +508,14 @@ impl Inner {
                             self.times.extend(name.parent().map(|parent| (parent.to_string(), now)));
                             for gone in subtree_keys(&self.inos, &name) {
                                 let Ok(gone) = VPath::parse(&gone) else { continue };
-                                let ino = self.inos.get(gone.as_str()).copied();
+                                let Some(ino) = self.inos.get(gone.as_str()).copied() else { continue };
+                                // A name the newer workspace still links to it keeps it.
+                                let others = self.other_names(&gone);
                                 let keep_removed = std::mem::replace(&mut self.keep_removed, true);
-                                self.unlink_path(&gone, Some(old.fork()), &[]);
+                                self.unlink_path(&gone, Some(old.fork()), &others);
                                 self.keep_removed = keep_removed;
-                                if !keep_removed && let Some(ino) = ino.filter(|ino| self.nodes.contains_key(ino)) {
+                                moved.insert(ino);
+                                if !keep_removed && self.nodes.get(&ino).is_some_and(|node| !node.linked) {
                                     self.moved_off.push(ino);
                                 }
                             }
@@ -525,6 +530,20 @@ impl Inner {
                 if went {
                     break;
                 }
+            }
+        }
+        // Another name of an inode that went, which the newer workspace no longer links
+        // to it, is looked up anew rather than reaching the removed inode.
+        let unlinked = |ino: &u64| moved.contains(ino) && self.nodes.get(ino).is_none_or(|node| !node.linked);
+        let dangling: Vec<String> =
+            self.inos.iter().filter(|(_, ino)| unlinked(ino)).map(|(path, _)| path.clone()).collect();
+        for name in dangling.iter().filter_map(|name| VPath::parse(name).ok()) {
+            self.inos.remove(name.as_str());
+            let parent = name.parent().and_then(|parent| self.inos.get(parent.as_str()).copied());
+            if let Some(parent) = parent {
+                stale.push(Stale::Entry(parent, name.name().unwrap_or_default().to_owned()));
+                stale.push(Stale::Inode(parent));
+                self.times.extend(name.parent().map(|parent| (parent.to_string(), now)));
             }
         }
         // Folders whose kept listings named an inode that went.
@@ -1415,7 +1434,7 @@ impl Inner {
     /// The files listing `fh` has no size for and whose size nobody worked out since,
     /// which can mean reading them: an NFS listing leaves their attributes out.
     #[cfg(any(nfs, test))]
-    pub fn sizeless(&self, fh: u64) -> FsResult<std::collections::HashSet<u64>> {
+    pub fn sizeless(&self, fh: u64) -> FsResult<HashSet<u64>> {
         let handle = self.handles.get(&fh).ok_or(Errno::EBADF)?;
         let sizeless = handle.entries.iter().filter(|(ino, _, name)| {
             handle.sizeless.contains_key(name)
@@ -1638,7 +1657,9 @@ impl Shared {
             let Some(next) = change()? else { return Ok(()) };
             let stale = inner.replace(next.ws, next.times, next.dirs, next.changed.as_ref(), &next.whole);
             inner.drafts = Some(next.saved.drafts());
-            *saved = next.saved;
+            // Files left open from before still read objects the old state handed out.
+            let old = std::mem::replace(&mut *saved, next.saved);
+            saved.take_over(old);
             stale
         };
         drop(saved);
@@ -2773,6 +2794,35 @@ mod tests {
         let ws = fs.ws.fork();
         fs.replace(ws, BTreeMap::new(), BTreeSet::new(), Some(&changed), &[]);
         assert!(!fs.nodes.contains_key(&readme_now));
+    }
+
+    #[test]
+    fn a_newer_workspace_keeps_hard_links_on_one_live_inode() {
+        let mut fs = fs();
+        fs.renumber_changed = true;
+        fs.keep_removed = false;
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        fs.link(readme, ROOT_INO, name("copy.md")).unwrap();
+        let changed: BTreeSet<String> = ["/mnt/README.md".to_owned()].into();
+        // Still linked in the newer workspace: both names stay on one inode, in use.
+        let ws = fs.ws.fork();
+        fs.replace(ws, BTreeMap::new(), BTreeSet::new(), Some(&changed), &[]);
+        let (readme, copy) = (
+            fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0,
+            fs.lookup(ROOT_INO, name("copy.md")).unwrap().ino.0,
+        );
+        assert_eq!(readme, copy);
+        assert!(fs.nodes[&readme].linked);
+        // No longer linked: the other name is looked up anew, not on the inode that went.
+        let mut ws = fs.ws.fork();
+        ws.remove("/mnt/README.md", false).unwrap();
+        ws.write("/mnt/README.md", "new\n").unwrap();
+        let stale = fs.replace(ws, BTreeMap::new(), BTreeSet::new(), Some(&changed), &[]);
+        assert!(stale.contains(&Stale::Entry(ROOT_INO, "copy.md".into())));
+        let copy = fs.lookup(ROOT_INO, name("copy.md")).unwrap().ino.0;
+        assert!(fs.nodes[&copy].linked);
+        assert_ne!(copy, fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0);
+        assert_eq!(&fs.read(copy, 0, 100).unwrap()[..], b"hello\n");
     }
 
     #[test]
