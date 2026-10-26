@@ -139,8 +139,9 @@ pub fn open(
 /// own at the commit.
 ///
 /// Both are written into the workspace like any change, so the repository is only
-/// read, and `changes` lists the copied files from the start.
-pub fn start(home: &Home, name: &str, branch: Option<&str>) -> Result<()> {
+/// read, and `changes` lists the copied files from the start. Returns the workspace as
+/// saved, for whatever is made from it next.
+pub fn start(home: &Home, name: &str, branch: Option<&str>) -> Result<Workspace> {
     let record = home.record(name)?;
     let Base::Git { repo, commit, .. } = &record.base else {
         bail!("{} is not a git repository", record.source);
@@ -168,7 +169,8 @@ pub fn start(home: &Home, name: &str, branch: Option<&str>) -> Result<()> {
     copy_changed(ws, &top, &changed, &mut times, &mut dirs)?;
     let snapshot = Snapshot { ws: ws.fork(), times, dirs };
     opened.saved.save(&snapshot, &VPath::parse(ROOT)?, true)?;
-    home.keep_start(name)
+    home.keep_start(name)?;
+    Ok(snapshot.ws)
 }
 
 /// The top of the git working folder that holds `folder`, if any.
@@ -689,6 +691,10 @@ pub fn folder_changes(private: &Path, dir: &Path) -> Result<Vec<String>> {
 
 /// The index file of the git working folder `top`, for [`make_folder`].
 pub fn index_of(top: &Path) -> Option<PathBuf> {
+    // A clone's own `.git`, without asking git; a worktree's `.git` names its own.
+    if top.join(".git").is_dir() && std::env::var_os("GIT_INDEX_FILE").is_none() {
+        return Some(top.join(".git").join(INDEX));
+    }
     git(top, &["rev-parse", "--git-path", INDEX]).ok().map(|path| top.join(path))
 }
 
@@ -838,22 +844,38 @@ impl Settings {
         let info = git(repo, &["rev-parse", "--git-common-dir", "--show-object-format"])?;
         let mut lines = info.lines();
         let common = repo.join(lines.next().context("git rev-parse printed nothing")?);
-        let common = common.canonicalize().with_context(|| format!("no repository at {}", common.display()))?;
-        let common = without_verbatim_prefix(common);
         let format = lines.next().unwrap_or("sha1").to_owned();
         // One git for every setting read here, since starting it costs the most.
         let settings =
             git(&common, &["config", "--get-regexp", r"^remote\.origin\.(promisor|url|partialclonefilter)$"])
                 .unwrap_or_default();
         let get = |key: &str| {
-            settings.lines().rev().find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')).map(str::to_owned)
+            settings
+                .lines()
+                .rev()
+                .find_map(|line| line.strip_prefix(&format!("remote.origin.{key} ")))
+                .map(str::to_owned)
         };
+        Self::new(repo, &common, format, get)
+    }
+
+    /// The settings `files`, the source of a commit of `repo`, read when it was opened.
+    fn of_source(repo: &Path, files: &GitSource) -> Result<Self> {
+        let get = |key: &str| files.remote_setting("origin", key).map(str::to_owned);
+        Self::new(repo, files.common_dir(), files.object_format().to_owned(), get)
+    }
+
+    /// The settings of `repo`, whose common folder is `common`, from its object `format`
+    /// and `origin`, its origin's setting of each key.
+    fn new(repo: &Path, common: &Path, format: String, origin: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let common = common.canonicalize().with_context(|| format!("no repository at {}", common.display()))?;
+        let common = without_verbatim_prefix(common);
         // A partial clone (every remote's local copy) borrows its origin; a local
         // repository is the origin itself.
-        let promisor = get("remote.origin.promisor")
+        let promisor = origin("promisor")
             .filter(|value| value == "true")
-            .map(|_| get("remote.origin.partialclonefilter").unwrap_or_else(|| "blob:none".to_owned()));
-        let origin = match get("remote.origin.url") {
+            .map(|_| origin("partialclonefilter").unwrap_or_else(|| "blob:none".to_owned()));
+        let origin = match origin("url") {
             Some(url) if promisor.is_some() => url,
             _ => repo.to_str().context("non-UTF-8 repository path")?.to_owned(),
         };
@@ -919,7 +941,10 @@ impl GitDir {
         home: &Path,
         files: Option<Arc<GitSource>>,
     ) -> Result<Self> {
-        let settings = Settings::read(repo)?;
+        let settings = match &files {
+            Some(files) => Settings::of_source(repo, files)?,
+            None => Settings::read(repo)?,
+        };
         let Settings { common, promisor, .. } = &settings;
         let common = common.clone();
         let promisor = promisor.is_some();

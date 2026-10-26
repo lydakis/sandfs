@@ -133,6 +133,76 @@ jobs:
             fi
             cat /tmp/macos.txt /tmp/macos-copies-1.json.txt
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Where the time of a fork and its changes goes
+        run: |
+          rm -rf /tmp/prof && mkdir /tmp/prof && git clone -q "$PWD" /tmp/prof/clone
+          export SANDFS_HOME=/tmp/prof/home
+          now() { perl -MTime::HiRes=time -e 'printf "%.6f", time'; }
+          # Perl reads its modules from disk the first time, which would count against sandfs.
+          now > /dev/null
+          profile() {
+            rm -f /tmp/prof/trace.json
+            start=$(now)
+            GIT_TRACE2_EVENT=/tmp/prof/trace.json "$@" > /dev/null
+            end=$(now)
+            python3 - "$start" "$end" "sandfs ${*:2}" <<'PY'
+          import json, sys
+          from datetime import datetime
+          start, end = float(sys.argv[1]), float(sys.argv[2])
+          runs = {}
+          try:
+              lines = open("/tmp/prof/trace.json").readlines()
+          except FileNotFoundError:
+              lines = []
+          for line in lines:
+              event = json.loads(line)
+              # Only git processes sandfs started, not their children.
+              if "/" in event["sid"]:
+                  continue
+              at = datetime.fromisoformat(event["time"].replace("Z", "+00:00")).timestamp()
+              if event["event"] == "start":
+                  argv = " ".join(event["argv"][1:]).replace("/private/tmp/prof/", "").replace("/tmp/prof/", "")
+                  runs[event["sid"]] = [at, None, argv[:90]]
+              elif event["event"] == "atexit" and event["sid"] in runs:
+                  runs[event["sid"]][1] = at
+          label = sys.argv[3].replace("/private/tmp/prof/", "").replace("/tmp/prof/", "")
+          short = sum(done - began for began, done, argv in runs.values() if done and "cat-file" not in argv)
+          print(f"{label}: {(end - start) * 1000:.0f} ms, {len(runs)} git runs, {short * 1000:.0f} ms inside the short ones")
+          # Each run: when git's main began after sandfs started, and how long it ran.
+          for began, done, argv in sorted(runs.values()):
+              ran = f"{(done - began) * 1000:5.1f} ms" if done else "   (helper)"
+              print(f"    at {(began - start) * 1000:6.1f} ms, {ran}  {argv}")
+          PY
+          }
+          {
+            echo '### Where the time goes (macOS)'
+            echo
+            echo '```'
+            profile /tmp/after/sandfs fork /tmp/prof/clone /tmp/prof/copy --branch prof
+            echo edit >> /tmp/prof/copy/README.md
+            profile /tmp/after/sandfs changes /tmp/prof/copy
+            profile /tmp/after/sandfs changes /tmp/prof/copy
+            profile /tmp/after/sandfs rm --unmount /tmp/prof/copy
+            profile /tmp/after/sandfs --version
+            # What one flush to disk costs here: sandfs flushes each durable save.
+            python3 - <<'PY'
+          import fcntl, os, time
+          fd = os.open("/tmp/prof/flush", os.O_RDWR | os.O_CREAT)
+          for name, flush in (("fsync", os.fsync), ("F_FULLFSYNC", lambda fd: fcntl.fcntl(fd, fcntl.F_FULLFSYNC))):
+              start = time.perf_counter()
+              for _ in range(20):
+                  os.write(fd, b"x" * 4096)
+                  flush(fd)
+              print(f"{name} after a 4 KiB write: {(time.perf_counter() - start) / 20 * 1000:.2f} ms")
+          # What starting git costs here, outside the time git itself reports.
+          import subprocess
+          start = time.perf_counter()
+          for _ in range(20):
+              subprocess.run(["git", "-C", "/tmp/prof/clone", "rev-parse", "HEAD"], stdout=subprocess.DEVNULL, check=True)
+          print(f"git rev-parse HEAD, wall: {(time.perf_counter() - start) / 20 * 1000:.2f} ms")
+          PY
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-macos-${{ github.sha }}

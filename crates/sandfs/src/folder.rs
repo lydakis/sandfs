@@ -24,11 +24,21 @@ const MARKER: &str = ".git/sandfs-workspace";
 /// The workspace's own repository over the folder (see [`git::make_folder`]).
 const PRIVATE: &str = "folder-git";
 
-/// Keep the new workspace `name`, a fork of the files in `top`, as the real folder
-/// `dir`, which must be new or empty. `index_from` is the git index of `top`, if any.
-/// Returns the folder, resolved. On failure the folder is removed again, and the
-/// caller removes the workspace.
-pub fn make(home: &Home, name: &str, top: &Path, dir: &Path, index_from: Option<&Path>) -> Result<PathBuf> {
+/// What the folder held when the workspace last read it (see [`signature`]).
+const SYNCED: &str = "folder-synced";
+
+/// Keep the new workspace `name`, opened as `ws`, a fork of the files in `top`, as the
+/// real folder `dir`, which must be new or empty. `index_from` is the git index of
+/// `top`, if any. Returns the folder, resolved. On failure the folder is removed again,
+/// and the caller removes the workspace.
+pub fn make(
+    home: &Home,
+    name: &str,
+    ws: &Workspace,
+    top: &Path,
+    dir: &Path,
+    index_from: Option<&Path>,
+) -> Result<PathBuf> {
     let target = crate::resolve_new(dir)?;
     if target.is_dir() && std::fs::read_dir(&target)?.next().is_some() {
         bail!("{} is not empty; a fork kept as a folder needs a new or empty one", target.display());
@@ -46,11 +56,19 @@ pub fn make(home: &Home, name: &str, top: &Path, dir: &Path, index_from: Option<
         };
         record.folder = Some(dir.clone());
         home.set_record(name, &record)?;
-        let opened = home.open(name)?;
-        clone_files(&opened.ws, top, &dir)?;
+        clone_files(ws, top, &dir)?;
         let private = home.workspace_dir(name).join(PRIVATE);
-        git::make_folder(&opened.ws, (&repo, &commit, branch.as_deref()), &dir, &private, index_from)?;
-        std::fs::write(dir.join(MARKER), name).context("marking the folder")
+        git::make_folder(ws, (&repo, &commit, branch.as_deref()), &dir, &private, index_from)?;
+        std::fs::write(dir.join(MARKER), name).context("marking the folder")?;
+        // Reading the folder can start from here if it holds what the workspace does:
+        // a file of the clone changed while it was copied may not.
+        let mut paths = changed_paths(ws)?;
+        paths.extend(git::folder_changes(&private, &dir)?);
+        let before = signature(&dir, &paths);
+        if holds(ws, &dir, &paths)? && signature(&dir, &paths) == before {
+            write_synced(&home.workspace_dir(name).join(SYNCED), before, &paths)?;
+        }
+        Ok(())
     })();
     if let Err(err) = made {
         let _ = store::remove_copy(&dir);
@@ -111,20 +129,27 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
     }
     let _writer = home.lock(name, &format!("sandfs, reading the changes in {}", dir.display()))?;
     let listed = git::folder_changes(&home.workspace_dir(name).join(PRIVATE), dir)?;
-    let mut opened = home.open(name)?;
-    let root = VPath::parse(ROOT)?;
-    let git_dir = VPath::parse(&format!("{ROOT}/.git"))?;
-    // The workspace's own changes too, so a file changed back is noticed.
-    let mut candidates: BTreeSet<String> = listed.into_iter().collect();
-    for change in opened.ws.changes()? {
-        if !change.path.starts_with(&git_dir) {
-            candidates.insert(change.path.strip_prefix(&root).unwrap_or_default().join("/"));
+    // Nothing to read if those files, and the ones the workspace had changed when it
+    // last read the folder, are as they were then.
+    let synced = home.workspace_dir(name).join(SYNCED);
+    if let Some((signature, mut paths)) = read_synced(&synced) {
+        paths.extend(listed.iter().cloned());
+        if self::signature(dir, &paths) == signature {
+            return Ok(());
         }
     }
+    let mut opened = home.open(name)?;
+    let root = VPath::parse(ROOT)?;
+    // The workspace's own changes too, so a file changed back, or ignored since, is noticed.
+    let mut candidates = changed_paths(&opened.ws)?;
+    candidates.extend(listed);
+    // Taken before the files are read: if one changes while they are, the next read
+    // must not take this one's for current.
+    let before = signature(dir, &candidates);
     // Deleted files first, so a folder that replaced a file is made after the file is gone.
     let (mut gone, mut changed) = (Vec::new(), Vec::new());
-    for rel in candidates {
-        let at = format!("{ROOT}/{rel}");
+    for rel in &candidates {
+        let (rel, at) = (rel.clone(), format!("{ROOT}/{rel}"));
         match git::in_folder(dir, &rel)? {
             None if opened.ws.exists(&at) => gone.push(rel),
             None => {}
@@ -134,13 +159,88 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
             Some(_) => {}
         }
     }
-    if gone.is_empty() && changed.is_empty() {
+    if !gone.is_empty() || !changed.is_empty() {
+        gone.append(&mut changed);
+        let Restored { mut times, mut dirs } = std::mem::take(&mut opened.restored);
+        git::copy_changed(&mut opened.ws, dir, &gone, &mut times, &mut dirs)?;
+        opened.saved.save(&Snapshot { ws: opened.ws.fork(), times, dirs }, &root, true)?;
+    }
+    if signature(dir, &candidates) != before {
+        let _ = std::fs::remove_file(&synced);
         return Ok(());
     }
-    gone.append(&mut changed);
-    let Restored { mut times, mut dirs } = std::mem::take(&mut opened.restored);
-    git::copy_changed(&mut opened.ws, dir, &gone, &mut times, &mut dirs)?;
-    opened.saved.save(&Snapshot { ws: opened.ws.fork(), times, dirs }, &root, true)
+    write_synced(&synced, before, &candidates)
+}
+
+/// The paths, relative to the root, that the workspace `ws` has changed outside `.git`.
+fn changed_paths(ws: &Workspace) -> Result<BTreeSet<String>> {
+    let root = VPath::parse(ROOT)?;
+    let git_dir = VPath::parse(&format!("{ROOT}/.git"))?;
+    Ok(ws
+        .changes()?
+        .into_iter()
+        .filter(|change| !change.path.starts_with(&git_dir))
+        .map(|change| change.path.strip_prefix(&root).unwrap_or_default().join("/"))
+        .collect())
+}
+
+/// Keep at `synced` the `signature` of the files `paths` of the folder as the workspace
+/// read them (see [`signature`]), and the paths: every other file is the commit's in
+/// both.
+fn write_synced(synced: &Path, signature: String, paths: &BTreeSet<String>) -> Result<()> {
+    let mut data = signature;
+    for path in paths {
+        data.push('\0');
+        data.push_str(path);
+    }
+    std::fs::write(synced, data).context("writing what the folder holds")
+}
+
+/// What [`write_synced`] kept at `synced`, if anything.
+fn read_synced(synced: &Path) -> Option<(String, BTreeSet<String>)> {
+    let data = std::fs::read_to_string(synced).ok()?;
+    let mut parts = data.split('\0');
+    let signature = parts.next()?.to_owned();
+    Some((signature, parts.map(str::to_owned).collect()))
+}
+
+/// What the files `paths` in the folder `dir` are now, as far as their metadata says:
+/// which files, and each one's size, times, inode and mode, hashed. A file changes all
+/// of them but its name when it is written, and its change time even when it is
+/// written back as it was.
+fn signature(dir: &Path, paths: &BTreeSet<String>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for rel in paths {
+        rel.hash(&mut hasher);
+        // As a read sees it: a file under a link to a folder is not in the folder.
+        let Ok(Some(meta)) = git::in_folder(dir, rel) else {
+            0u8.hash(&mut hasher);
+            continue;
+        };
+        (meta.len(), meta.modified().ok(), meta.file_type().is_symlink()).hash(&mut hasher);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            (meta.ino(), meta.mode(), meta.ctime(), meta.ctime_nsec()).hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Whether the files `paths` of the folder `dir` are as they are in `ws`.
+fn holds(ws: &Workspace, dir: &Path, paths: &BTreeSet<String>) -> Result<bool> {
+    for rel in paths {
+        let at = format!("{ROOT}/{rel}");
+        let held = match git::in_folder(dir, rel)? {
+            None => !ws.exists(&at),
+            Some(meta) => same(ws, &at, &meta, &dir.join(rel))?,
+        };
+        if !held {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether `at` in `ws` is what `host`, of metadata `meta`, is.

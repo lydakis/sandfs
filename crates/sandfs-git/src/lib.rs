@@ -43,6 +43,12 @@ pub struct GitSource {
     known_sizes: HashMap<SourceKey, u64>,
     /// The remote a partial clone fetches missing blobs from.
     promisor: Option<String>,
+    /// Where the repository keeps its objects and settings (`git rev-parse
+    /// --git-common-dir`), absolute.
+    common: PathBuf,
+    /// The settings of the repository's remotes read when it was opened: each one's
+    /// URL, whether it is a promisor, and its partial clone filter.
+    remotes: Vec<(String, String)>,
     /// Whether the partial clone has every tree, as a clone that leaves out only blobs
     /// does, so one walk of the whole tree finds every missing file.
     trees_local: bool,
@@ -116,16 +122,28 @@ impl GitSource {
         // Starting git is most of what opening costs, so each question is asked once.
         let resolved = git_output(
             &repo,
-            &["rev-parse", "--show-object-format", "--verify", "--end-of-options", &format!("{rev}^{{tree}}")],
+            &[
+                "rev-parse",
+                "--git-common-dir",
+                "--show-object-format",
+                "--verify",
+                "--end-of-options",
+                &format!("{rev}^{{tree}}"),
+            ],
         )?;
-        let (format, tree) = resolved.split_once('\n').ok_or_else(|| Error::Source(format!("git: {resolved}")))?;
+        let mut lines = resolved.lines();
+        let (Some(common), Some(format), Some(tree)) = (lines.next(), lines.next(), lines.next()) else {
+            return Err(Error::Source(format!("git: {resolved}")));
+        };
+        let common = repo.join(common);
         let hash_len = match format {
             "sha1" => 20,
             "sha256" => 32,
             other => return Err(Error::Source(format!("unsupported object format {other:?}"))),
         };
         let readers = Readers::new(&repo);
-        let (promisor, trees_local) = match promisor_remote(&repo) {
+        let remotes = remote_settings(&repo);
+        let (promisor, trees_local) = match promisor_remote(&remotes) {
             Some((remote, filter)) => (Some(remote), filter.is_some_and(|filter| filter.starts_with("blob:"))),
             None => (None, false),
         };
@@ -137,6 +155,8 @@ impl GitSource {
             sizes: None,
             known_sizes: HashMap::new(),
             promisor,
+            common,
+            remotes,
             trees_local,
             local: Arc::default(),
             behind: Arc::default(),
@@ -164,6 +184,24 @@ impl GitSource {
     pub fn with_known_sizes(mut self, sizes: HashMap<SourceKey, u64>) -> Self {
         self.known_sizes = sizes;
         self
+    }
+
+    /// Where the repository keeps its objects and settings, as `git rev-parse
+    /// --git-common-dir` says: the repository itself, or the main one of a worktree.
+    pub fn common_dir(&self) -> &Path {
+        &self.common
+    }
+
+    /// `sha1` or `sha256`.
+    pub fn object_format(&self) -> &str {
+        if self.hash_len == 32 { "sha256" } else { "sha1" }
+    }
+
+    /// The setting `remote.<remote>.<key>` the repository had when it was opened, for
+    /// `url`, `promisor` and `partialclonefilter`; the last one where git reads several.
+    pub fn remote_setting(&self, remote: &str, key: &str) -> Option<&str> {
+        let full = format!("remote.{remote}.{key}");
+        self.remotes.iter().rev().find(|(name, _)| *name == full).map(|(_, value)| value.as_str())
     }
 
     /// The size of the blob `id` given to [`GitSource::with_known_sizes`], if it was.
@@ -810,14 +848,24 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// The remote a partial clone was made from, if `repo` is one, and its filter.
-fn promisor_remote(repo: &Path) -> Option<(String, Option<String>)> {
-    let config = git_output(repo, &["config", "--get-regexp", r"^remote\..*\.(promisor|partialclonefilter)$"]).ok()?;
-    let values: Vec<(&str, &str)> = config.lines().filter_map(|line| line.split_once(' ')).collect();
-    let remote = values.iter().find_map(|&(key, value)| {
+/// Each remote's URL, promisor flag and partial clone filter, as `(key, value)` pairs in
+/// the order git reads them.
+fn remote_settings(repo: &Path) -> Vec<(String, String)> {
+    let config = git_output(repo, &["config", "--get-regexp", r"^remote\..*\.(url|promisor|partialclonefilter)$"]);
+    let config = config.unwrap_or_default();
+    config
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn promisor_remote(values: &[(String, String)]) -> Option<(String, Option<String>)> {
+    let remote = values.iter().find_map(|(key, value)| {
         (value == "true").then(|| key.strip_prefix("remote.")?.strip_suffix(".promisor"))?
     })?;
     let filter_key = format!("remote.{remote}.partialclonefilter");
-    let filter = values.iter().rev().find(|(key, _)| *key == filter_key).map(|(_, value)| (*value).to_owned());
+    let filter = values.iter().rev().find(|(key, _)| *key == filter_key).map(|(_, value)| value.clone());
     Some((remote.to_owned(), filter))
 }
 
