@@ -154,11 +154,11 @@ jobs:
           for line in lines:
               event = json.loads(line)
               if event["event"] == "start":
-                  runs[event["sid"]] = " ".join(event["argv"][1:]).replace("/tmp/prof/", "")[:100]
+                  runs[event["sid"]] = " ".join(event["argv"][1:]).replace("/private/tmp/prof/", "").replace("/tmp/prof/", "")[:100]
               # cat-file helpers live as long as sandfs does.
               elif event["event"] == "atexit" and "/" not in event["sid"] and "cat-file" not in runs[event["sid"]]:
                   spent += event["t_abs"]
-          label = sys.argv[3].replace("/tmp/prof/", "")
+          label = sys.argv[3].replace("/private/tmp/prof/", "").replace("/tmp/prof/", "")
           print(f"{label}: {total * 1000:.0f} ms, {len(runs)} git runs, {spent * 1000:.0f} ms in the short ones")
           for sid, argv in runs.items():
               print("   ", argv)
@@ -173,6 +173,18 @@ jobs:
             profile /tmp/after/sandfs changes /tmp/prof/copy
             profile /tmp/after/sandfs changes /tmp/prof/copy
             profile /tmp/after/sandfs rm --unmount /tmp/prof/copy
+            profile /tmp/after/sandfs --version
+            # What one flush to disk costs here: sandfs flushes each durable save.
+            python3 - <<'PY'
+          import fcntl, os, time
+          fd = os.open("/tmp/prof/flush", os.O_RDWR | os.O_CREAT)
+          for name, flush in (("fsync", os.fsync), ("F_FULLFSYNC", lambda fd: fcntl.fcntl(fd, fcntl.F_FULLFSYNC))):
+              start = time.perf_counter()
+              for _ in range(20):
+                  os.write(fd, b"x" * 4096)
+                  flush(fd)
+              print(f"{name} after a 4 KiB write: {(time.perf_counter() - start) / 20 * 1000:.2f} ms")
+          PY
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
