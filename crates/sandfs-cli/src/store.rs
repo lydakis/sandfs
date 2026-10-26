@@ -210,6 +210,14 @@ impl Home {
         (mount_source(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
     }
 
+    /// The workspace mounted at `dir`, by `table`, the [`mount_table`]: its source names
+    /// the workspace, whose own record must name that mount.
+    pub fn mounted_at(&self, dir: &Path, table: &HashMap<PathBuf, String>) -> Option<String> {
+        let name = table.get(dir)?.strip_prefix("sandfs:")?;
+        check_name(name).ok()?;
+        self.attached_in(name, table).filter(|info| info.mountpoint == dir).map(|_| name.to_owned())
+    }
+
     /// [`Home::attached_mount`] by `table`, the [`mount_table`] read once for many names.
     fn attached_in(&self, name: &str, table: &HashMap<PathBuf, String>) -> Option<MountInfo> {
         let info = self.recorded_mount(name)?;
@@ -261,14 +269,8 @@ impl Home {
         // The mount table names the workspace mounted at `dir`, so this costs the same
         // with ten workspaces mounted or ten thousand. Git asks it on every command run
         // in a mount (see `sandfs git-fsmonitor`).
-        if let Ok(dir) = dir {
-            let table = mount_table();
-            let mounted = table.get(&dir).and_then(|source| source.strip_prefix("sandfs:"));
-            if let Some(name) = mounted.filter(|name| check_name(name).is_ok())
-                && self.attached_in(name, &table).is_some_and(|info| info.mountpoint == dir)
-            {
-                return Ok(name.to_owned());
-            }
+        if let Some(name) = dir.ok().and_then(|dir| self.mounted_at(&dir, &mount_table())) {
+            return Ok(name);
         }
         bail!("{what:?} is neither a workspace name nor a mounted workspace")
     }
