@@ -2043,3 +2043,46 @@ fn update_keeps_a_hard_link_the_newer_source_has_the_bytes_of() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("hard link"), "{refused:?}");
 }
+
+/// A file whose contents come from a slow server: the first read waits for them, however
+/// long the fetch takes, instead of failing.
+#[test]
+fn a_slow_first_read_waits_for_the_fetch() {
+    if !fuse_available() {
+        return;
+    }
+    let remote = tempfile::Builder::new().prefix("sandfs-remote").tempdir().unwrap();
+    let remote = remote.path();
+    git(remote, &["init", "-q"]);
+    git(remote, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::write(remote.join("README.md"), "hello\n").unwrap();
+    git(remote, &["add", "-A"]);
+    git(remote, &["commit", "-q", "-m", "first"]);
+
+    // Every fetch from the remote takes 20 s, longer than an NFS client waits for an
+    // answer before it tries again.
+    let config = tempfile::tempdir().unwrap();
+    let hook = config.path().join("slow");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 20\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let global = config.path().join("gitconfig");
+    std::fs::write(&global, format!("[uploadpack]\n\tpackObjectsHook = {}\n", hook.display())).unwrap();
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let work = dirs.path().join("work");
+    let source = format!("git:file://{}", remote.display());
+    // The mount process keeps the environment of the command that starts it.
+    let mounted = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", sandfs.home.path())
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .args(["mount", &source, work.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(mounted.status.success(), "{}", String::from_utf8_lossy(&mounted.stderr));
+    sandfs.mounts.push(work.clone());
+
+    let started = std::time::Instant::now();
+    assert_eq!(std::fs::read_to_string(work.join("README.md")).unwrap(), "hello\n");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(15), "the read fetched: {:?}", started.elapsed());
+}
