@@ -36,7 +36,7 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.31", features = ["fs", "process", "resource", "signal", "user"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18", optional = true }
