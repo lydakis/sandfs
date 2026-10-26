@@ -24,11 +24,21 @@ const MARKER: &str = ".git/sandfs-workspace";
 /// The workspace's own repository over the folder (see [`git::make_folder`]).
 const PRIVATE: &str = "folder-git";
 
-/// Keep the new workspace `name`, a fork of the files in `top`, as the real folder
-/// `dir`, which must be new or empty. `index_from` is the git index of `top`, if any.
-/// Returns the folder, resolved. On failure the folder is removed again, and the
-/// caller removes the workspace.
-pub fn make(home: &Home, name: &str, top: &Path, dir: &Path, index_from: Option<&Path>) -> Result<PathBuf> {
+/// What the folder held when the workspace last read it (see [`signature`]).
+const SYNCED: &str = "folder-synced";
+
+/// Keep the new workspace `name`, opened as `ws`, a fork of the files in `top`, as the
+/// real folder `dir`, which must be new or empty. `index_from` is the git index of
+/// `top`, if any. Returns the folder, resolved. On failure the folder is removed again,
+/// and the caller removes the workspace.
+pub fn make(
+    home: &Home,
+    name: &str,
+    ws: &Workspace,
+    top: &Path,
+    dir: &Path,
+    index_from: Option<&Path>,
+) -> Result<PathBuf> {
     let target = crate::resolve_new(dir)?;
     if target.is_dir() && std::fs::read_dir(&target)?.next().is_some() {
         bail!("{} is not empty; a fork kept as a folder needs a new or empty one", target.display());
@@ -46,11 +56,14 @@ pub fn make(home: &Home, name: &str, top: &Path, dir: &Path, index_from: Option<
         };
         record.folder = Some(dir.clone());
         home.set_record(name, &record)?;
-        let opened = home.open(name)?;
-        clone_files(&opened.ws, top, &dir)?;
+        clone_files(ws, top, &dir)?;
         let private = home.workspace_dir(name).join(PRIVATE);
-        git::make_folder(&opened.ws, (&repo, &commit, branch.as_deref()), &dir, &private, index_from)?;
-        std::fs::write(dir.join(MARKER), name).context("marking the folder")
+        git::make_folder(ws, (&repo, &commit, branch.as_deref()), &dir, &private, index_from)?;
+        std::fs::write(dir.join(MARKER), name).context("marking the folder")?;
+        // The workspace is what the folder now holds, so reading it can start from there.
+        let listed = git::folder_changes(&private, &dir)?;
+        std::fs::write(home.workspace_dir(name).join(SYNCED), signature(&dir, &listed))
+            .context("writing what the folder holds")
     })();
     if let Err(err) = made {
         let _ = store::remove_copy(&dir);
@@ -111,6 +124,13 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
     }
     let _writer = home.lock(name, &format!("sandfs, reading the changes in {}", dir.display()))?;
     let listed = git::folder_changes(&home.workspace_dir(name).join(PRIVATE), dir)?;
+    // The workspace already holds the folder's files that differ from the commit, and
+    // matches the commit elsewhere, as it did when it last read them.
+    let synced = home.workspace_dir(name).join(SYNCED);
+    let signature = signature(dir, &listed);
+    if std::fs::read_to_string(&synced).is_ok_and(|last| last == signature) {
+        return Ok(());
+    }
     let mut opened = home.open(name)?;
     let root = VPath::parse(ROOT)?;
     let git_dir = VPath::parse(&format!("{ROOT}/.git"))?;
@@ -134,13 +154,36 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
             Some(_) => {}
         }
     }
-    if gone.is_empty() && changed.is_empty() {
-        return Ok(());
+    if !gone.is_empty() || !changed.is_empty() {
+        gone.append(&mut changed);
+        let Restored { mut times, mut dirs } = std::mem::take(&mut opened.restored);
+        git::copy_changed(&mut opened.ws, dir, &gone, &mut times, &mut dirs)?;
+        opened.saved.save(&Snapshot { ws: opened.ws.fork(), times, dirs }, &root, true)?;
     }
-    gone.append(&mut changed);
-    let Restored { mut times, mut dirs } = std::mem::take(&mut opened.restored);
-    git::copy_changed(&mut opened.ws, dir, &gone, &mut times, &mut dirs)?;
-    opened.saved.save(&Snapshot { ws: opened.ws.fork(), times, dirs }, &root, true)
+    std::fs::write(&synced, signature).context("writing what the folder holds")
+}
+
+/// What the files `listed` in the folder `dir` are now, as far as their metadata says:
+/// which files, and each one's size, times, inode and mode, hashed. A file changes all
+/// of them but its name when it is written, and its change time even when it is
+/// written back as it was.
+fn signature(dir: &Path, listed: &[String]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for rel in listed {
+        rel.hash(&mut hasher);
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(rel)) else {
+            0u8.hash(&mut hasher);
+            continue;
+        };
+        (meta.len(), meta.modified().ok(), meta.file_type().is_symlink()).hash(&mut hasher);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            (meta.ino(), meta.mode(), meta.ctime(), meta.ctime_nsec()).hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 /// Whether `at` in `ws` is what `host`, of metadata `meta`, is.

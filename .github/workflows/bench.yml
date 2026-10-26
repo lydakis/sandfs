@@ -133,6 +133,48 @@ jobs:
             fi
             cat /tmp/macos.txt /tmp/macos-copies-1.json.txt
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Where the time of a fork and its changes goes
+        run: |
+          rm -rf /tmp/prof && mkdir /tmp/prof && git clone -q "$PWD" /tmp/prof/clone
+          export SANDFS_HOME=/tmp/prof/home
+          profile() {
+            rm -f /tmp/prof/trace.json
+            now() { perl -MTime::HiRes=time -e 'printf "%.6f", time'; }
+            start=$(now)
+            GIT_TRACE2_EVENT=/tmp/prof/trace.json "$@" > /dev/null
+            end=$(now)
+            python3 - "$start" "$end" "sandfs ${*:2}" <<'PY'
+          import json, sys
+          total = float(sys.argv[2]) - float(sys.argv[1])
+          runs, spent = {}, 0.0
+          try:
+              lines = open("/tmp/prof/trace.json").readlines()
+          except FileNotFoundError:
+              lines = []
+          for line in lines:
+              event = json.loads(line)
+              if event["event"] == "start":
+                  runs[event["sid"]] = " ".join(event["argv"][1:]).replace("/tmp/prof/", "")[:100]
+              # cat-file helpers live as long as sandfs does.
+              elif event["event"] == "atexit" and "/" not in event["sid"] and "cat-file" not in runs[event["sid"]]:
+                  spent += event["t_abs"]
+          label = sys.argv[3].replace("/tmp/prof/", "")
+          print(f"{label}: {total * 1000:.0f} ms, {len(runs)} git runs, {spent * 1000:.0f} ms in the short ones")
+          for sid, argv in runs.items():
+              print("   ", argv)
+          PY
+          }
+          {
+            echo '### Where the time goes (macOS)'
+            echo
+            echo '```'
+            profile /tmp/after/sandfs fork /tmp/prof/clone /tmp/prof/copy --branch prof
+            echo edit >> /tmp/prof/copy/README.md
+            profile /tmp/after/sandfs changes /tmp/prof/copy
+            profile /tmp/after/sandfs changes /tmp/prof/copy
+            profile /tmp/after/sandfs rm --unmount /tmp/prof/copy
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-macos-${{ github.sha }}

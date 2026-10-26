@@ -106,6 +106,8 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
         (None, Some(name)) => default_name(Some(name), Path::new(""))?,
         (None, None) => bail!("name the snapshot with --name, or give a directory to mount the fork on"),
     };
+    // The new workspace, when making it opened it.
+    let mut started = None;
     let from = match origin {
         Origin::Workspace(from) => {
             sync(home, &from)?;
@@ -145,9 +147,12 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
             let mut record = home.resolve_checkout(&top)?;
             record.read_only = read_only;
             home.create(&name, &record)?;
-            if let Err(err) = git::start(home, &name, branch.as_deref()) {
-                remove_unused(home, &name);
-                return Err(err);
+            match git::start(home, &name, branch.as_deref()) {
+                Ok(ws) => started = Some(ws),
+                Err(err) => {
+                    remove_unused(home, &name);
+                    return Err(err);
+                }
             }
             drop(repos);
             top.display().to_string()
@@ -172,7 +177,12 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
     let real_folder = real && dir.is_some();
     let dir = match (dir, clone_of) {
         (Some(dir), Some((top, index))) if real => {
-            Some(folder::make(home, &name, &top, dir, index.as_deref()).inspect_err(|_| remove_unused(home, &name))?)
+            let made = match started {
+                Some(ws) => Ok(ws),
+                None => home.open(&name).map(|opened| opened.ws),
+            };
+            let made = made.and_then(|ws| folder::make(home, &name, &ws, &top, dir, index.as_deref()));
+            Some(made.inspect_err(|_| remove_unused(home, &name))?)
         }
         (Some(dir), _) => Some(mount_new(home, &name, dir, *foreground).inspect_err(|_| {
             // A failed mount takes the workspace with it, and so its copy of a folder.
