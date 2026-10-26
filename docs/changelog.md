@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (2026-10-26)
+
+The main changes:
+- `sandfs fork` is the one command for a task's copy: from a workspace or its mount, from a clone on this machine (its `HEAD` plus uncommitted files, with `--branch` to push work back), or from any folder (cloned, so it takes no space, on APFS, btrfs or XFS).
+- `changes --copy-to` refuses to overwrite a file edited where it copies since the workspace started.
+- `sandfs update` moves a workspace onto a newer commit or folder, keeping only its own changes.
+- One process serves thousands of mounts, and commands in a mount stay fast however many there are.
+- sandfs never runs git with the settings of a mount's `.git`.
+
+Only the `sandfs` command changed; the Rust and Python APIs are as in 0.5.1.
 
 - **sandfs-cli, task copies**: `sandfs fork` makes the copy to hand one task, wherever it starts. FROM can now be a folder of a git repository on this machine, such as a clone: the fork is its `HEAD` plus what its folder has changed since (changed, staged, new and deleted files, links and modes, but not ignored files), copied once, so the copy keeps its starting point while work goes on in the folder, and `changes` lists them from the start; what was staged shows as unstaged in the copy, and the repository is only read. FROM can also be any folder inside a mount. `--branch NAME` starts git in the fork on a new branch at FROM's commit, keeping its files and index, so its commits go back with `git push origin NAME`; a name the repository or FROM already has is refused. `--read-only PATH` adds read-only paths. `sandfs rm --unmount NAME` (or the mount's directory) unmounts a workspace and deletes it in one step. README gains a git-to-sandfs table.
 - **sandfs-cli, git settings in a mount never run as you**: sandfs asked a server for its branches (`mount git:URL`, `fork --branch`) by running git in the folder it was started in, so started inside a mount, it took that mount's `.git/config`, which any program writing to the mount can set to run a command (a remote rewritten to an `ext::` program, say). It now asks from an empty folder, and `fork --branch` asks a partial clone's remote by its URL, not through the repository's settings. `mount git:PATH` refuses a repository inside a mounted workspace, pointing to `sandfs fork` instead.
