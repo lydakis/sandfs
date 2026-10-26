@@ -245,10 +245,13 @@ enum Origin {
     Workspace(String),
     /// The working folder of a git repository sandfs doesn't serve.
     Checkout(PathBuf),
+    /// A folder in neither.
+    Folder(PathBuf),
 }
 
 /// What `fork FROM` copies: the workspace FROM names, or is mounted on, or that holds the
-/// folder FROM; else the git repository whose working folder holds FROM.
+/// folder FROM; else the git repository whose working folder holds FROM; else the
+/// folder itself.
 fn fork_origin(home: &Home, from: &str) -> Result<Origin> {
     let not_found = match home.find(from) {
         Ok(name) => return Ok(Origin::Workspace(name)),
@@ -262,13 +265,7 @@ fn fork_origin(home: &Home, from: &str) -> Result<Origin> {
     if let Some(name) = path.ancestors().find_map(|dir| home.mounted_at(dir, &table)) {
         return Ok(Origin::Workspace(name));
     }
-    match git::working_folder(&path) {
-        Some(top) => Ok(Origin::Checkout(top)),
-        None => bail!(
-            "{from} is neither in a workspace nor in a git repository, and forking a plain folder isn't \
-             supported yet; `sandfs mount {from} DIR` mounts it, showing its later changes too"
-        ),
-    }
+    Ok(git::working_folder(&path).map_or(Origin::Folder(path), Origin::Checkout))
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -331,9 +328,30 @@ fn run(cli: Cli) -> Result<()> {
                     drop(repos);
                     top.display().to_string()
                 }
+                Origin::Folder(folder) => {
+                    if branch.is_some() {
+                        bail!("--branch needs a git repository, and {} is a plain folder", folder.display());
+                    }
+                    let repos = home.repos_lock(false)?;
+                    let mut record = home.freeze(&folder)?;
+                    record.read_only = read_only;
+                    if let Err(err) = home.create(&name, &record) {
+                        if let Base::Dir { path } = &record.base {
+                            let _ = store::remove_copy(path);
+                        }
+                        return Err(err);
+                    }
+                    drop(repos);
+                    record.source
+                }
             };
             match dir {
-                Some(dir) => mount_new(&home, &name, &dir, foreground),
+                Some(dir) => mount_new(&home, &name, &dir, foreground).inspect_err(|_| {
+                    // A failed mount takes the workspace with it, and so its copy of a folder.
+                    if let Ok(_creating) = home.repos_lock(true) {
+                        let _ = home.remove_unused_copies();
+                    }
+                }),
                 None => {
                     println!("{name} forked from {from}");
                     Ok(())
@@ -416,8 +434,12 @@ fn run(cli: Cli) -> Result<()> {
                 unmount(&home, &name, &info)?;
             }
             home.record(&name)?;
-            let _writer = home.lock(&name, "sandfs rm")?;
-            home.remove(&name)
+            let writer = home.lock(&name, "sandfs rm")?;
+            home.remove(&name)?;
+            drop(writer);
+            // A copy of a folder goes with the last workspace over it.
+            let _creating = home.repos_lock(true)?;
+            home.remove_unused_copies()
         }
         Cmd::Clean => clean(&home),
         Cmd::Serve { mcp, workspace, name, read_only } => {
@@ -655,6 +677,7 @@ fn mount(home: &Home, name: &str, dir: &Path, foreground: bool) -> Result<()> {
 /// workspaces need, and delete those none uses.
 fn clean(home: &Home) -> Result<()> {
     let _creating = home.repos_lock(true)?;
+    home.remove_unused_copies()?;
     let repos = home.root().join("repos");
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     // The workspaces over each local copy, and the commits they are of.

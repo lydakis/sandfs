@@ -554,7 +554,7 @@ fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch
     assert_eq!(std::fs::read_to_string(repo.join("draft.txt")).unwrap(), "draft, finished\n");
 
     // Refused before anything is made: a branch the repository or a copy has, a name git
-    // won't take, a remote repository's branch, a folder source, a plain folder, and a
+    // won't take, a remote repository's branch, a folder source, a plain folder's branch, and a
     // workspace that exists.
     let refused = |sandfs: &Sandfs, args: &[&str], message: &str| {
         let output = sandfs.try_run(args);
@@ -590,7 +590,7 @@ fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch
     let folder = data.path().join("folder");
     sandfs.mount(&["mount", plain.to_str().unwrap(), folder.to_str().unwrap()], &folder);
     refused(&sandfs, &["fork", "folder", other, "--branch", "two"], "is a folder");
-    refused(&sandfs, &["fork", plain.to_str().unwrap(), other], "forking a plain folder isn't supported");
+    refused(&sandfs, &["fork", plain.to_str().unwrap(), other, "--branch", "two"], "needs a git repository");
     refused(&sandfs, &["fork", repo_path, other, "--name", "task"], "already exists");
     assert_eq!(sandfs.stdout(&["list"]).lines().count(), 6, "no workspace was left behind");
     for dir in [&second, &remote, &folder] {
@@ -602,6 +602,88 @@ fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch
     sandfs.run(&["rm", "--unmount", task.to_str().unwrap()]);
     sandfs.mounts.clear();
     assert!(!sandfs.stdout(&["list"]).lines().any(|line| line.starts_with("task\t")));
+}
+
+#[test]
+fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !fuse_available() {
+        return;
+    }
+    let mut sandfs = Sandfs::new();
+    let data = tempfile::tempdir().unwrap();
+    let folder = data.path().join("notes");
+    std::fs::create_dir_all(folder.join("drafts")).unwrap();
+    std::fs::write(folder.join("todo.md"), "a\n").unwrap();
+    std::fs::write(folder.join("drafts/plan.md"), "plan\n").unwrap();
+    std::fs::write(folder.join("run.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(folder.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("todo.md", folder.join("todo")).unwrap();
+    let copies_dir = sandfs.home.path().join("copies");
+    let copies = || std::fs::read_dir(&copies_dir).map_or(0, Iterator::count);
+
+    let task = data.path().join("task");
+    let output = sandfs.try_run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    if !output.status.success() {
+        // A disk that can't clone files, such as ext4, refuses, leaving nothing behind.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("needs the folder and sandfs's home on one disk that clones files"), "{stderr}");
+        if cfg!(target_os = "macos") {
+            panic!("APFS clones files: {stderr}");
+        }
+        assert!(!sandfs.stdout(&["list"]).contains("task"));
+        assert_eq!(copies(), 0);
+        return;
+    }
+    sandfs.mounts.push(task.clone());
+    let secs = |path: &Path| {
+        std::fs::metadata(path).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    };
+
+    // The fork is the folder as it was, times and modes included; later edits there stay out.
+    assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "a\n");
+    assert_eq!(secs(&task.join("todo.md")), secs(&folder.join("todo.md")));
+    assert_ne!(std::fs::metadata(task.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
+    assert_eq!(std::fs::read_link(task.join("todo")).unwrap(), Path::new("todo.md"));
+    std::fs::write(folder.join("todo.md"), "a, mine\n").unwrap();
+    std::fs::write(folder.join("drafts/plan.md"), "plan, mine\n").unwrap();
+    assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "a\n");
+    assert_eq!(std::fs::read_to_string(task.join("drafts/plan.md")).unwrap(), "plan\n");
+
+    // Its work goes back with `changes --copy-to`, which won't lose an edit made in the
+    // folder since.
+    std::fs::write(task.join("drafts/plan.md"), "plan, done\n").unwrap();
+    std::fs::write(task.join("new.md"), "new\n").unwrap();
+    assert_eq!(sandfs.stdout(&["changes", "task"]), "M drafts/plan.md\nA new.md\n");
+    let output = sandfs.try_run(&["changes", "task", "--copy-to", folder.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && stderr.contains("would lose that: drafts/plan.md;"), "{stderr}");
+    assert!(!folder.join("new.md").exists(), "nothing was written");
+    std::fs::write(folder.join("drafts/plan.md"), "plan\n").unwrap();
+    sandfs.run(&["changes", "task", "--copy-to", folder.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(folder.join("drafts/plan.md")).unwrap(), "plan, done\n");
+    assert_eq!(std::fs::read_to_string(folder.join("new.md")).unwrap(), "new\n");
+    assert_eq!(std::fs::read_to_string(folder.join("todo.md")).unwrap(), "a, mine\n", "unchanged in the fork");
+
+    // A snapshot of the fork shares its copy, which goes with the last workspace over it,
+    // however the home is named.
+    sandfs.run(&["fork", "task", "--name", "snap"]);
+    let linked = data.path().join("home");
+    std::os::unix::fs::symlink(sandfs.home.path(), &linked).unwrap();
+    let rm = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", &linked)
+        .args(["rm", "--unmount", "task"])
+        .output()
+        .unwrap();
+    assert!(rm.status.success(), "{}", String::from_utf8_lossy(&rm.stderr));
+    sandfs.mounts.clear();
+    assert_eq!(copies(), 1);
+    sandfs.mount(&["mount", "snap", task.to_str().unwrap()], &task);
+    assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "a\n");
+    sandfs.run(&["rm", "--unmount", "snap"]);
+    sandfs.mounts.clear();
+    assert_eq!(copies(), 0);
 }
 
 #[test]

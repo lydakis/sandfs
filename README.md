@@ -149,6 +149,14 @@ git push origin fix-login                  # the branch is now in ~/proj
 sandfs rm --unmount fix-login              # done with the copy
 ```
 
+A folder that isn't in git forks too: the copy is the folder as it is now, its files cloned rather than copied (on APFS, btrfs or XFS; ext4 can't clone, so there it is refused), and `changes --copy-to` brings the work back, refusing to overwrite a file edited in the folder meanwhile:
+
+```bash
+sandfs fork ~/notes ~/tasks/tidy-notes
+sandfs changes tidy-notes --copy-to ~/notes   # ...after the work...
+sandfs rm --unmount tidy-notes
+```
+
 If you know git, the rest maps one to one:
 
 | git | sandfs |
