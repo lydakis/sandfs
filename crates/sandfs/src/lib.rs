@@ -1,35 +1,74 @@
-//! Lazy, copy-on-write workspaces over host folders and git repositories, saved on
-//! disk and mounted as directories: FUSE on Linux, and on macOS an NFS server on
-//! localhost that macOS's own client mounts. This is the library behind the `sandfs`
-//! command, for programs that want its workspaces without running it.
+//! Copies of folders that cost nothing to make, saved on disk and mounted as real
+//! folders any program can work in: FUSE on Linux, and on macOS an NFS server on
+//! localhost that macOS's own client mounts, so nothing needs installing. This is the
+//! library behind the `sandfs` command, for a program that wants those copies without
+//! anyone installing or running `sandfs`.
 //!
 //! Workspaces live in a [`Home`], a folder of their saved changes. Each is over a
-//! source, read lazily and never written to: a host folder, a commit of a git
-//! repository (remote ones become partial clones, fetched as files are read), or a
-//! frozen copy of a plain folder. Every operation of the command is a method:
+//! source, read lazily and never written to: a folder on disk, a commit of a git
+//! repository (a remote one is fetched a file at a time, as files are read), or a
+//! frozen copy of a plain folder. Every command of `sandfs` is a method of [`Home`]
+//! that returns what it found:
+//!
+//! - [`Home::mount`] makes a workspace over a source and mounts it at a folder.
+//! - [`Home::fork`] copies a workspace, with its changes so far and none of its
+//!   source, mounted or kept as a snapshot.
+//! - [`Home::changes`] lists the files a workspace added, modified or deleted, against
+//!   its source or another workspace, and with [`ChangesOptions::copy_to`] writes them
+//!   into a folder.
+//! - [`Home::update`] moves a workspace onto a newer version of its source, keeping
+//!   its own changes, even while it is mounted.
+//! - [`Home::workspaces`], [`Home::unmount`], [`Home::remove`] and [`Home::clean`]
+//!   list, unmount and delete them, and free downloaded space.
+//! - [`Home::serve_mcp`] hands a workspace to an agent as MCP file tools, and
+//!   [`Home::shell`] runs a command confined to a mount by the operating system's
+//!   sandbox.
 //!
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
 //! // First thing in `main`: sandfs runs this program again to serve mounts.
 //! sandfs::handle_relaunch(&[]);
 //! let home = sandfs::Home::locate()?;
+//! // A folder, mounted at /tmp/docs; /srv/docs itself is never written to.
 //! let docs = home.mount("/srv/docs", "/tmp/docs".as_ref(), &Default::default())?;
+//! // A copy of it, mounted at /tmp/attempt, which any program can work in.
 //! let attempt = home.fork(&docs.name, Some("/tmp/attempt".as_ref()), &Default::default())?;
 //! std::fs::write("/tmp/attempt/notes.md", "draft\n")?;
 //! for change in home.changes(&attempt.name, &Default::default())?.changes {
-//!     println!("{:?} {}", change.kind, change.path);
+//!     println!("{:?} {}", change.kind, change.path); // Added notes.md
 //! }
 //! home.remove(&attempt.name, true)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! A mount is served by one background process per home, which outlives the program
-//! that asked for it. That process is this program, started again; see
-//! [`handle_relaunch`].
+//! `examples/attempts.rs` in the repository runs a whole round trip in a temporary
+//! folder: two copies of a folder, changed two ways, compared, and one written back.
+//! [Graft](https://github.com/lydakis/graft), which gives each task its own copy of a
+//! GitHub repository, is a program built on this crate.
 //!
-//! `sandfs-core` is the in-memory engine underneath: sources, forks and changes,
-//! with nothing on disk.
+//! # The one line in `main`
+//!
+//! A mount is served by one background process per home, which outlives the program
+//! that asked for it. That process is this program, started again, so
+//! [`handle_relaunch`] must be the first thing in `main`: in those runs it serves the
+//! mounts and exits. A program with commands of its own passes a word none of them
+//! uses, such as `&["sandfs"]`.
+//!
+//! # Before you build on it
+//!
+//! - sandfs is pre-1.0: a minor release (0.7 to 0.8) may change this API, and the
+//!   changelog says how. Depend on one minor version, such as `sandfs = "0.7"`.
+//! - Every file operation in a mount goes through the mount's process, and on macOS
+//!   each write is also a round trip over localhost before it returns, so write-heavy
+//!   work runs slower there than in a plain folder: compiling ripgrep from scratch
+//!   took about 18 s in a mount against 13 s outside one on the same Mac (October
+//!   2026).
+//! - Mounting needs the default `mount` feature, and on Linux FUSE 3
+//!   (`fusermount3`). Without it, and on Windows, everything but mounting works.
+//!
+//! `sandfs-core` is the in-memory engine underneath: sources, forks and changes, with
+//! nothing on disk.
 
 // Without a mount, mounting is stubbed out, which leaves its helpers unused.
 #![cfg_attr(not(mount), allow(dead_code, unused_imports))]
@@ -53,6 +92,11 @@ mod server;
 mod shell;
 mod store;
 mod update;
+
+// Keeps the README example compiling.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExample;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
