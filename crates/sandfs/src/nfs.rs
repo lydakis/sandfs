@@ -603,9 +603,13 @@ fn mount_options(port: u16) -> String {
         &format!("port={port},mountport={port}"),
         // Advisory locks stay on this machine, where every program using the mount is.
         "locallocks",
-        // Fail instead of hanging forever if this process dies without unmounting.
-        "soft",
+        // A soft mount gives up on any call after at most 30 s, however its timeouts
+        // are set, so a first read waiting on a slow fetch failed. A hard mount waits,
+        // and should this process die without unmounting, calls fail once it has not
+        // answered for a minute, rather than hang forever.
+        "hard",
         "intr",
+        "deadtimeout=60",
         // Send each write to the server before it returns, as FUSE does, instead of
         // keeping it in the client's cache, so a save sees every write that returned.
         "sync",
