@@ -53,6 +53,11 @@ use crate::fs::{FsResult, Inner, MAX_FILE_SIZE, ROOT_INO, Shared};
 #[cfg(nfs)]
 const MOUNT_CHECK: Duration = Duration::from_millis(500);
 
+/// How often it checks while a mount is going: after an unmount call, which the client
+/// sends before the mount leaves the table, for at most [`MOUNT_CHECK`].
+#[cfg(nfs)]
+const UNMOUNT_CHECK: Duration = Duration::from_millis(10);
+
 /// Listed names kept track of, at most: past this the oldest are forgotten, and a
 /// client resuming after one of those resumes by the entry's current name.
 const LISTED_NAMES: usize = 16384;
@@ -531,7 +536,18 @@ fn watch(dir: &Path, source: String) -> std::io::Result<tokio::sync::oneshot::Re
             let checked = watched.clone();
             std::thread::Builder::new().name("mount checks".to_owned()).spawn(move || {
                 loop {
-                    std::thread::sleep(MOUNT_CHECK);
+                    let unmounting = {
+                        let (left, call) = &UNMOUNTING;
+                        let mut left = left.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if *left == 0 {
+                            left = call.wait_timeout(left, MOUNT_CHECK).unwrap_or_else(|err| err.into_inner()).0;
+                        }
+                        *left = left.saturating_sub(1);
+                        *left > 0
+                    };
+                    if unmounting {
+                        std::thread::sleep(UNMOUNT_CHECK);
+                    }
                     // Mounts are only added at the end, so the first `before` were watched
                     // before the table was read; one added since may be missing from it.
                     let before = checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
@@ -547,6 +563,10 @@ fn watch(dir: &Path, source: String) -> std::io::Result<tokio::sync::oneshot::Re
                         index += 1;
                         !gone.is_closed() && (!read || table.get(dir) == Some(source))
                     });
+                    // The mount that was going is gone: back to checking now and then.
+                    if unmounting && checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() < before {
+                        *UNMOUNTING.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
+                    }
                 }
             })?;
             *started = Some(watched.clone());
@@ -557,6 +577,20 @@ fn watch(dir: &Path, source: String) -> std::io::Result<tokio::sync::oneshot::Re
     let (gone, wait) = tokio::sync::oneshot::channel();
     watched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((dir.to_path_buf(), source, gone));
     Ok(wait)
+}
+
+/// How many quick checks of the mount table are left, and the unmount call that asks
+/// for them: anyone can send one, so it only makes the table be read sooner.
+#[cfg(nfs)]
+static UNMOUNTING: (Mutex<u32>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// Check the mount table every [`UNMOUNT_CHECK`] for a while, as a mount is going.
+#[cfg(nfs)]
+fn unmounting() {
+    let (left, call) = &UNMOUNTING;
+    *left.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        (MOUNT_CHECK.as_millis() / UNMOUNT_CHECK.as_millis()) as u32;
+    call.notify_one();
 }
 
 /// `mount_nfs` options for a server on localhost `port`, which also answers the mount
@@ -621,6 +655,8 @@ struct Gate {
 impl CallFilter for Gate {
     fn check(&self, call: &[u8]) -> Verdict {
         if is_unmount_call(call) {
+            #[cfg(nfs)]
+            unmounting();
             Verdict::Reply(unmounted(call))
         } else if !call_allowed(call, &self.users) {
             Verdict::Reply(refusal(call))
@@ -660,7 +696,7 @@ fn call_allowed(call: &[u8], users: &[u32]) -> bool {
 
 /// Whether `call` is a mount-protocol UMNT or UMNTALL call. The server stops serving
 /// when it gets one, whoever sent it, so the gate answers these itself; the server
-/// sees the mount go from the mount table instead.
+/// sees the mount go from the mount table instead, which it reads at once.
 fn is_unmount_call(call: &[u8]) -> bool {
     let word = |at: usize| call.get(at..at + 4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()));
     word(4) == Some(0) && word(12) == Some(100005) && matches!(word(20), Some(3 | 4))
