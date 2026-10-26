@@ -33,7 +33,7 @@ use anyhow::{Context, Result, bail};
 use sandfs_core::{DirSource, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
-use crate::host::mount_source;
+use crate::host::{mount_source, mount_table};
 use crate::persist::{Restored, Saved, is_object_gone};
 
 /// Where a workspace's source is mounted inside the core workspace. The mount
@@ -194,7 +194,12 @@ impl Home {
 
     /// Where `name` is mounted, if a live process is serving it.
     pub fn mount_info(&self, name: &str) -> Option<MountInfo> {
-        self.attached_mount(name).filter(|info| crate::host::alive(info.pid))
+        self.mount_info_in(name, &mount_table())
+    }
+
+    /// [`Home::mount_info`] by `table`, the [`mount_table`] read once for many names.
+    pub fn mount_info_in(&self, name: &str, table: &HashMap<PathBuf, String>) -> Option<MountInfo> {
+        self.attached_in(name, table).filter(|info| crate::host::alive(info.pid))
     }
 
     /// Where `name` was mounted, if that mount is still attached, even when the process
@@ -203,6 +208,20 @@ impl Home {
         let info = self.recorded_mount(name)?;
         // Only this workspace's mount: another filesystem may have taken the path since.
         (mount_source(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
+    }
+
+    /// The workspace mounted at `dir`, by `table`, the [`mount_table`]: its source names
+    /// the workspace, whose own record must name that mount.
+    pub fn mounted_at(&self, dir: &Path, table: &HashMap<PathBuf, String>) -> Option<String> {
+        let name = table.get(dir)?.strip_prefix("sandfs:")?;
+        check_name(name).ok()?;
+        self.attached_in(name, table).filter(|info| info.mountpoint == dir).map(|_| name.to_owned())
+    }
+
+    /// [`Home::attached_mount`] by `table`, the [`mount_table`] read once for many names.
+    fn attached_in(&self, name: &str, table: &HashMap<PathBuf, String>) -> Option<MountInfo> {
+        let info = self.recorded_mount(name)?;
+        (*table.get(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
     }
 
     /// The mount recorded for `name`, attached or not.
@@ -247,12 +266,11 @@ impl Home {
                 _ => dir,
             })
         });
-        if let Ok(dir) = dir {
-            for name in self.names()? {
-                if self.attached_mount(&name).is_some_and(|info| info.mountpoint == dir) {
-                    return Ok(name);
-                }
-            }
+        // The mount table names the workspace mounted at `dir`, so this costs the same
+        // with ten workspaces mounted or ten thousand. Git asks it on every command run
+        // in a mount (see `sandfs git-fsmonitor`).
+        if let Some(name) = dir.ok().and_then(|dir| self.mounted_at(&dir, &mount_table())) {
+            return Ok(name);
         }
         bail!("{what:?} is neither a workspace name nor a mounted workspace")
     }

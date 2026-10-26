@@ -258,15 +258,9 @@ fn fork_origin(home: &Home, from: &str) -> Result<Origin> {
     if !path.is_dir() {
         return Err(not_found);
     }
-    let mounts: Vec<(String, PathBuf)> = home
-        .names()?
-        .into_iter()
-        .filter_map(|name| home.attached_mount(&name).map(|info| (name, info.mountpoint)))
-        .collect();
-    for dir in path.ancestors() {
-        if let Some((name, _)) = mounts.iter().find(|(_, mountpoint)| mountpoint == dir) {
-            return Ok(Origin::Workspace(name.clone()));
-        }
+    let table = host::mount_table();
+    if let Some(name) = path.ancestors().find_map(|dir| home.mounted_at(dir, &table)) {
+        return Ok(Origin::Workspace(name));
     }
     match git::working_folder(&path) {
         Some(top) => Ok(Origin::Checkout(top)),
@@ -400,9 +394,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::List => {
             let mut out = String::new();
+            let table = host::mount_table();
             for name in home.names()? {
                 let record = home.record(&name)?;
-                let mounted = home.mount_info(&name).map(|info| info.mountpoint.display().to_string());
+                let mounted = home.mount_info_in(&name, &table).map(|info| info.mountpoint.display().to_string());
                 writeln!(out, "{name}\t{}\t{}", record.source, mounted.as_deref().unwrap_or("-"))?;
             }
             print_out(&out)
