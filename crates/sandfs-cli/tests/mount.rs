@@ -112,7 +112,20 @@ fn mount_fork_changes_and_remount() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(main.join("run.sh"), "#!/bin/sh\necho ran\n").unwrap();
         std::fs::set_permissions(main.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let out = Command::new(main.join("run.sh")).output().unwrap();
+        // Another test's child can hold the script open for writing for a
+        // moment between its fork and exec, so a busy file is tried again.
+        let run = || Command::new(main.join("run.sh")).output();
+        let out = (0..50)
+            .map(|_| run())
+            .find(|out| {
+                let busy = matches!(out, Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy);
+                if busy {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                !busy
+            })
+            .unwrap_or_else(run)
+            .unwrap();
         assert_eq!(out.stdout, b"ran\n");
         std::fs::write(main.join("plain.sh"), "#!/bin/sh\necho ran\n").unwrap();
         let denied = Command::new(main.join("plain.sh")).output().unwrap_err();
