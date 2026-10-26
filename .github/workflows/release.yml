@@ -184,12 +184,15 @@ jobs:
             echo "::warning::CARGO_REGISTRY_TOKEN is not set, so no crates were published"
             exit 0
           fi
-          # cargo waits only a minute for each crate to show up on crates.io before
-          # publishing the ones that depend on it, and crates.io is sometimes
-          # slower (0.7.1 stopped after sandfs-core). On that timeout, wait and
-          # publish what is still missing.
+          # cargo waits only a minute for each crate to show up in the crates.io
+          # index before publishing the ones that depend on it, and the index is
+          # sometimes much slower (0.7.1 stopped after sandfs-core, and the index
+          # still lacked it 15 minutes later). While a crate is published but not
+          # yet in the index, cargo either times out waiting for it or can't
+          # resolve it as a dependency; on either, wait and publish what is still
+          # missing, for up to half an hour.
           set -o pipefail
-          for attempt in 1 2 3 4 5; do
+          for attempt in $(seq 15); do
             packages=()
             for crate in $(jq -r '.packages[] | select(.publish != []) | .name' <<<"$metadata"); do
               if ! curl -sf -A "sandfs-release (https://github.com/lydakis/sandfs)" "https://crates.io/api/v1/crates/$crate/$version" > /dev/null; then
@@ -203,10 +206,10 @@ jobs:
             if cargo publish "${packages[@]}" 2>&1 | tee publish.log; then
               exit 0
             fi
-            if ! grep -q "timeout while waiting for published dependencies" publish.log; then
+            if ! grep -qE "timeout while waiting for published dependencies|failed to select a version for the requirement \`sandfs" publish.log; then
               exit 1
             fi
-            echo "::warning::crates.io was slow to show a published crate (attempt $attempt); retrying the rest"
-            sleep 60
+            echo "::warning::the crates.io index doesn't show a published crate yet (attempt $attempt); retrying the rest"
+            sleep 120
           done
           exit 1
