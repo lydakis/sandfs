@@ -132,7 +132,7 @@ jobs:
               echo
             fi
             cat /tmp/macos.txt /tmp/macos-copies-1.json.txt
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-macos-${{ github.sha }}
