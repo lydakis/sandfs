@@ -23,7 +23,7 @@ use sandfs_core::{Kind, Listing, Source, SourceEntry, SourceKey, VPath, Workspac
 use sandfs_git::{GitSource, ObjectIds};
 
 use crate::github;
-use crate::persist::{PathState, Snapshot};
+use crate::persist::{PathState, Restored, Snapshot};
 use crate::store::{Base, Home, ROOT, expand};
 
 /// Resolve `spec` (what follows `git:`) to a local repository and a commit id,
@@ -73,6 +73,16 @@ pub fn resolve_branch(repos: &Path, spec: &str) -> Result<(PathBuf, String, Opti
     })
 }
 
+/// The repository whose working folder is `top`, its `HEAD` commit, and the branch
+/// checked out there, taking `top` as a path, never as a source with an `@revision`.
+pub fn resolve_head(top: &Path) -> Result<(PathBuf, String, Option<String>)> {
+    let repo = top.canonicalize().with_context(|| format!("no repository at {}", top.display()))?;
+    let commit = commit_of(&repo, "HEAD")?;
+    let branch = local_branch(&repo, "HEAD")
+        .filter(|branch| commit_of(&repo, &format!("refs/heads/{branch}")).is_ok_and(|tip| tip == commit));
+    Ok((repo, commit, branch))
+}
+
 /// The branch `rev` names in a local repository, if any.
 fn local_branch(repo: &Path, rev: &str) -> Option<String> {
     if rev == "HEAD" {
@@ -116,32 +126,25 @@ pub fn open(
     Ok((files, Arc::new(dir)))
 }
 
-/// Give the new git workspace `name` what `mount --branch` and `--uncommitted` ask for
-/// before it is first mounted: git on a branch of its own at the mounted commit, and
-/// the files the repository's folder has changed since that commit, copied in once.
+/// Make the new git workspace `name`, over the `HEAD` of a repository on this machine,
+/// a copy of the repository's working folder (see `fork`): the files the folder has
+/// changed since that commit, copied in once, and with `branch`, git on a branch of its
+/// own at the commit.
 ///
 /// Both are written into the workspace like any change, so the repository is only
 /// read, and `changes` lists the copied files from the start.
-pub fn start(home: &Home, name: &str, uncommitted: bool, branch: Option<&str>) -> Result<()> {
+pub fn start(home: &Home, name: &str, branch: Option<&str>) -> Result<()> {
     let record = home.record(name)?;
     let Base::Git { repo, commit, .. } = &record.base else {
-        bail!("--uncommitted and --branch work with a git: source, and {} is a folder", record.source);
+        bail!("{} is not a git repository", record.source);
     };
-    let managed = repo.starts_with(home.root().join("repos"));
     // Checked before anything is written, so a refusal leaves nothing to undo.
-    let folder = if uncommitted {
-        if managed {
-            bail!("--uncommitted copies changes from a folder on this machine, and {} is remote", record.source);
-        }
-        Some(changed_files(repo, commit)?)
-    } else {
-        None
-    };
+    let (top, changed) = changed_files(repo, commit)?;
     if let Some(branch) = branch {
         check_new_branch(repo, branch)?;
     }
 
-    let _writer = home.lock(name, "sandfs mount, preparing the workspace")?;
+    let _writer = home.lock(name, "sandfs fork, preparing the workspace")?;
     let mut opened = home.open(name)?;
     let ws = &mut opened.ws;
     // Read-only paths keep programs from changing the copy, not the copy from being
@@ -155,11 +158,60 @@ pub fn start(home: &Home, name: &str, uncommitted: bool, branch: Option<&str>) -
         ws.write(&format!("{ROOT}/.git/HEAD"), format!("ref: refs/heads/{branch}\n"))?;
         ws.write(&format!("{ROOT}/.git/refs/heads/{branch}"), format!("{commit}\n"))?;
     }
-    if let Some((top, changed)) = folder {
-        copy_changed(ws, &top, &changed, &mut times, &mut dirs)?;
-    }
+    copy_changed(ws, &top, &changed, &mut times, &mut dirs)?;
     let snapshot = Snapshot { ws: ws.fork(), times, dirs };
     opened.saved.save(&snapshot, &VPath::parse(ROOT)?, true)
+}
+
+/// The top of the git working folder that holds `folder`, if any.
+pub fn working_folder(folder: &Path) -> Option<PathBuf> {
+    let top = git(folder, &["rev-parse", "--show-toplevel"]).ok().filter(|top| !top.is_empty())?;
+    Some(PathBuf::from(top))
+}
+
+/// Put git in workspace `name`, just forked from a git workspace, on a new branch
+/// `branch` at the commit it is on, as `git switch -c` would: files and the index stay.
+pub fn switch_new(home: &Home, name: &str, branch: &str) -> Result<()> {
+    let record = home.record(name)?;
+    let Base::Git { repo, .. } = &record.base else {
+        bail!("--branch works with a git: source, and {} is a folder", record.source);
+    };
+    check_new_branch(repo, branch)?;
+
+    let _writer = home.lock(name, "sandfs fork, preparing the workspace")?;
+    let mut opened = home.open(name)?;
+    let ws = &mut opened.ws;
+    let head = ws.read_text(&format!("{ROOT}/.git/HEAD")).context("reading the fork's .git/HEAD")?;
+    let commit = match head.trim().strip_prefix("ref: ") {
+        Some(full) => ref_in(ws, full)?.with_context(|| format!("{full} has no commit yet"))?,
+        None => head.trim().to_owned(),
+    };
+    let full = format!("refs/heads/{branch}");
+    if ref_in(ws, &full)?.is_some() {
+        bail!("the workspace already has a branch {branch}; pick another name");
+    }
+    for path in &record.read_only {
+        ws.set_read_only(&format!("{ROOT}/{path}"), false)?;
+    }
+    ws.write(&format!("{ROOT}/.git/HEAD"), format!("ref: {full}\n"))?;
+    ws.write(&format!("{ROOT}/.git/{full}"), format!("{commit}\n"))?;
+    // Saved again in full, so the times the fork's files were saved with go along.
+    let Restored { times, dirs } = std::mem::take(&mut opened.restored);
+    let snapshot = Snapshot { ws: ws.fork(), times, dirs };
+    opened.saved.save(&snapshot, &VPath::parse(ROOT)?, true)
+}
+
+/// The commit ref `full` (such as `refs/heads/main`) names in the `.git` of `ws`: its own
+/// file, else its line in `packed-refs`.
+fn ref_in(ws: &Workspace, full: &str) -> Result<Option<String>> {
+    if let Ok(commit) = ws.read_text(&format!("{ROOT}/.git/{full}")) {
+        return Ok(Some(commit.trim().to_owned()));
+    }
+    let Ok(packed) = ws.read_text(&format!("{ROOT}/.git/packed-refs")) else { return Ok(None) };
+    Ok(packed.lines().find_map(|line| {
+        let (commit, name) = line.split_once(' ')?;
+        (name == full && !commit.starts_with('#')).then(|| commit.to_owned())
+    }))
 }
 
 /// The working folder of local repository `repo`, and the files in it that differ from
@@ -167,12 +219,13 @@ pub fn start(home: &Home, name: &str, uncommitted: bool, branch: Option<&str>) -
 /// doesn't ignore. Deleted files come first, so a folder that replaced a file is made
 /// after the file is gone.
 fn changed_files(repo: &Path, commit: &str) -> Result<(PathBuf, Vec<String>)> {
-    let top = git(repo, &["rev-parse", "--show-toplevel"]).ok().filter(|top| !top.is_empty()).with_context(|| {
-        format!("--uncommitted needs a repository with a working folder, and {} has none", repo.display())
-    })?;
+    let top = git(repo, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .filter(|top| !top.is_empty())
+        .with_context(|| format!("{} has no working folder to copy", repo.display()))?;
     let top = PathBuf::from(top);
     if commit_of(&top, "HEAD")? != commit {
-        bail!("--uncommitted brings in changes made since HEAD, so mount the repository at HEAD (no @revision)");
+        bail!("{} moved to another commit while it was being copied; try again", top.display());
     }
     let split = |out: Vec<u8>| -> Result<Vec<String>> {
         out.split(|&byte| byte == 0)
