@@ -32,11 +32,13 @@ suite() { # label dir
   phase "$L cargo build (no-op)" "$D" cargo build --offline -q
   echo "// edit" >> "$D/crates/core/main.rs"
   phase "$L cargo build (one edit)" "$D" cargo build --offline -q
+  phase "$L git status (after build, no file monitor)" "$D" git -c core.fsmonitor=false status --porcelain
   phase "$L git status (after build)" "$D" git status --porcelain
 }
 
 uname -a | tee -a "$R"; nproc | tee -a "$R"; findmnt -no FSTYPE -T "$W" | tee -a "$R"
 git config --global --add safe.directory '*'
+git config --global advice.detachedHead false
 git clone -q https://github.com/BurntSushi/ripgrep "$W/rg-src"
 git -C "$W/rg-src" checkout -q 14.1.1
 (cd "$W/rg-src" && cargo fetch -q)
@@ -83,9 +85,12 @@ copies() { # fs-label base-dir
   rm -rf "$B/clone" "$SANDFS_HOME"
 }
 mkdir -p "$W/ext4"
-copies ext4 "$W/ext4"
-copies btrfs /mnt/btrfs
-copies xfs /mnt/xfs
+for round in 1 2; do
+  log "### round $round"
+  copies ext4 "$W/ext4"
+  copies btrfs /mnt/btrfs
+  copies xfs /mnt/xfs
+done
 
 # B. FUSE transports over the same clone.
 if [ -x "$HP" ]; then
@@ -113,4 +118,5 @@ if [ -x "$HP" ]; then
   hp "fuse no cache" --nopassthrough --nocache
 fi
 log "done"
+echo "=== RESULTS ==="; grep -v '^    ' "$R" | grep -v '^      \|^  -\|^Usage\|^options\|^Fuse lowlevel\|^$' 
 cat "$R" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
