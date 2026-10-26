@@ -666,9 +666,17 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     assert_eq!(std::fs::read_to_string(folder.join("new.md")).unwrap(), "new\n");
     assert_eq!(std::fs::read_to_string(folder.join("todo.md")).unwrap(), "a, mine\n", "unchanged in the fork");
 
-    // A snapshot of the fork shares its copy, which goes with the last workspace over it.
+    // A snapshot of the fork shares its copy, which goes with the last workspace over it,
+    // however the home is named.
     sandfs.run(&["fork", "task", "--name", "snap"]);
-    sandfs.run(&["rm", "--unmount", "task"]);
+    let linked = data.path().join("home");
+    std::os::unix::fs::symlink(sandfs.home.path(), &linked).unwrap();
+    let rm = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .env("SANDFS_HOME", &linked)
+        .args(["rm", "--unmount", "task"])
+        .output()
+        .unwrap();
+    assert!(rm.status.success(), "{}", String::from_utf8_lossy(&rm.stderr));
     sandfs.mounts.clear();
     assert_eq!(copies(), 1);
     sandfs.mount(&["mount", "snap", task.to_str().unwrap()], &task);

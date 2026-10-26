@@ -471,15 +471,19 @@ impl Home {
     /// [`Home::repos_lock`] exclusively, so no workspace over one is being made.
     pub fn remove_unused_copies(&self) -> Result<()> {
         let Ok(entries) = std::fs::read_dir(self.copies_dir()) else { return Ok(()) };
+        // Compared as the disk sees them, since the home may have been named another way
+        // (through a link, as /tmp is on macOS) when a workspace was made.
         let mut used = Vec::new();
         for name in self.names()? {
-            if let Ok(Record { base: Base::Dir { path }, .. }) = self.record(&name) {
+            if let Ok(Record { base: Base::Dir { path }, .. }) = self.record(&name)
+                && let Ok(path) = path.canonicalize()
+            {
                 used.push(path);
             }
         }
         for entry in entries {
             let path = entry?.path();
-            if !used.contains(&path) {
+            if !used.contains(&path.canonicalize()?) {
                 remove_copy(&path)?;
             }
         }
