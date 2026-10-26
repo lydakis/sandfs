@@ -275,6 +275,29 @@ fn draft_errno(err: anyhow::Error) -> Errno {
     }
 }
 
+/// What a mount serves once its workspace moved onto a newer source (see
+/// [`Shared::replace`]).
+pub struct Replacement {
+    pub ws: Workspace,
+    pub saved: Saved,
+    pub times: BTreeMap<String, SystemTime>,
+    pub dirs: BTreeSet<String>,
+    /// The paths that may differ, if known, and folders anything below which may.
+    pub changed: Option<BTreeSet<String>>,
+    pub whole: Vec<VPath>,
+}
+
+/// What the kernel must forget once a mount serves a newer version of its workspace
+/// (see [`Inner::replace`]).
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(fuse), allow(dead_code))] // NFS clients look again once times change
+pub enum Stale {
+    /// An inode's attributes, and its cached pages or listing.
+    Inode(u64),
+    /// A name in a folder, which now names something else or nothing.
+    Entry(u64, String),
+}
+
 /// The filesystem state, behind one lock.
 pub struct Inner {
     ws: Workspace,
@@ -390,6 +413,93 @@ impl Inner {
         self.commit_written(settle);
         self.unsaved = false;
         Snapshot { ws: self.ws.fork(), times: self.times.clone(), dirs: self.dirs.clone() }
+    }
+
+    /// Serve `ws`, a newer version of the workspace served so far, with its saved
+    /// times and folders. Only the paths of `changed` may differ, and anything below
+    /// the folders of `whole`; with no `changed`, anything may. An inode stays with its
+    /// path, unless the name went or now names another kind of thing: then it is
+    /// removed, as if unlinked, and still reads as it was through handles left open.
+    /// Returns what the kernel must forget, since it holds names, attributes and pages
+    /// for as long as it likes, and their folders get a new time, for NFS clients
+    /// that look again only once a folder's time changes.
+    pub fn replace(
+        &mut self,
+        ws: Workspace,
+        times: BTreeMap<String, SystemTime>,
+        dirs: BTreeSet<String>,
+        changed: Option<&BTreeSet<String>>,
+        whole: &[VPath],
+    ) -> Vec<Stale> {
+        let old = std::mem::replace(&mut self.ws, ws);
+        #[cfg(any(nfs, test))]
+        {
+            self.mounted = self.ws.fork();
+        }
+        self.times = times;
+        self.dirs = dirs;
+        self.unsaved = false;
+        self.recent.borrow_mut().clear();
+        let Some(root) = self.nodes.get(&ROOT_INO).map(|node| node.path.clone()) else { return Vec::new() };
+        // What may differ: the paths named, and what the kernel may hold of the rest,
+        // with everything either version lists in each such folder.
+        let mut paths = changed.cloned().unwrap_or_default();
+        let in_whole = |path: &VPath| changed.is_none() || whole.iter().any(|folder| path.starts_with(folder));
+        let known: Vec<VPath> = self.inos.keys().filter_map(|path| VPath::parse(path).ok()).collect();
+        for path in known.iter().filter(|path| in_whole(path)) {
+            paths.insert(path.to_string());
+            for ws in [&old, &self.ws] {
+                for entry in ws.list(path.as_str()).unwrap_or_default() {
+                    paths.extend(path.join(&entry.name).ok().map(|child| child.to_string()));
+                }
+            }
+        }
+        let shape = |ws: &Workspace, path: &VPath| ws.stat(path.as_str()).ok().map(|meta| file_type(meta.kind).0);
+        let now = SystemTime::now();
+        let mut stale = Vec::new();
+        // Each name looked at, and whether it went or changed kind.
+        let mut looked: HashMap<VPath, bool> = HashMap::new();
+        for path in paths.iter().filter_map(|path| VPath::parse(path).ok()) {
+            if !path.starts_with(&root) || path == root {
+                continue;
+            }
+            // From the top down: what was below a name that went went with it, and the
+            // kernel holds nothing below a folder it doesn't know.
+            let below_root = path.ancestors().into_iter().filter(|above| above.starts_with(&root) && *above != root);
+            for name in below_root.chain([path.clone()]) {
+                let parent = name.parent().and_then(|parent| self.inos.get(parent.as_str()).copied());
+                let Some(parent) = parent else { break };
+                let went = match looked.get(&name) {
+                    Some(went) => *went,
+                    None => {
+                        let went = shape(&old, &name) != shape(&self.ws, &name);
+                        looked.insert(name.clone(), went);
+                        if went {
+                            stale.push(Stale::Entry(parent, name.name().unwrap_or_default().to_owned()));
+                            stale.push(Stale::Inode(parent));
+                            self.times.extend(name.parent().map(|parent| (parent.to_string(), now)));
+                            for gone in subtree_keys(&self.inos, &name) {
+                                if let Ok(gone) = VPath::parse(&gone) {
+                                    self.unlink_path(&gone, Some(old.fork()), &[]);
+                                }
+                            }
+                        } else if name == path
+                            && let Some(&ino) = self.inos.get(name.as_str())
+                        {
+                            stale.push(Stale::Inode(ino));
+                        }
+                        went
+                    }
+                };
+                if went {
+                    break;
+                }
+            }
+        }
+        // Folders whose kept listings named an inode that went.
+        #[cfg(any(fuse, test))]
+        stale.extend(self.take_stale_listings().into_iter().map(Stale::Inode));
+        stale
     }
 
     /// Whether the file `name` in folder `parent` is one macOS made to hold another
@@ -1472,6 +1582,51 @@ impl Shared {
         result
     }
 
+    /// Save every change, then, with requests held off, have `change` change the saved
+    /// workspace on disk and serve what it returns from then on: the workspace as it
+    /// is now, its saved state, and what may differ (see [`Inner::replace`]). Nothing
+    /// changes when `change` returns nothing or fails.
+    pub fn replace(&self, change: impl FnOnce() -> anyhow::Result<Option<Replacement>>) -> anyhow::Result<()> {
+        let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.stop.load(Ordering::SeqCst) {
+            anyhow::bail!("the mount is closing");
+        }
+        let stale = {
+            let mut inner = self.lock();
+            // Every write is saved, and none comes in until the newer workspace serves.
+            let snapshot = inner.snapshot(Duration::ZERO);
+            saved.skip_bookkeeping = inner.skip_bookkeeping;
+            let result = saved.save(&snapshot, &self.root, true);
+            for (path, version, stored) in saved.take_written() {
+                let _ = inner.ws.store(path.as_str(), version, stored);
+            }
+            if result.is_err() {
+                inner.unsaved = true;
+            }
+            result?;
+            let Some(next) = change()? else { return Ok(()) };
+            let stale = inner.replace(next.ws, next.times, next.dirs, next.changed.as_ref(), &next.whole);
+            inner.drafts = Some(next.saved.drafts());
+            *saved = next.saved;
+            stale
+        };
+        drop(saved);
+        // Told with no lock held, since the kernel may wait on requests that wait on one.
+        #[cfg(fuse)]
+        if let Some(notifier) = self.notifier.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+            for stale in stale {
+                // A name or inode the kernel has meanwhile forgotten has nothing to drop.
+                let _ = match stale {
+                    Stale::Inode(ino) => notifier.inval_inode(INodeNo(ino), 0, 0),
+                    Stale::Entry(parent, name) => notifier.inval_entry(INodeNo(parent), OsStr::new(&name)),
+                };
+            }
+        }
+        #[cfg(not(fuse))]
+        drop(stale);
+        Ok(())
+    }
+
     /// One background save, run by [`Savers`] once the changes it was queued for had
     /// [`SETTLE`] to settle: commit the writes that settled and save them, and queue
     /// another if something is still unsaved or being written.
@@ -2522,6 +2677,43 @@ mod tests {
 
         fs.forget(ino, 1);
         assert!(!fs.nodes.contains_key(&ino) && !fs.buffers.contains_key(&ino), "closed once forgotten");
+    }
+
+    #[test]
+    fn a_newer_workspace_keeps_inodes_and_names_what_went_stale() {
+        let mut fs = fs();
+        let readme = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let src = fs.lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        let lib = fs.lookup(src, name("lib.rs")).unwrap().ino.0;
+        let util = fs.lookup(src, name("util.rs")).unwrap().ino.0;
+        assert_eq!(&fs.read(readme, 0, 100).unwrap()[..], b"hello\n");
+        let newer =
+            MemorySource::from_files([("README.md", "hello again\n"), ("src", "a file now\n"), ("new.txt", "")])
+                .unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(newer)).unwrap();
+        let changed: BTreeSet<String> =
+            ["/mnt/README.md", "/mnt/src/lib.rs", "/mnt/src/util.rs", "/mnt/src", "/mnt/new.txt"]
+                .map(str::to_owned)
+                .into();
+        let stale = fs.replace(ws, BTreeMap::new(), BTreeSet::new(), Some(&changed), &[]);
+
+        assert_eq!(fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0, readme, "a file keeps its inode");
+        assert_eq!(&fs.read(readme, 0, 100).unwrap()[..], b"hello again\n", "and reads as it is now");
+        assert!(stale.contains(&Stale::Inode(readme)));
+        // The folder went, and a file took its name: the kernel looks the name up anew.
+        assert!(stale.contains(&Stale::Entry(ROOT_INO, "src".into())) && stale.contains(&Stale::Inode(ROOT_INO)));
+        let file = fs.lookup(ROOT_INO, name("src")).unwrap();
+        assert_ne!(file.ino.0, src);
+        assert_eq!(file.kind, FileType::RegularFile);
+        // What was inside went with it, but reads as it was through a handle left open.
+        assert_eq!(&fs.read(lib, 0, 100).unwrap()[..], b"fn one() {}\n");
+        assert_eq!(fs.path(util).unwrap_err(), Errno::ENOENT);
+        assert!(!stale.iter().any(|stale| matches!(stale, Stale::Entry(parent, _) if *parent == src)));
+        // A name found missing before is there now.
+        assert!(stale.contains(&Stale::Entry(ROOT_INO, "new.txt".into())));
+        assert_eq!(names(&mut fs, ROOT_INO), ["README.md", "new.txt", "src"]);
+        assert!(fs.times.contains_key("/mnt"), "the folder's time changed with its names");
     }
 
     #[test]

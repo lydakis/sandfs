@@ -134,8 +134,11 @@ enum Cmd {
         #[arg(long, requires = "copy_to")]
         force: bool,
     },
-    /// Move an unmounted workspace onto a newer version of its source, keeping its own
-    /// changes.
+    /// Move a workspace onto a newer version of its source, keeping its own changes.
+    ///
+    /// A mounted workspace moves in place: its changes are saved, and from then on the
+    /// mount reads as the newer source, while programs in it (a shell in one of its
+    /// folders, files left open) carry on.
     ///
     /// Without SOURCE, the source is looked up again as it was given, so a git: source
     /// or URL moves to the newest commit of its branch (a fixed @revision stays where it
@@ -825,17 +828,13 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     // A failed final save is reported by the `unmount` that asked for it, not a later one.
     let save_error = home.workspace_dir(name).join(SAVE_ERROR);
     let _ = std::fs::remove_file(&save_error);
-    let (mut opened, _base) = home.open_shared(name, bases)?;
+    let (mut opened, base) = home.open_shared(name, bases)?;
     opened.saved.collect_garbage();
     let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(dir)?);
     let group = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(dir)?);
     let base_time = UNIX_EPOCH + Duration::from_secs(opened.record.created);
     let root = VPath::parse(ROOT)?;
-    let mut times = opened.restored.times;
-    // Base files a newer source changed report when the workspace moved onto it.
-    for (rel, (secs, nanos)) in &opened.record.updated {
-        times.entry(format!("{ROOT}/{rel}")).or_insert(UNIX_EPOCH + Duration::new(*secs, *nanos));
-    }
+    let times = served_times(&opened);
     let mut inner = Inner::new(opened.ws, &root, times, opened.restored.dirs, base_time, (owner, group));
     inner.ranged_reads = matches!(opened.record.base, Base::Dir { .. });
     inner.drafts = Some(opened.saved.drafts());
@@ -844,6 +843,8 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     inner.keep_removed = !cfg!(nfs);
     inner.skip_bookkeeping = cfg!(nfs);
     let shared = Shared::new(inner, opened.saved, root);
+    // Listed for `update`, which moves the workspace while it stays mounted.
+    let _serving = server::serving(name, shared.clone(), base);
 
     // A mount that never came up has nothing to save, and saving would make a new
     // workspace look used to the `mount_new` that removes it again.
@@ -900,6 +901,18 @@ pub(crate) fn serve(home: &Home, name: &str, dir: &Path, bases: &Arc<Bases>, rea
     }
     result.context("serving the mount")?;
     saved.context("saving changes at unmount")
+}
+
+/// The modification times a mount of `opened` reports for the paths that don't keep
+/// their source's: the saved ones, and base files a newer source changed, which
+/// report when the workspace moved onto it.
+#[cfg(mount)]
+pub(crate) fn served_times(opened: &store::Opened) -> BTreeMap<String, SystemTime> {
+    let mut times = opened.restored.times.clone();
+    for (rel, (secs, nanos)) in &opened.record.updated {
+        times.entry(format!("{ROOT}/{rel}")).or_insert(UNIX_EPOCH + Duration::new(*secs, *nanos));
+    }
+    times
 }
 
 /// A number for a new mount that differs from the ones before it.
