@@ -5,10 +5,9 @@ use std::time::Duration;
 
 use anyhow;
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use crate::nfsserve::context::{CallFilter, RPCContext};
 use crate::nfsserve::rpcwire::*;
@@ -31,61 +30,9 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 }
 
 /// processes an established socket
-async fn process_socket(mut socket: tokio::net::TcpStream, context: RPCContext) -> Result<(), anyhow::Error> {
-    let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
+async fn process_socket(socket: tokio::net::TcpStream, context: RPCContext) -> Result<(), anyhow::Error> {
     let _ = socket.set_nodelay(true);
-
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = message_handler.read().await {
-                debug!("Message loop broken due to {:?}", e);
-                break;
-            }
-        }
-    });
-    loop {
-        tokio::select! {
-            _ = socket.readable() => {
-                let mut buf = [0; 128000];
-
-                match socket.try_read(&mut buf) {
-                    Ok(0) => {
-                        return Ok(());
-                    }
-                    Ok(n) => {
-                        // The reader stopped, on a message it refused: close the connection.
-                        if socksend.write_all(&buf[..n]).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e.into());
-                    }
-                }
-
-            },
-            reply = msgrecvchan.recv() => {
-                match reply {
-                    Some(Err(e)) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e);
-                    }
-                    Some(Ok(msg)) => {
-                        if let Err(e) = write_fragment(&mut socket, &msg).await {
-                            error!("Write error {:?}", e);
-                        }
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!("Unexpected socket context termination"));
-                    }
-                }
-            }
-        }
-    }
+    serve_connection(socket, context).await.inspect_err(|e| debug!("Message handling closed : {:?}", e))
 }
 
 #[async_trait]

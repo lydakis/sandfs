@@ -1,8 +1,7 @@
 use std::io::{Cursor, Read, Write};
 
 use anyhow::anyhow;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, error, trace, warn};
 
 use crate::nfsserve::context::{RPCContext, Verdict};
@@ -94,7 +93,7 @@ async fn handle_rpc(
 /// length in bytes of the fragment's data.  The boolean value is the
 /// highest-order bit of the header; the length is the 31 low-order bits.
 /// (Note that this record specification is NOT in XDR standard form!)
-async fn read_fragment(socket: &mut DuplexStream, append_to: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+async fn read_fragment(socket: &mut (impl AsyncRead + Unpin), append_to: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
     let mut header_buf = [0_u8; 4];
     socket.read_exact(&mut header_buf).await?;
     let fragment_header = u32::from_be_bytes(header_buf);
@@ -111,7 +110,7 @@ async fn read_fragment(socket: &mut DuplexStream, append_to: &mut Vec<u8>) -> Re
     Ok(is_last)
 }
 
-pub async fn write_fragment(socket: &mut tokio::net::TcpStream, buf: &[u8]) -> Result<(), anyhow::Error> {
+pub async fn write_fragment(socket: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> Result<(), anyhow::Error> {
     // TODO: split into many fragments
     assert!(buf.len() < (1 << 31));
     // set the last flag
@@ -123,73 +122,40 @@ pub async fn write_fragment(socket: &mut tokio::net::TcpStream, buf: &[u8]) -> R
     Ok(())
 }
 
-pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
-
-/// The Socket Message Handler reads from a TcpStream and spawns off
-/// subtasks to handle each message. replies are queued into the
-/// reply_send_channel.
-#[derive(Debug)]
-pub struct SocketMessageHandler {
-    cur_fragment: Vec<u8>,
-    socket_receive_channel: DuplexStream,
-    reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
-    context: RPCContext,
-}
-
-impl SocketMessageHandler {
-    /// Creates a new SocketMessageHandler with the receiver for queued message replies
-    pub fn new(context: &RPCContext) -> (Self, DuplexStream, mpsc::UnboundedReceiver<SocketMessageType>) {
-        let (socksend, sockrecv) = tokio::io::duplex(256000);
-        let (msgsend, msgrecv) = mpsc::unbounded_channel();
-        (
-            Self {
-                cur_fragment: Vec::new(),
-                socket_receive_channel: sockrecv,
-                reply_send_channel: msgsend,
-                context: context.clone(),
-            },
-            socksend,
-            msgrecv,
-        )
-    }
-
-    /// Reads a fragment from the socket. This should be looped.
-    pub async fn read(&mut self) -> Result<(), anyhow::Error> {
-        let is_last = read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
-        if is_last {
-            let fragment = std::mem::take(&mut self.cur_fragment);
-            let correct = match self.context.filter.as_ref().map(|filter| filter.check(&fragment)) {
-                Some(Verdict::Reply(reply)) => {
-                    let _ = self.reply_send_channel.send(Ok(reply));
-                    return Ok(());
+/// Answer the calls that come over `socket`, one after another, until it closes or a
+/// call can't be read. Each call is answered before the next is read: the file system
+/// answers each without waiting on anything, so answering them in tasks of their own
+/// would only add a hand-off per call.
+pub async fn serve_connection(socket: tokio::net::TcpStream, context: RPCContext) -> Result<(), anyhow::Error> {
+    let (read, mut write) = socket.into_split();
+    // Calls are small but for writes, which a read this size passes straight through.
+    let mut read = BufReader::with_capacity(64 << 10, read);
+    let mut call = Vec::new();
+    loop {
+        call.clear();
+        while !read_fragment(&mut read, &mut call).await? {}
+        let correct = match context.filter.as_ref().map(|filter| filter.check(&call)) {
+            Some(Verdict::Reply(reply)) => {
+                write_fragment(&mut write, &reply).await?;
+                continue;
+            }
+            Some(Verdict::Correct(correct)) => Some(correct),
+            Some(Verdict::Serve) | None => None,
+        };
+        let mut reply = Vec::new();
+        match handle_rpc(&mut Cursor::new(&call), &mut reply, context.clone()).await {
+            Err(e) => {
+                error!("RPC Error: {:?}", e);
+                return Err(e);
+            }
+            Ok(true) => {
+                if let Some(correct) = correct {
+                    correct(&mut reply);
                 }
-                Some(Verdict::Correct(correct)) => Some(correct),
-                Some(Verdict::Serve) | None => None,
-            };
-            let context = self.context.clone();
-            let send = self.reply_send_channel.clone();
-            tokio::spawn(async move {
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = Cursor::new(&mut write_buf);
-                let maybe_reply = handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
-                match maybe_reply {
-                    Err(e) => {
-                        error!("RPC Error: {:?}", e);
-                        let _ = send.send(Err(e));
-                    }
-                    Ok(true) => {
-                        let _ = std::io::Write::flush(&mut write_cursor);
-                        if let Some(correct) = correct {
-                            correct(&mut write_buf);
-                        }
-                        let _ = send.send(Ok(write_buf));
-                    }
-                    Ok(false) => {
-                        // do not reply
-                    }
-                }
-            });
+                write_fragment(&mut write, &reply).await?;
+            }
+            // A retransmission of a call already answered.
+            Ok(false) => {}
         }
-        Ok(())
     }
 }
