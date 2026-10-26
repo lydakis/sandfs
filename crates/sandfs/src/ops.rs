@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use sandfs_core::VPath;
+use sandfs_core::{VPath, Workspace};
 
 #[cfg(fuse)]
 use crate::fs::SandFs;
@@ -198,7 +198,9 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
 pub(crate) fn changes(home: &Home, workspace: &str, options: &ChangesOptions) -> Result<Changes> {
     let ChangesOptions { paths, since, copy_to, force } = options;
     let name = home.find(workspace)?;
-    sync(home, &name)?;
+    // Bringing a folder up to date may open the workspace's source, which reading
+    // its changes then opens it over again rather than starting git anew.
+    let mut base = sync(home, &name)?;
     let since = since.as_deref().map(|since| home.find(since)).transpose()?;
     if let Some(since) = &since {
         sync(home, since)?;
@@ -222,7 +224,7 @@ pub(crate) fn changes(home: &Home, workspace: &str, options: &ChangesOptions) ->
     let mut attempts = 0;
     loop {
         let copy = copy_to.as_deref().map(|dir| (dir, *force));
-        match changes_and_copy(home, &name, since.as_deref(), &wanted, copy) {
+        match changes_and_copy(home, &name, since.as_deref(), base.take(), &wanted, copy) {
             Ok(found) => return Ok(found),
             Err(err) if is_object_gone(&err) && attempts < 10 => attempts += 1,
             Err(err) => return Err(err),
@@ -353,32 +355,36 @@ fn default_name(name: Option<String>, dir: &Path) -> Result<String> {
 /// folder up to date with it. `fsync` on a FUSE
 /// mount's root directory makes the serving process save before it returns; an NFS
 /// mount's process saves when asked on its save port, since `fsync` never reaches it.
-fn sync(home: &Home, name: &str) -> Result<()> {
+/// Returns the workspace's base if bringing it up to date opened it, to open it over.
+fn sync(home: &Home, name: &str) -> Result<Option<Workspace>> {
     if let Some(dir) = home.record(name)?.folder {
         return folder::sync(home, name, &dir);
     }
-    let Some(info) = home.mount_info(name) else { return Ok(()) };
+    let Some(info) = home.mount_info(name) else { return Ok(None) };
     // A dead server's pid may belong to another process by now. Only the process holding
     // the workspace serves it; without one, the last save is all there is to read.
     #[cfg(mount)]
     if !home.locked_by(name, info.pid) {
-        return Ok(());
+        return Ok(None);
     }
     let saved = match (info.save_port, info.save_secret) {
         #[cfg(nfs)]
         (Some(port), Some(secret)) => nfs::request_save(port, &secret),
         _ => std::fs::File::open(&info.mountpoint).and_then(|dir| dir.sync_all()).map_err(anyhow::Error::from),
     };
-    saved.with_context(|| format!("saving {name} before reading it"))
+    saved.with_context(|| format!("saving {name} before reading it"))?;
+    Ok(None)
 }
 
 /// The changes of workspace `name` (against `since`, or its source) under any of
 /// `wanted`, as their kinds and paths relative to the workspace, after writing them
 /// into the folder of `copy_to` if given (forcing over files changed there with its flag).
+/// `base` is the workspace's source, if it is open already.
 fn changes_and_copy(
     home: &Home,
     name: &str,
     since: Option<&str>,
+    base: Option<Workspace>,
     wanted: &[VPath],
     copy_to: Option<(&Path, bool)>,
 ) -> Result<Changes> {
@@ -391,7 +397,7 @@ fn changes_and_copy(
             (opened, base.ws, changes)
         }
         None => {
-            let (opened, start) = home.open_with_start(name)?;
+            let (opened, start) = home.open_with_start(name, base)?;
             let changes = opened.ws.changes()?;
             (opened, start, changes)
         }

@@ -122,8 +122,9 @@ fn clone_files(ws: &Workspace, top: &Path, dir: &Path) -> Result<()> {
 
 /// Bring the workspace `name` up to date with its folder `dir`: whatever git finds
 /// changed there since the commit, and whatever the workspace had changed, is made in
-/// the workspace as it is in the folder now, and saved.
-pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
+/// the workspace as it is in the folder now, and saved. Returns the workspace's base if
+/// it opened it, to open the workspace over again.
+pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<Option<Workspace>> {
     if find(home, dir).as_deref() != Some(name) {
         bail!("{name}'s folder {} is gone; `sandfs rm {name}` deletes the workspace", dir.display());
     }
@@ -135,10 +136,11 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
     if let Some((signature, mut paths)) = read_synced(&synced) {
         paths.extend(listed.iter().cloned());
         if self::signature(dir, &paths) == signature {
-            return Ok(());
+            return Ok(None);
         }
     }
-    let mut opened = home.open(name)?;
+    let base = home.base(name)?;
+    let mut opened = home.open_over(name, &base)?;
     let root = VPath::parse(ROOT)?;
     // The workspace's own changes too, so a file changed back, or ignored since, is noticed.
     let mut candidates = changed_paths(&opened.ws)?;
@@ -167,9 +169,10 @@ pub fn sync(home: &Home, name: &str, dir: &Path) -> Result<()> {
     }
     if signature(dir, &candidates) != before {
         let _ = std::fs::remove_file(&synced);
-        return Ok(());
+    } else {
+        write_synced(&synced, before, &candidates)?;
     }
-    write_synced(&synced, before, &candidates)
+    Ok(Some(base))
 }
 
 /// The paths, relative to the root, that the workspace `ws` has changed outside `.git`.
