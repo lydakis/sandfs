@@ -1282,6 +1282,54 @@ fn a_failed_mount_leaves_no_workspace_behind() {
 }
 
 #[test]
+fn sandfs_never_runs_what_a_mounts_git_settings_name() {
+    if !fuse_available() {
+        return;
+    }
+    // Remote local copies are named after the URL, which can't have parts starting with '.'.
+    let data = tempfile::Builder::new().prefix("sandfs-settings").tempdir().unwrap();
+    let remote = data.path().join("remote");
+    std::fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "-q"]);
+    git(&remote, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::write(remote.join("notes.txt"), "notes\n").unwrap();
+    git(&remote, &["add", "."]);
+    git(&remote, &["commit", "-q", "-m", "first"]);
+    let url = format!("file://{}", remote.display());
+    let mut sandfs = Sandfs::new();
+    let work = data.path().join("work");
+    sandfs.mount(&["mount", &format!("git:{url}"), work.to_str().unwrap()], &work);
+
+    // What a program writing to the mount could put in its `.git/config`: the remote
+    // rewritten to a program that leaves a marker.
+    let marker = data.path().join("ran");
+    git(&work, &["config", "protocol.ext.allow", "always"]);
+    let program = format!("ext::sh -c touch% {}% >&2;false", marker.display());
+    git(&work, &["config", &format!("url.{program}.insteadOf"), &url]);
+
+    // Started in the mount, sandfs asks the server for the branch from no repository.
+    let other = data.path().join("other");
+    let output = Command::new(env!("CARGO_BIN_EXE_sandfs"))
+        .current_dir(&work)
+        .env("SANDFS_HOME", sandfs.home.path())
+        .args(["mount", &format!("git:{url}"), other.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    sandfs.mounts.push(other.clone());
+    assert!(!marker.exists(), "sandfs ran git with the mount's settings");
+
+    // Nor does it take the mount's repository as a source: a fork copies it.
+    let output =
+        sandfs.try_run(&["mount", &format!("git:{}", work.display()), data.path().join("x").to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sandfs fork work DIR"));
+    assert!(!marker.exists());
+    sandfs.unmount(&other);
+    sandfs.unmount(&work);
+}
+
+#[test]
 fn a_fork_without_a_directory_is_a_snapshot() {
     if !fuse_available() {
         return;

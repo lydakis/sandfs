@@ -211,6 +211,12 @@ impl Home {
         (mount_source(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
     }
 
+    /// The workspace mounted on `path` or on a folder that holds it.
+    pub fn mount_holding(&self, path: &Path) -> Option<String> {
+        let table = mount_table();
+        path.ancestors().find_map(|dir| self.mounted_at(dir, &table))
+    }
+
     /// The workspace mounted at `dir`, by `table`, the [`mount_table`]: its source names
     /// the workspace, whose own record must name that mount.
     pub fn mounted_at(&self, dir: &Path, table: &HashMap<PathBuf, String>) -> Option<String> {
@@ -496,6 +502,17 @@ impl Home {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let spec = source.strip_prefix("git:").or_else(|| source.contains("://").then_some(source));
         let base = if let Some(spec) = spec {
+            // Git would take that repository's settings, which whatever writes to the
+            // mount can change to name programs to run; a fork copies it without git.
+            if let Some(repo) = crate::git::local_repo(spec)
+                && let Some(name) = self.mount_holding(&repo)
+            {
+                bail!(
+                    "{} is in the mount of workspace {name}, and git can't be trusted to read a mount's \
+                     repository; `sandfs fork {name} DIR` copies it instead",
+                    repo.display()
+                );
+            }
             let (repo, commit, branch) = crate::git::resolve_branch(&self.root.join("repos"), spec)?;
             Base::Git { repo, commit, branch }
         } else {
