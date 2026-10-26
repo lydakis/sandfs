@@ -12,13 +12,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use sandfs_core::{Error, Kind, Metadata, VPath, Workspace};
+use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::persist::{PathState, Snapshot};
 use crate::store::{Base, Home, ROOT, Record, open_base};
 
 /// What [`update`] did.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Updated {
     /// The base before and after, for display.
     pub from: String,
@@ -30,15 +31,26 @@ pub struct Updated {
     pub upstream: Option<usize>,
     /// Saved changes that matched the newer source, and so are changes no longer.
     pub matched: usize,
+    /// The paths, relative to the source, that may read differently now, when the
+    /// source can say: what it changed, and the workspace's changes that went. A mount
+    /// tells the kernel to forget what it holds of them.
+    #[serde(skip)]
+    pub changed: Option<BTreeSet<String>>,
 }
 
-/// Move the unmounted workspace `name` onto `source`, or onto the newest version of the
-/// source it was made from: another folder, or another commit of the same repository.
+/// Move the workspace `name` onto `source`, or onto the newest version of the source it
+/// was made from: another folder, or another commit of the same repository. A mounted
+/// workspace is moved by the process serving it, in place, so whatever runs in the
+/// mount reads the newer files from then on.
 pub fn update(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
     let frozen = home.record(name).is_ok_and(|record| is_copy(home, &record));
-    let updated = move_onto(home, name, source);
+    let updated = match home.attached_mount(name) {
+        Some(_) => move_mounted(home, name, source),
+        None => move_onto(home, name, source),
+    };
     // The copy of the folder the workspace was over goes once nothing is over it, as
-    // does a new one a failed move made.
+    // does a new one a failed move made. A mount that moved keeps the old copy until
+    // it ends, for files it still has open (see `Home::hold_copy`).
     if frozen && let Ok(_creating) = home.repos_lock(true) {
         let _ = home.remove_unused_copies();
     }
@@ -51,22 +63,54 @@ fn is_copy(home: &Home, record: &Record) -> bool {
 }
 
 fn move_onto(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
-    if home.attached_mount(name).is_some() {
-        bail!("{name} is mounted; unmount it first (sandfs unmount {name}), then update it");
-    }
     let _writer = home.lock(name, "sandfs update")?;
     // Reading the sources: `sandfs clean` waits.
     let _repos = home.repos_lock(false)?;
-    let mut record = home.record(name)?;
+    let next = next_source(home, &home.record(name)?, source)?;
+    apply(home, name, next, source.is_some())
+}
+
+/// Find the newer source here, where a relative path means what it says, and have the
+/// process serving the mount move the workspace onto it.
+#[cfg(mount)]
+fn move_mounted(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
+    // Held until the mount's record names the new source, so `sandfs clean` can't
+    // delete a copy just frozen for it in between.
+    let repos = home.repos_lock(false)?;
+    let next = next_source(home, &home.record(name)?, source)?;
+    let updated = crate::server::update(home, name, &next, source.is_some())?;
+    drop(repos);
+    // macOS's NFS client asks for a folder's attributes again only once a second has
+    // passed since it last did, and only then sees the names that changed.
+    #[cfg(nfs)]
+    std::thread::sleep(std::time::Duration::from_millis(1050));
+    Ok(updated)
+}
+
+#[cfg(not(mount))]
+fn move_mounted(_home: &Home, name: &str, _source: Option<&str>) -> Result<Updated> {
+    bail!("{name} is mounted; unmount it first (sandfs unmount {name}), then update it")
+}
+
+/// The source to move the workspace of `record` onto: `source`, or the newest version
+/// of the one it was made from.
+fn next_source(home: &Home, record: &Record, source: Option<&str>) -> Result<Record> {
     let next = match source {
         Some(source) => home.resolve(source)?,
-        None => home.resolve(&recorded_source(&record))?,
+        None => home.resolve(&recorded_source(record))?,
     };
     // A copy of a folder as it was moves onto a new copy of the folder as it is now.
-    let next = match &next.base {
-        Base::Dir { path } if is_copy(home, &record) => home.freeze(path)?,
+    Ok(match &next.base {
+        Base::Dir { path } if is_copy(home, record) => home.freeze(path)?,
         _ => next,
-    };
+    })
+}
+
+/// Move the workspace `name`, which the caller holds, onto `next`, which names it from
+/// now on if `given`, the source having been named. The caller also holds the sources
+/// (see [`Home::repos_lock`]).
+pub fn apply(home: &Home, name: &str, next: Record, given: bool) -> Result<Updated> {
+    let mut record = home.record(name)?;
     // Which files the newer source changed, when the source can say; a folder can't,
     // so its files are compared with the older folder's as needed.
     let (upstream, commits, before) = match (&record.base, &next.base) {
@@ -294,18 +338,23 @@ fn move_onto(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
         }
         record.updated = kept;
     }
+    let changed = upstream.as_ref().map(|changed| {
+        let written = writes.iter().filter_map(|(path, _)| path.strip_prefix(&full("")).map(str::to_owned));
+        changed.iter().chain(&forget).cloned().chain(written).collect()
+    });
     let updated = Updated {
         from: describe(&record.base),
         to: describe(&next.base),
         both,
         upstream: upstream.as_ref().map(BTreeSet::len),
         matched,
+        changed,
     };
 
     // The record goes first: if the rest fails, the saved changes that would have
     // been forgotten match the new base and simply count as changes still.
     record.base = next.base;
-    if source.is_some() {
+    if given {
         record.source = next.source;
     }
     home.set_record(name, &record)?;

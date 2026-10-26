@@ -4,7 +4,9 @@
 //! owner can reach, and start it first when none is running. Each mount runs on
 //! threads of its own, and workspaces over the same commit share it (see [`Bases`]).
 //! The process exits once its last mount is gone, so nothing stays running.
+//! `update` asks it to move a workspace it serves onto a newer source in place.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -12,7 +14,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,7 +22,9 @@ use nix::sys::signal::kill;
 use nix::unistd::{Pid, setsid};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Bases, Home};
+use crate::fs::{Replacement, Shared};
+use crate::store::{Base, Bases, Home, Lease, ROOT, Record};
+use crate::update::{self, Updated};
 
 /// How long the process stays after its last mount, so a mount right after finds it.
 const LINGER: Duration = Duration::from_secs(2);
@@ -34,12 +38,23 @@ const MOUNT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "linux")]
 const MAPS_KEPT: usize = 1024;
 
-/// A request to mount the workspace `name` at `dir`, which exists and is canonical.
-/// The directory goes as its bytes, since a path needn't be UTF-8.
+/// A request to mount the workspace `name` at `dir`, which exists and is canonical,
+/// or to move the mounted workspace `name` onto a newer source. The directory goes as
+/// its bytes, since a path needn't be UTF-8.
 #[derive(Serialize, Deserialize)]
 struct Request {
     name: String,
     dir: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    update: Option<Move>,
+}
+
+/// The source to move a workspace onto, found by the command that asked, and whether
+/// it was named (see [`update::apply`]).
+#[derive(Serialize, Deserialize)]
+struct Move {
+    next: Record,
+    given: bool,
 }
 
 impl Request {
@@ -48,10 +63,12 @@ impl Request {
     }
 }
 
-/// The answer, once the mount is up or has failed.
+/// The answer, once the mount is up or has failed, or the workspace has moved.
 #[derive(Serialize, Deserialize)]
 struct Reply {
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated: Option<Updated>,
 }
 
 /// Where the background process writes what it reports.
@@ -75,7 +92,8 @@ fn run_dir(home: &Home) -> Result<PathBuf> {
 /// Mount `name` at `dir` in the home's background process, starting the process if
 /// none is running, and wait until the mount is up.
 pub fn mount(home: &Home, name: &str, dir: &Path) -> Result<()> {
-    let request = serde_json::to_string(&Request { name: name.to_owned(), dir: dir.as_os_str().as_bytes().to_vec() })?;
+    let dir = dir.as_os_str().as_bytes().to_vec();
+    let request = serde_json::to_string(&Request { name: name.to_owned(), dir, update: None })?;
     let started = Instant::now();
     let mut server: Option<Pid> = None;
     // A running process answers at once, and a new one within a few milliseconds.
@@ -97,6 +115,22 @@ pub fn mount(home: &Home, name: &str, dir: &Path) -> Result<()> {
         }
         std::thread::sleep(wait);
         wait = (wait * 2).min(Duration::from_millis(50));
+    }
+}
+
+/// Have the process serving the mounted workspace `name` move it onto `next`, which
+/// names it from now on if `given`.
+pub fn update(home: &Home, name: &str, next: &Record, given: bool) -> Result<Updated> {
+    let update = Move { next: next.clone(), given };
+    let request = serde_json::to_string(&Request { name: name.to_owned(), dir: Vec::new(), update: Some(update) })?;
+    let unserved =
+        || anyhow!("{name} is mounted by a process that can't move it; unmount it first (sandfs unmount {name})");
+    let stream = UnixStream::connect(socket_path(home)).map_err(|_| unserved())?;
+    let reply = ask(stream, &request)?.ok_or_else(unserved)?;
+    match (reply.error, reply.updated) {
+        (Some(err), _) => Err(anyhow!(err)),
+        (None, Some(updated)) => Ok(updated),
+        (None, None) => Err(unserved()),
     }
 }
 
@@ -245,13 +279,24 @@ pub fn run(home: Home) -> Result<()> {
     Ok(())
 }
 
-/// Read one request from `stream`, start the mount and answer once it is up or failed.
+/// Read one request from `stream`, start the mount and answer once it is up or failed,
+/// or move the workspace and answer once it has moved.
 fn answer(mut stream: &UnixStream, home: &Home, bases: &Arc<Bases>, ticket: Ticket) {
-    let request = read_request(stream);
+    let mut request = read_request(stream);
+    if let Ok(Request { name, update: Some(next), .. }) = &mut request {
+        let reply = match move_served(home, bases, name, next) {
+            Ok(updated) => Reply { error: None, updated: Some(updated) },
+            Err(err) => Reply { error: Some(format!("{err:#}")), updated: None },
+        };
+        if let Ok(reply) = serde_json::to_string(&reply) {
+            let _ = stream.write_all(format!("{reply}\n").as_bytes());
+        }
+        return;
+    }
     let dir = request.as_ref().ok().map(Request::dir);
     let mounted = request.and_then(|request| start_mount(home, bases, request, ticket));
     let up = mounted.is_ok();
-    let reply = Reply { error: mounted.err().map(|err| format!("{err:#}")) };
+    let reply = Reply { error: mounted.err().map(|err| format!("{err:#}")), updated: None };
     let told =
         serde_json::to_string(&reply).is_ok_and(|reply| stream.write_all(format!("{reply}\n").as_bytes()).is_ok());
     // A requester that gave up (timed out, or was interrupted) has reported a failure,
@@ -303,6 +348,118 @@ fn start_mount(home: &Home, bases: &Arc<Bases>, request: Request, ticket: Ticket
         })
         .context("starting a mount")?;
     outcome.recv().unwrap_or_else(|_| Err(anyhow!("the mount stopped unexpectedly")))
+}
+
+/// A mount this process serves, as `update` needs it.
+pub struct Served {
+    shared: Arc<Shared>,
+    /// The mount's use of its base, which moves to the newer base with it.
+    lease: Mutex<Lease>,
+    /// Held while the workspace moves, so it moves once at a time.
+    moving: Mutex<()>,
+    /// The copies of folders it moved off, held for files it may still have open there
+    /// (see [`Home::hold_copy`]).
+    retired: Mutex<Vec<File>>,
+}
+
+/// A mount listed among the ones this process serves, until dropped.
+pub struct Serving {
+    name: String,
+    served: Arc<Served>,
+}
+
+/// List the mount of `name`, served through `shared` over the base of `lease`.
+pub fn serving(name: &str, shared: Arc<Shared>, lease: Lease) -> Serving {
+    let served =
+        Arc::new(Served { shared, lease: Mutex::new(lease), moving: Mutex::new(()), retired: Mutex::default() });
+    let mut all = served_list();
+    all.insert(name.to_owned(), Arc::downgrade(&served));
+    Serving { name: name.to_owned(), served }
+}
+
+/// The mounts this process serves, by workspace name, until each one's [`Serving`]
+/// is dropped.
+fn served_list() -> std::sync::MutexGuard<'static, HashMap<String, Weak<Served>>> {
+    static SERVED: OnceLock<Mutex<HashMap<String, Weak<Served>>>> = OnceLock::new();
+    SERVED.get_or_init(Mutex::default).lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Serving {
+    /// Stop listing the mount, which has ended, and delete the copies of folders it
+    /// moved off that nothing else uses, now that it reads none of their files.
+    pub fn end(self, home: &Home) {
+        let retired = std::mem::take(&mut *self.served.retired.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(self);
+        if retired.is_empty() {
+            return;
+        }
+        drop(retired);
+        // Not waited for: deleting waits on whoever is making a workspace.
+        let home = home.clone();
+        std::thread::spawn(move || {
+            if let Ok(_creating) = home.repos_lock(true) {
+                let _ = home.remove_unused_copies();
+            }
+        });
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        let mut all = served_list();
+        // Unless the workspace was mounted again since, by a mount listed in its place.
+        if all.get(&self.name).is_some_and(|listed| std::ptr::eq(listed.as_ptr(), Arc::as_ptr(&self.served))) {
+            all.remove(&self.name);
+        }
+    }
+}
+
+/// Move the workspace `name`, mounted here, onto `next` while it stays mounted: its
+/// changes are saved, the workspace on disk moved as when unmounted, and the mount
+/// serves it from then on, the kernel told to forget what changed.
+fn move_served(home: &Home, bases: &Arc<Bases>, name: &str, next: &Move) -> Result<Updated> {
+    let served = served_list().get(name).and_then(Weak::upgrade);
+    let served = served.with_context(|| {
+        format!("{name} is mounted by a process that can't move it; unmount it first (sandfs unmount {name})")
+    })?;
+    let _moving = served.moving.lock().unwrap_or_else(PoisonError::into_inner);
+    // Reading the sources: `sandfs clean` waits.
+    let _repos = home.repos_lock(false)?;
+    let record = home.record(name)?;
+    let before = serde_json::to_value(&record)?;
+    let mut updated = None;
+    served.shared.replace(|| {
+        let moved = update::apply(home, name, next.next.clone(), next.given);
+        let failed = moved.is_err();
+        let changed = moved.as_ref().ok().and_then(|moved| moved.changed.clone());
+        updated = Some(moved);
+        // A move that failed before changing anything leaves the mount as it is.
+        if failed && serde_json::to_value(home.record(name)?)? == before {
+            return Ok(None);
+        }
+        // A copy of a folder moved off stays while files of it may be open here.
+        let moved_off = match &record.base {
+            Base::Dir { path } if home.holds_copy(path) && home.record(name)?.base != record.base => {
+                Some(home.hold_copy(path)?)
+            }
+            _ => None,
+        };
+        let (opened, lease) = home.open_shared(name, bases)?;
+        *served.lease.lock().unwrap_or_else(PoisonError::into_inner) = lease;
+        served.retired.lock().unwrap_or_else(PoisonError::into_inner).extend(moved_off);
+        let full = |rel: &str| format!("{ROOT}/{rel}");
+        let git = matches!(opened.record.base, Base::Git { .. });
+        Ok(Some(Replacement {
+            times: crate::served_times(&opened),
+            ws: opened.ws,
+            saved: opened.saved,
+            dirs: opened.restored.dirs,
+            changed: changed.map(|changed| changed.iter().map(|rel| full(rel)).collect()),
+            // What git keeps follows the commit, which a source's changes don't list.
+            whole: if git { vec![sandfs_core::VPath::parse(&full(".git"))?] } else { Vec::new() },
+        }))
+    })?;
+    updated.unwrap_or_else(|| Err(anyhow!("the mount stopped before {name} moved")))
 }
 
 /// How many mounts, and requests for one, the process is serving, and whether it has
@@ -363,7 +520,7 @@ mod tests {
     #[test]
     fn requests_carry_any_directory_name() {
         let dir = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9"));
-        let request = Request { name: "ws".into(), dir: dir.as_os_str().as_bytes().to_vec() };
+        let request = Request { name: "ws".into(), dir: dir.as_os_str().as_bytes().to_vec(), update: None };
         let sent: Request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(sent.dir(), dir);
     }

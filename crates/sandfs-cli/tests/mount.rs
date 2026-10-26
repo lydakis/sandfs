@@ -621,7 +621,15 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     std::fs::set_permissions(folder.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink("todo.md", folder.join("todo")).unwrap();
     let copies_dir = sandfs.home.path().join("copies");
-    let copies = || std::fs::read_dir(&copies_dir).map_or(0, Iterator::count);
+    // The copies themselves, not the files that hold one for a mount.
+    let copies = || {
+        let entries = std::fs::read_dir(&copies_dir).map(|entries| entries.flatten().collect::<Vec<_>>());
+        entries
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry.path().extension().is_none_or(|ext| ext != "held"))
+            .count()
+    };
 
     let task = data.path().join("task");
     let output = sandfs.try_run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
@@ -692,12 +700,26 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     std::fs::write(task.join("mine.md"), "mine\n").unwrap();
     sandfs.unmount(&task);
     std::fs::write(folder.join("todo.md"), "b\n").unwrap();
+    std::fs::write(folder.join("gone.md"), "going\n").unwrap();
     sandfs.run(&["update", "task"]);
     assert_eq!(copies(), 1);
     std::fs::write(folder.join("todo.md"), "c\n").unwrap();
+    std::fs::remove_file(folder.join("gone.md")).unwrap();
     sandfs.mount(&["mount", "task", task.to_str().unwrap()], &task);
     assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "b\n");
     assert_eq!(std::fs::read_to_string(task.join("mine.md")).unwrap(), "mine\n");
+    assert_eq!(sandfs.stdout(&["changes", "task"]), "A mine.md\n");
+    // Mounted, it moves in place onto another new copy. The old one stays while the
+    // mount may read files of it left open, until the mount ends.
+    let held = std::fs::File::open(task.join("gone.md")).unwrap();
+    sandfs.run(&["update", "task"]);
+    assert_eq!(copies(), 2);
+    assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "c\n");
+    assert!(!task.join("gone.md").exists());
+    let mut was = String::new();
+    std::io::Read::read_to_string(&mut &held, &mut was).unwrap();
+    assert_eq!(was, "going\n");
+    drop(held);
     assert_eq!(sandfs.stdout(&["changes", "task"]), "A mine.md\n");
     sandfs.run(&["rm", "--unmount", "task"]);
     sandfs.mounts.clear();
@@ -1696,8 +1718,6 @@ fn update_moves_a_git_workspace_onto_a_newer_commit() {
     git(repo.path(), &["commit", "-q", "-m", "third"]);
     let third = git_out(repo.path(), &["rev-parse", "HEAD"]);
 
-    let refused = sandfs.try_run(&["update", "main"]);
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("unmount it first"));
     sandfs.unmount(&main);
     // Seconds apart, so the times files report tell the move from the mount.
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -1714,6 +1734,127 @@ fn update_moves_a_git_workspace_onto_a_newer_commit() {
     let mtime = |name: &str| std::fs::metadata(main.join(name)).unwrap().modified().unwrap();
     assert!(mtime("c.txt") > mtime("keep.txt"), "files the move changed look changed to build tools");
     assert_eq!(mtime("b.txt"), mtime("c.txt"));
+}
+
+#[test]
+fn update_moves_a_mounted_workspace_in_place() {
+    if !fuse_available() {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+    std::fs::create_dir_all(repo.path().join("old")).unwrap();
+    for (name, text) in
+        [("a.txt", "a0\n"), ("b.txt", "b0\n"), ("gone.txt", "gone\n"), ("sub/s.txt", "s0\n"), ("old/x.txt", "x\n")]
+    {
+        std::fs::write(repo.path().join(name), text).unwrap();
+    }
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "first"]);
+
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let main = dirs.path().join("main");
+    let source = format!("git:{}", repo.path().display());
+    sandfs.mount(&["mount", &source, main.to_str().unwrap()], &main);
+    std::fs::write(main.join("a.txt"), "mine\n").unwrap();
+    // A shell sits in a folder of the mount, a file stays open, and the kernel holds
+    // what was looked at: names, sizes, contents, a name found missing, listings.
+    let mut shell = Command::new("sleep").arg("60").current_dir(main.join("sub")).spawn().unwrap();
+    let held = std::fs::File::open(main.join("gone.txt")).unwrap();
+    assert_eq!(std::fs::read_to_string(main.join("b.txt")).unwrap(), "b0\n");
+    assert_eq!(std::fs::read_to_string(main.join("sub/s.txt")).unwrap(), "s0\n");
+    assert_eq!(std::fs::read_to_string(main.join("old/x.txt")).unwrap(), "x\n");
+    assert!(!main.join("c.txt").exists());
+    let names = |dir: &Path| {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&main), [".git", "a.txt", "b.txt", "gone.txt", "old", "sub"]);
+    assert_eq!(git_out(&main, &["status", "--porcelain"]), " M a.txt\n");
+
+    std::fs::write(repo.path().join("b.txt"), "b1, longer\n").unwrap();
+    std::fs::write(repo.path().join("c.txt"), "c\n").unwrap();
+    std::fs::write(repo.path().join("sub/s.txt"), "s1\n").unwrap();
+    std::fs::remove_file(repo.path().join("gone.txt")).unwrap();
+    std::fs::remove_dir_all(repo.path().join("old")).unwrap();
+    std::fs::write(repo.path().join("old"), "a file now\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "second"]);
+    let second = git_out(repo.path(), &["rev-parse", "HEAD"]);
+
+    let moved = sandfs.run(&["update", "main"]);
+    assert_eq!(String::from_utf8_lossy(&moved.stdout), "", "nothing changed on both sides");
+    assert!(String::from_utf8_lossy(&moved.stderr).contains("moved main"));
+
+    assert_eq!(std::fs::read_to_string(main.join("b.txt")).unwrap(), "b1, longer\n");
+    assert_eq!(std::fs::read_to_string(main.join("c.txt")).unwrap(), "c\n");
+    assert_eq!(std::fs::read_to_string(main.join("sub/s.txt")).unwrap(), "s1\n");
+    assert_eq!(std::fs::read_to_string(main.join("old")).unwrap(), "a file now\n");
+    assert!(!main.join("gone.txt").exists());
+    assert_eq!(names(&main), [".git", "a.txt", "b.txt", "c.txt", "old", "sub"]);
+    assert_eq!(std::fs::read_to_string(main.join("a.txt")).unwrap(), "mine\n", "the workspace's own change stays");
+    assert_eq!(git_out(&main, &["rev-parse", "HEAD"]), second);
+    assert_eq!(git_out(&main, &["status", "--porcelain"]), " M a.txt\n");
+    assert_eq!(sandfs.stdout(&["changes", "main"]), "M a.txt\n");
+    // The shell is still where it was, and a file left open reads as it was.
+    let inside = Command::new("cat").arg("s.txt").current_dir(main.join("sub")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&inside.stdout), "s1\n");
+    #[cfg(target_os = "linux")]
+    {
+        let cwd = std::fs::read_link(format!("/proc/{}/cwd", shell.id())).unwrap();
+        assert_eq!(cwd, main.join("sub").canonicalize().unwrap(), "the shell's folder is still there");
+    }
+    let mut was = String::new();
+    std::io::Read::read_to_string(&mut &held, &mut was).unwrap();
+    assert_eq!(was, "gone\n");
+    drop(held);
+    shell.kill().unwrap();
+    shell.wait().unwrap();
+
+    // Written on, it saves as ever, and comes back the same once mounted again.
+    std::fs::write(main.join("c.txt"), "c, mine\n").unwrap();
+    sandfs.unmount(&main);
+    assert_eq!(sandfs.stdout(&["changes", "main"]), "M a.txt\nM c.txt\n");
+    sandfs.mount(&["mount", "main", main.to_str().unwrap()], &main);
+    assert_eq!(std::fs::read_to_string(main.join("b.txt")).unwrap(), "b1, longer\n");
+    assert_eq!(git_out(&main, &["status", "--porcelain"]), " M a.txt\n M c.txt\n");
+    sandfs.unmount(&main);
+}
+
+#[test]
+fn update_moves_a_mounted_folder_workspace_onto_another_folder() {
+    if !fuse_available() {
+        return;
+    }
+    let old = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    for (dir, files) in [
+        (old.path(), &[("same.txt", "same\n"), ("f.txt", "f0\n"), ("gone.txt", "gone\n")][..]),
+        (new.path(), &[("same.txt", "same\n"), ("f.txt", "f1, longer\n"), ("new.txt", "new\n")][..]),
+    ] {
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+    }
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", old.path().to_str().unwrap(), ws.to_str().unwrap(), "--name", "ws"], &ws);
+    std::fs::write(ws.join("mine.txt"), "mine\n").unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("f.txt")).unwrap(), "f0\n");
+    assert!(!ws.join("new.txt").exists());
+
+    sandfs.run(&["update", "ws", new.path().to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(ws.join("f.txt")).unwrap(), "f1, longer\n");
+    assert_eq!(std::fs::read_to_string(ws.join("new.txt")).unwrap(), "new\n");
+    assert_eq!(std::fs::read_to_string(ws.join("mine.txt")).unwrap(), "mine\n");
+    assert!(!ws.join("gone.txt").exists());
+    assert_eq!(sandfs.stdout(&["changes", "ws"]), "A mine.txt\n");
+    sandfs.unmount(&ws);
 }
 
 #[test]

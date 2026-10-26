@@ -495,8 +495,19 @@ impl Home {
         self.root.join("copies")
     }
 
-    /// Delete the copies of folders that no workspace is over any more. The caller holds
-    /// [`Home::repos_lock`] exclusively, so no workspace over one is being made.
+    /// Keep the copy of a folder at `path` while the returned file is open, though no
+    /// workspace is over it any more: a mount that moved off it may still read files
+    /// it has open there.
+    pub fn hold_copy(&self, path: &Path) -> Result<File> {
+        let held = held_path(path);
+        let file = File::options().write(true).create(true).truncate(false).open(&held)?;
+        file.lock_shared().with_context(|| format!("locking {}", held.display()))?;
+        Ok(file)
+    }
+
+    /// Delete the copies of folders that no workspace is over any more, and nothing
+    /// holds (see [`Home::hold_copy`]). The caller holds [`Home::repos_lock`]
+    /// exclusively, so no workspace over one is being made.
     pub fn remove_unused_copies(&self) -> Result<()> {
         let Ok(entries) = std::fs::read_dir(self.copies_dir()) else { return Ok(()) };
         // Compared as the disk sees them, since the home may have been named another way
@@ -511,9 +522,17 @@ impl Home {
         }
         for entry in entries {
             let path = entry?.path();
-            if !used.contains(&path.canonicalize()?) {
-                remove_copy(&path)?;
+            if path.extension().is_some_and(|ext| ext == "held") || used.contains(&path.canonicalize()?) {
+                continue;
             }
+            let held = held_path(&path);
+            let hold = File::options().write(true).open(&held);
+            match hold {
+                Ok(hold) if hold.try_lock().is_err() => continue,
+                Ok(_) => std::fs::remove_file(&held)?,
+                Err(_) => {}
+            }
+            remove_copy(&path)?;
         }
         Ok(())
     }
@@ -617,6 +636,13 @@ fn clone_tree(top: &Path, to: &Path, home: &Path) -> Result<()> {
 }
 
 /// Delete a copy of a folder, along with folders in it that were cloned read-only.
+/// The file whose lock holds the copy at `path` (see [`Home::hold_copy`]).
+fn held_path(path: &Path) -> PathBuf {
+    let mut held = path.as_os_str().to_owned();
+    held.push(".held");
+    PathBuf::from(held)
+}
+
 pub fn remove_copy(path: &Path) -> Result<()> {
     if std::fs::remove_dir_all(path).is_err() {
         let mut folders = vec![path.to_path_buf()];

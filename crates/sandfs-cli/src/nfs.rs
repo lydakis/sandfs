@@ -575,6 +575,13 @@ fn mount_options(port: u16) -> String {
         // Send each write to the server before it returns, as FUSE does, instead of
         // keeping it in the client's cache, so a save sees every write that returned.
         "sync",
+        // A folder's attributes are asked for again after a second, not up to a minute,
+        // so files `update` changed under a mount appear within a second (see
+        // `Inner::renumber_changed`). Files keep the usual times.
+        "acdirmin=1",
+        "acdirmax=1",
+        "acrootdirmin=1",
+        "acrootdirmax=1",
         "rsize=1048576",
         "wsize=1048576",
         // A folder, not a disk: Finder leaves it out of its sidebar and the Desktop, and

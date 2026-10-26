@@ -521,6 +521,10 @@ pub struct Saved {
     /// that loaded the index just before that save still finds it, and only once no
     /// file here reads from it, such as a removed file a program still has open.
     doomed: Vec<SourceKey>,
+    /// Objects not packed that the saved state this one took over from handed out
+    /// (see [`Saved::take_over`]). Files left open from before may still read them, so
+    /// none goes while one does; one that nothing here names goes once none does.
+    earlier: Vec<SourceKey>,
     /// Objects written since the last durable save that names them, not yet flushed to
     /// disk, by file: a pack is flushed once for all the objects in it.
     unsynced: HashSet<String>,
@@ -570,6 +574,7 @@ impl Saved {
             store,
             objects: HashMap::new(),
             doomed: Vec::new(),
+            earlier: Vec::new(),
             unsynced: HashSet::new(),
             packs: HashMap::new(),
             pack_limit: Some(PACK_LIMIT),
@@ -577,6 +582,23 @@ impl Saved {
             deleting: None,
             last: None,
             skip_bookkeeping: false,
+        }
+    }
+
+    /// Take over from `old`, the saved state of this workspace before it was moved onto
+    /// a newer source while served: files left open from before read `old`'s objects,
+    /// whose names this one has its own counts for, so it keeps `old`'s as well.
+    pub fn take_over(&mut self, mut old: Saved) {
+        let mut seen = HashSet::new();
+        let unpacked = old.objects.values().map(|(_, object)| object).chain(&old.doomed).chain(&old.earlier);
+        for object in unpacked.filter(|object| !object.contains('@')) {
+            if seen.insert(Arc::as_ptr(object).cast::<u8>()) {
+                self.earlier.push(object.clone());
+            }
+        }
+        for (file, pack) in std::mem::take(&mut old.packs) {
+            let into = self.packs.entry(file).or_insert(Pack { size: pack.size, objects: Vec::new(), unnamed: false });
+            into.objects.extend(pack.objects);
         }
     }
 
@@ -972,11 +994,29 @@ impl Saved {
         let live: HashSet<&str> = kept.values().map(|(_, object)| &**object).collect();
         let mut waiting = Vec::new();
         let mut deleted = Vec::new();
+        // What files left open from before a take-over still read, and what nothing
+        // reads any more and nothing names either: that goes.
+        let read_earlier: HashSet<String> = self
+            .earlier
+            .iter()
+            .filter(|object| Arc::strong_count(object) > 1)
+            .map(|object| object.to_string())
+            .collect();
+        let named: HashSet<&str> =
+            self.objects.values().map(|(_, object)| &**object).chain(self.doomed.iter().map(|o| &**o)).collect();
+        for object in std::mem::take(&mut self.earlier) {
+            if Arc::strong_count(&object) > 1 {
+                self.earlier.push(object);
+            } else if !live.contains(&*object) && !named.contains(&*object) && !read_earlier.contains(&*object) {
+                self.unsynced.remove(&*object);
+                deleted.push(object.to_string());
+            }
+        }
         for object in std::mem::take(&mut self.doomed) {
             if live.contains(&*object) {
                 continue;
             }
-            if Arc::strong_count(&object) == 1 {
+            if Arc::strong_count(&object) == 1 && !read_earlier.contains(&*object) {
                 self.unsynced.remove(&*object);
                 deleted.push(object.to_string());
             } else {
@@ -1946,6 +1986,35 @@ mod tests {
         save_and_store(&mut saved, &mut ws);
         assert_eq!(objects(state.path()), ["2"], "and goes once nothing reads from it");
         assert_eq!(ws.read_text("/mnt/log.txt").unwrap(), "second");
+    }
+
+    #[test]
+    fn an_object_a_file_open_from_before_a_take_over_reads_from_is_kept() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = base();
+        ws.write("/mnt/log.txt", "first").unwrap();
+        let mut saved = Saved::new(state.path());
+        saved.pack_limit = None;
+        save_and_store(&mut saved, &mut ws);
+        let still_open = ws.fork();
+        drop(ws);
+        // The workspace is loaded again, as an update in place does, with names of its
+        // own for the same objects.
+        let mut next = base();
+        let mut fresh = Saved::new(state.path());
+        fresh.pack_limit = None;
+        fresh.load(&mut next, &root()).unwrap();
+        fresh.take_over(saved);
+        next.write("/mnt/log.txt", "second").unwrap();
+        for _ in 0..3 {
+            save_and_store(&mut fresh, &mut next);
+        }
+        assert_eq!(objects(state.path()), ["1", "2"], "object 1 waits for the file open from before");
+        assert_eq!(still_open.read_text("/mnt/log.txt").unwrap(), "first");
+
+        drop(still_open);
+        save_and_store(&mut fresh, &mut next);
+        assert_eq!(objects(state.path()), ["2"], "and goes once nothing reads from it");
     }
 
     #[test]
