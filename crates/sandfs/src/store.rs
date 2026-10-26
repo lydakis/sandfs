@@ -9,6 +9,7 @@
 //! workspaces/<name>/changes.json    its saved changes (see `persist`)
 //! workspaces/<name>/objects/        bodies of saved files
 //! workspaces/<name>/start/           the changes it was made with, if any (a fork of a clone)
+//! workspaces/<name>/folder-git/      for a fork kept as a real folder, git's view of it (see `folder`)
 //! workspaces/<name>/mount.json      present while it is mounted
 //! workspaces/<name>/lock            held by the one process that may save it
 //! workspaces/<name>/holder          who holds the lock, for whoever it refuses
@@ -74,6 +75,9 @@ pub struct Record {
     /// as changed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub updated: BTreeMap<String, (u64, u32)>,
+    /// For a fork kept as a real folder instead of a mount (see `folder`), that folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
 }
 
 /// `mount.json`: the process serving a mounted workspace.
@@ -272,12 +276,13 @@ impl Home {
         Ok(())
     }
 
-    /// The workspace a command names: a workspace name, or a directory one is mounted on.
+    /// The workspace a command names: a workspace name, or a directory one is mounted on
+    /// or kept in (see `folder`).
     pub fn find(&self, what: &str) -> Result<String> {
         if self.exists(what) {
             return Ok(what.to_owned());
         }
-        match self.mounted(what) {
+        match self.mounted(what).or_else(|| crate::folder::find(self, Path::new(what))) {
             Some(name) => Ok(name),
             None => bail!("{what:?} is neither a workspace name nor a mounted workspace"),
         }
@@ -485,7 +490,14 @@ impl Home {
         clone_tree(folder, copy.path(), &self.root)?;
         let path = copy.keep();
         let source = folder.display().to_string();
-        Ok(Record { source, base: Base::Dir { path }, created, read_only: Vec::new(), updated: BTreeMap::new() })
+        Ok(Record {
+            source,
+            base: Base::Dir { path },
+            created,
+            read_only: Vec::new(),
+            updated: BTreeMap::new(),
+            folder: None,
+        })
     }
 
     /// Whether `path` is one of the copies of folders [`Home::freeze`] makes, however the
@@ -579,7 +591,7 @@ impl Home {
             }
             Base::Dir { path }
         };
-        Ok(Record { source: named, base, created, read_only: Vec::new(), updated: BTreeMap::new() })
+        Ok(Record { source: named, base, created, read_only: Vec::new(), updated: BTreeMap::new(), folder: None })
     }
 
     /// The record for a new workspace over the `HEAD` of the repository whose working
@@ -594,6 +606,7 @@ impl Home {
             created,
             read_only: Vec::new(),
             updated: BTreeMap::new(),
+            folder: None,
         })
     }
 }
@@ -667,7 +680,7 @@ pub fn remove_copy(path: &Path) -> Result<()> {
 }
 
 /// Give `copy` the mode and modification time of `path`.
-fn keep_times(path: &Path, copy: &Path) -> Result<()> {
+pub(crate) fn keep_times(path: &Path, copy: &Path) -> Result<()> {
     let meta = std::fs::metadata(path)?;
     let file = File::open(copy)?;
     file.set_modified(meta.modified()?).with_context(|| format!("setting the time of {}", copy.display()))?;
@@ -676,12 +689,12 @@ fn keep_times(path: &Path, copy: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn symlink(target: &Path, path: &Path) -> Result<()> {
+pub(crate) fn symlink(target: &Path, path: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, path).with_context(|| format!("linking {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn symlink(_target: &Path, path: &Path) -> Result<()> {
+pub(crate) fn symlink(_target: &Path, path: &Path) -> Result<()> {
     bail!("{} is a symbolic link, which this system can't copy", path.display())
 }
 

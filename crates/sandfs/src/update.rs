@@ -44,6 +44,7 @@ pub struct Updated {
 /// workspace is moved by the process serving it, in place, so whatever runs in the
 /// mount reads the newer files from then on.
 pub fn update(home: &Home, name: &str, source: Option<&str>) -> Result<Updated> {
+    crate::ops::not_a_folder(home, name)?;
     let frozen = home.record(name).is_ok_and(|record| is_copy(home, &record));
     let updated = match home.attached_mount(name) {
         Some(_) => move_mounted(home, name, source),

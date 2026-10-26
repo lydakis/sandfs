@@ -12,7 +12,8 @@
 //!
 //! - [`Home::mount`] makes a workspace over a source and mounts it at a folder.
 //! - [`Home::fork`] copies a workspace, with its changes so far and none of its
-//!   source, mounted or kept as a snapshot.
+//!   source, mounted or kept as a snapshot; a copy of a git clone can also be a real
+//!   folder of cloned files, as it is by default on macOS.
 //! - [`Home::changes`] lists the files a workspace added, modified or deleted, against
 //!   its source or another workspace, and with [`ChangesOptions::copy_to`] writes them
 //!   into a folder.
@@ -74,6 +75,7 @@
 #![cfg_attr(not(mount), allow(dead_code, unused_imports))]
 
 mod copy;
+mod folder;
 #[cfg(mount)]
 mod fs;
 mod git;
@@ -146,8 +148,9 @@ impl Home {
         ops::mount_source(&self.inner, source, dir, options)
     }
 
-    /// Fork `from`, with its changes so far, and mount the fork at `dir`; without
-    /// `dir`, keep it unmounted, as a snapshot. The source is never copied.
+    /// Fork `from`, with its changes so far, and mount the fork at `dir` (or keep it there
+    /// as a real folder, see [`ForkOptions::real_folder`]); without `dir`, keep it
+    /// unmounted, as a snapshot. The source is never copied.
     ///
     /// `from` is a workspace (its name, the folder it is mounted on, or a folder in
     /// that); a git repository's working folder that sandfs doesn't serve, such as a
@@ -241,6 +244,15 @@ pub struct ForkOptions {
     pub branch: Option<String>,
     /// Serve the mount in this process, returning once it is unmounted.
     pub foreground: bool,
+    /// Keep a fork of a git repository's folder (or of such a fork) at `dir` as a real
+    /// folder rather than a mount: `Some(true)` or `Some(false)`. By default it is one on
+    /// macOS, where a mount is slowest at work on many small files, unless the fork
+    /// has read-only paths, which need a mount. Its files are clones of the folder's,
+    /// which cost no space on a disk that clones files (APFS, btrfs, XFS) and are copied
+    /// on others, and git in it is as fast as in the clone. [`Home::changes`] and
+    /// [`Home::fork`] read it as they read a mount; [`Home::remove`] with `unmount`
+    /// deletes it. It can't be mounted, updated, served or confined.
+    pub real_folder: Option<bool>,
 }
 
 /// What [`Home::changes`] lists, and where it copies them.
@@ -285,8 +297,11 @@ pub struct Forked {
     pub name: String,
     /// What it was forked from: a workspace's name, or a folder.
     pub from: String,
-    /// Where it is mounted, or `None` for a snapshot.
+    /// Where it is mounted or kept, or `None` for a snapshot.
     pub dir: Option<PathBuf>,
+    /// Whether it is kept as a real folder rather than mounted (see
+    /// [`ForkOptions::real_folder`]).
+    pub real_folder: bool,
 }
 
 /// What [`Home::changes`] found.

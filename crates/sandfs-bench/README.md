@@ -126,7 +126,7 @@ Each copy then has a day of work done in it: the first `git status`, a commit of
 
 ## Copies of a clone
 
-`--only copies` gives each task its own copy of a git clone already on the machine, the way an agent harness gives each attempt a folder, three ways: a git worktree, a copy-on-write copy of the clone (`cp -c` on macOS, `cp --reflink=auto` elsewhere, which is a full copy where the disk can't share blocks) on a new branch, and a `sandfs fork` of the clone on a new branch. The clone is a local clone of this repository. Each copy is then used the way an agent uses it, one step at a time:
+`--only copies` gives each task its own copy of a git clone already on the machine, the way an agent harness gives each attempt a folder, three ways: a git worktree, a copy-on-write copy of the clone (`cp -c` on macOS, `cp --reflink=auto` elsewhere, which is a full copy where the disk can't share blocks) on a new branch, and a `sandfs fork` of the clone on a new branch (on macOS a real folder of APFS clones, see the main README). The clone is a local clone of this repository. Each copy is then used the way an agent uses it, one step at a time:
 
 - make the copy;
 - create 1,000 small files in a new folder, rewrite them, save them the way editors do (write a temporary file, rename it over the file), and delete them;

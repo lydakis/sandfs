@@ -534,3 +534,118 @@ fn update_moves_a_workspace_onto_another_folder() {
     assert_eq!(stdout(home.path(), &["changes", "data"]), "M notes.txt\nD raw/a.csv\nD raw/b.csv\nM survey.csv\n");
     assert!(stdout(home.path(), &["list"]).starts_with(&format!("data\t{}\t", v2.display())));
 }
+
+/// Git's output in `dir`, which must succeed.
+#[cfg(unix)]
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fork_of_a_clone_can_be_kept_as_a_real_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let home = home.path();
+    let repo = data.path().join("repo");
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    git_in(data.path(), &["init", "-q", "-b", "main", "repo"]);
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    std::fs::write(repo.join("docs/guide.md"), "guide\n").unwrap();
+    std::fs::write(repo.join("run.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(repo.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+    commit_all(&repo, "first");
+    // Uncommitted work comes along; ignored files don't.
+    std::fs::write(repo.join("README.md"), "hello, edited\n").unwrap();
+    std::fs::write(repo.join("draft.txt"), "draft\n").unwrap();
+    std::fs::write(repo.join("build.log"), "ignored\n").unwrap();
+    let before = git_in(&repo, &["status", "--porcelain"]);
+
+    let task = data.path().join("task");
+    let at = task.to_str().unwrap();
+    let made = stdout(home, &["fork", repo.to_str().unwrap(), at, "--branch", "task/one", "--real-folder"]);
+    let task = task.canonicalize().unwrap();
+    assert_eq!(made, format!("task kept at {}\n", task.display()));
+    assert!(!std::fs::read_to_string("/proc/mounts").unwrap_or_default().contains(at), "not a mount");
+    assert_eq!(std::fs::read_to_string(task.join("README.md")).unwrap(), "hello, edited\n");
+    assert_eq!(std::fs::metadata(task.join("run.sh")).unwrap().permissions().mode() & 0o111, 0o111);
+    assert!(!task.join("build.log").exists(), "ignored files stay out");
+    assert_eq!(
+        git_in(&task, &["status", "--porcelain", "-b"]),
+        format!("## task/one\n{before}").replace("?? build.log\n", "")
+    );
+    assert_eq!(stdout(home, &["changes", at]), "M README.md\nA draft.txt\n");
+    assert_eq!(
+        stdout(home, &["list"]),
+        format!("task\tgit:{}\t{}\n", repo.canonicalize().unwrap().display(), task.display())
+    );
+
+    // Work in the folder shows as the workspace's changes; a file changed back doesn't.
+    std::fs::write(task.join("notes.txt"), "notes\n").unwrap();
+    std::fs::remove_file(task.join("docs/guide.md")).unwrap();
+    std::os::unix::fs::symlink("README.md", task.join("readme")).unwrap();
+    std::fs::set_permissions(task.join("run.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        stdout(home, &["changes", "task"]),
+        "M README.md\nD docs/guide.md\nA draft.txt\nA notes.txt\nA readme\nM run.sh\n"
+    );
+    std::fs::write(task.join("README.md"), "hello\n").unwrap();
+    assert_eq!(stdout(home, &["changes", "task", "docs", "README.md"]), "D docs/guide.md\n");
+
+    // Its commits go back as a branch, and the clone's own work is left alone.
+    git_in(&task, &["add", "-A"]);
+    git_in(&task, &["commit", "-qm", "task"]);
+    git_in(&task, &["push", "-q", "origin", "task/one"]);
+    assert_eq!(git_in(&repo, &["log", "--format=%s", "task/one"]), "task\nfirst\n");
+    assert_eq!(git_in(&repo, &["status", "--porcelain"]), before);
+
+    // A fork of the folder, from a folder in it, is a folder too, with its files.
+    let second = data.path().join("second");
+    stdout(home, &["fork", task.join("docs").to_str().unwrap(), second.to_str().unwrap(), "--real-folder"]);
+    assert_eq!(std::fs::read_to_string(second.join("notes.txt")).unwrap(), "notes\n");
+    std::fs::write(second.join("more.txt"), "more\n").unwrap();
+    assert_eq!(stdout(home, &["changes", "second", "--since", "task"]), "A more.txt\n");
+
+    // Settings git runs programs from are shown apart.
+    std::fs::create_dir(task.join(".git/hooks")).unwrap();
+    std::fs::write(task.join(".git/hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+    let changed = sandfs(home, &["changes", "task"], "");
+    assert!(String::from_utf8_lossy(&changed.stderr).contains(".git/hooks/pre-commit changed"));
+
+    // Written back into the clone as files.
+    stdout(home, &["changes", "task", "notes.txt", "--copy-to", repo.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(repo.join("notes.txt")).unwrap(), "notes\n");
+
+    // What only a mount does is refused; removing it takes the folder along when asked.
+    let refused = |args: &[&str], message: &str| {
+        let output = sandfs(home, args, "");
+        assert!(!output.status.success(), "sandfs {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "sandfs {args:?}: {stderr}");
+    };
+    let other = data.path().join("other");
+    let other = other.to_str().unwrap();
+    refused(&["mount", "task", other], "kept as the folder");
+    refused(&["update", "task"], "kept as the folder");
+    refused(&["unmount", at], "not mounted");
+    refused(&["serve", "--mcp", "task"], "kept as the folder");
+    refused(&["rm", "task"], "pass --unmount");
+    refused(&["fork", repo.to_str().unwrap(), other, "--real-folder", "--read-only", "docs"], "needs a mount");
+    refused(&["fork", repo.to_str().unwrap(), "--name", "snap", "--real-folder"], "give DIR");
+    std::fs::create_dir(other).unwrap();
+    std::fs::write(data.path().join("other/file"), "").unwrap();
+    refused(&["fork", repo.to_str().unwrap(), other, "--real-folder"], "not empty");
+    stdout(home, &["rm", "--unmount", at]);
+    assert!(!task.exists());
+    stdout(home, &["rm", "--unmount", "second"]);
+    assert_eq!(stdout(home, &["list"]), "");
+    assert!(std::fs::read_dir(data.path().join("other")).unwrap().count() == 1, "a folder it didn't make stays");
+}
