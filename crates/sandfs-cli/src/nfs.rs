@@ -459,8 +459,9 @@ pub fn run(
     mounted: impl FnOnce(u16, String) -> Result<()>,
 ) -> Result<()> {
     // Each mount has a runtime of its own, so everything it started stops with it. Calls
-    // take turns on the workspace, so a couple of threads keep up.
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    // take turns on the workspace, so the thread serving the mount runs them all: a
+    // process serving thousands of mounts would otherwise run thousands more threads.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
         let fs = SandNfs::new(shared.clone())?;
         let root = fs.id_to_fh(ROOT_INO).data;
@@ -493,13 +494,46 @@ pub fn run(
 
         // The gate keeps the client's unmount call from the server, since anyone could
         // send one, so the mount table says when the mount is gone (or replaced).
-        let mut check = tokio::time::interval(MOUNT_CHECK);
-        let ours = format!("sandfs:{name}");
-        while crate::host::mount_source(dir).is_some_and(|source| source == ours) {
-            check.tick().await;
-        }
+        let _ = watch(dir, format!("sandfs:{name}")).await;
         Ok(())
     })
+}
+
+/// The mounts waiting to hear that they are gone from the mount table, each with the
+/// source it was mounted from: one thread reads the table for all of them, since reading
+/// it means running `mount`, and twice a second for each of thousands of mounts would
+/// keep the machine busy.
+#[cfg(nfs)]
+type Watched = Mutex<Vec<(std::path::PathBuf, String, tokio::sync::oneshot::Sender<()>)>>;
+
+/// Wait until the mount at `dir` is no longer the one from `source`: unmounted, or
+/// replaced.
+#[cfg(nfs)]
+fn watch(dir: &Path, source: String) -> tokio::sync::oneshot::Receiver<()> {
+    static WATCHED: std::sync::OnceLock<Arc<Watched>> = std::sync::OnceLock::new();
+    let watched = WATCHED.get_or_init(|| {
+        let watched = Arc::new(Watched::default());
+        let checked = watched.clone();
+        let _ = std::thread::Builder::new().name("mount checks".to_owned()).spawn(move || {
+            loop {
+                std::thread::sleep(MOUNT_CHECK);
+                if checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty() {
+                    continue;
+                }
+                // A table that couldn't be read says nothing about what is mounted.
+                let Some(table) = crate::host::read_mount_table() else { continue };
+                // Dropping a mount's sender tells it its mount is gone.
+                checked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|(dir, source, gone)| !gone.is_closed() && table.get(dir) == Some(source));
+            }
+        });
+        watched
+    });
+    let (gone, wait) = tokio::sync::oneshot::channel();
+    watched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((dir.to_path_buf(), source, gone));
+    wait
 }
 
 /// `mount_nfs` options for a server on localhost `port`, which also answers the mount
