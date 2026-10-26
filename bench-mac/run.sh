@@ -37,21 +37,12 @@ phase() { # label, command...
 
 git clone -q https://github.com/BurntSushi/ripgrep "$W/rg-src"
 git -C "$W/rg-src" checkout -q 14.1.1
-(cd "$W/rg-src" && cargo fetch -q)
 
 suite() { # dir label
   local D=$1 L=$2
-  phase "$L smallfiles" python3 "$OPS" "$D/smallfiles" 1000
+  python3 "$OPS" "$D/smallfiles" 1000 | sed "s/^/$L smallfiles: /" | tee -a "$W/results.txt"
   phase "$L git status (first)" git -C "$D" status
   phase "$L git status" git -C "$D" status
-  phase "$L git status" git -C "$D" status
-  phase "$L cargo build clean" bash -c "cd '$D' && cargo build -q --offline"
-  phase "$L cargo build no-op" bash -c "cd '$D' && cargo build -q --offline"
-  phase "$L cargo build no-op" bash -c "cd '$D' && cargo build -q --offline"
-  for i in 1 2; do
-    echo "// $i" >> "$D/crates/core/main.rs"
-    phase "$L cargo build incremental" bash -c "cd '$D' && cargo build -q --offline"
-  done
 }
 
 git clone -q "$W/rg-src" "$W/local"
@@ -61,18 +52,19 @@ suite "$W/local" "local"
 variant() { # name, DROP, ADD
   export SANDFS_HOME="$W/home-$1" SANDFS_NFS_DROP="$2" SANDFS_NFS_ADD="$3" SANDFS_NFS_STATS="$W/stats-$1"
   mkdir -p "$W/m-$1"
-  if ! "$S" mount "git:$W/rg-src" "$W/m-$1"; then log "$1: mount failed"; return; fi
+  if ! "$S" fork "$W/local" "$W/m-$1" --branch "b-$1"; then log "$1: fork failed"; return; fi
   log "== $1: $(mount | grep "m-$1" | sed 's/.*(//')"
   suite "$W/m-$1" "$1"
-  "$S" unmount "$W/m-$1" || umount -f "$W/m-$1"
+  phase "$1 unmount" "$S" unmount "$W/m-$1"
+  phase "$1 rm" "$S" rm "m-$1"
 }
 variant base "" ""
-variant acdir5 "acdirmin,acdirmax,acrootdirmin,acrootdirmax" ""
-variant rdirplus "" "rdirplus"
+variant nonegnamecache "" "nonegnamecache"
 variant async "sync" ""
-variant actimeo60 "acdirmin,acdirmax,acrootdirmin,acrootdirmax" "actimeo=60"
-variant all "acdirmin,acdirmax,acrootdirmin,acrootdirmax,sync" "actimeo=60,rdirplus"
-
+variant noacc "" "nonegnamecache,noacl"
+log "done"
+cat "$W/results.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+exit 0
 # First full read: golang/go
 unset SANDFS_NFS_DROP SANDFS_NFS_ADD
 log "== full read"
