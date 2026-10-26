@@ -355,6 +355,11 @@ pub struct Inner {
     /// minute without asking, opens included; it does look a name up again once the
     /// folder's time changes, and a new inode then has nothing cached.
     pub renumber_changed: bool,
+    /// What the last [`Inner::replace`] took off its names while removed files aren't
+    /// kept ([`Inner::keep_removed`] off, NFS). A client never says when it is done
+    /// with an inode, so these stay readable through handles left open until the next
+    /// replace, instead of going at once.
+    moved_off: Vec<u64>,
     /// Keep files macOS makes for its own bookkeeping out of saves, so they never
     /// show up among the changes, and the `._name` ones out of listings too. See
     /// [`crate::persist::is_bookkeeping`].
@@ -404,6 +409,7 @@ impl Inner {
             recent: RefCell::default(),
             keep_removed: true,
             renumber_changed: false,
+            moved_off: Vec::new(),
             skip_bookkeeping: false,
         };
         inner.inos.insert(root.to_string(), ROOT_INO);
@@ -443,6 +449,13 @@ impl Inner {
         #[cfg(any(nfs, test))]
         {
             self.mounted = self.ws.fork();
+        }
+        for ino in std::mem::take(&mut self.moved_off) {
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                node.lookups = 0;
+                node.removed_from = None;
+            }
+            self.maybe_drop(ino);
         }
         self.times = times;
         self.dirs = dirs;
@@ -492,8 +505,13 @@ impl Inner {
                             stale.push(Stale::Inode(parent));
                             self.times.extend(name.parent().map(|parent| (parent.to_string(), now)));
                             for gone in subtree_keys(&self.inos, &name) {
-                                if let Ok(gone) = VPath::parse(&gone) {
-                                    self.unlink_path(&gone, Some(old.fork()), &[]);
+                                let Ok(gone) = VPath::parse(&gone) else { continue };
+                                let ino = self.inos.get(gone.as_str()).copied();
+                                let keep_removed = std::mem::replace(&mut self.keep_removed, true);
+                                self.unlink_path(&gone, Some(old.fork()), &[]);
+                                self.keep_removed = keep_removed;
+                                if !keep_removed && let Some(ino) = ino.filter(|ino| self.nodes.contains_key(ino)) {
+                                    self.moved_off.push(ino);
                                 }
                             }
                         } else if name == path
@@ -2744,6 +2762,17 @@ mod tests {
         assert_ne!(fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0, readme, "a new inode has nothing cached");
         assert_eq!(fs.lookup(ROOT_INO, name("src")).unwrap().ino.0, src, "a folder keeps its inode");
         assert!(fs.times.contains_key("/mnt") && fs.times.contains_key("/mnt/src"));
+        // Where removed files aren't kept until forgotten (NFS), the old inode still
+        // reads as it was until the next replace.
+        fs.keep_removed = false;
+        let readme_now = fs.lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let changed: BTreeSet<String> = ["/mnt/README.md".to_owned()].into();
+        let ws = fs.ws.fork();
+        fs.replace(ws, BTreeMap::new(), BTreeSet::new(), Some(&changed), &[]);
+        assert_eq!(&fs.read(readme_now, 0, 100).unwrap()[..], b"hello again\n");
+        let ws = fs.ws.fork();
+        fs.replace(ws, BTreeMap::new(), BTreeSet::new(), Some(&changed), &[]);
+        assert!(!fs.nodes.contains_key(&readme_now));
     }
 
     #[test]
