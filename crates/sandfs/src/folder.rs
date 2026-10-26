@@ -208,7 +208,8 @@ fn signature(dir: &Path, paths: &BTreeSet<String>) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for rel in paths {
         rel.hash(&mut hasher);
-        let Ok(meta) = std::fs::symlink_metadata(dir.join(rel)) else {
+        // As a read sees it: a file under a link to a folder is not in the folder.
+        let Ok(Some(meta)) = git::in_folder(dir, rel) else {
             0u8.hash(&mut hasher);
             continue;
         };
