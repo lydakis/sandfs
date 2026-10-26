@@ -1,8 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-10-26)
 
-- **sandfs, a library of everything the command does**: the new `sandfs` crate holds what only the command could do before: the home of saved workspaces, the folder, git and GitHub sources, `fork`, `update`, `changes` with `--copy-to`, `clean`, and mounting with its background process. Each command is a method of `sandfs::Home` that returns what it found (`Changes`, `Updated`, `Forked` and so on) instead of printing it, so a program builds on workspaces without running `sandfs` or parsing its output. The mount process outlives whoever asked for a mount, so sandfs starts it by running the program again: a program embedding sandfs calls `sandfs::handle_relaunch(&["sandfs"])` first thing in `main`, and runs of `PROGRAM sandfs ...` are then sandfs's. The `sandfs` command is now a thin layer over the library and works as before. `sandfs-core` stays the in-memory engine underneath.
+The main changes:
+- A new `sandfs` crate, the library behind the command: a program can mount, fork, update and list changes of saved workspaces, and serve their mounts, without `sandfs` installed.
+- `sandfs update` works on a mounted workspace, in place, so a shell or agent working in it carries on.
+
+The `sandfs` command works as in 0.6.0; `sandfs-core` and the Python API are unchanged.
+
+- **sandfs, a library of everything the command does**: the new `sandfs` crate holds what only the command could do before: the home of saved workspaces, the folder, git and GitHub sources, `fork`, `update`, `changes` with `--copy-to`, `clean`, and mounting with its background process. Each command is a method of `sandfs::Home` that returns what it found (`Changes`, `Updated`, `Forked` and so on) instead of printing it, so a program builds on workspaces without running `sandfs` or parsing its output. `Home::locate` finds the same home the command uses; `Home::at` takes another. The mount process outlives whoever asked for a mount, so sandfs starts it by running the program again: a program embedding sandfs calls `sandfs::handle_relaunch(&["sandfs"])` first thing in `main`, and runs of `PROGRAM sandfs ...` are then sandfs's. The `sandfs` command is now a thin layer over the library and works as before. `sandfs-core` stays the in-memory engine underneath.
 - **sandfs-cli, `update` on a mounted workspace**: `sandfs update NAME` no longer asks to unmount first. A mounted workspace moves in place: its changes are saved, and the mount reads as the newer source from then on, while a shell in one of its folders and files left open carry on (an open file the newer source removed still reads as it was). On Linux the kernel is told what to forget. On macOS, whose NFS client can't be told, files that may have changed get new file handles, folders' attributes are asked for again after a second, and `update` waits that second before returning.
 
 ## 0.6.0 (2026-10-26)
