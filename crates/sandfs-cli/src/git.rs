@@ -44,6 +44,13 @@ pub fn resolve(repos: &Path, spec: &str) -> Result<(PathBuf, String)> {
     Ok((repo.clone(), commit_of(&repo, rev)?))
 }
 
+/// The repository on this machine that `spec` (what follows `git:`) names, if it names
+/// one rather than a URL.
+pub fn local_repo(spec: &str) -> Option<PathBuf> {
+    let (location, _) = split_rev(spec);
+    (!location.is_empty() && !is_url(location)).then(|| expand(location).canonicalize().ok()).flatten()
+}
+
 fn commit_of(repo: &Path, rev: &str) -> Result<String> {
     git(repo, &["rev-parse", "--verify", "--end-of-options", &format!("{rev}^{{commit}}")])
         .with_context(|| format!("{rev:?} is not a commit in {}", repo.display()))
@@ -98,14 +105,14 @@ fn local_branch(repo: &Path, rev: &str) -> Option<String> {
 fn remote_branch(url: &str, rev: &str) -> Option<(String, String)> {
     if rev == "HEAD" {
         // `ref: refs/heads/main\tHEAD`, then `<commit>\tHEAD`.
-        let out = git(Path::new("."), &["ls-remote", "--symref", url, "HEAD"]).ok()?;
+        let out = git_outside(&["ls-remote", "--symref", url, "HEAD"]).ok()?;
         let branch = out.lines().find_map(|line| line.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD"))?;
         let tip = out.lines().find_map(|line| line.strip_suffix("\tHEAD").filter(|id| is_commit_id(id)))?;
         return Some((branch.to_owned(), tip.to_owned()));
     }
     let name = rev.strip_prefix("refs/heads/").unwrap_or(rev);
     let full = format!("refs/heads/{name}");
-    let out = git(Path::new("."), &["ls-remote", url, &full]).ok()?;
+    let out = git_outside(&["ls-remote", url, &full]).ok()?;
     let tip = out.lines().find_map(|line| line.strip_suffix(&format!("\t{full}")))?;
     Some((name.to_owned(), tip.to_owned()))
 }
@@ -372,7 +379,14 @@ fn check_new_branch(repo: &Path, branch: &str) -> Result<()> {
         // A partial clone's own branches needn't be the remote's: sandfs's copies keep
         // what they fetched under refs of their own.
         let url = origin(repo).context("the partial clone names no remote")?;
-        if !git(repo, &["ls-remote", "origin", &full]).context("asking the remote for its branches")?.is_empty() {
+        if url.starts_with('-') {
+            bail!("the partial clone's remote {url:?} is not a URL");
+        }
+        // A path relative to the repository, as git reads one there.
+        let remote = if is_url(&url) { url.clone() } else { repo.join(&url).to_string_lossy().into_owned() };
+        // Asked from outside the repository, whose settings could make git run a program
+        // to reach the remote (an `ext::` URL, a URL rewritten to one, an ssh command).
+        if !git_outside(&["ls-remote", &remote, &full]).context("asking the remote for its branches")?.is_empty() {
             bail!("{url} already has a branch {branch}; pick another name");
         }
     } else if git(repo, &["show-ref", "--verify", "-q", &full]).is_ok() {
@@ -1069,7 +1083,7 @@ fn create_clone(dest: &Path, url: &str) -> Result<()> {
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     let tmp_str = tmp.to_str().context("non-UTF-8 home directory")?;
-    let setup = git(Path::new("."), &["init", "-q", "--bare", tmp_str])
+    let setup = git_outside(&["init", "-q", "--bare", tmp_str])
         .and_then(|_| git(&tmp, &["remote", "add", "origin", url]))
         .and_then(|_| git(&tmp, &["config", "remote.origin.promisor", "true"]))
         .and_then(|_| git(&tmp, &["config", "remote.origin.partialclonefilter", "blob:none"]));
@@ -1253,14 +1267,28 @@ fn git_raw(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> 
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()
-        .context("running git")?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo);
+    run_git(cmd, args)
+}
+
+/// Run git in no repository, for what needs none, such as asking a server for its
+/// branches. Run where sandfs was started, git would take the settings of a repository
+/// holding that folder, which can name programs to run: a mounted folder's `.git` is
+/// one, and whatever writes to the mount can change it. An empty folder, which git
+/// looks no further up from, holds none.
+fn git_outside(args: &[&str]) -> Result<String> {
+    let dir = tempfile::tempdir().context("creating a temporary folder")?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir.path()).env_remove("GIT_DIR").env_remove("GIT_WORK_TREE");
+    if let Some(parent) = dir.path().parent() {
+        cmd.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    run_git(cmd, args)
+}
+
+fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
+    let output = cmd.args(args).env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null()).output().context("running git")?;
     if !output.status.success() {
         bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -1350,6 +1378,33 @@ mod tests {
         assert!(!index.windows(4).any(|w| w == b"link"), "the index stands alone, with no shared part");
         assert_eq!(shared(), before, "nothing written into the repository");
         assert!(!marker.exists(), "the repository's hooks don't run");
+    }
+
+    #[test]
+    fn branch_checks_ask_the_remote_without_the_repositorys_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        run(&remote, &["init", "-q", "-b", "main"]);
+        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        std::fs::write(remote.join("a.txt"), "one").unwrap();
+        run(&remote, &["add", "a.txt"]);
+        run(&remote, &["commit", "-q", "-m", "first"]);
+        run(&remote, &["branch", "taken"]);
+        let url = format!("file://{}", remote.display());
+        run(tmp.path(), &["clone", "-q", "--filter=blob:none", &url, "partial"]);
+        let partial = tmp.path().join("partial");
+        // Settings anything that writes to the repository could add: `origin` rewritten
+        // to a program that leaves a marker.
+        let marker = tmp.path().join("ran");
+        run(&partial, &["config", "protocol.ext.allow", "always"]);
+        let program = format!("ext::sh -c touch% {}% >&2;false", marker.display());
+        run(&partial, &["config", &format!("url.{program}.insteadOf"), &url]);
+
+        assert!(check_new_branch(&partial, "free").is_ok());
+        let taken = check_new_branch(&partial, "taken").unwrap_err();
+        assert!(taken.to_string().contains("already has a branch taken"), "{taken:#}");
+        assert!(!marker.exists(), "the repository's settings named the program git ran");
     }
 
     /// Run git in `dir` for a test, with an identity for commits.

@@ -205,6 +205,17 @@ impl Home {
         (mount_source(&info.mountpoint)? == format!("sandfs:{name}")).then_some(info)
     }
 
+    /// The workspace mounted on `path` or on a folder that holds it.
+    pub fn mount_holding(&self, path: &Path) -> Result<Option<String>> {
+        for name in self.names()? {
+            let recorded = self.recorded_mount(&name).is_some_and(|info| path.starts_with(&info.mountpoint));
+            if recorded && self.attached_mount(&name).is_some() {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
     /// The mount recorded for `name`, attached or not.
     pub fn recorded_mount(&self, name: &str) -> Option<MountInfo> {
         serde_json::from_slice(&std::fs::read(self.workspace_dir(name).join("mount.json")).ok()?).ok()
@@ -424,6 +435,17 @@ impl Home {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let spec = source.strip_prefix("git:").or_else(|| source.contains("://").then_some(source));
         let base = if let Some(spec) = spec {
+            // Git would take that repository's settings, which whatever writes to the
+            // mount can change to name programs to run; a fork copies it without git.
+            if let Some(repo) = crate::git::local_repo(spec)
+                && let Some(name) = self.mount_holding(&repo)?
+            {
+                bail!(
+                    "{} is in the mount of workspace {name}, and git can't be trusted to read a mount's \
+                     repository; `sandfs fork {name} DIR` copies it instead",
+                    repo.display()
+                );
+            }
             let (repo, commit, branch) = crate::git::resolve_branch(&self.root.join("repos"), spec)?;
             Base::Git { repo, commit, branch }
         } else {
