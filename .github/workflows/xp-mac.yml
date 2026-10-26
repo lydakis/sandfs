@@ -1,6 +1,8 @@
 name: xp-mac
 on:
-  workflow_dispatch:
+  push:
+    branches: [claude/project-thread-jx4nw5]
+    paths: ["xp/mac.sh", "xp/probe-fskit.sh", "xp/passthrough.c", "xp/nfsdiff.py", "xp/ops.py", ".github/workflows/xp-mac.yml"]
 jobs:
   fuset:
     runs-on: macos-26
