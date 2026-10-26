@@ -563,7 +563,7 @@ fn watch(dir: &Path, source: String) -> std::io::Result<tokio::sync::oneshot::Re
 /// protocol, so no portmapper is needed.
 #[cfg(any(nfs, test))]
 fn mount_options(port: u16) -> String {
-    [
+    let options = [
         "vers=3",
         "tcp",
         &format!("port={port},mountport={port}"),
@@ -588,7 +588,14 @@ fn mount_options(port: u16) -> String {
         // offers no Eject for it. It still works as any folder, and `mount` lists it.
         "nobrowse",
     ]
-    .join(",")
+    .join(",");
+    // Bench only: drop and add options.
+    let drop: Vec<String> =
+        std::env::var("SANDFS_NFS_DROP").unwrap_or_default().split(',').map(str::to_owned).collect();
+    let mut options: Vec<String> =
+        options.split(',').filter(|o| !drop.iter().any(|d| !d.is_empty() && o.starts_with(d.as_str()))).map(str::to_owned).collect();
+    options.extend(std::env::var("SANDFS_NFS_ADD").unwrap_or_default().split(',').filter(|o| !o.is_empty()).map(str::to_owned));
+    options.join(",")
 }
 
 /// What decides each call before the server sees it: only calls [`call_allowed`] lets
