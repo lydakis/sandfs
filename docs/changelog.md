@@ -1,8 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 (2026-10-26)
+
+The `sandfs` crate's README and docs.rs page now say how to build on it, and git's file monitor no longer prints an error in a git worktree added from a mount. No API changes.
 
 - **sandfs, documentation for building on it**: the README has a "Build on sandfs" section, and the `sandfs` crate's README and docs.rs page say what the library gives a program, the one line it needs in `main`, what to weigh before depending on it (the API may change before 1.0; writes in a mount cost more, most of all on macOS) and who uses it. `examples/attempts.rs` runs a whole round trip in a temporary folder: two copies of a folder, changed two ways, compared, and one written back.
+- **sandfs and sandfs-cli, git's file monitor outside a mount**: a git worktree added from a git mount shares the mount's settings, so git ran `sandfs git-fsmonitor` there too, and it failed with "is neither a workspace name nor a mounted workspace" on every git command, often several times per command. Outside a mount it now answers that any file may have changed, the same fallback git already took, without the error.
 
 ## 0.7.0 (2026-10-26)
 
