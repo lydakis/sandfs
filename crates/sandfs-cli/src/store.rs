@@ -411,6 +411,15 @@ impl Home {
         };
         Ok(Record { source: source.to_owned(), base, created, read_only: Vec::new() })
     }
+
+    /// The record for a new workspace over the `HEAD` of the repository whose working
+    /// folder is `top` (see `fork`).
+    pub fn resolve_checkout(&self, top: &Path) -> Result<Record> {
+        let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (repo, commit, branch) = crate::git::resolve_head(top)?;
+        let source = format!("git:{}", repo.display());
+        Ok(Record { source, base: Base::Git { repo, commit, branch }, created, read_only: Vec::new() })
+    }
 }
 
 /// An empty workspace with `base` mounted at [`ROOT`], for the home at `home`.

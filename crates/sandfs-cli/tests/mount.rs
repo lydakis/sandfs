@@ -565,6 +565,9 @@ fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch
         &["fork", partial.to_str().unwrap(), other, "--branch", "task/one"],
         "already has a branch task/one",
     );
+    // A path is taken as it is, never as a source with an @revision.
+    git(data.path(), &["clone", "-q", repo.to_str().unwrap(), "clone@work"]);
+    sandfs.run(&["fork", data.path().join("clone@work").to_str().unwrap(), "--name", "at"]);
     let plain = data.path().join("plain");
     std::fs::create_dir(&plain).unwrap();
     let folder = data.path().join("folder");
@@ -572,7 +575,7 @@ fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch
     refused(&sandfs, &["fork", "folder", other, "--branch", "two"], "is a folder");
     refused(&sandfs, &["fork", plain.to_str().unwrap(), other], "forking a plain folder isn't supported");
     refused(&sandfs, &["fork", repo_path, other, "--name", "task"], "already exists");
-    assert_eq!(sandfs.stdout(&["list"]).lines().count(), 5, "no workspace was left behind");
+    assert_eq!(sandfs.stdout(&["list"]).lines().count(), 6, "no workspace was left behind");
     for dir in [&second, &remote, &folder] {
         sandfs.unmount(dir);
     }

@@ -73,6 +73,16 @@ pub fn resolve_branch(repos: &Path, spec: &str) -> Result<(PathBuf, String, Opti
     })
 }
 
+/// The repository whose working folder is `top`, its `HEAD` commit, and the branch
+/// checked out there, taking `top` as a path, never as a source with an `@revision`.
+pub fn resolve_head(top: &Path) -> Result<(PathBuf, String, Option<String>)> {
+    let repo = top.canonicalize().with_context(|| format!("no repository at {}", top.display()))?;
+    let commit = commit_of(&repo, "HEAD")?;
+    let branch = local_branch(&repo, "HEAD")
+        .filter(|branch| commit_of(&repo, &format!("refs/heads/{branch}")).is_ok_and(|tip| tip == commit));
+    Ok((repo, commit, branch))
+}
+
 /// The branch `rev` names in a local repository, if any.
 fn local_branch(repo: &Path, rev: &str) -> Option<String> {
     if rev == "HEAD" {

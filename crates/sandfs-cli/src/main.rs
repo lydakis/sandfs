@@ -320,9 +320,8 @@ fn run(cli: Cli) -> Result<()> {
                     from
                 }
                 Origin::Checkout(top) => {
-                    let source = format!("git:{}", top.to_str().context("the repository's path is not UTF-8")?);
                     let repos = home.repos_lock(false)?;
-                    let mut record = home.resolve(&source)?;
+                    let mut record = home.resolve_checkout(&top)?;
                     record.read_only = read_only;
                     home.create(&name, &record)?;
                     if let Err(err) = git::start(&home, &name, branch.as_deref()) {
