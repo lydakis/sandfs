@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **sandfs, documentation for building on it**: the README has a "Build on sandfs" section, and the `sandfs` crate's README and docs.rs page say what the library gives a program, the one line it needs in `main`, what to weigh before depending on it (the API may change before 1.0; writes in a mount cost more, most of all on macOS) and who uses it. `examples/attempts.rs` runs a whole round trip in a temporary folder: two copies of a folder, changed two ways, compared, and one written back.
+
 ## 0.7.0 (2026-10-26)
 
 The main changes:

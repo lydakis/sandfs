@@ -23,6 +23,8 @@ curl -L https://github.com/lydakis/sandfs/releases/latest/download/sandfs-aarch6
 sandfs-aarch64-apple-darwin/sandfs --version   # move it onto your PATH
 ```
 
+To build a program of your own on these copies, `cargo add sandfs`; see [Build on sandfs](#build-on-sandfs).
+
 ## A first workspace
 
 ```python
@@ -183,13 +185,40 @@ Every mount is served by one background process, started by the first `mount` or
 
 On Linux, mounting needs FUSE 3 (`fusermount3`, package `fuse3`). On macOS there is nothing to install: the mount is served over NFS on localhost and mounted with macOS's own NFS client. On Windows, `changes`, `list`, `rm` and `serve --mcp` work, and `sandfs serve --mcp SOURCE` gives an agent a workspace there; `fork` and `unmount` need a mount. When changes are saved, what a fork on disk costs and how offline git mounts behave are covered in [sandfs-cli](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-cli/README.md).
 
+## Build on sandfs
+
+Everything the `sandfs` command does is also a Rust library, the [`sandfs` crate](https://github.com/lydakis/sandfs/blob/main/crates/sandfs/README.md), for building tools of your own on these copies: a job runner that gives each job its own copy of a shared data folder, a tool that tries a cleanup of someone's files before touching them, an app that keeps several drafts of a folder side by side. It saves workspaces on disk, mounts them as real folders, and forks, updates and compares them, and the people using your program never install `sandfs`.
+
+```bash
+cargo add sandfs anyhow
+```
+
+```rust
+fn main() -> anyhow::Result<()> {
+    sandfs::handle_relaunch(&[]);    // first thing in main: sandfs runs this program again to serve mounts
+    let home = sandfs::Home::locate()?;
+    let photos = home.mount("/srv/photos", "/tmp/photos".as_ref(), &Default::default())?;
+    let job = home.fork(&photos.name, Some("/tmp/job-1".as_ref()), &Default::default())?;
+    // ...any program works in /tmp/job-1, while /srv/photos is never written to...
+    for change in home.changes(&job.name, &Default::default())?.changes {
+        println!("{:?} {}", change.kind, change.path);
+    }
+    home.remove(&job.name, true)?;   // unmount the copy and delete it
+    Ok(())
+}
+```
+
+The one thing to know is that mounts are served by a background process that outlives your program, and sandfs starts it by running your program again; `handle_relaunch` at the top of `main` catches those runs. [Graft](https://github.com/lydakis/graft), which gives each task its own copy of a GitHub repository and turns a finished copy into a pull request, is built this way. `cargo run -p sandfs --example attempts` runs a whole round trip in a temporary folder, and [docs.rs](https://docs.rs/sandfs) has the API.
+
+Two things to weigh first. The library is as young as the rest of sandfs: until 1.0 a minor release may change its API, and the [changelog](https://github.com/lydakis/sandfs/blob/main/docs/changelog.md) says how. And writing in a mount costs more than writing to a plain folder, most of all on macOS, where each write is a round trip to the mount's process over localhost: compiling ripgrep from scratch took about 18 s in a mount against 13 s outside one on the same Mac. A program that only needs copies in memory, with no folder on disk, can use [`sandfs-core`](https://github.com/lydakis/sandfs/blob/main/crates/sandfs-core/README.md), the engine underneath, or the Python package above.
+
 ## More features
 
 - **Read-only paths**: sources are never written, but an agent can still change their files in its own copy. `set_read_only(path)` (or `mount(..., read_only=True)`) stops that too: writes, deletes and moves at or below the path raise `OSError` with errno `EROFS`, as a read-only file system does, while reads work as before. Forks keep it.
 - **Large files**: `read(path, offset=..., length=...)` reads one range without caching the file. A folder source seeks on disk, so a multi-gigabyte data set or video is never held in memory whole. A Python source can define `read_range(path, offset, length)` to do the same; without it, and for a git commit, the whole file is read and then sliced.
 - **Safe concurrent writes**: `stat(path).version` and `write(...)` give a file's version, and `write(path, data, expected_version=v)` raises `sandfs.VersionMismatch` if the file changed since.
 - **Threads**: calls release the GIL, so a slow source never blocks other threads. Use one workspace per thread; forks are cheap.
-- **Rust**: the same calls are in the `sandfs-core` crate (`cargo add sandfs-core`), with git in `sandfs-git`. Everything the `sandfs` command does (workspaces saved on disk, mounting, `fork`, `update`, `changes --copy-to`) is in the `sandfs` crate (`cargo add sandfs`), as methods of `sandfs::Home`, for a program that builds on workspaces without running the command.
+- **Rust**: the same calls are in the `sandfs-core` crate (`cargo add sandfs-core`), with git in `sandfs-git`. Everything the command does is in the `sandfs` crate; see [Build on sandfs](#build-on-sandfs).
 
 ### Python API
 
