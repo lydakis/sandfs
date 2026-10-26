@@ -76,6 +76,17 @@ enum Cmd {
         /// system. Repeat for several; forks keep them.
         #[arg(long, value_name = "PATH")]
         read_only: Vec<String>,
+        /// With git:<path>, a repository on this machine at HEAD: also bring in the files
+        /// its folder has changed since, as `git status` lists them (changed, new or
+        /// deleted; ignored files stay out). They are copied once, now, so later edits
+        /// there don't reach the workspace.
+        #[arg(long)]
+        uncommitted: bool,
+        /// With a git: source: start git in the workspace on a new branch NAME at the
+        /// mounted commit, so its commits can be pushed back to the repository with
+        /// `git push origin NAME` without touching the branches there.
+        #[arg(long, value_name = "NAME")]
+        branch: Option<String>,
         /// Serve in the foreground instead of in the background.
         #[arg(long, short)]
         foreground: bool,
@@ -121,7 +132,13 @@ enum Cmd {
         workspace: String,
     },
     /// Delete an unmounted workspace and its changes.
-    Rm { name: String },
+    Rm {
+        /// The workspace's name, or with --unmount the directory it is mounted on.
+        name: String,
+        /// Unmount the workspace first if it is mounted.
+        #[arg(long)]
+        unmount: bool,
+    },
     /// Free the disk space remote repositories' downloaded files take up.
     ///
     /// For each remote repository none of whose workspaces is in use, drop the file
@@ -216,10 +233,13 @@ fn print_out(text: &str) -> Result<()> {
 fn run(cli: Cli) -> Result<()> {
     let home = Home::locate()?;
     match cli.command {
-        Cmd::Mount { source, dir, name, read_only, foreground } => {
+        Cmd::Mount { source, dir, name, read_only, uncommitted, branch, foreground } => {
             // A bare word naming a workspace remounts it; anything else is a source.
             if home.exists(&source) && name.is_none() {
                 only_when_created(&read_only, &source)?;
+                if uncommitted || branch.is_some() {
+                    bail!("--uncommitted and --branch apply when a workspace is created, and {source} already exists");
+                }
                 return mount(&home, &source, &dir, foreground);
             }
             let name = default_name(name, &dir)?;
@@ -227,6 +247,12 @@ fn run(cli: Cli) -> Result<()> {
             let mut record = home.resolve(&source)?;
             record.read_only = relative_paths(&read_only)?;
             home.create(&name, &record)?;
+            if (uncommitted || branch.is_some())
+                && let Err(err) = git::start(&home, &name, uncommitted, branch.as_deref())
+            {
+                remove_unused(&home, &name);
+                return Err(err);
+            }
             drop(repos);
             mount_new(&home, &name, &dir, foreground)
         }
@@ -319,9 +345,13 @@ fn run(cli: Cli) -> Result<()> {
             let info = home.attached_mount(&name).with_context(|| format!("{name} is not mounted"))?;
             unmount(&home, &name, &info)
         }
-        Cmd::Rm { name } => {
-            if home.attached_mount(&name).is_some() {
-                bail!("{name} is mounted; unmount it first");
+        Cmd::Rm { name, unmount: first } => {
+            let name = if first { home.find(&name)? } else { name };
+            if let Some(info) = home.attached_mount(&name) {
+                if !first {
+                    bail!("{name} is mounted; unmount it first, or pass --unmount");
+                }
+                unmount(&home, &name, &info)?;
             }
             home.record(&name)?;
             let _writer = home.lock(&name, "sandfs rm")?;

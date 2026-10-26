@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **sandfs-cli, task copies of a local repository**: `sandfs mount git:PATH DIR --branch NAME` starts git in the mount on a new branch at the mounted commit, so its commits go back with `git push origin NAME` without touching the branches there; a name the repository already has is refused. `--uncommitted` also brings in what the repository's folder has changed since `HEAD`: changed, staged, new and deleted files, links and modes, but not ignored files. They are copied once, when the workspace is made, so the copy keeps its starting point while work goes on in the folder, and `changes` lists them from the start; what was staged shows as unstaged in the copy. The repository is only read. `sandfs rm --unmount NAME` (or the mount's directory) unmounts a workspace and deletes it in one step.
+
 ## 0.5.1 (2026-10-22)
 
 The same code as 0.5.0, released again so that it reaches PyPI. The 0.5.0 crates and GitHub release (with the `sandfs` downloads) came out, but the PyPI upload failed because the release workflow handed PyPI the `sandfs` archives along with the Python packages. It now uploads only the Python packages.

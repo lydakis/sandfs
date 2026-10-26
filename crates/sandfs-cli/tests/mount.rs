@@ -425,6 +425,137 @@ fn git_works_inside_a_remote_git_mount() {
 }
 
 #[test]
+fn a_task_copy_carries_uncommitted_files_and_pushes_back_on_its_own_branch() {
+    if !fuse_available() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    // Named so that the repository can also be given as a URL (see the remote test).
+    let data = tempfile::Builder::new().prefix("sandfs-task").tempdir().unwrap();
+    let repo = data.path().join("repo");
+    std::fs::create_dir_all(repo.join("old")).unwrap();
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    std::fs::write(repo.join("old/notes.md"), "old\n").unwrap();
+    std::fs::write(repo.join("docs/guide"), "guide\n").unwrap();
+    std::fs::create_dir_all(repo.join("lib")).unwrap();
+    std::fs::write(repo.join("lib/one.rs"), "one\n").unwrap();
+    std::fs::create_dir_all(repo.join("assets")).unwrap();
+    std::fs::write(repo.join("assets/logo.txt"), "logo\n").unwrap();
+    std::fs::write(repo.join("queue"), "queue\n").unwrap();
+    std::fs::write(repo.join("run.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(repo.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "first"]);
+
+    // Uncommitted work of every kind: an edit, a staged new file, a new one, a link, a
+    // deletion that empties a folder, a mode change, a folder in place of a file, a file
+    // in place of a folder, a link in place of a folder, an ignored file, and a pipe,
+    // which is left out.
+    std::fs::write(repo.join("README.md"), "hello, edited\n").unwrap();
+    std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+    git(&repo, &["add", "staged.txt"]);
+    std::fs::write(repo.join("draft.txt"), "draft\n").unwrap();
+    std::os::unix::fs::symlink("README.md", repo.join("readme")).unwrap();
+    std::fs::remove_dir_all(repo.join("old")).unwrap();
+    std::fs::set_permissions(repo.join("run.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::remove_file(repo.join("docs/guide")).unwrap();
+    std::fs::create_dir(repo.join("docs/guide")).unwrap();
+    std::fs::write(repo.join("docs/guide/intro.md"), "intro\n").unwrap();
+    std::fs::remove_dir_all(repo.join("lib")).unwrap();
+    std::fs::write(repo.join("lib"), "lib\n").unwrap();
+    std::fs::remove_dir_all(repo.join("assets")).unwrap();
+    std::fs::create_dir(repo.join("art")).unwrap();
+    std::fs::write(repo.join("art/logo.txt"), "new logo\n").unwrap();
+    std::os::unix::fs::symlink("art", repo.join("assets")).unwrap();
+    std::fs::write(repo.join("build.log"), "ignored\n").unwrap();
+    std::fs::remove_file(repo.join("queue")).unwrap();
+    assert!(Command::new("mkfifo").arg(repo.join("queue")).status().unwrap().success());
+    let before = git_out(&repo, &["status", "--porcelain"]);
+
+    let mut sandfs = Sandfs::new();
+    let task = data.path().join("task");
+    let source = format!("git:{}", repo.display());
+    let args =
+        ["mount", &source, task.to_str().unwrap(), "--uncommitted", "--branch", "task/one", "--read-only", "docs"];
+    sandfs.mount(&args, &task);
+
+    // The copy looks like the folder to git, on its own branch, though nothing is staged in it.
+    assert_eq!(git_out(&task, &["status", "--porcelain", "-b"]).lines().next(), Some("## task/one"));
+    let unstaged = |status: &str| {
+        let mut lines: Vec<String> =
+            status.lines().filter(|line| !line.ends_with(" queue")).map(|line| line.replace("A  ", "?? ")).collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(unstaged(&git_out(&task, &["status", "--porcelain"])), unstaged(&before));
+    assert!(before.contains("A  staged.txt\n"), "{before}");
+    assert_eq!(std::fs::read_to_string(task.join("docs/guide/intro.md")).unwrap(), "intro\n");
+    assert!(std::fs::write(task.join("docs/guide/intro.md"), "changed\n").is_err(), "docs stays read-only");
+    assert_eq!(std::fs::read_to_string(task.join("lib")).unwrap(), "lib\n");
+    assert_eq!(std::fs::read_link(task.join("assets")).unwrap(), Path::new("art"));
+    assert_eq!(std::fs::read_to_string(task.join("queue")).unwrap(), "queue\n", "the pipe was left out");
+    assert_eq!(std::fs::read_link(task.join("readme")).unwrap(), Path::new("README.md"));
+    assert!(!task.join("old").exists(), "a folder git emptied is gone");
+    assert!(!task.join("build.log").exists(), "ignored files stay out");
+    assert_eq!(std::fs::metadata(task.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
+    assert_eq!(
+        sandfs.stdout(&["changes", "task"]),
+        "M README.md\nA art/logo.txt\nA assets\nD assets/logo.txt\nD docs/guide\nA docs/guide/intro.md\nA draft.txt\nA lib\nD lib/one.rs\nD old/notes.md\nA readme\nM run.sh\nA staged.txt\n"
+    );
+
+    // Later edits in the folder stay out of the copy, and the copy's commits come back
+    // as a branch, leaving the folder's own work alone.
+    std::fs::write(repo.join("README.md"), "hello, later\n").unwrap();
+    assert_eq!(std::fs::read_to_string(task.join("README.md")).unwrap(), "hello, edited\n");
+    git_out(&task, &["add", "-A"]);
+    git_out(&task, &["commit", "-q", "-m", "task"]);
+    git_out(&task, &["push", "-q", "origin", "task/one"]);
+    assert_eq!(git_out(&repo, &["show", "task/one:README.md"]), "hello, edited\n");
+    assert_eq!(git_out(&repo, &["log", "--format=%s", "task/one"]), "task\nfirst\n");
+    std::fs::write(repo.join("README.md"), "hello, edited\n").unwrap();
+    assert_eq!(git_out(&repo, &["status", "--porcelain"]), before);
+
+    // Refused before anything is made: a branch the repository has, a name git won't
+    // take, a commit other than HEAD, a remote repository, a folder source, and a
+    // workspace that exists.
+    let refused = |args: &[&str], message: &str| {
+        let output = sandfs.try_run(args);
+        assert!(!output.status.success(), "sandfs {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "sandfs {args:?}: {stderr}");
+    };
+    let other = data.path().join("other");
+    let other = other.to_str().unwrap();
+    refused(&["mount", &source, other, "--branch", "task/one"], "already has a branch task/one");
+    refused(&["mount", &source, other, "--branch", "bad..name"], "not a name git takes");
+    refused(&["mount", &format!("{source}@task/one"), other, "--uncommitted"], "mount the repository at HEAD");
+    let url = format!("git:file://{}", repo.display());
+    refused(&["mount", &url, other, "--uncommitted"], "is remote");
+    refused(&["mount", &url, other, "--branch", "task/one"], "already has a branch task/one");
+    // A partial clone's pushes go to the remote it borrows from, which is what counts.
+    git(&repo, &["config", "uploadpack.allowFilter", "true"]);
+    let partial = data.path().join("partial");
+    git(data.path(), &["clone", "-q", "--filter=blob:none", &format!("file://{}", repo.display()), "partial"]);
+    refused(
+        &["mount", &format!("git:{}", partial.display()), other, "--branch", "task/one"],
+        "already has a branch task/one",
+    );
+    refused(&["mount", repo.to_str().unwrap(), other, "--branch", "two"], "is a folder");
+    refused(&["mount", "task", other, "--branch", "two"], "already exists");
+    assert_eq!(sandfs.stdout(&["list"]).lines().count(), 1, "no workspace was left behind");
+
+    // Removing a mounted copy unmounts it first only when asked.
+    refused(&["rm", "task"], "pass --unmount");
+    sandfs.run(&["rm", "--unmount", task.to_str().unwrap()]);
+    sandfs.mounts.clear();
+    assert_eq!(sandfs.stdout(&["list"]), "");
+}
+
+#[test]
 fn a_directory_source_is_never_written() {
     if !fuse_available() {
         return;
