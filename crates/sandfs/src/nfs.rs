@@ -902,6 +902,7 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
     }
 
+    #[cfg(nfs)]
     #[test]
     fn a_save_is_answered_by_a_server_that_reads_only_the_secret() {
         use std::io::{Read, Write};
