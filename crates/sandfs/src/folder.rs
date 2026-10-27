@@ -41,8 +41,12 @@ pub fn clones_into(top: &Path, dir: &Path) -> bool {
         return false;
     };
     let probe = at.join(format!(".sandfs-clone-check-{}", std::process::id()));
+    // The clone is made only where nothing has the name, and a failed one is removed
+    // again, so only a clone made here is ours to remove.
     let cloned = reflink_copy::reflink(&file, &probe).is_ok();
-    let _ = std::fs::remove_file(&probe);
+    if cloned {
+        let _ = std::fs::remove_file(&probe);
+    }
     cloned
 }
 
