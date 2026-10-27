@@ -50,7 +50,7 @@ The home is `$SANDFS_HOME`, else `$XDG_DATA_HOME/sandfs`, else `~/.local/share/s
 
 ## Before you build on it
 
-- **The API will change.** sandfs is pre-1.0, so a minor release (0.7 to 0.8) may change this crate's API; the [changelog](https://github.com/lydakis/sandfs/blob/main/docs/changelog.md) says how each time. Depend on one minor version, such as `sandfs = "0.7"`.
+- **The API will change.** sandfs is pre-1.0, so a minor release (0.8 to 0.9) may change this crate's API; the [changelog](https://github.com/lydakis/sandfs/blob/main/docs/changelog.md) says how each time. Depend on one minor version, such as `sandfs = "0.8"`.
 - **Writing in a mount costs more than writing to a plain folder, most of all on macOS.** Every file operation in a mount goes through the mount's process. On macOS each write is also a round trip over localhost before it returns, so write-heavy work is where a Mac feels it: compiling ripgrep from scratch took about 18 s in a mount against 13 s in a plain folder on the same Mac (October 2026).
 - **Linux needs FUSE 3** (`fusermount3`, package `fuse3`) to mount.
 - **sandfs isn't an execution sandbox.** A program working in a mount can still reach anything else its user can; `Home::shell` runs one confined to the mount by the operating system's own sandbox.

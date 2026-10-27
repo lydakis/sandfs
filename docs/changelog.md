@@ -1,10 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 (2026-10-27)
 
-A fork of a plain folder on another disk than sandfs's home can now copy its files instead of being refused, and the refusal is an error a program can match on. `ForkOptions` has a new field, so code that builds it without `..Default::default()` needs to add it.
+The main changes:
+- On macOS, a fork of a git clone is a real folder of APFS clones rather than a mount, so programs and git run in it at the disk's own speed.
+- A fork of a plain folder on another disk than sandfs's home can copy its files (`--allow-copy`) instead of being refused, and the refusal is an error a program can match on.
+- Forks, `changes` and small-file writes in a mount are faster, and a slow first read on a macOS mount waits instead of failing.
 
+API changes in the `sandfs` crate: `ForkOptions` has two new fields, `real_folder` and `allow_copy`, and `Forked` has `real_folder`, so code that builds `ForkOptions` without `..Default::default()` needs to add them. `sandfs::CrossDevice` is new. `sandfs-core` and the Python API are unchanged.
+
+- **sandfs and sandfs-cli, a fork of a clone kept as a real folder**: on macOS a mount goes through the system's NFS client, which makes work on many small files 4 to 10 times slower than in a worktree. `sandfs fork CLONE DIR` (or a fork of such a fork) is now a real folder there by default: its files are clones of the clone's, with their times and modes, ignored files left out, and its `.git` is what a mount would show (same commit, `--branch`, origin). sandfs brings the workspace up to date from the folder before `changes` and `fork`, running git in a private repository of its own, so settings written into the folder's `.git` never make `sandfs changes` run a program; `.git/config` edits and hooks are still reported. `--real-folder` makes one on any platform (copying files where the disk can't clone), `--mount` forces a mount, and `--read-only` implies one. `rm --unmount` deletes the folder; `mount`, `update`, `unmount`, `serve --mcp` and `shell` refuse one and say why. In the library this is `ForkOptions::real_folder` and `Forked::real_folder`. A fork of a real folder carries its files but not commits made in it.
 - **sandfs and sandfs-cli, forking a folder on another disk**: a fork of a plain folder clones its files into the home, and a file is cloned only within one disk that can clone, so a folder on another disk (such as a separate APFS volume on macOS) was refused with "can't clone ...: Cross-device link", which read like a fault of the disk. It is now refused with "FOLDER is on another disk than sandfs's home (HOME)", and in the library with a `sandfs::CrossDevice { folder, home }` error, found with `err.downcast_ref::<sandfs::CrossDevice>()`. `ForkOptions::allow_copy` (`sandfs fork --allow-copy`) copies the files that can't be cloned in full instead, on another disk or on one that doesn't clone files such as ext4, and `update` of such a fork copies the same way. Files that can be cloned still are. Without it, nothing changed: the fork is refused rather than copied.
+- **sandfs-cli, faster forks and `changes`**: small files (64 KiB or less) written in a mount stay in memory until a save packs them, instead of going through a file on disk first (Linux, 1,000 files: rewrite 511 to 65 ms, create 576 to 110 ms). macOS sees an unmount at once rather than at its next half-second check. A fork of a local clone runs fewer git processes, and the ones left at once (Linux: 31 to 17 ms); `changes` on a real folder skips files unchanged since it last looked and reuses the source its update opened (macOS CI: 113 to about 60 ms, and 84 to 97 ms after an edit).
+- **sandfs-cli, a slow first read on macOS**: a macOS mount was soft, so the system gave up on a call after at most about 30 s, and a first read waiting on a slow download failed with an I/O error. It is now `hard,intr,deadtimeout=60`: slow reads wait, and if the mount process dies, calls fail after a minute without answers.
+- **Benchmarks**: `sandfs-bench --only copies` compares a git worktree, a copy-on-write copy of a clone and `sandfs fork` at the work an agent does in a task's copy, on Linux and macOS for every pull request.
 
 ## 0.7.1 (2026-10-26)
 
