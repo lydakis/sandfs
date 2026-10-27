@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+A fork of a plain folder on another disk than sandfs's home can now copy its files instead of being refused, and the refusal is an error a program can match on. `ForkOptions` has a new field, so code that builds it without `..Default::default()` needs to add it.
+
+- **sandfs and sandfs-cli, forking a folder on another disk**: a fork of a plain folder clones its files into the home, and a file is cloned only within one disk that can clone, so a folder on another disk (such as a separate APFS volume on macOS) was refused with "can't clone ...: Cross-device link", which read like a fault of the disk. It is now refused with "FOLDER is on another disk than sandfs's home (HOME)", and in the library with a `sandfs::CrossDevice { folder, home }` error, found with `err.downcast_ref::<sandfs::CrossDevice>()`. `ForkOptions::allow_copy` (`sandfs fork --allow-copy`) copies the files that can't be cloned in full instead, on another disk or on one that doesn't clone files such as ext4, and `update` of such a fork copies the same way. Files that can be cloned still are. Without it, nothing changed: the fork is refused rather than copied.
+
 ## 0.7.1 (2026-10-26)
 
 The `sandfs` crate's README and docs.rs page now say how to build on it, and git's file monitor no longer prints an error in a git worktree added from a mount. No API changes.

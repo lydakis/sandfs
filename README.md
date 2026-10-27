@@ -154,7 +154,7 @@ sandfs rm --unmount fix-login              # done with the copy
 
 On macOS such a copy of a clone is a real folder rather than a mount, because macOS reaches a mount over NFS, which makes work on many small files several times slower than on the disk. Its files are APFS clones of the clone's, so it still takes no space, and programs and git run in it at the disk's own speed. sandfs reads its changes from the folder when asked (`changes`, `fork`), and `rm --unmount` deletes it. What only a mount can do, it can't: `--read-only` paths and `sandfs shell` need one, so with `--read-only`, or with `--mount`, the copy is mounted as on Linux. `--real-folder` makes one anywhere (on a disk that can't clone files, its files are copied).
 
-A folder that isn't in git forks too: the copy is the folder as it is now, its files cloned rather than copied (on APFS, btrfs or XFS; ext4 can't clone, so there it is refused), and `changes --copy-to` brings the work back, refusing to overwrite a file edited in the folder meanwhile:
+A folder that isn't in git forks too: the copy is the folder as it is now, its files cloned rather than copied (on APFS, btrfs or XFS), and `changes --copy-to` brings the work back, refusing to overwrite a file edited in the folder meanwhile. Cloning works only within one disk that can clone, so a folder on another disk than sandfs's home, or on ext4, is refused, unless `--allow-copy` says to copy its files in full:
 
 ```bash
 sandfs fork ~/notes ~/tasks/tidy-notes

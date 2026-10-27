@@ -87,6 +87,12 @@ enum Cmd {
         /// Mount the fork at DIR even where it would be kept as a real folder.
         #[arg(long)]
         mount: bool,
+        /// For a plain folder whose files can't be cloned into $SANDFS_HOME, because it
+        /// is on another disk or on one that doesn't clone files (such as ext4), copy
+        /// them in full instead of refusing. That takes as much space as the folder and
+        /// the time to copy it, and `update` copies the same way.
+        #[arg(long)]
+        allow_copy: bool,
         /// Serve in the foreground instead of in the background.
         #[arg(long, short)]
         foreground: bool,
@@ -229,9 +235,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Fork { from, dir, name, read_only, branch, real_folder, mount, foreground } => {
+        Cmd::Fork { from, dir, name, read_only, branch, real_folder, mount, allow_copy, foreground } => {
             let real_folder = (real_folder || mount).then_some(real_folder);
-            let options = ForkOptions { name, read_only, branch, foreground, real_folder };
+            let options = ForkOptions { name, read_only, branch, foreground, real_folder, allow_copy };
             let forked = home.fork(&from, dir.as_deref(), &options)?;
             match forked.dir {
                 Some(dir) if forked.real_folder => println!("{} kept at {}", forked.name, dir.display()),

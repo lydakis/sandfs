@@ -103,7 +103,7 @@ fn next_source(home: &Home, record: &Record, source: Option<&str>) -> Result<Rec
     };
     // A copy of a folder as it was moves onto a new copy of the folder as it is now.
     Ok(match &next.base {
-        Base::Dir { path } if is_copy(home, record) => home.freeze(path)?,
+        Base::Dir { path } if is_copy(home, record) => home.freeze(path, record.allow_copy)?,
         _ => next,
     })
 }

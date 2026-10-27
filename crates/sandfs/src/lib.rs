@@ -155,8 +155,11 @@ impl Home {
     /// `from` is a workspace (its name, the folder it is mounted on, or a folder in
     /// that); a git repository's working folder that sandfs doesn't serve, such as a
     /// clone, forked as its HEAD commit plus the files it changed since; or a plain
-    /// folder, frozen as it is now (which needs a disk that clones files: APFS, btrfs
-    /// or XFS). Later changes to `from` don't reach the fork.
+    /// folder, frozen as it is now by cloning its files into the home, which needs the
+    /// folder and the home on one disk that clones files (APFS, btrfs or XFS) unless
+    /// [`ForkOptions::allow_copy`] is set. A folder on another disk than the home is
+    /// refused with a [`CrossDevice`] error. Later changes to `from` don't reach the
+    /// fork.
     pub fn fork(&self, from: &str, dir: Option<&Path>, options: &ForkOptions) -> Result<Forked> {
         ops::fork(&self.inner, from, dir, options)
     }
@@ -253,7 +256,42 @@ pub struct ForkOptions {
     /// [`Home::fork`] read it as they read a mount; [`Home::remove`] with `unmount`
     /// deletes it. It can't be mounted, updated, served or confined.
     pub real_folder: Option<bool>,
+    /// For a plain folder whose files can't be cloned into the home, because it is on
+    /// another disk or on one that doesn't clone files (such as ext4), copy them in
+    /// full instead of refusing. That takes as much space as the folder, and the time
+    /// to copy it; [`Home::update`] copies the same way. Files that can be cloned still
+    /// are.
+    pub allow_copy: bool,
 }
+
+/// [`Home::fork`] refused to freeze a plain folder, since `folder` is on another disk
+/// than the home, and a file is cloned only within one disk. Set
+/// [`ForkOptions::allow_copy`] to copy the files instead, or mount the folder itself
+/// with [`Home::mount`], which shows its later changes too. Find it with
+/// `err.downcast_ref::<sandfs::CrossDevice>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossDevice {
+    /// The folder forked, or the folder in it that is on another disk.
+    pub folder: PathBuf,
+    /// The home.
+    pub home: PathBuf,
+}
+
+impl std::fmt::Display for CrossDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is on another disk than sandfs's home ({}), and forking a plain folder clones its files, \
+             which works only within one disk. `sandfs fork --allow-copy` copies them in full instead; \
+             `sandfs mount {} DIR` mounts the folder itself, showing its later changes too",
+            self.folder.display(),
+            self.home.display(),
+            self.folder.display()
+        )
+    }
+}
+
+impl std::error::Error for CrossDevice {}
 
 /// What [`Home::changes`] lists, and where it copies them.
 #[derive(Debug, Clone, Default)]

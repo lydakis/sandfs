@@ -680,16 +680,21 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
 
     let task = data.path().join("task");
     let output = sandfs.try_run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    // Where a fork of the folder copies files the disk can't clone.
+    let mut allow_copy = vec![];
     if !output.status.success() {
-        // A disk that can't clone files, such as ext4, refuses, leaving nothing behind.
+        // A disk that can't clone files, such as ext4, refuses, leaving nothing behind,
+        // unless told to copy them instead; the rest then runs on copies.
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("needs the folder and sandfs's home on one disk that clones files"), "{stderr}");
+        assert!(stderr.contains("--allow-copy"), "{stderr}");
         if cfg!(target_os = "macos") {
             panic!("APFS clones files: {stderr}");
         }
         assert!(!sandfs.stdout(&["list"]).contains("task"));
         assert_eq!(copies(), 0);
-        return;
+        allow_copy.push("--allow-copy");
+        sandfs.run(&[&["fork", folder.to_str().unwrap(), task.to_str().unwrap()], &allow_copy[..]].concat());
     }
     sandfs.mounts.push(task.clone());
     let secs = |path: &Path| {
@@ -742,7 +747,7 @@ fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
 
     // Moving a fork of the folder takes a new copy of the folder as it is now, keeping
     // the fork's own changes, and the old copy goes.
-    sandfs.run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    sandfs.run(&[&["fork", folder.to_str().unwrap(), task.to_str().unwrap()], &allow_copy[..]].concat());
     sandfs.mounts.push(task.clone());
     std::fs::write(task.join("mine.md"), "mine\n").unwrap();
     sandfs.unmount(&task);

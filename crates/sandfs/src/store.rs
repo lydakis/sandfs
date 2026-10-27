@@ -35,6 +35,7 @@ use anyhow::{Context, Result, bail};
 use sandfs_core::{DirSource, VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
+use crate::CrossDevice;
 use crate::host::{mount_source, mount_table};
 use crate::persist::{Restored, Saved, is_object_gone};
 
@@ -78,6 +79,10 @@ pub struct Record {
     /// For a fork kept as a real folder instead of a mount (see `folder`), that folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<PathBuf>,
+    /// For a copy of a plain folder, whether files that can't be cloned were copied in
+    /// full (see `freeze`), as `update` copies them again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_copy: bool,
 }
 
 /// `mount.json`: the process serving a mounted workspace.
@@ -487,8 +492,8 @@ impl Home {
     /// `fork`): its files are cloned into `copies/`, which costs no time or space for
     /// their contents on a disk that clones files (APFS, btrfs, XFS). Where the disk
     /// can't, or `folder` is on another disk than the home, it is refused rather than
-    /// copied in full. Pipes, sockets and devices are left out.
-    pub fn freeze(&self, folder: &Path) -> Result<Record> {
+    /// copied in full, unless `allow_copy`. Pipes, sockets and devices are left out.
+    pub fn freeze(&self, folder: &Path, allow_copy: bool) -> Result<Record> {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if crate::resolve_new(&self.root)?.starts_with(folder) {
             bail!(
@@ -503,7 +508,7 @@ impl Home {
             .prefix("copy-")
             .tempdir_in(&copies)
             .with_context(|| format!("making room in {}", copies.display()))?;
-        clone_tree(folder, copy.path(), &self.root)?;
+        clone_tree(folder, copy.path(), &self.root, allow_copy)?;
         let path = copy.keep();
         let source = folder.display().to_string();
         Ok(Record {
@@ -513,6 +518,7 @@ impl Home {
             read_only: Vec::new(),
             updated: BTreeMap::new(),
             folder: None,
+            allow_copy,
         })
     }
 
@@ -607,7 +613,15 @@ impl Home {
             }
             Base::Dir { path }
         };
-        Ok(Record { source: named, base, created, read_only: Vec::new(), updated: BTreeMap::new(), folder: None })
+        Ok(Record {
+            source: named,
+            base,
+            created,
+            read_only: Vec::new(),
+            updated: BTreeMap::new(),
+            folder: None,
+            allow_copy: false,
+        })
     }
 
     /// The record for a new workspace over the `HEAD` of the repository whose working
@@ -623,13 +637,15 @@ impl Home {
             read_only: Vec::new(),
             updated: BTreeMap::new(),
             folder: None,
+            allow_copy: false,
         })
     }
 }
 
 /// Clone every file, link and folder in `top` into the empty folder `to`, keeping
-/// modes and modification times, so a build sees the files as it left them.
-fn clone_tree(top: &Path, to: &Path, home: &Path) -> Result<()> {
+/// modes and modification times, so a build sees the files as it left them. A file
+/// that can't be cloned is copied if `allow_copy`, and refused otherwise.
+fn clone_tree(top: &Path, to: &Path, home: &Path, allow_copy: bool) -> Result<()> {
     let mut folders = vec![(top.to_path_buf(), to.to_path_buf())];
     let mut made = Vec::new();
     while let Some((from, to)) = folders.pop() {
@@ -643,12 +659,24 @@ fn clone_tree(top: &Path, to: &Path, home: &Path) -> Result<()> {
             } else if kind.is_symlink() {
                 symlink(&std::fs::read_link(&path)?, &copy)?;
             } else if kind.is_file() {
-                reflink_copy::reflink(&path, &copy).map_err(|err| {
+                let cloned = if allow_copy {
+                    reflink_copy::reflink_or_copy(&path, &copy).map(drop)
+                } else {
+                    reflink_copy::reflink(&path, &copy)
+                };
+                cloned.map_err(|err| -> anyhow::Error {
+                    if err.kind() == std::io::ErrorKind::CrossesDevices {
+                        // The folder itself, unless only a folder mounted in it is elsewhere.
+                        let same = device(top).is_some() && device(top) == device(home);
+                        let folder = if same { &from } else { top };
+                        return CrossDevice { folder: folder.to_path_buf(), home: home.to_path_buf() }.into();
+                    }
                     anyhow::anyhow!(
                         "can't clone {} into {}: {err}. Forking a plain folder clones its files, which \
                          needs the folder and sandfs's home on one disk that clones files, such as APFS, \
-                         btrfs or XFS (ext4 doesn't); `sandfs mount {} DIR` mounts the folder itself \
-                         instead, showing its later changes too",
+                         btrfs or XFS (ext4 doesn't); `sandfs fork --allow-copy` copies them in full \
+                         instead, and `sandfs mount {} DIR` mounts the folder itself, showing its later \
+                         changes too",
                         path.display(),
                         home.display(),
                         top.display()
@@ -668,7 +696,17 @@ fn clone_tree(top: &Path, to: &Path, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Delete a copy of a folder, along with folders in it that were cloned read-only.
+/// The disk `path` is on, where the system says.
+#[cfg(unix)]
+fn device(path: &Path) -> Option<u64> {
+    Some(std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(path).ok()?))
+}
+
+#[cfg(not(unix))]
+fn device(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// The file whose lock holds the copy at `path` (see [`Home::hold_copy`]).
 fn held_path(path: &Path) -> PathBuf {
     let mut held = path.as_os_str().to_owned();
@@ -676,6 +714,7 @@ fn held_path(path: &Path) -> PathBuf {
     PathBuf::from(held)
 }
 
+/// Delete a copy of a folder, along with folders in it that were cloned read-only.
 pub fn remove_copy(path: &Path) -> Result<()> {
     if std::fs::remove_dir_all(path).is_err() {
         let mut folders = vec![path.to_path_buf()];
@@ -852,6 +891,50 @@ mod tests {
         };
         home.set_mount_info("ws", Some(&info)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A folder on another disk than `near`, if this system has one to write in.
+    #[cfg(unix)]
+    fn other_disk(near: &Path) -> Option<tempfile::TempDir> {
+        let here = device(near)?;
+        ["/dev/shm", "/Volumes/RAMDisk"]
+            .iter()
+            .filter(|path| device(Path::new(path)).is_some_and(|dev| dev != here))
+            .find_map(|path| tempfile::tempdir_in(path).ok())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_on_another_disk_is_refused_by_kind_or_copied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = tempfile::tempdir().unwrap();
+        let Some(data) = other_disk(state.path()) else { return };
+        let home = Home::at(state.path());
+        let folder = data.path().join("notes");
+        std::fs::create_dir_all(folder.join("drafts")).unwrap();
+        std::fs::write(folder.join("drafts/plan.md"), "plan\n").unwrap();
+        std::fs::write(folder.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(folder.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        File::options().write(true).open(folder.join("run.sh")).unwrap().set_modified(old).unwrap();
+
+        // Refused, naming both, with nothing left behind.
+        let err = home.freeze(&folder, false).unwrap_err();
+        let refused = err.downcast_ref::<CrossDevice>().expect("a CrossDevice error");
+        assert_eq!(refused, &CrossDevice { folder: folder.clone(), home: state.path().to_path_buf() });
+        assert!(err.to_string().contains("is on another disk than sandfs's home"), "{err}");
+        assert_eq!(std::fs::read_dir(home.copies_dir()).unwrap().count(), 0);
+
+        // Copied in full when allowed, with modes and times, and the record says so.
+        let record = home.freeze(&folder, true).unwrap();
+        assert!(record.allow_copy);
+        let Base::Dir { path } = &record.base else { panic!("{:?}", record.base) };
+        assert_eq!(std::fs::read_to_string(path.join("drafts/plan.md")).unwrap(), "plan\n");
+        let meta = std::fs::metadata(path.join("run.sh")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        assert_eq!(meta.modified().unwrap(), old);
+        assert!(home.holds_copy(path));
     }
 
     #[test]
