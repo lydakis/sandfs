@@ -16,7 +16,7 @@ jobs:
       - name: Build sandfs
         run: rustup toolchain install stable --profile minimal && rustup default stable && cargo build --release -p sandfs-cli
       - name: Experiment
-        run: xp/mac.sh
+        run: SKIP_NFS4=1 xp/mac.sh
   macfuse-off:
     if: false
     runs-on: macos-26

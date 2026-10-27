@@ -108,8 +108,8 @@ passthrough() { # label lib-flags backend-options...
     for _ in $(seq 1 40); do mount | grep -qF " $M " && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done
     mount | grep -qF " $M " && break
     log "$label attempt $attempt: $(tr '\n' ' ' < "$W/pt.log" | cut -c1-300)"
-    log show --last 30s --predicate 'process CONTAINS "fskit" OR subsystem CONTAINS "FSKit"' 2>/dev/null \
-      | grep -iE 'error|fail|denied|not |disabled|enable|reject|entitle' | cut -c1-260 | tail -8 | sed 's/^/    fskit: /' | tee -a "$R"
+    /usr/bin/log show --last 40s --predicate 'process CONTAINS "fskit" OR subsystem CONTAINS "FSKit"' 2>/dev/null \
+      | grep -viE 'NotifyToken|CFURLResolve|returning ep|activating connection' | cut -c1-260 | tail -25 | sed 's/^/    fskit: /' | tee -a "$R"
     kill $pid 2>/dev/null; sleep 15
   done
   if mount | grep -qF " $M "; then
@@ -124,7 +124,7 @@ passthrough() { # label lib-flags backend-options...
 if [ "${FUSET:-1}" = 1 ]; then
   LIB=fuset
   cc -O2 -o "$W/pt-fuset" "$X/passthrough.c" -D_FILE_OFFSET_BITS=64 $(pkg-config --cflags --libs fuse-t) 2>&1 | tail -5
-  passthrough "fuse-t nfs" "" -f -o backend=nfs
+  [ "${SKIP_NFS4:-0}" = 1 ] || passthrough "fuse-t nfs" "" -f -o backend=nfs
   passthrough "fuse-t fskit" "" -f -o backend=fskit
 fi
 if [ "${MACFUSE:-0}" = 1 ]; then
