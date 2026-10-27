@@ -697,11 +697,14 @@ fn clone_tree(top: &Path, to: &Path, home: &Path, allow_copy: bool) -> Result<()
 }
 
 /// The disk `path` is on, where the system says.
+#[cfg(unix)]
 fn device(path: &Path) -> Option<u64> {
-    #[cfg(unix)]
-    return std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(path).ok()?).into();
-    #[cfg(not(unix))]
-    return None;
+    Some(std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(path).ok()?))
+}
+
+#[cfg(not(unix))]
+fn device(_path: &Path) -> Option<u64> {
+    None
 }
 
 /// The file whose lock holds the copy at `path` (see [`Home::hold_copy`]).
