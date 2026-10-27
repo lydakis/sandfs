@@ -88,8 +88,8 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
         Origin::Workspace(from) => home.record(from)?.folder.map(|top| (top, Some(folder::private_index(home, from)))),
         Origin::Folder(_) => None,
     };
-    // By default only on macOS, where the mount is slowest, and only where nothing
-    // needs a mount.
+    // By default on macOS, where the mount is slowest, and on Linux where the disk
+    // clones files, so the folder costs no space; only where nothing needs a mount.
     let real = match real_folder {
         Some(true) if dir.is_none() => bail!("a fork kept as a folder needs the folder: give DIR"),
         Some(true) if clone_of.is_none() => {
@@ -99,7 +99,12 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
             bail!("--read-only needs a mount, and a fork kept as a folder isn't one")
         }
         Some(real) => *real,
-        None => cfg!(target_os = "macos") && dir.is_some() && clone_of.is_some() && read_only.is_empty(),
+        None => {
+            read_only.is_empty()
+                && dir
+                    .zip(clone_of.as_ref())
+                    .is_some_and(|(dir, (top, _))| cfg!(target_os = "macos") || folder::clones_into(top, dir))
+        }
     };
     let name = match (dir, name.clone()) {
         (Some(dir), name) => default_name(name, dir)?,

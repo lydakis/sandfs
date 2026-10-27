@@ -651,6 +651,60 @@ fn a_fork_of_a_clone_carries_uncommitted_files_and_pushes_back_on_its_own_branch
     assert!(!sandfs.stdout(&["list"]).lines().any(|line| line.starts_with("task\t")));
 }
 
+/// Whether files clone without copying their contents in `dir`: APFS on macOS, btrfs or
+/// XFS on Linux. With `SANDFS_REQUIRE_REFLINK` set, as CI does for a run on btrfs, they
+/// must.
+fn clones_files(dir: &Path) -> bool {
+    let clones = cfg!(target_os = "macos") || {
+        std::fs::write(dir.join("clone-check"), "check\n").unwrap();
+        let copy =
+            Command::new("cp").current_dir(dir).args(["--reflink=always", "clone-check", "clone-check-copy"]).output();
+        copy.is_ok_and(|out| out.status.success())
+    };
+    assert!(clones || std::env::var_os("SANDFS_REQUIRE_REFLINK").is_none(), "{} can't clone files", dir.display());
+    clones
+}
+
+#[test]
+fn a_fork_of_a_clone_is_a_real_folder_where_the_disk_clones_files() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let repo = data.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "first"]);
+    std::fs::write(repo.join("README.md"), "hello, edited\n").unwrap();
+
+    let mut sandfs = Sandfs::new();
+    let task = data.path().join("task");
+    let made = sandfs.stdout(&["fork", repo.to_str().unwrap(), task.to_str().unwrap()]);
+    let task = task.canonicalize().unwrap();
+    if clones_files(data.path()) {
+        assert_eq!(made, format!("task kept at {}\n", task.display()));
+        assert_eq!(mounts_at(&task), 0, "a folder, not a mount");
+    } else {
+        sandfs.mounts.push(task.clone());
+        assert_eq!(made, format!("task mounted at {}\n", task.display()));
+        assert_eq!(mounts_at(&task), 1);
+    }
+    assert_eq!(std::fs::read_to_string(task.join("README.md")).unwrap(), "hello, edited\n");
+    assert_eq!(sandfs.stdout(&["changes", "task"]), "M README.md\n");
+    assert!(
+        !std::fs::read_dir(data.path())
+            .unwrap()
+            .any(|entry| { entry.unwrap().file_name().to_string_lossy().starts_with(".sandfs-clone-check") })
+    );
+
+    // Asked for, a mount is a mount anywhere.
+    let mounted = data.path().join("mounted");
+    sandfs.mount(&["fork", repo.to_str().unwrap(), mounted.to_str().unwrap(), "--mount"], &mounted);
+    assert_eq!(mounts_at(&mounted.canonicalize().unwrap()), 1);
+}
+
 #[test]
 fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     use std::os::unix::fs::PermissionsExt;

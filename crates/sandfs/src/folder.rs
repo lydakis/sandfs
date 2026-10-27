@@ -2,7 +2,9 @@
 //! is a round trip to its NFS server, which makes work on many small files several
 //! times slower than on the disk. So there a fork of a git clone is a plain folder
 //! instead: clones of the clone's files, which cost no time or space for their contents
-//! on APFS, and a `.git` of its own, as a mount would show it.
+//! on APFS, and a `.git` of its own, as a mount would show it. On Linux the mount is
+//! closer to the disk, but a folder is still faster, so a fork is one there too where
+//! the disk clones files ([`clones_into`]: btrfs, XFS); on ext4 it stays a mount.
 //!
 //! The workspace stays, and is brought up to date with the folder whenever it is read
 //! (`changes`, `fork`), so whatever reads workspaces works on these too. What only a
@@ -27,6 +29,23 @@ const PRIVATE: &str = "folder-git";
 /// What the folder held when the workspace last read it (see [`signature`]).
 const SYNCED: &str = "folder-synced";
 
+/// Whether files of the folder `top` clone into `dir`, which needn't exist yet, without
+/// copying their contents: tried by cloning one of its files there and removing the
+/// clone. True on btrfs and XFS, false on ext4, tmpfs or across two disks.
+pub fn clones_into(top: &Path, dir: &Path) -> bool {
+    // Where `dir` would be made: the nearest folder of it that exists.
+    let Ok(dir) = crate::ops::resolve_new(dir) else { return false };
+    let Some(at) = dir.ancestors().find(|at| at.is_dir()) else { return false };
+    // Any file will do; a clone's or a worktree's `.git` has one.
+    let Some(file) = [".git/HEAD", ".git"].into_iter().map(|name| top.join(name)).find(|path| path.is_file()) else {
+        return false;
+    };
+    let probe = at.join(format!(".sandfs-clone-check-{}", std::process::id()));
+    let cloned = reflink_copy::reflink(&file, &probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    cloned
+}
+
 /// Keep the new workspace `name`, opened as `ws`, a fork of the files in `top`, as the
 /// real folder `dir`, which must be new or empty. `index_from` is the git index of
 /// `top`, if any. Returns the folder, resolved. On failure the folder is removed again,
@@ -39,7 +58,7 @@ pub fn make(
     dir: &Path,
     index_from: Option<&Path>,
 ) -> Result<PathBuf> {
-    let target = crate::resolve_new(dir)?;
+    let target = crate::ops::resolve_new(dir)?;
     if target.is_dir() && std::fs::read_dir(&target)?.next().is_some() {
         bail!("{} is not empty; a fork kept as a folder needs a new or empty one", target.display());
     }
