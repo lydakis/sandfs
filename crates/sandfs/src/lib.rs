@@ -58,8 +58,8 @@
 //!
 //! # Before you build on it
 //!
-//! - sandfs is pre-1.0: a minor release (0.7 to 0.8) may change this API, and the
-//!   changelog says how. Depend on one minor version, such as `sandfs = "0.7"`.
+//! - sandfs is pre-1.0: a minor release (0.8 to 0.9) may change this API, and the
+//!   changelog says how. Depend on one minor version, such as `sandfs = "0.8"`.
 //! - Every file operation in a mount goes through the mount's process, and on macOS
 //!   each write is also a round trip over localhost before it returns, so write-heavy
 //!   work runs slower there than in a plain folder: compiling ripgrep from scratch
