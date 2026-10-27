@@ -699,6 +699,13 @@ fn a_fork_of_a_clone_is_a_real_folder_where_the_disk_clones_files() {
             .any(|entry| { entry.unwrap().file_name().to_string_lossy().starts_with(".sandfs-clone-check") })
     );
 
+    // On Linux, inside the clone it stays a mount: finding out would write into the clone.
+    if cfg!(target_os = "linux") {
+        let inside = repo.join("inside/task");
+        sandfs.mount(&["fork", repo.to_str().unwrap(), inside.to_str().unwrap(), "--name", "inside"], &inside);
+        assert_eq!(mounts_at(&inside.canonicalize().unwrap()), 1);
+    }
+
     // Asked for, a mount is a mount anywhere.
     let mounted = data.path().join("mounted");
     sandfs.mount(&["fork", repo.to_str().unwrap(), mounted.to_str().unwrap(), "--mount"], &mounted);

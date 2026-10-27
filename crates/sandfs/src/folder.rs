@@ -31,11 +31,15 @@ const SYNCED: &str = "folder-synced";
 
 /// Whether files of the folder `top` clone into `dir`, which needn't exist yet, without
 /// copying their contents: tried by cloning one of its files there and removing the
-/// clone. True on btrfs and XFS, false on ext4, tmpfs or across two disks.
+/// clone. True on btrfs and XFS, false on ext4, tmpfs or across two disks, and false
+/// for a `dir` inside `top`, which is never written to.
 pub fn clones_into(top: &Path, dir: &Path) -> bool {
     // Where `dir` would be made: the nearest folder of it that exists.
     let Ok(dir) = crate::ops::resolve_new(dir) else { return false };
     let Some(at) = dir.ancestors().find(|at| at.is_dir()) else { return false };
+    if at.starts_with(top.canonicalize().unwrap_or_else(|_| top.to_path_buf())) {
+        return false;
+    }
     // Any file will do; a clone's or a worktree's `.git` has one.
     let Some(file) = [".git/HEAD", ".git"].into_iter().map(|name| top.join(name)).find(|path| path.is_file()) else {
         return false;
