@@ -78,7 +78,7 @@ pub(crate) fn mount_source(home: &Home, source: &str, dir: &Path, options: &Moun
 }
 
 pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOptions) -> Result<Forked> {
-    let ForkOptions { name, read_only, branch, foreground, real_folder } = options;
+    let ForkOptions { name, read_only, branch, foreground, real_folder, allow_copy } = options;
     let origin = fork_origin(home, from)?;
     let read_only = relative_paths(read_only)?;
     // Where the files of a fork kept as a folder are cloned from, and the git index
@@ -162,7 +162,7 @@ pub(crate) fn fork(home: &Home, from: &str, dir: Option<&Path>, options: &ForkOp
                 bail!("--branch needs a git repository, and {} is a plain folder", folder.display());
             }
             let repos = home.repos_lock(false)?;
-            let mut record = home.freeze(&folder)?;
+            let mut record = home.freeze(&folder, *allow_copy)?;
             record.read_only = read_only;
             if let Err(err) = home.create(&name, &record) {
                 if let Base::Dir { path } = &record.base {
