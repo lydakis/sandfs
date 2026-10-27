@@ -712,6 +712,69 @@ fn a_fork_of_a_clone_is_a_real_folder_where_the_disk_clones_files() {
     assert_eq!(mounts_at(&mounted.canonicalize().unwrap()), 1);
 }
 
+/// Whether git in `dir` fails, and what it said.
+fn git_fails(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+    assert!(!output.status.success(), "git {args:?} should fail in {}", dir.display());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn a_linked_worktree_in_a_folder_commits_inside_the_workspace_or_not_at_all() {
+    if !fuse_available() {
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    // A folder holding a repository with a worktree of its own, and a worktree of a
+    // repository outside the folder; git names both repositories by full path.
+    let folder = data.path().join("work");
+    let repo = folder.join("repo");
+    let outside = data.path().join("outside");
+    for dir in [&repo, &outside] {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        std::fs::write(dir.join("notes.md"), "one\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "one"]);
+    }
+    git(&repo, &["worktree", "add", "-q", ".worktrees/wt"]);
+    git(&outside, &["worktree", "add", "-q", folder.join("theirs").to_str().unwrap()]);
+    let heads = || (git_out(&repo, &["rev-parse", "--all"]), git_out(&outside, &["rev-parse", "--all"]));
+    let before = heads();
+
+    let mut sandfs = Sandfs::new();
+    let ws = data.path().join("ws");
+    sandfs.mount(&["mount", folder.to_str().unwrap(), ws.to_str().unwrap()], &ws);
+    let wt = ws.join("repo/.worktrees/wt");
+    std::fs::write(wt.join("notes.md"), "two\n").unwrap();
+    git_out(&wt, &["commit", "-qam", "two"]);
+    assert_eq!(git_out(&wt, &["show", "HEAD:notes.md"]), "two\n");
+    // The commit is the workspace's: the repositories on disk have what they had.
+    assert_eq!(heads(), before);
+    assert_eq!(std::fs::read_to_string(folder.join("repo/.worktrees/wt/notes.md")).unwrap(), "one\n");
+    let said = git_fails(&ws.join("theirs"), &["status"]);
+    assert!(said.contains("not a git repository") && said.contains("outside this folder"), "{said}");
+    let output = sandfs.run(&["changes", "ws"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("git repository in repo has commits made here"), "{stderr}");
+    sandfs.unmount(&ws);
+
+    // A copy of the folder points the same way.
+    let task = data.path().join("task");
+    let output = sandfs.try_run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    if !output.status.success() {
+        sandfs.run(&["fork", "--allow-copy", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    }
+    sandfs.mounts.push(task.clone());
+    let wt = task.join("repo/.worktrees/wt");
+    std::fs::write(wt.join("notes.md"), "three\n").unwrap();
+    git_out(&wt, &["commit", "-qam", "three"]);
+    assert_eq!(heads(), before);
+    let said = git_fails(&task.join("theirs"), &["status"]);
+    assert!(said.contains("outside this folder"), "{said}");
+    sandfs.unmount(&task);
+}
+
 #[test]
 fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     use std::os::unix::fs::PermissionsExt;

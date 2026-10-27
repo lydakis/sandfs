@@ -79,6 +79,7 @@ mod folder;
 #[cfg(mount)]
 mod fs;
 mod git;
+mod gitfile;
 mod github;
 mod host;
 mod mcp;
@@ -354,6 +355,11 @@ pub struct Changes {
     /// The changed files among `.git/config` and `.git/hooks`, relative to the
     /// workspace, for whoever reviews it before running git there.
     pub git_settings: Vec<String>,
+    /// Folders in the workspace, relative to it, holding a git repository of their own
+    /// whose branches or tags changed: commits made there, which a copy leaves out with
+    /// the rest of `.git`, so they arrive only if pushed. A git mount's own `.git` is
+    /// not among them.
+    pub committed: Vec<String>,
 }
 
 /// One changed file.

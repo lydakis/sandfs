@@ -435,6 +435,10 @@ fn changes_and_copy(
             .map(|change| change.path.strip_prefix(&root).unwrap_or_default().join("/"))
             .collect(),
     };
+    let committed = committed(
+        changes.iter().filter(|change| !git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir))),
+        &root,
+    );
     let listed: Vec<_> = changes
         .iter()
         .filter(|change| !git_dir.as_ref().is_some_and(|dir| change.path.starts_with(dir)))
@@ -449,7 +453,21 @@ fn changes_and_copy(
         held_back = copy::copy_to(&opened.ws, start, &items, dir)?;
     }
     let changes = listed.into_iter().map(|(change, path)| Change { kind: change.kind, path }).collect();
-    Ok(Changes { changes, held_back, git_settings: settings })
+    Ok(Changes { changes, held_back, git_settings: settings, committed })
+}
+
+/// The folders, relative to `root`, whose `.git` has changed branches or tags among
+/// `changes` (see [`Changes::committed`]).
+fn committed<'a>(changes: impl Iterator<Item = &'a sandfs_core::Change>, root: &VPath) -> Vec<String> {
+    let mut folders = std::collections::BTreeSet::new();
+    for change in changes {
+        let parts = change.path.strip_prefix(root).unwrap_or_default();
+        let Some(at) = parts.iter().position(|part| *part == ".git") else { continue };
+        if matches!(parts.get(at + 1), Some(&"refs" | &"packed-refs")) {
+            folders.insert(parts[..at].join("/"));
+        }
+    }
+    folders.into_iter().collect()
 }
 
 /// `--read-only` paths as a workspace records them: relative to the source, checked.
