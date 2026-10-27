@@ -106,6 +106,22 @@ impl Cache {
         self.blobs.lock().expect("cache lock").remove(key);
     }
 
+    /// Put `entry` in the cached listing `key` under `name`, in place of the entry with
+    /// the same source key, and say whether that changed it. The listing's own lock is
+    /// held throughout, so two files of one directory changed at once both stay changed.
+    fn patch_listing(&self, key: &CacheKey, name: &str, entry: SourceEntry) -> bool {
+        let Some(slot) = self.dirs.lock().expect("cache lock").get(key).cloned() else { return false };
+        let mut listing = slot.lock().expect("cache slot lock");
+        let Some(current) = listing.as_ref() else { return false };
+        if current.get(name).is_none_or(|listed| listed.key != entry.key || *listed == entry) {
+            return false;
+        }
+        let mut fresh = (**current).clone();
+        fresh.insert(name.to_owned(), entry);
+        *listing = Some(Arc::new(fresh));
+        true
+    }
+
     /// The cached blob for `key`, if it is loaded and not being loaded right now.
     fn peek_blob(&self, key: &CacheKey) -> Option<Bytes> {
         let slot = self.blobs.lock().expect("cache lock").get(key)?.clone();
@@ -430,14 +446,13 @@ impl Workspace {
         let Some(dir) = self.base_dir(&parent, &mount)? else { return Ok(false) };
         let listing = self.cached_listing(&mount, &dir)?;
         // A file moved here from another directory isn't in this listing.
-        let Some(listed) = listing.get(name).filter(|entry| entry.key == key) else { return Ok(false) };
-        let Some(now) = mount.source.entry_now(&key)? else { return Ok(false) };
-        if *listed == now {
+        if listing.get(name).is_none_or(|entry| entry.key != key) {
             return Ok(false);
         }
-        let mut fresh = (*listing).clone();
-        fresh.insert(name.to_owned(), now.clone());
-        self.cache.replace_listing((mount.id, dir), Arc::new(fresh));
+        let Some(now) = mount.source.entry_now(&key)? else { return Ok(false) };
+        if !self.cache.patch_listing(&(mount.id, dir), name, now.clone()) {
+            return Ok(false);
+        }
         self.cache.forget_blob(&(mount.id, key));
         if let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id) {
             self.cache.remember_entry(mount.id, &path.as_str()[mount_path.as_str().len() + 1..], now);

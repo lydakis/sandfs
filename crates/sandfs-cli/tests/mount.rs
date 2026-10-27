@@ -1116,7 +1116,21 @@ fn a_file_that_shrank_in_the_folder_reads_back_without_zeros() {
     let file = ws.join("notes.md");
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 24);
     std::fs::write(folder.path().join("notes.md"), "new").unwrap();
-    assert_eq!(std::fs::read(&file).unwrap(), b"new");
+    // The macOS client won't take a smaller size from a read, so there the first read
+    // fails, and the next asks for the size again. A read never gives zeros.
+    let mut reads = 0;
+    let read = loop {
+        reads += 1;
+        match std::fs::read(&file) {
+            Ok(read) => break read,
+            Err(err) if cfg!(target_os = "macos") && reads < 10 => {
+                eprintln!("read {reads}: {err}");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(err) => panic!("read {reads}: {err}"),
+        }
+    };
+    assert_eq!(read, b"new");
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 3);
     sandfs.unmount(&ws);
 }

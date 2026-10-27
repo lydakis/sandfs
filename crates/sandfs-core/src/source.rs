@@ -488,7 +488,15 @@ impl Source for DirSource {
         if key.is_empty() || !Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
             return Ok(None);
         }
+        // The folder holding it is checked as a listing checks it: one swapped for a
+        // link since must not lead outside.
+        let parent = Path::new(key).parent().and_then(Path::to_str).unwrap_or_default();
         let path = self.host_path(key);
+        let dir = path.parent().unwrap_or(&self.root);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        self.check_dir(parent, dir)?;
         let meta = match path.symlink_metadata() {
             Ok(meta) => meta,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),

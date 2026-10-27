@@ -1044,6 +1044,18 @@ fn a_recheck_takes_a_changed_folder_file_as_it_is_now() {
     // Gone from the folder: kept as it was.
     std::fs::remove_file(dir.join("sub/shrink.txt")).unwrap();
     assert!(!ws.recheck("/host/sub/shrink.txt").unwrap());
+    // Its folder swapped for a link out of the folder: nothing there is looked at.
+    let outside = std::env::temp_dir().join(format!("sandfs-recheck-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("other.txt"), "outside").unwrap();
+    std::fs::rename(dir.join("sub"), dir.join("moved")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, dir.join("sub")).unwrap();
+        assert!(ws.recheck("/host/sub/other.txt").is_err());
+        assert_eq!(ws.stat("/host/sub/other.txt").unwrap().size, 17);
+    }
+    std::fs::remove_dir_all(&outside).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

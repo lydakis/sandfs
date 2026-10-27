@@ -277,12 +277,14 @@ impl NFSFileSystem for SandNfs {
         let data = reading.read(offset, count).nfs()?;
         let end = offset + data.len() as u64;
         // Fewer bytes than asked for is the file's end. Short of its size, the file
-        // shrank in the folder under the mount since it was listed: the attributes this
-        // reply carries (taken after the read) must say so, or the client fills the rest
-        // with zeros, and a copy from the mount writes zeros.
+        // shrank in the folder under the mount since it was listed, and the client,
+        // which still has the old size, fills the rest with zeros: a copy from the
+        // mount would write zeros. The macOS client won't take a smaller size from a
+        // READ reply, so this read fails instead; its reply carries the new size (taken
+        // after the read), and the client asks again before its next look at the file.
         let short = data.len() < count as usize;
-        if short && end < size {
-            let _ = self.shared.lock().recheck(id);
+        if short && end < size && self.shared.lock().recheck(id).unwrap_or(false) {
+            return Err(nfsstat3::NFS3ERR_STALE);
         }
         Ok((data.to_vec(), short || end >= size))
     }
@@ -935,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_shrank_in_the_folder_reads_to_its_end_without_zeros() {
+    fn a_file_that_shrank_in_the_folder_fails_a_read_then_reads_to_its_end() {
         // A copy from the mount onto the folder under it truncates the file there
         // first: the mount's listing still says 24 bytes, and a client told so fills
         // the rest of a 3-byte read with zeros.
@@ -952,8 +954,9 @@ mod tests {
             let id = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();
             assert_eq!(fs.getattr(id).await.unwrap().size, 24);
             std::fs::write(folder.path().join("notes.md"), "new").unwrap();
-            assert_eq!(fs.read(id, 0, 24).await.unwrap(), (b"new".to_vec(), true), "the end, not more to come");
+            assert!(fs.read(id, 0, 24).await.is_err(), "no zeros where the client expects 24 bytes");
             assert_eq!(fs.getattr(id).await.unwrap().size, 3, "the size the reply carries");
+            assert_eq!(fs.read(id, 0, 24).await.unwrap(), (b"new".to_vec(), true), "the end, not more to come");
             // A read of part of a file that hasn't changed is not its end.
             std::fs::write(folder.path().join("notes.md"), "a longer file now").unwrap();
             let id2 = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();
