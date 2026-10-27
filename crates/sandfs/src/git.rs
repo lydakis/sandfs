@@ -153,10 +153,15 @@ pub fn start(home: &Home, name: &str, branch: Option<&str>) -> Result<Workspace>
     };
     // Checked before anything is written, so a refusal leaves nothing to undo.
     // A fork of a checkout is over the repository at its working folder (see `fork`).
-    let (top, changed) = (repo.clone(), changed_files(repo, commit)?);
-    if let Some(branch) = branch {
-        check_new_branch(repo, branch)?;
-    }
+    // Each git run costs its start-up, so the branch is checked while the files are read.
+    let (top, changed) = std::thread::scope(|scope| {
+        let checked = branch.map(|branch| scope.spawn(move || check_new_branch(repo, branch)));
+        let changed = changed_files(repo, commit);
+        if let Some(checked) = checked {
+            checked.join().map_err(|_| anyhow!("checking the branch name failed"))??;
+        }
+        anyhow::Ok((repo.clone(), changed?))
+    })?;
 
     let _writer = home.lock(name, "sandfs fork, preparing the workspace")?;
     let mut opened = home.open(name)?;
@@ -479,13 +484,27 @@ fn changed_files(top: &Path, commit: &str) -> Result<Vec<String>> {
             .collect()
     };
     // Optional locks would let git refresh the repository's index: it is only read.
-    let tracked = split(git_raw(
-        top,
-        &["--no-optional-locks", "diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=all", commit, "--"],
-        None,
-    )?)?;
-    let untracked =
-        split(git_raw(top, &["--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard"], None)?)?;
+    // The two run at once, as each git run costs its start-up.
+    let (tracked, untracked) = std::thread::scope(|scope| {
+        let untracked = scope
+            .spawn(|| git_raw(top, &["--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard"], None));
+        let tracked = git_raw(
+            top,
+            &[
+                "--no-optional-locks",
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--ignore-submodules=all",
+                commit,
+                "--",
+            ],
+            None,
+        );
+        let untracked = untracked.join().map_err(|_| anyhow!("listing new files failed"))?;
+        anyhow::Ok((split(tracked?)?, split(untracked?)?))
+    })?;
     let (mut gone, mut present) = (Vec::new(), Vec::new());
     // A repository inside the folder is listed as its folder, which a mount doesn't show.
     for path in tracked.into_iter().chain(untracked.into_iter().filter(|path| !path.ends_with('/'))) {
@@ -720,13 +739,21 @@ fn private_git(private: &Path, dir: &Path, args: &[&str], input: Option<&[u8]>) 
 /// itself, or for a partial clone (sandfs's copy of a remote among them) the remote it
 /// borrows from, as [`GitDir`] sets it.
 fn check_new_branch(repo: &Path, branch: &str) -> Result<()> {
-    let checked =
-        (!branch.starts_with('-')).then(|| git(repo, &["check-ref-format", "--branch", branch]).ok()).flatten();
-    if checked.as_deref() != Some(branch) {
+    if branch.starts_with('-') {
         bail!("{branch:?} is not a name git takes for a branch");
     }
     let full = format!("refs/heads/{branch}");
-    let promisor = git(repo, &["config", "--get", "remote.origin.promisor"]).is_ok_and(|value| value == "true");
+    // All three asked at once, as each git run costs its start-up; whether the
+    // repository has the branch matters only when it isn't a partial clone.
+    let (checked, promisor, taken) = std::thread::scope(|scope| {
+        let checked = scope.spawn(|| git(repo, &["check-ref-format", "--branch", branch]).ok());
+        let taken = scope.spawn(|| git(repo, &["show-ref", "--verify", "-q", &full]).is_ok());
+        let promisor = git(repo, &["config", "--get", "remote.origin.promisor"]).is_ok_and(|value| value == "true");
+        (checked.join().ok().flatten(), promisor, taken.join().unwrap_or(false))
+    });
+    if checked.as_deref() != Some(branch) {
+        bail!("{branch:?} is not a name git takes for a branch");
+    }
     if promisor {
         // A partial clone's own branches needn't be the remote's: sandfs's copies keep
         // what they fetched under refs of their own.
@@ -741,7 +768,7 @@ fn check_new_branch(repo: &Path, branch: &str) -> Result<()> {
         if !git_outside(&["ls-remote", &remote, &full]).context("asking the remote for its branches")?.is_empty() {
             bail!("{url} already has a branch {branch}; pick another name");
         }
-    } else if git(repo, &["show-ref", "--verify", "-q", &full]).is_ok() {
+    } else if taken {
         bail!("{} already has a branch {branch}; pick another name", repo.display());
     }
     Ok(())
