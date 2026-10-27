@@ -2223,8 +2223,10 @@ impl Filesystem for SandFs {
 
     /// `fsync` on a directory saves the whole workspace; the CLI uses it to make sure
     /// a fork or `changes` sees everything written so far.
-    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        let result = self.0.save(true).map_err(|err| log_io(&err));
+    /// `fsync` on a folder saves every change; `fdatasync` saves them without flushing
+    /// what was written to the disk, for a reader that only needs them saved.
+    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let result = self.0.save(!datasync).map_err(|err| log_io(&err));
         self.reply_empty(reply, result);
     }
 

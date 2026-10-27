@@ -792,7 +792,12 @@ async fn answer_saves(saves: tokio::net::TcpListener, shared: Arc<Shared>, secre
             if !matches!(read, Ok(Ok(_))) || !same_bytes(&asked, secret.as_bytes()) {
                 return;
             }
-            let saved = tokio::task::spawn_blocking(move || shared.save(true)).await;
+            // After the secret, a client may say the save needn't be flushed to the disk:
+            // `-`. Otherwise it sends nothing more and gets a flushed save.
+            let mut flag = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut flag)).await;
+            let durable = !matches!(read, Ok(Ok(1))) || flag[0] != b'-';
+            let saved = tokio::task::spawn_blocking(move || shared.save(durable)).await;
             let reply = match saved {
                 Ok(Ok(())) => "ok\n".to_owned(),
                 Ok(Err(err)) => format!("{err:#}\n"),
@@ -803,16 +808,33 @@ async fn answer_saves(saves: tokio::net::TcpListener, shared: Arc<Shared>, secre
     }
 }
 
-/// Ask the process serving a mount to save, through its save port.
+/// Ask the process serving a mount to save, through its save port; `durable` also
+/// flushes what it wrote to the disk.
 #[cfg(nfs)]
-pub fn request_save(port: u16, secret: &str) -> Result<()> {
+pub fn request_save(port: u16, secret: &str, durable: bool) -> Result<()> {
     use std::io::{Read, Write};
 
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
     stream.write_all(secret.as_bytes())?;
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
-    match reply.trim() {
+    // A durable save is asked as older servers know it, so they answer it as before.
+    if !durable {
+        stream.write_all(b"-")?;
+    }
+    // Nothing more comes, which a server reading past the secret sees at once.
+    stream.shutdown(std::net::Shutdown::Write)?;
+    // The reply is one line. A server that never read the `-` may reset the connection
+    // once it has sent it, so a complete line counts whatever follows.
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 512];
+    while !reply.contains(&b'\n') {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => reply.extend_from_slice(&chunk[..read]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    match String::from_utf8_lossy(&reply).trim() {
         "ok" => Ok(()),
         "" => anyhow::bail!("the mount's process stopped before saving"),
         err => anyhow::bail!("{err}"),
@@ -878,6 +900,30 @@ mod tests {
 
     fn block<T>(future: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+    }
+
+    #[cfg(nfs)]
+    #[test]
+    fn a_save_is_answered_by_a_server_that_reads_only_the_secret() {
+        use std::io::{Read, Write};
+
+        // A server from before saves could skip the flush: it reads the secret, replies,
+        // and closes with the `-` unread, which may reset the connection.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut secret = [0u8; 6];
+                stream.read_exact(&mut secret).unwrap();
+                assert_eq!(&secret, b"secret");
+                std::thread::sleep(Duration::from_millis(50));
+                stream.write_all(b"ok\n").unwrap();
+            }
+        });
+        request_save(port, "secret", true).unwrap();
+        request_save(port, "secret", false).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
