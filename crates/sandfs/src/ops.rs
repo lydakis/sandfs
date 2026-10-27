@@ -325,7 +325,8 @@ pub(crate) fn git_fsmonitor(home: &Home, version: &str) -> Result<()> {
     // A git worktree added from a mount shares the mount's config, this monitor
     // included, but is a plain folder: there any file may have changed, and git looks.
     let Some(name) = root.to_str().and_then(|root| home.mounted(root)) else { return git::fsmonitor_all(version) };
-    sync(home, &name)?;
+    // Git asks before every status; it needs the changed paths, not them on the disk.
+    sync_mount(home, &name, false)?;
     git::fsmonitor(&Saved::new(home.workspace_dir(&name)).paths()?, version)
 }
 
@@ -357,6 +358,13 @@ fn default_name(name: Option<String>, dir: &Path) -> Result<String> {
 /// mount's process saves when asked on its save port, since `fsync` never reaches it.
 /// Returns the workspace's base if bringing it up to date opened it, to open it over.
 fn sync(home: &Home, name: &str) -> Result<Option<Workspace>> {
+    sync_mount(home, name, true)
+}
+
+/// [`sync`], where a mount's save may skip flushing what it wrote to the disk
+/// (`durable` false): enough for a reader of the saved changes on this machine, and
+/// after a build, which writes hundreds of files, much faster.
+fn sync_mount(home: &Home, name: &str, durable: bool) -> Result<Option<Workspace>> {
     if let Some(dir) = home.record(name)?.folder {
         return folder::sync(home, name, &dir);
     }
@@ -369,8 +377,11 @@ fn sync(home: &Home, name: &str) -> Result<Option<Workspace>> {
     }
     let saved = match (info.save_port, info.save_secret) {
         #[cfg(nfs)]
-        (Some(port), Some(secret)) => nfs::request_save(port, &secret),
-        _ => std::fs::File::open(&info.mountpoint).and_then(|dir| dir.sync_all()).map_err(anyhow::Error::from),
+        (Some(port), Some(secret)) => nfs::request_save(port, &secret, durable),
+        // `fdatasync` asks for a save that doesn't flush (see `fsyncdir` in `fs`).
+        _ => std::fs::File::open(&info.mountpoint)
+            .and_then(|dir| if durable { dir.sync_all() } else { dir.sync_data() })
+            .map_err(anyhow::Error::from),
     };
     saved.with_context(|| format!("saving {name} before reading it"))?;
     Ok(None)

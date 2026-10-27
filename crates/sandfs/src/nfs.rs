@@ -238,19 +238,11 @@ impl NFSFileSystem for SandNfs {
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let mut inner = self.shared.lock();
-        let found = match &filename.0[..] {
+        match &filename.0[..] {
             b"." => Ok(dirid),
             b".." => inner.parent_of(dirid).ok_or(nfsstat3::NFS3ERR_NOENT),
-            _ => inner.lookup(dirid, os_name(filename)).nfs().map(|attr| attr.ino.0),
-        };
-        // Experiment only: which names the client looks up.
-        if let Some(trace) = std::env::var_os("SANDFS_XP_TRACE") {
-            use std::io::Write as _;
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(trace) {
-                let _ = writeln!(file, "LOOKUP {} {}", String::from_utf8_lossy(&filename.0), if found.is_ok() { "ok" } else { "missing" });
-            }
+            _ => Ok(inner.lookup(dirid, os_name(filename)).nfs()?.ino.0),
         }
-        found
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
@@ -800,7 +792,12 @@ async fn answer_saves(saves: tokio::net::TcpListener, shared: Arc<Shared>, secre
             if !matches!(read, Ok(Ok(_))) || !same_bytes(&asked, secret.as_bytes()) {
                 return;
             }
-            let saved = tokio::task::spawn_blocking(move || shared.save(true)).await;
+            // After the secret, a client may say whether the save must be flushed to the
+            // disk: `-` for no. Older clients send nothing more and get a flushed save.
+            let mut flag = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut flag)).await;
+            let durable = !matches!(read, Ok(Ok(1))) || flag[0] != b'-';
+            let saved = tokio::task::spawn_blocking(move || shared.save(durable)).await;
             let reply = match saved {
                 Ok(Ok(())) => "ok\n".to_owned(),
                 Ok(Err(err)) => format!("{err:#}\n"),
@@ -811,13 +808,17 @@ async fn answer_saves(saves: tokio::net::TcpListener, shared: Arc<Shared>, secre
     }
 }
 
-/// Ask the process serving a mount to save, through its save port.
+/// Ask the process serving a mount to save, through its save port; `durable` also
+/// flushes what it wrote to the disk.
 #[cfg(nfs)]
-pub fn request_save(port: u16, secret: &str) -> Result<()> {
+pub fn request_save(port: u16, secret: &str, durable: bool) -> Result<()> {
     use std::io::{Read, Write};
 
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
     stream.write_all(secret.as_bytes())?;
+    stream.write_all(if durable { b"+" } else { b"-" })?;
+    // Nothing more comes, which a server reading past the secret sees at once.
+    stream.shutdown(std::net::Shutdown::Write)?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
     match reply.trim() {

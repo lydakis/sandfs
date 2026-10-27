@@ -1962,10 +1962,6 @@ impl Filesystem for SandFs {
         let no_opendir = config.add_capabilities(InitFlags::FUSE_NO_OPENDIR_SUPPORT).is_ok();
         self.0.no_opendir.store(no_opendir, Ordering::SeqCst);
         self.0.lock().keep_listed = no_opendir;
-        // Experiment only: let the kernel cache writes and send them in batches.
-        if std::env::var_os("SANDFS_XP_WRITEBACK").is_some() {
-            let _ = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE);
-        }
         Ok(())
     }
 
@@ -2227,8 +2223,10 @@ impl Filesystem for SandFs {
 
     /// `fsync` on a directory saves the whole workspace; the CLI uses it to make sure
     /// a fork or `changes` sees everything written so far.
-    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        let result = self.0.save(true).map_err(|err| log_io(&err));
+    /// `fsync` on a folder saves every change; `fdatasync` saves them without flushing
+    /// what was written to the disk, for a reader that only needs them saved.
+    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let result = self.0.save(!datasync).map_err(|err| log_io(&err));
         self.reply_empty(reply, result);
     }
 
