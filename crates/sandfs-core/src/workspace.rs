@@ -101,6 +101,11 @@ impl Cache {
         self.dirs.lock().expect("cache lock").insert(key, Arc::new(Mutex::new(Some(listing))));
     }
 
+    /// Drop the cached blob for `key`, whose file changed in its source.
+    fn forget_blob(&self, key: &CacheKey) {
+        self.blobs.lock().expect("cache lock").remove(key);
+    }
+
     /// The cached blob for `key`, if it is loaded and not being loaded right now.
     fn peek_blob(&self, key: &CacheKey) -> Option<Bytes> {
         let slot = self.blobs.lock().expect("cache lock").get(key)?.clone();
@@ -407,6 +412,37 @@ impl Workspace {
                 Metadata { kind, size, version, modified }
             }
         })
+    }
+
+    /// Ask the source again about the file at `path`, which this workspace hasn't
+    /// changed, after a read showed it is no longer what its listing said: a read that
+    /// came back shorter than the listed size, from a folder written to meanwhile. Its
+    /// size, time and cached bytes become what the source says now (see
+    /// [`Source::entry_now`]), for this file alone; the rest of its directory stays as
+    /// first listed. Returns whether anything changed. Forks share what was asked,
+    /// as they share every listing.
+    pub fn recheck(&self, path: &str) -> Result<bool> {
+        let path = VPath::parse(path)?;
+        let Ok(Resolved::File { content: Content::Base { mount, key, .. }, .. }) = self.resolve(&path) else {
+            return Ok(false);
+        };
+        let (Some(parent), Some(name)) = (path.parent(), path.name()) else { return Ok(false) };
+        let Some(dir) = self.base_dir(&parent, &mount)? else { return Ok(false) };
+        let listing = self.cached_listing(&mount, &dir)?;
+        // A file moved here from another directory isn't in this listing.
+        let Some(listed) = listing.get(name).filter(|entry| entry.key == key) else { return Ok(false) };
+        let Some(now) = mount.source.entry_now(&key)? else { return Ok(false) };
+        if *listed == now {
+            return Ok(false);
+        }
+        let mut fresh = (*listing).clone();
+        fresh.insert(name.to_owned(), now.clone());
+        self.cache.replace_listing((mount.id, dir), Arc::new(fresh));
+        self.cache.forget_blob(&(mount.id, key));
+        if let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id) {
+            self.cache.remember_entry(mount.id, &path.as_str()[mount_path.as_str().len() + 1..], now);
+        }
+        Ok(true)
     }
 
     /// [`Metadata::modified`] alone: the source's time for a file nobody wrote, found

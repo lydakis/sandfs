@@ -1099,6 +1099,29 @@ fn rereading_a_changed_file_never_returns_cached_bytes() {
 }
 
 #[test]
+fn a_file_that_shrank_in_the_folder_reads_back_without_zeros() {
+    if !fuse_available() {
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("notes.md"), "twenty-four bytes long..").unwrap();
+    let mut sandfs = Sandfs::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let ws = dirs.path().join("ws");
+    sandfs.mount(&["mount", folder.path().to_str().unwrap(), ws.to_str().unwrap()], &ws);
+
+    // Listed with its size but never read, as `ls -l` leaves it; then the folder's
+    // file shrinks, as a copy onto it truncates it first. The mount used to answer
+    // with the 3 bytes left padded by zeros to the 24 it had listed.
+    let file = ws.join("notes.md");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 24);
+    std::fs::write(folder.path().join("notes.md"), "new").unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 3);
+    sandfs.unmount(&ws);
+}
+
+#[test]
 fn open_files_work_without_open_or_close_reaching_sandfs() {
     use std::io::{Read, Seek, SeekFrom, Write};
     if !fuse_available() {

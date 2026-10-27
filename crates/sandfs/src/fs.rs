@@ -1192,6 +1192,21 @@ impl Inner {
         self.entry(&path)
     }
 
+    /// Ask the source again about `ino`, a file of the source nobody wrote, after a
+    /// read of it came back short of its size: the folder under the mount changed
+    /// since it was listed (see [`Workspace::recheck`]). Its attributes then give the
+    /// folder's size now, so a client never fills the bytes it lacks with zeros.
+    /// Returns whether anything changed.
+    pub fn recheck(&self, ino: u64) -> FsResult<bool> {
+        if self.buffers.contains_key(&ino) {
+            return Ok(false);
+        }
+        match self.nodes.get(&ino) {
+            Some(Node { linked: true, path, .. }) => self.ws.recheck(path.as_str()).fs(),
+            _ => Ok(false),
+        }
+    }
+
     /// The workspace and path holding `ino`'s contents: the workspace itself, or for
     /// a removed file the kernel may still have open, the one from before the removal.
     fn contents(&self, ino: u64) -> FsResult<(&Workspace, &VPath)> {
@@ -2087,7 +2102,17 @@ impl Filesystem for SandFs {
     ) {
         let reading = self.0.lock().reading(ino.0, offset, size);
         match reading.and_then(|reading| reading.read(offset, size)) {
-            Ok(data) => reply.data(&data),
+            Ok(data) => {
+                // The kernel takes a short read as the file's end; its size from now on
+                // says the same (see `Inner::recheck`).
+                if data.len() < size as usize {
+                    let inner = self.0.lock();
+                    if inner.attr(ino.0).is_ok_and(|attr| attr.size > offset + data.len() as u64) {
+                        let _ = inner.recheck(ino.0);
+                    }
+                }
+                reply.data(&data)
+            }
             Err(err) => reply.error(err),
         }
     }

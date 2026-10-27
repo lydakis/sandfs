@@ -275,8 +275,16 @@ impl NFSFileSystem for SandNfs {
             (inner.reading(id, offset, count).nfs()?, inner.attr(id).nfs()?.size)
         };
         let data = reading.read(offset, count).nfs()?;
-        let eof = offset + data.len() as u64 >= size;
-        Ok((data.to_vec(), eof))
+        let end = offset + data.len() as u64;
+        // Fewer bytes than asked for is the file's end. Short of its size, the file
+        // shrank in the folder under the mount since it was listed: the attributes this
+        // reply carries (taken after the read) must say so, or the client fills the rest
+        // with zeros, and a copy from the mount writes zeros.
+        let short = data.len() < count as usize;
+        if short && end < size {
+            let _ = self.shared.lock().recheck(id);
+        }
+        Ok((data.to_vec(), short || end >= size))
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
@@ -924,6 +932,33 @@ mod tests {
         request_save(port, "secret", true).unwrap();
         request_save(port, "secret", false).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_file_that_shrank_in_the_folder_reads_to_its_end_without_zeros() {
+        // A copy from the mount onto the folder under it truncates the file there
+        // first: the mount's listing still says 24 bytes, and a client told so fills
+        // the rest of a 3-byte read with zeros.
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("notes.md"), "twenty-four bytes long..").unwrap();
+        let mut ws = Workspace::new();
+        ws.mount("/mnt", Arc::new(sandfs_core::DirSource::new(folder.path()).unwrap())).unwrap();
+        let root = VPath::parse("/mnt").unwrap();
+        let mut inner = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), UNIX_EPOCH, (501, 20));
+        inner.ranged_reads = true;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = SandNfs::new(Shared::new(inner, Saved::new(dir.path()), root)).unwrap();
+        block(async {
+            let id = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();
+            assert_eq!(fs.getattr(id).await.unwrap().size, 24);
+            std::fs::write(folder.path().join("notes.md"), "new").unwrap();
+            assert_eq!(fs.read(id, 0, 24).await.unwrap(), (b"new".to_vec(), true), "the end, not more to come");
+            assert_eq!(fs.getattr(id).await.unwrap().size, 3, "the size the reply carries");
+            // A read of part of a file that hasn't changed is not its end.
+            std::fs::write(folder.path().join("notes.md"), "a longer file now").unwrap();
+            let id2 = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();
+            assert_eq!(fs.read(id2, 0, 2).await.unwrap(), (b"a ".to_vec(), false));
+        });
     }
 
     #[test]

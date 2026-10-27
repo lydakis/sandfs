@@ -356,11 +356,15 @@ pub async fn nfsproc3_read(
     }
     let id = id.unwrap();
 
+    // The attributes are taken after the read, which may have found the file
+    // smaller than it was (sandfs: a folder changed under the mount); with the older
+    // size, a client fills what it lacks with zeros.
+    let read = context.vfs.read(id, args.offset, args.count).await;
     let obj_attr = match context.vfs.getattr(id).await {
         Ok(v) => nfs::post_op_attr::attributes(v),
         Err(_) => nfs::post_op_attr::Void,
     };
-    match context.vfs.read(id, args.offset, args.count).await {
+    match read {
         Ok((bytes, eof)) => {
             let res = READ3resok { file_attributes: obj_attr, count: bytes.len() as u32, eof, data: bytes };
             make_success_reply(xid).serialize(output)?;

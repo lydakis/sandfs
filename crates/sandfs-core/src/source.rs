@@ -71,7 +71,8 @@ pub type Listing = BTreeMap<String, SourceEntry>;
 /// Implementations must return the same answer for the same key every time; the
 /// workspace caches results and shares them between forks. The one exception is a
 /// listing's sizes: after a [`Source::prefetch`], a listing may report sizes it left
-/// out before.
+/// out before. A source whose files can change underneath it (a folder on disk) can
+/// also say what a file is now, through [`Source::entry_now`].
 pub trait Source: Send + Sync + fmt::Debug {
     /// Key of the root directory.
     fn root(&self) -> Result<SourceKey>;
@@ -127,6 +128,17 @@ pub trait Source: Send + Sync + fmt::Debug {
     fn is_local(&self, key: &str) -> bool {
         let _ = key;
         false
+    }
+
+    /// The file at `key` as the source has it now, for a source whose files can change
+    /// while a workspace is over it (a folder on disk). The workspace asks only once a
+    /// read shows a file is no longer what its listing said (see
+    /// [`crate::Workspace::recheck`]). `None`, the default, keeps the answer the
+    /// workspace has, as a source whose answers never change should; so does a source
+    /// that no longer has the file.
+    fn entry_now(&self, key: &str) -> Result<Option<SourceEntry>> {
+        let _ = key;
+        Ok(None)
     }
 }
 
@@ -235,12 +247,12 @@ impl DirSource {
         if !root.is_dir() {
             return Err(Error::Source(format!("{} is not a directory", root.display())));
         }
-        Ok(DirSource { root: root.canonicalize().map_err(io_error)? })
+        Ok(DirSource { root: root.canonicalize().map_err(|err| io_error(root, err))? })
     }
 
     /// Fail unless `dir`, with every symlink resolved, is still `root` or inside it.
     fn check_inside(&self, dir: &Path) -> Result<()> {
-        if dir.canonicalize().map_err(io_error)?.starts_with(&self.root) {
+        if dir.canonicalize().map_err(|err| io_error(dir, err))?.starts_with(&self.root) {
             Ok(())
         } else {
             Err(Error::Source(format!("{} is outside the mounted directory", dir.display())))
@@ -258,8 +270,11 @@ impl DirSource {
             use std::os::unix::fs::OpenOptionsExt;
             // A directory-only open fails at once on anything else, such as a fifo
             // swapped in since the listing, which a plain open would block on.
-            let opened =
-                std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(dir).map_err(io_error)?;
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(dir)
+                .map_err(|err| io_error(dir, err))?;
             if let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd())) {
                 return if path == dir {
                     Ok(())
@@ -283,7 +298,7 @@ impl DirSource {
     /// reaches on the host; an absolute one outside is kept as written.
     fn link_target(&self, key: &str) -> Result<Bytes> {
         let path = self.host_path(key);
-        let target = std::fs::read_link(&path).map_err(io_error)?;
+        let target = std::fs::read_link(&path).map_err(|err| io_error(&path, err))?;
         let parent = Path::new(key).parent().unwrap_or(Path::new(""));
         let rewritten = match self.named_inside(parent, &target) {
             Some(_) if !target.has_root() => target.clone(),
@@ -364,6 +379,33 @@ impl DirSource {
         Some(inside.into_iter().collect())
     }
 
+    /// The entry for the file at `key`, of type `file_type`, with `meta` its metadata
+    /// (its own for a link, not its target's). `None` for what a workspace doesn't
+    /// hold: special files, and links whose target no workspace path could hold.
+    fn entry_of(
+        &self,
+        key: String,
+        file_type: std::fs::FileType,
+        meta: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+    ) -> Result<Option<SourceEntry>> {
+        let (kind, size, modified) = if file_type.is_dir() {
+            (Kind::Dir, None, None)
+        } else if file_type.is_file() {
+            let meta = meta().map_err(|err| io_error(&self.host_path(&key), err))?;
+            (Kind::File { executable: is_executable(&meta) }, Some(meta.len()), meta.modified().ok())
+        } else if file_type.is_symlink() {
+            let modified = meta().ok().and_then(|meta| meta.modified().ok());
+            match self.link_target(&key) {
+                Ok(target) => (Kind::Symlink, Some(target.len() as u64), modified),
+                Err(Error::NotText(_)) => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(SourceEntry { kind, key: key.as_str().into(), size, modified }))
+    }
+
     fn host_path(&self, key: &str) -> PathBuf {
         if key.is_empty() { self.root.clone() } else { self.root.join(key) }
     }
@@ -378,7 +420,7 @@ impl DirSource {
         let path = self.host_path(key);
         // Checked before opening, so a special file (a fifo) is never opened, and a
         // link is never followed: its target is read from the folder holding it.
-        let file_type = path.symlink_metadata().map_err(io_error)?.file_type();
+        let file_type = path.symlink_metadata().map_err(|err| io_error(&path, err))?.file_type();
         if file_type.is_symlink() {
             let parent = Path::new(key).parent().and_then(Path::to_str).unwrap_or_default();
             self.check_dir(parent, path.parent().unwrap_or(&self.root))?;
@@ -387,7 +429,7 @@ impl DirSource {
         if !file_type.is_file() {
             return Err(Error::Source(format!("{} is not a regular file", path.display())));
         }
-        let file = std::fs::File::open(&path).map_err(io_error)?;
+        let file = std::fs::File::open(&path).map_err(|err| io_error(&path, err))?;
         // On Linux the kernel names the file that was actually opened. It must be this
         // very path: a symlink anywhere on the way would resolve to another one. That
         // is one call, where resolving the parent costs one per component.
@@ -424,36 +466,35 @@ impl Source for DirSource {
     fn read_dir(&self, key: &str) -> Result<Listing> {
         let dir = self.host_path(key);
         self.check_dir(key, &dir)?;
-        let entries = std::fs::read_dir(dir).map_err(io_error)?;
+        let entries = std::fs::read_dir(&dir).map_err(|err| io_error(&dir, err))?;
         let mut listing = Listing::new();
         for entry in entries {
-            let entry = entry.map_err(io_error)?;
+            let entry = entry.map_err(|err| io_error(&dir, err))?;
             let Ok(name) = entry.file_name().into_string() else {
                 continue; // non-UTF-8 names cannot be addressed by a workspace path
             };
             // The entry's type usually comes with the listing, so only files, which
             // need a size and a mode, cost a stat (relative to the open directory).
-            let file_type = entry.file_type().map_err(io_error)?;
+            let file_type = entry.file_type().map_err(|err| io_error(&entry.path(), err))?;
             let child_key = if key.is_empty() { name.clone() } else { format!("{key}/{name}") };
-            let (kind, size, modified) = if file_type.is_dir() {
-                (Kind::Dir, None, None)
-            } else if file_type.is_file() {
-                let meta = entry.metadata().map_err(io_error)?;
-                (Kind::File { executable: is_executable(&meta) }, Some(meta.len()), meta.modified().ok())
-            } else if file_type.is_symlink() {
-                // The listing's metadata is the link's own, not its target's.
-                let modified = entry.metadata().ok().and_then(|meta| meta.modified().ok());
-                match self.link_target(&child_key) {
-                    Ok(target) => (Kind::Symlink, Some(target.len() as u64), modified),
-                    Err(Error::NotText(_)) => continue, // a target no workspace path could hold
-                    Err(err) => return Err(err),
-                }
-            } else {
-                continue; // special files are not part of a workspace
-            };
-            listing.insert(name, SourceEntry { kind, key: child_key.as_str().into(), size, modified });
+            if let Some(found) = self.entry_of(child_key, file_type, || entry.metadata())? {
+                listing.insert(name, found);
+            }
         }
         Ok(listing)
+    }
+
+    fn entry_now(&self, key: &str) -> Result<Option<SourceEntry>> {
+        if key.is_empty() || !Path::new(key).components().all(|part| matches!(part, Component::Normal(_))) {
+            return Ok(None);
+        }
+        let path = self.host_path(key);
+        let meta = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io_error(&path, err)),
+        };
+        self.entry_of(key.to_owned(), meta.file_type(), || Ok(meta.clone()))
     }
 
     fn read_file(&self, key: &str) -> Result<Bytes> {
@@ -461,9 +502,10 @@ impl Source for DirSource {
             Opened::File(file) => file,
             Opened::Link(target) => return Ok(target),
         };
-        let size = file.metadata().map_err(io_error)?.len();
+        let error = |err| io_error(&self.host_path(key), err);
+        let size = file.metadata().map_err(error)?.len();
         let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        file.read_to_end(&mut data).map_err(io_error)?;
+        file.read_to_end(&mut data).map_err(error)?;
         Ok(Bytes::from(data))
     }
 
@@ -472,10 +514,11 @@ impl Source for DirSource {
             Opened::File(file) => file,
             Opened::Link(target) => return Ok(slice(&target, offset, len)),
         };
-        let available = file.metadata().map_err(io_error)?.len().saturating_sub(offset);
-        file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        let error = |err| io_error(&self.host_path(key), err);
+        let available = file.metadata().map_err(error)?.len().saturating_sub(offset);
+        file.seek(SeekFrom::Start(offset)).map_err(error)?;
         let mut data = Vec::with_capacity(usize::try_from(len.min(available)).unwrap_or(0));
-        file.take(len).read_to_end(&mut data).map_err(io_error)?;
+        file.take(len).read_to_end(&mut data).map_err(error)?;
         Ok(Bytes::from(data))
     }
 }
@@ -506,8 +549,9 @@ fn relative_link(from: &Path, to: &Path) -> PathBuf {
     if link.as_os_str().is_empty() { PathBuf::from(".") } else { link }
 }
 
-fn io_error(err: std::io::Error) -> Error {
-    Error::Source(err.to_string())
+/// An error from the disk at `path`, naming it, so a log of failures says where.
+fn io_error(path: &Path, err: std::io::Error) -> Error {
+    Error::Source(format!("{}: {err}", path.display()))
 }
 
 #[cfg(unix)]
