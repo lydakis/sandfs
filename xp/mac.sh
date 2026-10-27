@@ -62,7 +62,7 @@ else
 fi
 
 # 2b. Which names the macOS NFS client looks up, per small-file operation (20 files each).
-export SANDFS_XP_TRACE="$W/trace.txt"
+export SANDFS_XP_TRACE="$W/trace.txt" SANDFS_HOME="$W/sandfs-home-trace"
 mkdir -p "$W/m-trace"
 if "$S" fork "$W/rg-src" "$W/m-trace" --mount --branch trace > /dev/null 2>&1; then
   python3 - "$W/m-trace/sf" "$W/trace.txt" <<'PY' | tee -a "$R"
@@ -101,9 +101,17 @@ passthrough() { # label lib-flags backend-options...
   local label=$1 flags=$2; shift 2
   local B="$W/b-$label" M="$W/m-$label"
   git clone -q "$W/rg-src" "$B"; mkdir -p "$M"
-  "$W/pt-$LIB" "$B" "$M" "$@" > "$W/pt.log" 2>&1 &
-  local pid=$!
-  for _ in $(seq 1 60); do mount | grep -qF " $M " && break; sleep 0.5; done
+  local pid
+  for attempt in 1 2 3; do
+    "$W/pt-$LIB" "$B" "$M" "$@" > "$W/pt.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 40); do mount | grep -qF " $M " && break; kill -0 $pid 2>/dev/null || break; sleep 0.5; done
+    mount | grep -qF " $M " && break
+    log "$label attempt $attempt: $(tr '\n' ' ' < "$W/pt.log" | cut -c1-300)"
+    log show --last 30s --predicate 'process CONTAINS "fskit" OR subsystem CONTAINS "FSKit"' 2>/dev/null \
+      | grep -iE 'error|fail|denied|not |disabled|enable|reject|entitle' | cut -c1-260 | tail -8 | sed 's/^/    fskit: /' | tee -a "$R"
+    kill $pid 2>/dev/null; sleep 15
+  done
   if mount | grep -qF " $M "; then
     suite "$label" "$M"
   else
@@ -117,7 +125,6 @@ if [ "${FUSET:-1}" = 1 ]; then
   LIB=fuset
   cc -O2 -o "$W/pt-fuset" "$X/passthrough.c" -D_FILE_OFFSET_BITS=64 $(pkg-config --cflags --libs fuse-t) 2>&1 | tail -5
   passthrough "fuse-t nfs" "" -f -o backend=nfs
-  passthrough "fuse-t smb" "" -f -o backend=smb
   passthrough "fuse-t fskit" "" -f -o backend=fskit
 fi
 if [ "${MACFUSE:-0}" = 1 ]; then
@@ -126,4 +133,5 @@ if [ "${MACFUSE:-0}" = 1 ]; then
   passthrough "macfuse fskit" "" -f -o backend=fskit
 fi
 log "done"
+echo "=== RESULTS ==="; cat "$R"
 cat "$R" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"

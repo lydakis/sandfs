@@ -74,11 +74,11 @@ copies() { # fs-label base-dir
   make overlayfs "$B/ov" mount -t overlay overlay -o "lowerdir=$B/clone,upperdir=$B/ov-upper,workdir=$B/ov-work" "$B/ov"
   umount "$B/ov"; rm -rf "$B/ov-upper" "$B/ov-work" "$B/ov"
   export SANDFS_HOME="$B/sandfs-home"
-  make "sandfs fork" "$B/fork" "$S" fork "$B/clone" "$B/fork" --branch xp
+  make "sandfs fork" "$B/fork" "$S" fork "$B/clone" "$B/fork" --branch xp --name "xp-$F-$round"
   "$S" rm --unmount "$B/fork" > /dev/null 2>&1
   if [ "$F" = ext4 ]; then
     export SANDFS_XP_WRITEBACK=1
-    make "sandfs fork + writeback cache" "$B/fork" "$S" fork "$B/clone" "$B/fork" --branch xp2
+    make "sandfs fork + writeback cache" "$B/fork" "$S" fork "$B/clone" "$B/fork" --branch xp2 --name "xpwb-$F-$round"
     "$S" rm --unmount "$B/fork" > /dev/null 2>&1
     unset SANDFS_XP_WRITEBACK
   fi

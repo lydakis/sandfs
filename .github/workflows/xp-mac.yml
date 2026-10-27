@@ -17,7 +17,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal && rustup default stable && cargo build --release -p sandfs-cli
       - name: Experiment
         run: xp/mac.sh
-  macfuse:
+  macfuse-off:
+    if: false
     runs-on: macos-26
     timeout-minutes: 90
     steps:
