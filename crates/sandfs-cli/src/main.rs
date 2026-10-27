@@ -76,9 +76,9 @@ enum Cmd {
         /// changes, so the fork's commits can be pushed with `git push origin NAME`.
         #[arg(long, value_name = "NAME")]
         branch: Option<String>,
-        /// Keep the fork at DIR as a real folder instead of a mount: the default on
-        /// macOS for a fork of a git repository's folder (or of such a fork), without
-        /// --read-only. Its files are clones of the folder's, which take no space on a
+        /// Keep the fork at DIR as a real folder instead of a mount: the default for a
+        /// fork of a git repository's folder (or of such a fork), without --read-only,
+        /// on macOS and on Linux where the disk clones files into DIR (btrfs, XFS). Its files are clones of the folder's, which take no space on a
         /// disk that clones files (APFS, btrfs, XFS), and programs and git work in it at
         /// the disk's own speed. `changes` and `fork` read it as they read a mount, and
         /// `rm --unmount` deletes it; it can't be mounted, updated, served or confined.

@@ -249,8 +249,9 @@ pub struct ForkOptions {
     pub foreground: bool,
     /// Keep a fork of a git repository's folder (or of such a fork) at `dir` as a real
     /// folder rather than a mount: `Some(true)` or `Some(false)`. By default it is one on
-    /// macOS, where a mount is slowest at work on many small files, unless the fork
-    /// has read-only paths, which need a mount. Its files are clones of the folder's,
+    /// macOS, where a mount is slowest at work on many small files, and on Linux where
+    /// the folder's disk clones files into `dir` (btrfs, XFS; not ext4), unless the
+    /// fork has read-only paths, which need a mount. Its files are clones of the folder's,
     /// which cost no space on a disk that clones files (APFS, btrfs, XFS) and are copied
     /// on others, and git in it is as fast as in the clone. [`Home::changes`] and
     /// [`Home::fork`] read it as they read a mount; [`Home::remove`] with `unmount`

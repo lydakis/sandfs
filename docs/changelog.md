@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **sandfs and sandfs-cli, real folders on Linux**: `sandfs fork` of a git clone (or of a fork kept as a folder) into a folder on a disk that clones files, btrfs or XFS, now keeps the fork there as a real folder of clones of the clone's files, as on macOS, instead of mounting it. It takes no space for the files, about 30 ms to make, and builds and git run in it at the disk's own speed, where a mount ran a build after an edit 25-40% slower and created small files 2-5 times slower. sandfs finds out by cloning one file next to the folder and removing it. On ext4, or with `--read-only` or `--mount`, the fork is mounted as before.
+
 ## 0.8.0 (2026-10-27)
 
 The main changes:
@@ -14,6 +18,7 @@ API changes in the `sandfs` crate: `ForkOptions` has two new fields, `real_folde
 - **sandfs-cli, faster forks and `changes`**: small files (64 KiB or less) written in a mount stay in memory until a save packs them, instead of going through a file on disk first (Linux, 1,000 files: rewrite 511 to 65 ms, create 576 to 110 ms). macOS sees an unmount at once rather than at its next half-second check. A fork of a local clone runs fewer git processes, and the ones left at once (Linux: 31 to 17 ms); `changes` on a real folder skips files unchanged since it last looked and reuses the source its update opened (macOS CI: 113 to about 60 ms, and 84 to 97 ms after an edit).
 - **sandfs-cli, a slow first read on macOS**: a macOS mount was soft, so the system gave up on a call after at most about 30 s, and a first read waiting on a slow download failed with an I/O error. It is now `hard,intr,deadtimeout=60`: slow reads wait, and if the mount process dies, calls fail after a minute without answers.
 - **Benchmarks**: `sandfs-bench --only copies` compares a git worktree, a copy-on-write copy of a clone and `sandfs fork` at the work an agent does in a task's copy, on Linux and macOS for every pull request.
+- **sandfs and sandfs-cli, `git status` in a mount**: git's file monitor (`sandfs git-fsmonitor`) has the mount save its changes without flushing them to the disk, which is all git needs, so `git status` right after a build no longer waits for the build's output to be flushed: 0.58 s down to about 0.15 s after building ripgrep in a Linux mount. A mount process started by an older sandfs still answers, with a flushed save.
 
 ## 0.7.1 (2026-10-26)
 
