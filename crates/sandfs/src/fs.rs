@@ -1192,6 +1192,41 @@ impl Inner {
         self.entry(&path)
     }
 
+    /// Ask the source again about `ino`, a file of the source nobody wrote, after a
+    /// read of it came back short of its size: the folder under the mount changed
+    /// since it was listed (see [`Workspace::recheck`]). Its attributes then give the
+    /// folder's size now, so a client never fills the bytes it lacks with zeros.
+    /// Returns whether anything changed.
+    ///
+    /// With [`Inner::renumber_changed`] (NFS), a changed file also gets a new inode
+    /// and its folder a new time, as [`Inner::replace`] does: the macOS client won't
+    /// take a smaller size from a read, and keeps the one it has for up to a minute,
+    /// so the old inode goes, and reads through it fail rather than fill with zeros.
+    pub fn recheck(&mut self, ino: u64) -> FsResult<bool> {
+        if self.buffers.contains_key(&ino) {
+            return Ok(false);
+        }
+        let Some(Node { linked: true, path, .. }) = self.nodes.get(&ino) else { return Ok(false) };
+        let path = path.clone();
+        let changed = self.ws.recheck(path.as_str()).fs()?;
+        // Every name of the file goes off the inode at once: a hard link left on it
+        // would bring back the size the client keeps for it.
+        if changed && self.renumber_changed {
+            let now = SystemTime::now();
+            for name in self.other_names(&path).iter().chain([&path]) {
+                if self.inos.get(name.as_str()) == Some(&ino) {
+                    self.inos.remove(name.as_str());
+                }
+                self.times.extend(name.parent().map(|parent| (parent.to_string(), now)));
+            }
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                (node.linked, node.lookups) = (false, 0);
+            }
+            self.maybe_drop(ino);
+        }
+        Ok(changed)
+    }
+
     /// The workspace and path holding `ino`'s contents: the workspace itself, or for
     /// a removed file the kernel may still have open, the one from before the removal.
     fn contents(&self, ino: u64) -> FsResult<(&Workspace, &VPath)> {
@@ -2087,7 +2122,17 @@ impl Filesystem for SandFs {
     ) {
         let reading = self.0.lock().reading(ino.0, offset, size);
         match reading.and_then(|reading| reading.read(offset, size)) {
-            Ok(data) => reply.data(&data),
+            Ok(data) => {
+                // The kernel takes a short read as the file's end; its size from now on
+                // says the same (see `Inner::recheck`).
+                if data.len() < size as usize {
+                    let mut inner = self.0.lock();
+                    if inner.attr(ino.0).is_ok_and(|attr| attr.size > offset + data.len() as u64) {
+                        let _ = inner.recheck(ino.0);
+                    }
+                }
+                reply.data(&data)
+            }
             Err(err) => reply.error(err),
         }
     }

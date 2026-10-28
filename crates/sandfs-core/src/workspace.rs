@@ -101,6 +101,30 @@ impl Cache {
         self.dirs.lock().expect("cache lock").insert(key, Arc::new(Mutex::new(Some(listing))));
     }
 
+    /// Drop the cached blob for `key`, whose file changed in its source.
+    fn forget_blob(&self, key: &CacheKey) {
+        self.blobs.lock().expect("cache lock").remove(key);
+    }
+
+    /// Put `entry` in the cached listing `key` under `name`, in place of the entry with
+    /// the same source key, and say whether that changed it. The listing's own lock is
+    /// held throughout, so two files of one directory changed at once both stay changed.
+    /// `then` runs under that lock too, so what it caches from `entry` changes in the
+    /// same order as the listing.
+    fn patch_listing(&self, key: &CacheKey, name: &str, entry: SourceEntry, then: impl FnOnce(SourceEntry)) -> bool {
+        let Some(slot) = self.dirs.lock().expect("cache lock").get(key).cloned() else { return false };
+        let mut listing = slot.lock().expect("cache slot lock");
+        let Some(current) = listing.as_ref() else { return false };
+        if current.get(name).is_none_or(|listed| listed.key != entry.key || *listed == entry) {
+            return false;
+        }
+        let mut fresh = (**current).clone();
+        fresh.insert(name.to_owned(), entry.clone());
+        *listing = Some(Arc::new(fresh));
+        then(entry);
+        true
+    }
+
     /// The cached blob for `key`, if it is loaded and not being loaded right now.
     fn peek_blob(&self, key: &CacheKey) -> Option<Bytes> {
         let slot = self.blobs.lock().expect("cache lock").get(key)?.clone();
@@ -407,6 +431,58 @@ impl Workspace {
                 Metadata { kind, size, version, modified }
             }
         })
+    }
+
+    /// Ask the source again about the file at `path`, whose bytes this workspace hasn't
+    /// changed, after a read showed it is no longer what its listing said: a read that
+    /// came back shorter than the listed size, from a folder written to meanwhile. Its
+    /// size, time and cached bytes become what the source says now (see
+    /// [`Source::entry_now`]), for this file alone; the rest of its directory stays as
+    /// first listed. A file whose mode changed here keeps its mode. Returns whether
+    /// anything changed. Forks share the listing, as they share every listing.
+    pub fn recheck(&mut self, path: &str) -> Result<bool> {
+        let path = VPath::parse(path)?;
+        let Ok(Resolved::File { content: Content::Base { mount, key, .. }, .. }) = self.resolve(&path) else {
+            return Ok(false);
+        };
+        let Some(now) = mount.source.entry_now(&key)? else { return Ok(false) };
+        let mut changed = false;
+        // A file whose mode changed here, or that has several names, holds the
+        // source's size and time itself.
+        let held = match self.overlay.get(&path) {
+            Some(Overlay::Linked { id }) => {
+                let id = *id;
+                self.links.get_mut(&id).map(|linked| &mut linked.content)
+            }
+            Some(Overlay::File { .. }) => match self.overlay.get_mut(&path) {
+                Some(Overlay::File { content, .. }) => Some(content),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(Content::Base { key: held, size, modified, .. }) = held
+            && *held == key
+            && matches!(now.kind, Kind::File { .. })
+            && (*size, *modified) != (now.size, now.modified)
+        {
+            (*size, *modified) = (now.size, now.modified);
+            changed = true;
+        }
+        // A file moved here from another directory isn't in this listing.
+        if let (Some(parent), Some(name)) = (path.parent(), path.name())
+            && let Some(dir) = self.base_dir(&parent, &mount)?
+            && self.cached_listing(&mount, &dir)?.get(name).is_some_and(|entry| entry.key == key)
+            && let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id)
+            && self.cache.patch_listing(&(mount.id, dir), name, now, |now| {
+                self.cache.remember_entry(mount.id, &path.as_str()[mount_path.as_str().len() + 1..], now);
+            })
+        {
+            changed = true;
+        }
+        if changed {
+            self.cache.forget_blob(&(mount.id, key));
+        }
+        Ok(changed)
     }
 
     /// [`Metadata::modified`] alone: the source's time for a file nobody wrote, found

@@ -1003,6 +1003,78 @@ fn dir_source_reads_ranges_from_disk() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn a_recheck_takes_a_changed_folder_file_as_it_is_now() {
+    let dir = std::env::temp_dir().join(format!("sandfs-recheck-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/shrink.txt"), "twenty-four bytes long..").unwrap();
+    std::fs::write(dir.join("sub/other.txt"), "other").unwrap();
+    std::fs::write(dir.join("sub/mine.txt"), "mine").unwrap();
+    std::fs::write(dir.join("sub/mode.txt"), "twenty-four bytes long..").unwrap();
+    std::fs::write(dir.join("sub/linked.txt"), "twenty-four bytes long..").unwrap();
+
+    let mut ws = Workspace::new();
+    ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
+    assert_eq!(ws.stat("/host/sub/shrink.txt").unwrap().size, 24);
+    assert_eq!(ws.read_text("/host/sub/other.txt").unwrap(), "other");
+    ws.write("/host/sub/mine.txt", "written here").unwrap();
+    assert!(!ws.recheck("/host/sub/shrink.txt").unwrap(), "nothing changed yet");
+
+    // The folder changes under the workspace; the listing still says 24 bytes.
+    std::fs::write(dir.join("sub/shrink.txt"), "new").unwrap();
+    std::fs::write(dir.join("sub/other.txt"), "other, longer now").unwrap();
+    std::fs::write(dir.join("sub/mine.txt"), "changed on disk").unwrap();
+    std::fs::write(dir.join("sub/added.txt"), "added").unwrap();
+    assert_eq!(ws.stat("/host/sub/shrink.txt").unwrap().size, 24);
+    assert_eq!(ws.read_range("/host/sub/shrink.txt", 0, 24).unwrap(), Bytes::from_static(b"new"));
+
+    assert!(ws.recheck("/host/sub/shrink.txt").unwrap());
+    assert_eq!(ws.stat("/host/sub/shrink.txt").unwrap().size, 3);
+    assert_eq!(ws.read_text("/host/sub/shrink.txt").unwrap(), "new");
+    assert!(!ws.recheck("/host/sub/shrink.txt").unwrap(), "asked once per change");
+    // Only that file: the rest of the folder stays as first seen, cached bytes included.
+    assert_eq!(ws.read_text("/host/sub/other.txt").unwrap(), "other");
+    assert!(!ws.exists("/host/sub/added.txt"));
+    // A file written here is the workspace's own.
+    assert!(!ws.recheck("/host/sub/mine.txt").unwrap());
+    assert_eq!(ws.read_text("/host/sub/mine.txt").unwrap(), "written here");
+    // A file of a cached whole read is read again once rechecked.
+    assert!(ws.recheck("/host/sub/other.txt").unwrap());
+    assert_eq!(ws.read_text("/host/sub/other.txt").unwrap(), "other, longer now");
+    // A forked snapshot sees the same answer, as it shares every listing.
+    assert_eq!(ws.fork().stat("/host/sub/shrink.txt").unwrap().size, 3);
+    // A file whose mode changed here takes the new size too, and keeps its mode.
+    let mut ws = ws.fork();
+    ws.set_executable("/host/sub/mode.txt", true).unwrap();
+    std::fs::write(dir.join("sub/mode.txt"), "new").unwrap();
+    assert!(ws.recheck("/host/sub/mode.txt").unwrap());
+    let meta = ws.stat("/host/sub/mode.txt").unwrap();
+    assert_eq!((meta.size, meta.kind), (3, Kind::File { executable: true }));
+    assert!(!ws.recheck("/host/sub/mode.txt").unwrap());
+    // So does a file with a second name, through either name.
+    ws.hard_link("/host/sub/linked.txt", "/host/sub/second.txt").unwrap();
+    std::fs::write(dir.join("sub/linked.txt"), "new").unwrap();
+    assert!(ws.recheck("/host/sub/second.txt").unwrap());
+    assert_eq!(ws.stat("/host/sub/linked.txt").unwrap().size, 3);
+    assert_eq!(ws.read_text("/host/sub/second.txt").unwrap(), "new");
+    // Gone from the folder: kept as it was.
+    std::fs::remove_file(dir.join("sub/shrink.txt")).unwrap();
+    assert!(!ws.recheck("/host/sub/shrink.txt").unwrap());
+    // Its folder swapped for a link out of the folder: nothing there is looked at.
+    let outside = std::env::temp_dir().join(format!("sandfs-recheck-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("other.txt"), "outside").unwrap();
+    std::fs::rename(dir.join("sub"), dir.join("moved")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, dir.join("sub")).unwrap();
+        assert!(ws.recheck("/host/sub/other.txt").is_err());
+        assert_eq!(ws.stat("/host/sub/other.txt").unwrap().size, 17);
+    }
+    std::fs::remove_dir_all(&outside).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A slow source that counts file reads and fails the first one when asked to.
 #[derive(Debug)]
 struct Slow {
