@@ -109,7 +109,9 @@ impl Cache {
     /// Put `entry` in the cached listing `key` under `name`, in place of the entry with
     /// the same source key, and say whether that changed it. The listing's own lock is
     /// held throughout, so two files of one directory changed at once both stay changed.
-    fn patch_listing(&self, key: &CacheKey, name: &str, entry: SourceEntry) -> bool {
+    /// `then` runs under that lock too, so what it caches from `entry` changes in the
+    /// same order as the listing.
+    fn patch_listing(&self, key: &CacheKey, name: &str, entry: SourceEntry, then: impl FnOnce(SourceEntry)) -> bool {
         let Some(slot) = self.dirs.lock().expect("cache lock").get(key).cloned() else { return false };
         let mut listing = slot.lock().expect("cache slot lock");
         let Some(current) = listing.as_ref() else { return false };
@@ -117,8 +119,9 @@ impl Cache {
             return false;
         }
         let mut fresh = (**current).clone();
-        fresh.insert(name.to_owned(), entry);
+        fresh.insert(name.to_owned(), entry.clone());
         *listing = Some(Arc::new(fresh));
+        then(entry);
         true
     }
 
@@ -469,11 +472,11 @@ impl Workspace {
         if let (Some(parent), Some(name)) = (path.parent(), path.name())
             && let Some(dir) = self.base_dir(&parent, &mount)?
             && self.cached_listing(&mount, &dir)?.get(name).is_some_and(|entry| entry.key == key)
-            && self.cache.patch_listing(&(mount.id, dir), name, now.clone())
-        {
-            if let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id) {
+            && let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id)
+            && self.cache.patch_listing(&(mount.id, dir), name, now, |now| {
                 self.cache.remember_entry(mount.id, &path.as_str()[mount_path.as_str().len() + 1..], now);
-            }
+            })
+        {
             changed = true;
         }
         if changed {
