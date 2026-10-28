@@ -34,7 +34,7 @@ pub fn rewrite(contents: &[u8], at: &Path, top: &Path) -> Option<Vec<u8>> {
     let inside = inside(repo, top).filter(|rel| rel.components().all(|part| matches!(part, Component::Normal(_))));
     Some(
         match inside {
-            Some(rel) => format!("gitdir: {}\n", relative(at, &rel).display()),
+            Some(rel) => format!("gitdir: {}\n", relative(at, &rel)),
             None => format!("gitdir: {OUTSIDE}{named}\n"),
         }
         .into_bytes(),
@@ -65,13 +65,14 @@ fn inside(repo: &Path, top: &Path) -> Option<PathBuf> {
         .find_map(|repo| tops.iter().find_map(|top| repo.strip_prefix(top).ok().map(Path::to_path_buf)))
 }
 
-/// The relative path from the folder `from` to `to`, both relative to one top.
-fn relative(from: &Path, to: &Path) -> PathBuf {
+/// The relative path from the folder `from` to `to`, both relative to one top, with
+/// `/` between names, which git reads on every system.
+fn relative(from: &Path, to: &Path) -> String {
     let (from, to): (Vec<_>, Vec<_>) = (from.components().collect(), to.components().collect());
     let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
-    let mut path: PathBuf = from[common..].iter().map(|_| Component::ParentDir).collect();
-    path.extend(&to[common..]);
-    if path.as_os_str().is_empty() { PathBuf::from(".") } else { path }
+    let ups = from[common..].iter().map(|_| "..".into());
+    let names: Vec<_> = ups.chain(to[common..].iter().map(|part| part.as_os_str().to_string_lossy())).collect();
+    if names.is_empty() { ".".to_owned() } else { names.join("/") }
 }
 
 /// A folder on disk as a mount shows it: [`DirSource`], with its linked worktrees'
@@ -164,31 +165,44 @@ impl Source for FolderSource {
 mod tests {
     use super::*;
 
+    /// `path`, a full path on Unix, as a full path on this system.
+    fn full(path: &str) -> String {
+        if cfg!(windows) { format!("C:{path}") } else { path.to_owned() }
+    }
+
+    fn git_file(repo: &str) -> Vec<u8> {
+        format!("gitdir: {}\n", full(repo)).into_bytes()
+    }
+
     #[test]
     fn a_repository_in_the_folder_is_named_from_the_worktree() {
-        let top = Path::new("/work/proj");
-        let said = rewrite(b"gitdir: /work/proj/repo/.git/worktrees/wt\n", Path::new("repo/.worktrees/wt"), top);
+        let top = full("/work/proj");
+        let said =
+            rewrite(&git_file("/work/proj/repo/.git/worktrees/wt"), Path::new("repo/.worktrees/wt"), top.as_ref());
         assert_eq!(said.unwrap(), b"gitdir: ../../.git/worktrees/wt\n");
     }
 
     #[test]
     fn a_repository_elsewhere_is_named_where_nothing_is() {
-        let said = rewrite(b"gitdir: /elsewhere/repo/.git/worktrees/wt\n", Path::new("wt"), Path::new("/work/proj"));
+        let top = full("/work/proj");
+        let said = rewrite(&git_file("/elsewhere/repo/.git/worktrees/wt"), Path::new("wt"), top.as_ref());
         let said = String::from_utf8(said.unwrap()).unwrap();
-        assert_eq!(said, format!("gitdir: {OUTSIDE}/elsewhere/repo/.git/worktrees/wt\n"));
+        assert_eq!(said, format!("gitdir: {OUTSIDE}{}\n", full("/elsewhere/repo/.git/worktrees/wt")));
         // A neighbour whose name starts the same is elsewhere too.
-        let said = rewrite(b"gitdir: /work/proj2/.git", Path::new(""), Path::new("/work/proj"));
+        let said = rewrite(&git_file("/work/proj2/.git"), Path::new(""), top.as_ref());
         assert!(String::from_utf8(said.unwrap()).unwrap().contains(OUTSIDE));
     }
 
     #[test]
     fn relative_and_other_files_are_shown_as_they_are() {
-        let top = Path::new("/work/proj");
+        let top = full("/work/proj");
+        let top = Path::new(&top);
         assert_eq!(rewrite(b"gitdir: ../.git/modules/lib\n", Path::new("lib"), top), None);
         assert_eq!(rewrite(b"not a git file", Path::new(""), top), None);
         assert_eq!(rewrite(&[0xff, 0xfe], Path::new(""), top), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn macos_names_tmp_with_or_without_private() {
         let said =
