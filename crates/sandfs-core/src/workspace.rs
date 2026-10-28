@@ -444,9 +444,20 @@ impl Workspace {
         };
         let Some(now) = mount.source.entry_now(&key)? else { return Ok(false) };
         let mut changed = false;
-        // A file whose mode changed here holds the source's size and time itself.
-        if let Some(Overlay::File { content: Content::Base { key: held, size, modified, .. }, .. }) =
-            self.overlay.get_mut(&path)
+        // A file whose mode changed here, or that has several names, holds the
+        // source's size and time itself.
+        let held = match self.overlay.get(&path) {
+            Some(Overlay::Linked { id }) => {
+                let id = *id;
+                self.links.get_mut(&id).map(|linked| &mut linked.content)
+            }
+            Some(Overlay::File { .. }) => match self.overlay.get_mut(&path) {
+                Some(Overlay::File { content, .. }) => Some(content),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(Content::Base { key: held, size, modified, .. }) = held
             && *held == key
             && matches!(now.kind, Kind::File { .. })
             && (*size, *modified) != (now.size, now.modified)

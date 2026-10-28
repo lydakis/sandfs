@@ -1011,6 +1011,7 @@ fn a_recheck_takes_a_changed_folder_file_as_it_is_now() {
     std::fs::write(dir.join("sub/other.txt"), "other").unwrap();
     std::fs::write(dir.join("sub/mine.txt"), "mine").unwrap();
     std::fs::write(dir.join("sub/mode.txt"), "twenty-four bytes long..").unwrap();
+    std::fs::write(dir.join("sub/linked.txt"), "twenty-four bytes long..").unwrap();
 
     let mut ws = Workspace::new();
     ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
@@ -1050,6 +1051,12 @@ fn a_recheck_takes_a_changed_folder_file_as_it_is_now() {
     let meta = ws.stat("/host/sub/mode.txt").unwrap();
     assert_eq!((meta.size, meta.kind), (3, Kind::File { executable: true }));
     assert!(!ws.recheck("/host/sub/mode.txt").unwrap());
+    // So does a file with a second name, through either name.
+    ws.hard_link("/host/sub/linked.txt", "/host/sub/second.txt").unwrap();
+    std::fs::write(dir.join("sub/linked.txt"), "new").unwrap();
+    assert!(ws.recheck("/host/sub/second.txt").unwrap());
+    assert_eq!(ws.stat("/host/sub/linked.txt").unwrap().size, 3);
+    assert_eq!(ws.read_text("/host/sub/second.txt").unwrap(), "new");
     // Gone from the folder: kept as it was.
     std::fs::remove_file(dir.join("sub/shrink.txt")).unwrap();
     assert!(!ws.recheck("/host/sub/shrink.txt").unwrap());
