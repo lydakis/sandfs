@@ -834,10 +834,25 @@ pub fn remove_copy(path: &Path) -> Result<()> {
 /// Give `copy` the mode and modification time of `path`.
 pub(crate) fn keep_times(path: &Path, copy: &Path) -> Result<()> {
     let meta = std::fs::metadata(path)?;
-    let file = File::open(copy)?;
+    let file = open_to_set_times(copy)?;
     file.set_modified(meta.modified()?).with_context(|| format!("setting the time of {}", copy.display()))?;
     std::fs::set_permissions(copy, meta.permissions())
         .with_context(|| format!("setting the mode of {}", copy.display()))
+}
+
+#[cfg(not(windows))]
+fn open_to_set_times(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+/// Windows sets a time only through a handle that may write attributes,
+/// and opens a folder only with backup semantics.
+#[cfg(windows)]
+fn open_to_set_times(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)
 }
 
 #[cfg(unix)]
