@@ -4,7 +4,9 @@
 //! owner can reach, and start it first when none is running. Each mount runs on
 //! threads of its own, and workspaces over the same commit share it (see [`Bases`]).
 //! The process exits once its last mount is gone, so nothing stays running.
-//! `update` asks it to move a workspace it serves onto a newer source in place.
+//! `update` asks it to move a workspace it serves onto a newer source in place, and
+//! `trim` to let go of memory its mounts can do without; a mount left unused for a
+//! minute is trimmed anyway.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -22,6 +24,7 @@ use nix::sys::signal::kill;
 use nix::unistd::{Pid, setsid};
 use serde::{Deserialize, Serialize};
 
+use crate::Trimmed;
 use crate::fs::{Replacement, Shared};
 use crate::store::{Base, Bases, Home, Lease, ROOT, Record};
 use crate::update::{self, Updated};
@@ -32,6 +35,8 @@ const LINGER: Duration = Duration::from_secs(2);
 const START: Duration = Duration::from_secs(10);
 /// How long a mount may take, which includes fetching a remote commit's folders.
 const MOUNT: Duration = Duration::from_secs(120);
+/// How long a mount goes unused before it is trimmed (see [`trim`]).
+const IDLE: Duration = Duration::from_secs(60);
 /// The memory maps kept free when taking another mount, for what mounts already served
 /// need: threads that answer requests, large reads (each read of a large file maps
 /// memory of its own) and git helpers. A mount takes about 10.
@@ -39,14 +44,17 @@ const MOUNT: Duration = Duration::from_secs(120);
 const MAPS_KEPT: usize = 1024;
 
 /// A request to mount the workspace `name` at `dir`, which exists and is canonical,
-/// or to move the mounted workspace `name` onto a newer source. The directory goes as
-/// its bytes, since a path needn't be UTF-8.
+/// to move the mounted workspace `name` onto a newer source, or to trim the mount of
+/// `name` (every mount when it is empty). The directory goes as its bytes, since a
+/// path needn't be UTF-8.
 #[derive(Serialize, Deserialize)]
 struct Request {
     name: String,
     dir: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     update: Option<Move>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    trim: bool,
 }
 
 /// The source to move a workspace onto, found by the command that asked, and whether
@@ -63,12 +71,15 @@ impl Request {
     }
 }
 
-/// The answer, once the mount is up or has failed, or the workspace has moved.
+/// The answer, once the mount is up or has failed, the workspace has moved, or the
+/// mounts are trimmed.
 #[derive(Serialize, Deserialize)]
 struct Reply {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated: Option<Updated>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trimmed: Option<Trimmed>,
 }
 
 /// Where the background process writes what it reports.
@@ -93,7 +104,7 @@ fn run_dir(home: &Home) -> Result<PathBuf> {
 /// none is running, and wait until the mount is up.
 pub fn mount(home: &Home, name: &str, dir: &Path) -> Result<()> {
     let dir = dir.as_os_str().as_bytes().to_vec();
-    let request = serde_json::to_string(&Request { name: name.to_owned(), dir, update: None })?;
+    let request = serde_json::to_string(&Request { name: name.to_owned(), dir, update: None, trim: false })?;
     let started = Instant::now();
     let mut server: Option<Pid> = None;
     // A running process answers at once, and a new one within a few milliseconds.
@@ -122,7 +133,8 @@ pub fn mount(home: &Home, name: &str, dir: &Path) -> Result<()> {
 /// names it from now on if `given`.
 pub fn update(home: &Home, name: &str, next: &Record, given: bool) -> Result<Updated> {
     let update = Move { next: next.clone(), given };
-    let request = serde_json::to_string(&Request { name: name.to_owned(), dir: Vec::new(), update: Some(update) })?;
+    let request =
+        serde_json::to_string(&Request { name: name.to_owned(), dir: Vec::new(), update: Some(update), trim: false })?;
     let unserved =
         || anyhow!("{name} is mounted by a process that can't move it; unmount it first (sandfs unmount {name})");
     let stream = UnixStream::connect(socket_path(home)).map_err(|_| unserved())?;
@@ -132,6 +144,63 @@ pub fn update(home: &Home, name: &str, next: &Record, given: bool) -> Result<Upd
         (None, Some(updated)) => Ok(updated),
         (None, None) => Err(unserved()),
     }
+}
+
+/// Have the home's process save the changes of the mounted workspace `name` (every
+/// workspace it serves, when empty), then let go of what those mounts keep that they
+/// can get again, and hand the memory freed back to the system. Nothing they serve
+/// changes. With no process running, nothing is mounted to trim.
+pub fn trim(home: &Home, name: &str) -> Result<Trimmed> {
+    let request = serde_json::to_string(&Request { name: name.to_owned(), dir: Vec::new(), update: None, trim: true })?;
+    let unserved = || anyhow!("{name} isn't mounted by this home's background process");
+    let Ok(stream) = UnixStream::connect(socket_path(home)) else {
+        return if name.is_empty() { Ok(Trimmed::default()) } else { Err(unserved()) };
+    };
+    match ask(stream, &request)? {
+        Some(Reply { error: Some(err), .. }) => Err(anyhow!(err)),
+        Some(Reply { trimmed: Some(trimmed), .. }) => Ok(trimmed),
+        Some(_) => Err(anyhow!("the background process can't trim; unmount and mount again to update it")),
+        None if name.is_empty() => Ok(Trimmed::default()),
+        None => Err(unserved()),
+    }
+}
+
+/// Trim the mount of `name`, or every mount this process serves when it is empty.
+fn trim_served(name: &str) -> Result<Trimmed> {
+    let served: Vec<Arc<Served>> = served_list()
+        .iter()
+        .filter(|(served, _)| name.is_empty() || *served == name)
+        .filter_map(|(_, served)| served.upgrade())
+        .collect();
+    if !name.is_empty() && served.is_empty() {
+        bail!("{name} isn't mounted by this home's background process");
+    }
+    let mut failed = None;
+    for mount in &served {
+        if let Err(err) = mount.shared.trim() {
+            failed.get_or_insert(err);
+        }
+    }
+    let given_back = crate::memory::give_back().map(|bytes| bytes as u64);
+    match failed {
+        Some(err) => Err(err.context("saving before trimming")),
+        None => Ok(Trimmed { mounts: served.len(), given_back }),
+    }
+}
+
+/// Trim the mounts no one has asked anything for `idle`, once each until used again.
+fn trim_idle(idle: Duration) {
+    let idle: Vec<Arc<Served>> =
+        served_list().values().filter_map(Weak::upgrade).filter(|served| served.shared.idle_untrimmed(idle)).collect();
+    if idle.is_empty() {
+        return;
+    }
+    for mount in &idle {
+        if let Err(err) = mount.shared.trim() {
+            eprintln!("sandfs: trimming an unused mount: {err:#}");
+        }
+    }
+    crate::memory::give_back();
 }
 
 /// Send `request` and read the reply, or `None` if the connection closes first.
@@ -271,6 +340,12 @@ pub fn run(home: Home) -> Result<()> {
             std::thread::spawn(move || answer(&stream, &home, &bases, ticket));
         }
     });
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(IDLE / 4);
+            trim_idle(IDLE);
+        }
+    });
     state.wait_until_idle(LINGER);
     // The socket stays: connecting to it fails once this process is gone, and the next
     // process replaces it. Removing it here could remove a successor's instead, when
@@ -283,10 +358,20 @@ pub fn run(home: Home) -> Result<()> {
 /// or move the workspace and answer once it has moved.
 fn answer(mut stream: &UnixStream, home: &Home, bases: &Arc<Bases>, ticket: Ticket) {
     let mut request = read_request(stream);
+    if let Ok(Request { name, trim: true, .. }) = &request {
+        let reply = match trim_served(name) {
+            Ok(trimmed) => Reply { error: None, updated: None, trimmed: Some(trimmed) },
+            Err(err) => Reply { error: Some(format!("{err:#}")), updated: None, trimmed: None },
+        };
+        if let Ok(reply) = serde_json::to_string(&reply) {
+            let _ = stream.write_all(format!("{reply}\n").as_bytes());
+        }
+        return;
+    }
     if let Ok(Request { name, update: Some(next), .. }) = &mut request {
         let reply = match move_served(home, bases, name, next) {
-            Ok(updated) => Reply { error: None, updated: Some(updated) },
-            Err(err) => Reply { error: Some(format!("{err:#}")), updated: None },
+            Ok(updated) => Reply { error: None, updated: Some(updated), trimmed: None },
+            Err(err) => Reply { error: Some(format!("{err:#}")), updated: None, trimmed: None },
         };
         if let Ok(reply) = serde_json::to_string(&reply) {
             let _ = stream.write_all(format!("{reply}\n").as_bytes());
@@ -296,7 +381,7 @@ fn answer(mut stream: &UnixStream, home: &Home, bases: &Arc<Bases>, ticket: Tick
     let dir = request.as_ref().ok().map(Request::dir);
     let mounted = request.and_then(|request| start_mount(home, bases, request, ticket));
     let up = mounted.is_ok();
-    let reply = Reply { error: mounted.err().map(|err| format!("{err:#}")), updated: None };
+    let reply = Reply { error: mounted.err().map(|err| format!("{err:#}")), updated: None, trimmed: None };
     let told =
         serde_json::to_string(&reply).is_ok_and(|reply| stream.write_all(format!("{reply}\n").as_bytes()).is_ok());
     // A requester that gave up (timed out, or was interrupted) has reported a failure,
@@ -343,6 +428,8 @@ fn start_mount(home: &Home, bases: &Arc<Bases>, request: Request, ticket: Ticket
             if let Err(err) = &served {
                 eprintln!("sandfs: {}: {err:#}", request.name);
             }
+            // What the mount took is free now: hand it back to the system.
+            crate::memory::give_back();
             // A mount that never came up reports why; for one that did, this goes unread.
             let _ = done.send(served);
         })
@@ -520,7 +607,8 @@ mod tests {
     #[test]
     fn requests_carry_any_directory_name() {
         let dir = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9"));
-        let request = Request { name: "ws".into(), dir: dir.as_os_str().as_bytes().to_vec(), update: None };
+        let request =
+            Request { name: "ws".into(), dir: dir.as_os_str().as_bytes().to_vec(), update: None, trim: false };
         let sent: Request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(sent.dir(), dir);
     }

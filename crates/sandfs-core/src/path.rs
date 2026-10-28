@@ -2,6 +2,7 @@
 
 use std::borrow::Borrow;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
@@ -10,13 +11,16 @@ use crate::error::{Error, Result};
 /// Parsing collapses repeated slashes and `.` components and resolves `..`; a `..`
 /// that would climb above the root is rejected rather than clamped, so a caller can
 /// never address something outside the workspace by accident.
+///
+/// A path never changes once made, so a copy shares its bytes: a mount's table of
+/// files and the path each file is known by hold one string between them.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VPath(String);
+pub struct VPath(Arc<str>);
 
 impl VPath {
     /// The root path `/`.
     pub fn root() -> Self {
-        VPath("/".to_owned())
+        VPath("/".into())
     }
 
     /// Parse and normalize an absolute path.
@@ -27,7 +31,7 @@ impl VPath {
         // Most paths arrive already normalized; keep them as they are.
         let normal = |part: &str| !part.is_empty() && part != "." && part != ".." && !part.contains('\0');
         if raw == "/" || raw.split('/').skip(1).all(normal) {
-            return Ok(VPath(raw.to_owned()));
+            return Ok(VPath(raw.into()));
         }
         let mut parts: Vec<&str> = Vec::new();
         for part in raw.split('/') {
@@ -46,7 +50,7 @@ impl VPath {
                 }
             }
         }
-        Ok(VPath(format!("/{}", parts.join("/"))))
+        Ok(VPath(format!("/{}", parts.join("/")).into()))
     }
 
     /// The path as a string.
@@ -56,7 +60,7 @@ impl VPath {
 
     /// True for `/`.
     pub fn is_root(&self) -> bool {
-        self.0 == "/"
+        &*self.0 == "/"
     }
 
     /// The parent directory, or `None` for the root.
@@ -65,7 +69,7 @@ impl VPath {
             return None;
         }
         let idx = self.0.rfind('/').unwrap_or(0);
-        Some(if idx == 0 { VPath::root() } else { VPath(self.0[..idx].to_owned()) })
+        Some(if idx == 0 { VPath::root() } else { VPath(self.0[..idx].into()) })
     }
 
     /// The last component, or `None` for the root.
@@ -78,7 +82,7 @@ impl VPath {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(Error::InvalidPath(format!("{}/{}", self.0, name)));
         }
-        Ok(if self.is_root() { VPath(format!("/{name}")) } else { VPath(format!("{}/{name}", self.0)) })
+        Ok(if self.is_root() { VPath(format!("/{name}").into()) } else { VPath(format!("{}/{name}", self.0).into()) })
     }
 
     /// The components after the root, in order.
@@ -95,7 +99,7 @@ impl VPath {
     pub fn starts_with(&self, prefix: &VPath) -> bool {
         prefix.is_root()
             || self.0 == prefix.0
-            || (self.0.starts_with(&prefix.0) && self.0.as_bytes().get(prefix.0.len()) == Some(&b'/'))
+            || (self.0.starts_with(&*prefix.0) && self.0.as_bytes().get(prefix.0.len()) == Some(&b'/'))
     }
 
     /// The components of `self` below `prefix`, if `self` starts with it.
@@ -121,7 +125,7 @@ impl VPath {
     /// Every proper ancestor from the root down, as slices of this path, so walking
     /// them allocates nothing.
     pub(crate) fn ancestor_strs(&self) -> impl Iterator<Item = &str> {
-        let path = self.0.as_str();
+        let path = &*self.0;
         let root = (!self.is_root()).then_some("/");
         // Each '/' after the leading one ends an ancestor.
         root.into_iter().chain(path.match_indices('/').skip(1).map(move |(idx, _)| &path[..idx]))
@@ -131,15 +135,15 @@ impl VPath {
     pub(crate) fn descendants_end(&self) -> VPath {
         if self.is_root() {
             // '0' is the byte after '/', so it bounds every absolute path.
-            VPath("0".to_owned())
+            VPath("0".into())
         } else {
-            VPath(format!("{}0", self.0))
+            VPath(format!("{}0", self.0).into())
         }
     }
 
     /// The smallest string that sorts before every descendant of `self`.
     pub(crate) fn descendants_start(&self) -> VPath {
-        VPath(if self.is_root() { "/".to_owned() } else { format!("{}/", self.0) })
+        VPath(if self.is_root() { "/".into() } else { format!("{}/", self.0).into() })
     }
 }
 

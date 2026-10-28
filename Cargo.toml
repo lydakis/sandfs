@@ -21,7 +21,9 @@ sandfs = { path = "crates/sandfs", version = "0.9.0", default-features = false }
 sandfs-cli = { path = "crates/sandfs-cli", version = "0.9.0" }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Deny rather than forbid: `memory::give_back` in the sandfs crate is the one audited
+# exception, allowed on that call alone.
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [workspace.lints.clippy]

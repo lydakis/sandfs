@@ -1327,3 +1327,39 @@ fn a_read_only_path_that_does_not_exist_yet_cannot_be_covered_by_a_file() {
     refused(ws.hard_link("/books/budget.csv", "/books/future"));
     ws.mkdir("/books/future", false).unwrap();
 }
+
+#[test]
+fn trimming_fetches_again_what_is_next_needed_and_shows_the_same() {
+    let (ws, source) = workspace();
+    assert_eq!(ws.read_text("/repo/src/lib.rs").unwrap(), "pub fn one() -> u32 { 1 }\n");
+    let read = source.reads();
+    ws.read_text("/repo/src/lib.rs").unwrap();
+    assert_eq!(source.reads(), read, "the cache answers");
+
+    let mut fork = ws.fork();
+    fork.write("/repo/src/new.rs", "new").unwrap();
+    ws.trim();
+    assert_eq!(fork.read_text("/repo/src/lib.rs").unwrap(), "pub fn one() -> u32 { 1 }\n");
+    assert!(source.reads().0 > read.0 && source.reads().1 > read.1, "forks share the cache, and it was let go");
+    assert_eq!(names(&fork, "/repo/src"), ["lib.rs", "new.rs", "util"]);
+    assert_eq!(fork.read_text("/repo/src/new.rs").unwrap(), "new", "what was written stays");
+}
+
+#[test]
+fn listings_are_kept_to_a_budget() {
+    // Far more listings than the cache keeps: each directory lists 200 long names.
+    let files =
+        (0..400).flat_map(|dir| (0..200).map(move |file| (format!("d{dir:03}/{file:03}-{}", "x".repeat(200)), "")));
+    let source = Counting::new(MemorySource::from_files(files).unwrap());
+    let mut ws = Workspace::new();
+    ws.mount("/repo", source.clone()).unwrap();
+    for dir in 0..400 {
+        assert_eq!(ws.list(&format!("/repo/d{dir:03}")).unwrap().len(), 200);
+    }
+    let listed = source.reads().0;
+    // The latest stay; the first ones went and are listed again.
+    ws.list("/repo/d399").unwrap();
+    assert_eq!(source.reads().0, listed);
+    ws.list("/repo/d000").unwrap();
+    assert_eq!(source.reads().0, listed + 1);
+}

@@ -74,6 +74,13 @@ pub const MAX_FILE_SIZE: usize = i64::MAX as usize;
 const COPY_PIECE: u64 = 8 << 20;
 /// The largest file kept in memory while it is written, where there are no drafts.
 const MAX_MEMORY_FILE: u64 = 4 << 30;
+/// Milliseconds since this process first asked, from 1, for times kept in atomics: 0
+/// stands for never.
+fn since_start() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
 /// How many whole files, and bytes of them, [`Inner::reading`] keeps for sources that
 /// can't read a range on its own. The kernel asks for a file in chunks and caches
 /// what it gets, so only the few files being read right now are worth keeping.
@@ -322,8 +329,9 @@ pub enum Stale {
 pub struct Inner {
     ws: Workspace,
     nodes: HashMap<u64, Node>,
-    /// Path to inode, ordered so a renamed directory's entries are one range.
-    inos: BTreeMap<String, u64>,
+    /// Path to inode, ordered so a renamed directory's entries are one range. A path
+    /// here shares its bytes with its node's.
+    inos: BTreeMap<VPath, u64>,
     next_ino: u64,
     handles: HashMap<u64, DirHandle>,
     next_fh: u64,
@@ -432,12 +440,25 @@ impl Inner {
             moved_off: Vec::new(),
             skip_bookkeeping: false,
         };
-        inner.inos.insert(root.to_string(), ROOT_INO);
+        inner.inos.insert(root.clone(), ROOT_INO);
         inner.nodes.insert(
             ROOT_INO,
             Node { path: root.clone(), lookups: 0, linked: true, sized: Cell::new(false), removed_from: None },
         );
         inner
+    }
+
+    /// Let go of what can be had again: the cache of listings and file bytes, shared
+    /// with the workspace's forks (see [`Workspace::trim`]), files read lately and the
+    /// room tables kept after growing. Writes not yet saved stay.
+    pub fn trim(&mut self) {
+        self.ws.trim();
+        let recent = std::mem::take(&mut *self.recent.borrow_mut());
+        drop(recent);
+        self.nodes.shrink_to_fit();
+        self.handles.shrink_to_fit();
+        self.open.shrink_to_fit();
+        self.buffers.shrink_to_fit();
     }
 
     /// A copy of what a save needs; the workspace part is an O(1) fork. Files written
@@ -486,7 +507,7 @@ impl Inner {
         // with everything either version lists in each such folder.
         let mut paths = changed.cloned().unwrap_or_default();
         let in_whole = |path: &VPath| changed.is_none() || whole.iter().any(|folder| path.starts_with(folder));
-        let known: Vec<VPath> = self.inos.keys().filter_map(|path| VPath::parse(path).ok()).collect();
+        let known: Vec<VPath> = self.inos.keys().cloned().collect();
         for path in known.iter().filter(|path| in_whole(path)) {
             paths.insert(path.to_string());
             for ws in [&old, &self.ws] {
@@ -527,7 +548,6 @@ impl Inner {
                             stale.push(Stale::Inode(parent));
                             self.times.extend(name.parent().map(|parent| (parent.to_string(), now)));
                             for gone in subtree_keys(&self.inos, &name) {
-                                let Ok(gone) = VPath::parse(&gone) else { continue };
                                 let Some(ino) = self.inos.get(gone.as_str()).copied() else { continue };
                                 // A name the newer workspace still links to it keeps it.
                                 let others = self.other_names(&gone);
@@ -555,9 +575,9 @@ impl Inner {
         // Another name of an inode that went, which the newer workspace no longer links
         // to it, is looked up anew rather than reaching the removed inode.
         let unlinked = |ino: &u64| moved.contains(ino) && self.nodes.get(ino).is_none_or(|node| !node.linked);
-        let dangling: Vec<String> =
+        let dangling: Vec<VPath> =
             self.inos.iter().filter(|(_, ino)| unlinked(ino)).map(|(path, _)| path.clone()).collect();
-        for name in dangling.iter().filter_map(|name| VPath::parse(name).ok()) {
+        for name in dangling {
             self.inos.remove(name.as_str());
             let parent = name.parent().and_then(|parent| self.inos.get(parent.as_str()).copied());
             if let Some(parent) = parent {
@@ -666,12 +686,12 @@ impl Inner {
         // Every name of a hard-linked file is one inode, so the kernel caches its
         // pages once and a write through one name is read through the others.
         if let Some(ino) = self.linked_ino(path) {
-            self.inos.insert(path.to_string(), ino);
+            self.inos.insert(path.clone(), ino);
             return ino;
         }
         let ino = self.next_ino;
         self.next_ino += 1;
-        self.inos.insert(path.to_string(), ino);
+        self.inos.insert(path.clone(), ino);
         self.nodes.insert(
             ino,
             Node { path: path.clone(), lookups: 0, linked: true, sized: Cell::new(false), removed_from: None },
@@ -887,7 +907,7 @@ impl Inner {
             {
                 node.path = other.clone();
             }
-            self.inos.entry(other.to_string()).or_insert(ino);
+            self.inos.entry(other.clone()).or_insert(ino);
             return;
         }
         if let Some(node) = self.nodes.get_mut(&ino) {
@@ -1009,7 +1029,7 @@ impl Inner {
         let from = self.path(ino)?;
         let to = self.child(new_parent, new_name)?;
         self.ws.hard_link(from.as_str(), to.as_str()).fs()?;
-        self.inos.insert(to.to_string(), ino);
+        self.inos.insert(to.clone(), ino);
         // The file keeps its time; only the directory it gained a name in changes.
         self.keep_source_time(&from);
         match self.times.get(from.as_str()).copied() {
@@ -1137,11 +1157,11 @@ impl Inner {
         let moved = |map_keys: Vec<String>| -> Vec<(String, String)> {
             map_keys.into_iter().map(|key| (key.clone(), format!("{to}{}", &key[from.as_str().len()..]))).collect()
         };
-        let ino_keys = moved(subtree_keys(&self.inos, from));
-        for (old, new) in ino_keys {
+        for old in subtree_keys(&self.inos, from) {
+            let Ok(new) = VPath::parse(&format!("{to}{}", &old.as_str()[from.as_str().len()..])) else { continue };
             if let Some(ino) = self.inos.remove(&old) {
-                if let (Some(node), Ok(path)) = (self.nodes.get_mut(&ino), VPath::parse(&new)) {
-                    node.path = path;
+                if let Some(node) = self.nodes.get_mut(&ino) {
+                    node.path = new.clone();
                 }
                 self.inos.insert(new, ino);
             }
@@ -1624,6 +1644,10 @@ pub struct Shared {
     /// Whether a background save of this mount is waiting in [`Savers`].
     scheduled: AtomicBool,
     stop: AtomicBool,
+    /// When the mount was last asked anything, and when it was last trimmed, as
+    /// [`since_start`] gives them.
+    used: AtomicU64,
+    trimmed: AtomicU64,
     /// Whether the kernel took no-open mode, so opens and flushes can be refused.
     #[cfg(fuse)]
     no_open: AtomicBool,
@@ -1644,6 +1668,8 @@ impl Shared {
             me: me.clone(),
             scheduled: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            used: AtomicU64::new(since_start()),
+            trimmed: AtomicU64::new(0),
             #[cfg(fuse)]
             no_open: AtomicBool::new(false),
             #[cfg(fuse)]
@@ -1654,7 +1680,24 @@ impl Shared {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.used.store(since_start(), Ordering::Relaxed);
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Save every change, then let go of what the mount keeps that it can get again
+    /// (see [`Inner::trim`]). What it serves stays the same.
+    pub fn trim(&self) -> anyhow::Result<()> {
+        self.save(false)?;
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner).trim();
+        self.trimmed.store(since_start(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Whether the mount has gone unasked for `idle` since it was last used, and wasn't
+    /// trimmed since.
+    pub fn idle_untrimmed(&self, idle: Duration) -> bool {
+        let used = self.used.load(Ordering::Relaxed);
+        used > self.trimmed.load(Ordering::Relaxed) && since_start().saturating_sub(used) >= idle.as_millis() as u64
     }
 
     /// Save the workspace's changes now, including every write; `durable` also
@@ -2716,6 +2759,34 @@ mod tests {
         Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
         assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");
         assert_eq!(restored.read_text("/mnt/new.md").unwrap(), "NEW\n");
+    }
+
+    #[test]
+    fn a_trim_saves_writes_and_keeps_what_the_mount_serves() {
+        let state = tempfile::tempdir().unwrap();
+        let saved = Saved::new(state.path());
+        let mut inner = fs();
+        inner.drafts = Some(saved.drafts());
+        let shared = Shared::new(inner, saved, VPath::parse("/mnt").unwrap());
+        let readme = shared.lock().lookup(ROOT_INO, name("README.md")).unwrap().ino.0;
+        let src = shared.lock().lookup(ROOT_INO, name("src")).unwrap().ino.0;
+        shared.lock().write(readme, 0, b"HE").unwrap();
+        assert!(shared.idle_untrimmed(Duration::ZERO), "used, never trimmed");
+        shared.trim().unwrap();
+        assert!(!shared.idle_untrimmed(Duration::ZERO), "trimmed since last used");
+        std::thread::sleep(Duration::from_millis(2));
+
+        // The write was saved, and the same inodes serve the same files.
+        let mut restored = fs().ws;
+        Saved::new(state.path()).load(&mut restored, &VPath::parse("/mnt").unwrap()).unwrap();
+        assert_eq!(restored.read_text("/mnt/README.md").unwrap(), "HEllo\n");
+        let mut inner = shared.lock();
+        assert_eq!(&inner.read(readme, 0, 100).unwrap()[..], b"HEllo\n");
+        assert_eq!(inner.lookup(ROOT_INO, name("src")).unwrap().ino.0, src);
+        let lib = inner.lookup(src, name("lib.rs")).unwrap().ino.0;
+        assert_eq!(&inner.read(lib, 0, 100).unwrap()[..], b"fn one() {}\n");
+        drop(inner);
+        assert!(shared.idle_untrimmed(Duration::ZERO), "used since the trim");
     }
 
     #[test]
