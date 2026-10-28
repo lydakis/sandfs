@@ -201,6 +201,7 @@ fn trim_idle(idle: Duration) {
         }
     }
     crate::memory::give_back();
+    eprintln!("sandfs: trimmed {} mount(s) unused for {}s", idle.len(), IDLE.as_secs());
 }
 
 /// Send `request` and read the reply, or `None` if the connection closes first.

@@ -1515,8 +1515,12 @@ mod tests {
                 }
             })
         };
+        let started = std::time::Instant::now();
         walk();
-        eprintln!("walked {files} files, {} inodes known", nfs.shared.lock().node_count());
+        eprintln!("walked {files} files in {:?}, {} inodes known", started.elapsed(), nfs.shared.lock().node_count());
+        let started = std::time::Instant::now();
+        walk();
+        eprintln!("walked again in {:?}", started.elapsed());
         // A trim lets go of what can be read again, and the next walk reads it.
         nfs.shared.trim().unwrap();
         crate::memory::give_back();

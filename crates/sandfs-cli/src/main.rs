@@ -317,7 +317,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Trim { workspace } => {
             let trimmed = home.trim(workspace.as_deref())?;
             let mounts = if trimmed.mounts == 1 { "1 mount".to_owned() } else { format!("{} mounts", trimmed.mounts) };
-            match trimmed.given_back {
+            // macOS's allocator may hand pages back later rather than say so now.
+            match trimmed.given_back.filter(|&bytes| bytes > 0) {
                 Some(bytes) => print_out(&format!("trimmed {mounts}; {} given back to the system\n", size(bytes))),
                 None => print_out(&format!("trimmed {mounts}\n")),
             }
