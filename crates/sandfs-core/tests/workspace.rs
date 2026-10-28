@@ -1010,6 +1010,7 @@ fn a_recheck_takes_a_changed_folder_file_as_it_is_now() {
     std::fs::write(dir.join("sub/shrink.txt"), "twenty-four bytes long..").unwrap();
     std::fs::write(dir.join("sub/other.txt"), "other").unwrap();
     std::fs::write(dir.join("sub/mine.txt"), "mine").unwrap();
+    std::fs::write(dir.join("sub/mode.txt"), "twenty-four bytes long..").unwrap();
 
     let mut ws = Workspace::new();
     ws.mount("/host", Arc::new(DirSource::new(&dir).unwrap())).unwrap();
@@ -1041,6 +1042,14 @@ fn a_recheck_takes_a_changed_folder_file_as_it_is_now() {
     assert_eq!(ws.read_text("/host/sub/other.txt").unwrap(), "other, longer now");
     // A forked snapshot sees the same answer, as it shares every listing.
     assert_eq!(ws.fork().stat("/host/sub/shrink.txt").unwrap().size, 3);
+    // A file whose mode changed here takes the new size too, and keeps its mode.
+    let mut ws = ws.fork();
+    ws.set_executable("/host/sub/mode.txt", true).unwrap();
+    std::fs::write(dir.join("sub/mode.txt"), "new").unwrap();
+    assert!(ws.recheck("/host/sub/mode.txt").unwrap());
+    let meta = ws.stat("/host/sub/mode.txt").unwrap();
+    assert_eq!((meta.size, meta.kind), (3, Kind::File { executable: true }));
+    assert!(!ws.recheck("/host/sub/mode.txt").unwrap());
     // Gone from the folder: kept as it was.
     std::fs::remove_file(dir.join("sub/shrink.txt")).unwrap();
     assert!(!ws.recheck("/host/sub/shrink.txt").unwrap());

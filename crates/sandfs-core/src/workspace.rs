@@ -430,34 +430,45 @@ impl Workspace {
         })
     }
 
-    /// Ask the source again about the file at `path`, which this workspace hasn't
+    /// Ask the source again about the file at `path`, whose bytes this workspace hasn't
     /// changed, after a read showed it is no longer what its listing said: a read that
     /// came back shorter than the listed size, from a folder written to meanwhile. Its
     /// size, time and cached bytes become what the source says now (see
     /// [`Source::entry_now`]), for this file alone; the rest of its directory stays as
-    /// first listed. Returns whether anything changed. Forks share what was asked,
-    /// as they share every listing.
-    pub fn recheck(&self, path: &str) -> Result<bool> {
+    /// first listed. A file whose mode changed here keeps its mode. Returns whether
+    /// anything changed. Forks share the listing, as they share every listing.
+    pub fn recheck(&mut self, path: &str) -> Result<bool> {
         let path = VPath::parse(path)?;
         let Ok(Resolved::File { content: Content::Base { mount, key, .. }, .. }) = self.resolve(&path) else {
             return Ok(false);
         };
-        let (Some(parent), Some(name)) = (path.parent(), path.name()) else { return Ok(false) };
-        let Some(dir) = self.base_dir(&parent, &mount)? else { return Ok(false) };
-        let listing = self.cached_listing(&mount, &dir)?;
-        // A file moved here from another directory isn't in this listing.
-        if listing.get(name).is_none_or(|entry| entry.key != key) {
-            return Ok(false);
-        }
         let Some(now) = mount.source.entry_now(&key)? else { return Ok(false) };
-        if !self.cache.patch_listing(&(mount.id, dir), name, now.clone()) {
-            return Ok(false);
+        let mut changed = false;
+        // A file whose mode changed here holds the source's size and time itself.
+        if let Some(Overlay::File { content: Content::Base { key: held, size, modified, .. }, .. }) =
+            self.overlay.get_mut(&path)
+            && *held == key
+            && matches!(now.kind, Kind::File { .. })
+            && (*size, *modified) != (now.size, now.modified)
+        {
+            (*size, *modified) = (now.size, now.modified);
+            changed = true;
         }
-        self.cache.forget_blob(&(mount.id, key));
-        if let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id) {
-            self.cache.remember_entry(mount.id, &path.as_str()[mount_path.as_str().len() + 1..], now);
+        // A file moved here from another directory isn't in this listing.
+        if let (Some(parent), Some(name)) = (path.parent(), path.name())
+            && let Some(dir) = self.base_dir(&parent, &mount)?
+            && self.cached_listing(&mount, &dir)?.get(name).is_some_and(|entry| entry.key == key)
+            && self.cache.patch_listing(&(mount.id, dir), name, now.clone())
+        {
+            if let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id) {
+                self.cache.remember_entry(mount.id, &path.as_str()[mount_path.as_str().len() + 1..], now);
+            }
+            changed = true;
         }
-        Ok(true)
+        if changed {
+            self.cache.forget_blob(&(mount.id, key));
+        }
+        Ok(changed)
     }
 
     /// [`Metadata::modified`] alone: the source's time for a file nobody wrote, found
