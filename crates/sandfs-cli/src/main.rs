@@ -268,6 +268,13 @@ fn run(cli: Cli) -> Result<()> {
             for rel in &found.git_settings {
                 eprintln!("sandfs: {rel} changed; git runs the programs it names, so read it before running git here");
             }
+            for rel in &found.committed {
+                let folder = if rel.is_empty() { "the workspace's top folder" } else { rel };
+                eprintln!(
+                    "sandfs: the git repository in {folder} has commits made here, which copies leave out with \
+                     the rest of .git; push them from the workspace to keep them"
+                );
+            }
             Ok(())
         }
         Cmd::Update { workspace, source } => {

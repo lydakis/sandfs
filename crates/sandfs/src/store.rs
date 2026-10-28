@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use sandfs_core::{DirSource, VPath, Workspace};
+use sandfs_core::{VPath, Workspace};
 use serde::{Deserialize, Serialize};
 
 use crate::CrossDevice;
@@ -658,6 +658,13 @@ fn clone_tree(top: &Path, to: &Path, home: &Path, allow_copy: bool) -> Result<()
                 folders.push((path, copy));
             } else if kind.is_symlink() {
                 symlink(&std::fs::read_link(&path)?, &copy)?;
+            } else if kind.is_file()
+                && entry.file_name() == ".git"
+                && let Some(shown) = linked_worktree(top, &from, &path)?
+            {
+                // Pointed at the copy's own repository, or nowhere (see `gitfile`).
+                std::fs::write(&copy, shown).with_context(|| format!("writing {}", copy.display()))?;
+                keep_times(&path, &copy)?;
             } else if kind.is_file() {
                 let cloned = if allow_copy {
                     reflink_copy::reflink_or_copy(&path, &copy).map(drop)
@@ -694,6 +701,17 @@ fn clone_tree(top: &Path, to: &Path, home: &Path, allow_copy: bool) -> Result<()
         keep_times(&folder, &copy)?;
     }
     Ok(())
+}
+
+/// What the `.git` file at `path`, in `folder` inside the folder `top` being copied,
+/// says in the copy, if it names a repository by full path (see `gitfile`).
+fn linked_worktree(top: &Path, folder: &Path, path: &Path) -> Result<Option<Vec<u8>>> {
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 4096) {
+        return Ok(None);
+    }
+    let contents = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let at = folder.strip_prefix(top).unwrap_or(Path::new(""));
+    Ok(crate::gitfile::rewrite(&contents, at, top))
 }
 
 /// The disk `path` is on, where the system says.
@@ -757,7 +775,7 @@ pub(crate) fn symlink(_target: &Path, path: &Path) -> Result<()> {
 pub fn open_base(base: &Base, home: &Path) -> Result<Workspace> {
     let mut ws = Workspace::new();
     match base {
-        Base::Dir { path } => ws.mount(ROOT, Arc::new(DirSource::new(path)?))?,
+        Base::Dir { path } => ws.mount(ROOT, Arc::new(crate::gitfile::FolderSource::new(path)?))?,
         Base::Git { repo, commit, branch } => {
             let (files, git_dir) = crate::git::open(repo, commit, branch.as_deref(), home)?;
             ws.mount(ROOT, files)?;
