@@ -145,6 +145,16 @@ enum Cmd {
         /// A workspace name or the directory it is mounted on.
         workspace: String,
     },
+    /// Have mounts give back the memory they can do without.
+    ///
+    /// Saves the changes of the mounted workspace (every mounted one, without a name),
+    /// then lets go of the folder listings and file bytes it keeps and of idle git
+    /// helpers, and hands the memory freed back to the system. Nothing in the mount
+    /// changes. A mount left unused for a minute is trimmed on its own.
+    Trim {
+        /// A workspace name or the directory it is mounted on.
+        workspace: Option<String>,
+    },
     /// Delete an unmounted workspace and its changes.
     Rm {
         /// The workspace's name, or with --unmount the directory it is mounted on or
@@ -304,6 +314,15 @@ fn run(cli: Cli) -> Result<()> {
             print_out(&out)
         }
         Cmd::Unmount { workspace } => home.unmount(&workspace),
+        Cmd::Trim { workspace } => {
+            let trimmed = home.trim(workspace.as_deref())?;
+            let mounts = if trimmed.mounts == 1 { "1 mount".to_owned() } else { format!("{} mounts", trimmed.mounts) };
+            // macOS's allocator may hand pages back later rather than say so now.
+            match trimmed.given_back.filter(|&bytes| bytes > 0) {
+                Some(bytes) => print_out(&format!("trimmed {mounts}; {} given back to the system\n", size(bytes))),
+                None => print_out(&format!("trimmed {mounts}\n")),
+            }
+        }
         Cmd::Rm { name, unmount } => home.remove(&name, unmount),
         Cmd::Clean => {
             let mut out = String::new();

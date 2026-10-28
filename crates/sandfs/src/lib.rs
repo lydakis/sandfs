@@ -58,8 +58,8 @@
 //!
 //! # Before you build on it
 //!
-//! - sandfs is pre-1.0: a minor release (0.8 to 0.9) may change this API, and the
-//!   changelog says how. Depend on one minor version, such as `sandfs = "0.8"`.
+//! - sandfs is pre-1.0: a minor release (0.9 to 0.10) may change this API, and the
+//!   changelog says how. Depend on one minor version, such as `sandfs = "0.9"`.
 //! - Every file operation in a mount goes through the mount's process, and on macOS
 //!   each write is also a round trip over localhost before it returns, so write-heavy
 //!   work runs slower there than in a plain folder: compiling ripgrep from scratch
@@ -83,6 +83,8 @@ mod gitfile;
 mod github;
 mod host;
 mod mcp;
+#[cfg(mount)]
+mod memory;
 #[cfg(any(nfs, all(test, fuse)))]
 mod nfs;
 #[cfg(any(nfs, all(test, fuse)))]
@@ -194,6 +196,16 @@ impl Home {
     /// Unmount `workspace` once its changes are saved. `mount` brings it back.
     pub fn unmount(&self, workspace: &str) -> Result<()> {
         ops::unmount_workspace(&self.inner, workspace)
+    }
+
+    /// Have the mount of `workspace` (every mount of the home, when `None`) give back
+    /// the memory it can do without: its changes are saved, then the folder listings
+    /// and file bytes it keeps and idle git helpers go, and the memory freed goes back
+    /// to the system. Nothing it serves changes; what it needs next is read again. A
+    /// mount left unused for a minute is trimmed on its own, so this is for giving
+    /// memory back now, such as when an agent's task goes idle.
+    pub fn trim(&self, workspace: Option<&str>) -> Result<Trimmed> {
+        ops::trim(&self.inner, workspace)
     }
 
     /// Delete the workspace `name` and its changes. A mounted one is refused, unless
@@ -382,6 +394,16 @@ pub struct WorkspaceInfo {
     pub source: String,
     /// Where it is mounted, if it is.
     pub mounted: Option<PathBuf>,
+}
+
+/// What [`Home::trim`] let go of.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Trimmed {
+    /// The mounts trimmed.
+    pub mounts: usize,
+    /// The bytes of freed memory the allocator handed back to the system, where it says
+    /// (macOS).
+    pub given_back: Option<u64>,
 }
 
 /// What [`Home::clean`] did with one local copy of a remote repository.

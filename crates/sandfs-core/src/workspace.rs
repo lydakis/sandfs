@@ -49,16 +49,136 @@ type Slot<T> = Mutex<Option<T>>;
 /// A `(mount id, source key)` pair.
 type CacheKey = (u64, SourceKey);
 
+/// The bytes the cache keeps of each kind, at most (about): what it holds can always
+/// be fetched again, so past these the least used goes. Listings are what a walk of a
+/// large folder fills; a file's bytes are kept only when read whole through the API,
+/// since a mount reads in ranges and the system caches what it read.
+const LISTING_BYTES: usize = 32 << 20;
+const SIZED_BYTES: usize = 8 << 20;
+const ENTRY_BYTES: usize = 8 << 20;
+const BLOB_BYTES: usize = 16 << 20;
+/// What a cached entry costs besides its strings: the map's room for it, its own
+/// fields and the allocations' bookkeeping.
+const ENTRY_COST: usize = 96;
+/// Directories noted for prefetching and for reads, at most, before the notes start
+/// over: they only steer prefetching.
+const NOTED_DIRS: usize = 1 << 16;
+
+/// Entries that can be fetched again, kept to about `budget` bytes in two halves. New
+/// entries go in the young half; once it holds half the budget it becomes the old half,
+/// and the old half goes. An entry used from the old half moves back to the young one,
+/// so what is in use stays and the rest goes within two turns, at no cost per lookup.
+struct Halves<K, V> {
+    young: HashMap<K, (V, usize)>,
+    old: HashMap<K, (V, usize)>,
+    /// The bytes the young half holds.
+    bytes: usize,
+    budget: usize,
+    /// A half that just went, for the caller to drop once it lets go of the lock.
+    gone: Option<HashMap<K, (V, usize)>>,
+}
+
+impl<K: std::hash::Hash + Eq, V: Clone> Halves<K, V> {
+    fn new(budget: usize) -> Self {
+        Halves { young: HashMap::new(), old: HashMap::new(), bytes: 0, budget, gone: None }
+    }
+
+    fn get<Q: ?Sized + std::hash::Hash + Eq>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        if let Some((value, _)) = self.young.get(key) {
+            return Some(value.clone());
+        }
+        let (key, (value, bytes)) = self.old.remove_entry(key)?;
+        self.insert(key, value.clone(), bytes);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V, bytes: usize) {
+        if self.bytes + bytes > self.budget / 2 && !self.young.is_empty() {
+            self.turn();
+        }
+        self.bytes += bytes;
+        if let Some((_, before)) = self.young.insert(key, (value, bytes)) {
+            self.bytes -= before;
+        }
+    }
+
+    /// Count `bytes` more for the entry `key`, once loaded, if it is still the one
+    /// `loaded` picks out. A load may finish after its half turned old: the old half's
+    /// entry then holds the bytes, which count once it moves back.
+    fn charge(&mut self, key: &K, bytes: usize, loaded: impl Fn(&V) -> bool) {
+        if let Some((value, held)) = self.young.get_mut(key) {
+            if loaded(value) {
+                *held += bytes;
+                self.bytes += bytes;
+                if self.bytes > self.budget / 2 {
+                    self.turn();
+                }
+            }
+        } else if let Some((value, held)) = self.old.get_mut(key)
+            && loaded(value)
+        {
+            *held += bytes;
+        }
+    }
+
+    fn remove<Q: ?Sized + std::hash::Hash + Eq>(&mut self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        if let Some((_, bytes)) = self.young.remove(key) {
+            self.bytes -= bytes;
+        }
+        self.old.remove(key);
+    }
+
+    /// The young half becomes the old one.
+    fn turn(&mut self) {
+        let old = std::mem::replace(&mut self.old, std::mem::take(&mut self.young));
+        self.gone = Some(old);
+        self.bytes = 0;
+    }
+
+    /// Everything, taken out to be dropped once the lock is let go.
+    fn clear(&mut self) -> [HashMap<K, (V, usize)>; 2] {
+        self.bytes = 0;
+        self.gone = None;
+        [std::mem::take(&mut self.young), std::mem::take(&mut self.old)]
+    }
+}
+
+/// Run `op` on the map behind `lock`, dropping what it let go after the lock is let go,
+/// so other threads don't wait for that.
+fn with<K, V, T>(lock: &Mutex<Halves<K, V>>, op: impl FnOnce(&mut Halves<K, V>) -> T) -> T {
+    let (out, gone) = {
+        let mut map = lock.lock().expect("cache lock");
+        let out = op(&mut map);
+        (out, map.gone.take())
+    };
+    drop(gone);
+    out
+}
+
+/// What a listing costs to keep.
+fn listing_bytes(listing: &Listing) -> usize {
+    listing.iter().map(|(name, entry)| name.len() + entry.key.len() + ENTRY_COST).sum::<usize>() + ENTRY_COST
+}
+
+type Slots<T> = Mutex<Halves<CacheKey, Arc<Slot<T>>>>;
+
 /// Listings and blobs fetched from sources; keys are immutable, so forks share it.
-#[derive(Default)]
+/// Everything here can be fetched again, so each kind is kept to a budget, and
+/// [`Workspace::trim`] drops it all.
 struct Cache {
-    dirs: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
-    blobs: Mutex<HashMap<CacheKey, Arc<Slot<Bytes>>>>,
+    dirs: Slots<Arc<Listing>>,
+    blobs: Slots<Bytes>,
     /// Directories already found, by mount id and path below the mount, so resolving a
     /// path costs a lookup or two instead of one listing lookup per component. Only
     /// entries that exist are kept, so probing for missing names costs no memory.
     /// A path that is its entry's key, as in a folder, shares the key's bytes.
-    entries: Mutex<HashMap<u64, HashMap<SourceKey, SourceEntry>>>,
+    entries: Mutex<HashMap<u64, Halves<SourceKey, SourceEntry>>>,
     /// Directories already prefetched, and whether recursively, so each is asked once.
     prefetched: Mutex<HashSet<(CacheKey, bool)>>,
     /// Base files each directory needed fetched in the current look: sizes missing
@@ -66,46 +186,95 @@ struct Cache {
     /// so a file read in pieces counts once.
     touched: Mutex<HashMap<CacheKey, HashSet<SourceKey>>>,
     /// Directories listed again for their files' sizes, at most once each.
-    sized: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
+    sized: Slots<Arc<Listing>>,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Cache {
+            dirs: Mutex::new(Halves::new(LISTING_BYTES)),
+            blobs: Mutex::new(Halves::new(BLOB_BYTES)),
+            entries: Mutex::default(),
+            prefetched: Mutex::default(),
+            touched: Mutex::default(),
+            sized: Mutex::new(Halves::new(SIZED_BYTES)),
+        }
+    }
+}
+
+/// What a cached value costs to keep.
+trait Weigh {
+    fn bytes(&self) -> usize;
+}
+
+impl Weigh for Arc<Listing> {
+    fn bytes(&self) -> usize {
+        listing_bytes(self)
+    }
+}
+
+impl Weigh for Bytes {
+    fn bytes(&self) -> usize {
+        self.len() + ENTRY_COST
+    }
 }
 
 impl Cache {
     /// The cached value for `key`, loading it with `fetch` on a miss. Concurrent
     /// misses on one key fetch once. A failed fetch caches nothing, so it is retried.
-    fn get_or_load<T: Clone>(
-        map: &Mutex<HashMap<CacheKey, Arc<Slot<T>>>>,
-        key: CacheKey,
-        fetch: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+    fn get_or_load<T: Clone + Weigh>(map: &Slots<T>, key: CacheKey, fetch: impl FnOnce() -> Result<T>) -> Result<T> {
         // The map lock is held only to find the slot, so loads of different keys
         // never wait for each other.
-        let slot = map.lock().expect("cache lock").entry(key).or_default().clone();
+        let slot = with(map, |map| {
+            map.get(&key).unwrap_or_else(|| {
+                let slot = Arc::<Slot<T>>::default();
+                map.insert(key.clone(), slot.clone(), ENTRY_COST + key.1.len());
+                slot
+            })
+        });
         let mut value = slot.lock().expect("cache slot lock");
         if let Some(value) = value.as_ref() {
             return Ok(value.clone());
         }
         let fetched = fetch()?;
         *value = Some(fetched.clone());
+        drop(value);
+        with(map, |map| map.charge(&key, fetched.bytes(), |held| Arc::ptr_eq(held, &slot)));
         Ok(fetched)
     }
 
     fn entry(&self, mount: u64, rel: &str) -> Option<SourceEntry> {
-        self.entries.lock().expect("cache lock").get(&mount)?.get(rel).cloned()
+        let (found, gone) = {
+            let mut entries = self.entries.lock().expect("cache lock");
+            let found = entries.get_mut(&mount)?;
+            (found.get(rel), found.gone.take())
+        };
+        drop(gone);
+        found
     }
 
     fn remember_entry(&self, mount: u64, rel: &str, entry: SourceEntry) {
-        let rel = if *entry.key == *rel { entry.key.clone() } else { rel.into() };
-        self.entries.lock().expect("cache lock").entry(mount).or_default().insert(rel, entry);
+        let shared = *entry.key == *rel;
+        let bytes = ENTRY_COST + entry.key.len() + if shared { 0 } else { rel.len() };
+        let rel = if shared { entry.key.clone() } else { rel.into() };
+        let gone = {
+            let mut entries = self.entries.lock().expect("cache lock");
+            let found = entries.entry(mount).or_insert_with(|| Halves::new(ENTRY_BYTES));
+            found.insert(rel, entry, bytes);
+            found.gone.take()
+        };
+        drop(gone);
     }
 
     /// Replace a cached listing with a newer answer from the same source.
     fn replace_listing(&self, key: CacheKey, listing: Arc<Listing>) {
-        self.dirs.lock().expect("cache lock").insert(key, Arc::new(Mutex::new(Some(listing))));
+        let bytes = listing.bytes();
+        with(&self.dirs, |dirs| dirs.insert(key, Arc::new(Mutex::new(Some(listing))), bytes));
     }
 
     /// Drop the cached blob for `key`, whose file changed in its source.
     fn forget_blob(&self, key: &CacheKey) {
-        self.blobs.lock().expect("cache lock").remove(key);
+        with(&self.blobs, |blobs| blobs.remove(key));
     }
 
     /// Put `entry` in the cached listing `key` under `name`, in place of the entry with
@@ -113,7 +282,7 @@ impl Cache {
     /// held throughout, so two files of one directory changed at once both stay changed.
     /// Files aren't in the path-entry cache, so the listing is the one place to change.
     fn patch_listing(&self, key: &CacheKey, name: &str, entry: SourceEntry) -> bool {
-        let Some(slot) = self.dirs.lock().expect("cache lock").get(key).cloned() else { return false };
+        let Some(slot) = with(&self.dirs, |dirs| dirs.get(key)) else { return false };
         let mut listing = slot.lock().expect("cache slot lock");
         let Some(current) = listing.as_ref() else { return false };
         if current.get(name).is_none_or(|listed| listed.key != entry.key || *listed == entry) {
@@ -127,8 +296,28 @@ impl Cache {
 
     /// The cached blob for `key`, if it is loaded and not being loaded right now.
     fn peek_blob(&self, key: &CacheKey) -> Option<Bytes> {
-        let slot = self.blobs.lock().expect("cache lock").get(key)?.clone();
+        let slot = with(&self.blobs, |blobs| blobs.get(key))?;
         slot.try_lock().ok()?.clone()
+    }
+
+    /// Note `dir` as prefetched, and whether recursively; false if it was already.
+    fn note_prefetched(&self, dir: CacheKey, recursive: bool) -> bool {
+        let mut prefetched = self.prefetched.lock().expect("cache lock");
+        if prefetched.len() >= NOTED_DIRS {
+            prefetched.clear();
+        }
+        prefetched.insert((dir, recursive))
+    }
+
+    /// Drop everything: it is all fetched again when next needed.
+    fn clear(&self) {
+        let dirs = self.dirs.lock().expect("cache lock").clear();
+        let blobs = self.blobs.lock().expect("cache lock").clear();
+        let sized = self.sized.lock().expect("cache lock").clear();
+        let entries = std::mem::take(&mut *self.entries.lock().expect("cache lock"));
+        let prefetched = std::mem::take(&mut *self.prefetched.lock().expect("cache lock"));
+        let touched = std::mem::take(&mut *self.touched.lock().expect("cache lock"));
+        drop((dirs, blobs, sized, entries, prefetched, touched));
     }
 }
 
@@ -480,6 +669,20 @@ impl Workspace {
             self.cache.forget_blob(&(mount.id, key));
         }
         Ok(changed)
+    }
+
+    /// Let go of everything this workspace and its forks keep that can be fetched
+    /// again: listings, file bytes, the directories found and what steers prefetching.
+    /// Nothing they show changes; the next look fetches what it needs again. The cache
+    /// keeps to a budget on its own (tens of megabytes), so this is for giving back
+    /// even that, such as when the workspace goes unused for a while.
+    pub fn trim(&self) {
+        self.cache.clear();
+        for mount in self.mounts.values() {
+            mount.source.trim();
+        }
+        let walks = std::mem::take(&mut *self.walks.lock().expect("walks lock"));
+        drop(walks);
     }
 
     /// [`Metadata::modified`] alone: the source's time for a file nobody wrote, found
@@ -1089,6 +1292,11 @@ impl Workspace {
             return;
         }
         let mut walks = self.walks.lock().expect("walks lock");
+        // Only the latest walks matter: past this many directories, start over.
+        if walks.listed.len() >= NOTED_DIRS {
+            walks.listed.clear();
+            walks.starts.clear();
+        }
         walks.listed.insert(path.clone());
         let Some(parent) = path.parent().filter(|parent| walks.listed.contains(parent)) else { return };
         let start = walks.starts.entry(parent.clone()).or_insert(parent).clone();
@@ -1143,6 +1351,9 @@ impl Workspace {
         let fresh = read && !walking && !steady;
         let (count, first) = {
             let mut touched = self.cache.touched.lock().expect("cache lock");
+            if touched.len() >= NOTED_DIRS && !touched.contains_key(&(mount.id, dir.clone())) {
+                touched.clear();
+            }
             let files = touched.entry((mount.id, dir.clone())).or_default();
             if fresh {
                 files.clear();
@@ -1199,7 +1410,7 @@ impl Workspace {
         };
         let Some(below) = below else { return Ok(steady) };
         if let Some(key) = self.base_dir(&below, mount)? {
-            if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, key.clone()), true)) {
+            if self.cache.note_prefetched((mount.id, key.clone()), true) {
                 mount.source.prefetch(&key, true);
             }
         }
@@ -1210,7 +1421,7 @@ impl Workspace {
     /// It is asked even when everything below a parent was: a source may still be
     /// fetching a large tree, and this asks for these files first.
     fn prefetch_dir(&self, mount: &Arc<Mount>, dir: &SourceKey) {
-        if self.cache.prefetched.lock().expect("cache lock").insert(((mount.id, dir.clone()), false)) {
+        if self.cache.note_prefetched((mount.id, dir.clone()), false) {
             mount.source.prefetch(dir, false);
         }
     }
@@ -1589,5 +1800,29 @@ fn content_size(content: &Content) -> Option<u64> {
         Content::Bytes(bytes) => Some(bytes.len() as u64),
         Content::Base { size, .. } => *size,
         Content::Stored(stored) => Some(stored.size),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_load_that_finishes_after_its_half_turned_old_is_counted_when_it_moves_back() {
+        let mut halves: Halves<&str, Arc<u8>> = Halves::new(200);
+        let slow = Arc::new(1);
+        halves.insert("slow", slow.clone(), 10);
+        // Another load fills the young half meanwhile, which turns it old.
+        let fast = Arc::new(2);
+        halves.insert("fast", fast.clone(), 10);
+        halves.charge(&"fast", 90, |held| Arc::ptr_eq(held, &fast));
+        assert!(halves.young.is_empty() && halves.old.contains_key("slow"));
+        halves.charge(&"slow", 90, |held| Arc::ptr_eq(held, &slow));
+        assert_eq!(halves.old["slow"].1, 100);
+        // A charge for a slot that was replaced since counts for nothing.
+        halves.charge(&"slow", 1000, |held| Arc::ptr_eq(held, &fast));
+        assert_eq!(halves.old["slow"].1, 100);
+        halves.get("slow");
+        assert_eq!(halves.bytes, 100, "its bytes count in the young half again");
     }
 }

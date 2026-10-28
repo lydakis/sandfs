@@ -548,6 +548,14 @@ impl Source for GitSource {
             }
         }
     }
+
+    /// The `cat-file` processes not reading right now exit: each keeps a cache of its
+    /// own, and the next read starts one again.
+    fn trim(&self) {
+        self.readers.trim();
+        let sizes = self.sizes.as_ref().and_then(|sizes| sizes.lock().ok().and_then(|mut sizes| sizes.take()));
+        drop(sizes);
+    }
 }
 
 /// See [`GitSource::missing`].
@@ -918,6 +926,21 @@ impl Readers {
         }
         self.returned.notify_one();
         read
+    }
+
+    /// End the processes not reading right now.
+    fn trim(&self) {
+        let idle = match self.idle.lock() {
+            Ok(mut idle) => {
+                let batches = std::mem::take(&mut idle.0);
+                idle.1 -= batches.len();
+                batches
+            }
+            Err(_) => return,
+        };
+        self.returned.notify_all();
+        // Dropping one waits for it to exit, so outside the lock.
+        drop(idle);
     }
 
     /// An idle process; else a new one, if there is room; else the next to come free.

@@ -257,6 +257,17 @@ pub(crate) fn unmount_workspace(home: &Home, workspace: &str) -> Result<()> {
     unmount(home, &name, &info)
 }
 
+pub(crate) fn trim(home: &Home, workspace: Option<&str>) -> Result<crate::Trimmed> {
+    let name = workspace.map(|workspace| home.find(workspace)).transpose()?;
+    #[cfg(mount)]
+    return server::trim(home, name.as_deref().unwrap_or_default());
+    #[cfg(not(mount))]
+    {
+        let _ = name;
+        Ok(crate::Trimmed::default())
+    }
+}
+
 pub(crate) fn remove(home: &Home, name: &str, first: bool) -> Result<()> {
     let name = if first { home.find(name)? } else { name.to_owned() };
     if let Some(info) = home.attached_mount(&name) {

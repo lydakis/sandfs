@@ -140,6 +140,11 @@ pub trait Source: Send + Sync + fmt::Debug {
         let _ = key;
         Ok(None)
     }
+
+    /// Let go of what the source keeps only to answer faster, such as helper processes
+    /// sitting idle, when a workspace over it is trimmed ([`crate::Workspace::trim`]).
+    /// Every answer stays the same. The default keeps nothing, so does nothing.
+    fn trim(&self) {}
 }
 
 /// The part of `bytes` a ranged read asks for, clamped to its end.

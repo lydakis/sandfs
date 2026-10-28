@@ -1474,4 +1474,59 @@ mod tests {
         assert!(options.split(',').any(|option| option == "sync"), "{options}");
         assert!(options.split(',').any(|option| option == "nobrowse"), "{options}");
     }
+
+    /// What a walk of a big folder costs the server, the way macOS's client walks one:
+    /// every folder listed with attributes, every name looked up and its attributes
+    /// asked for, and nothing ever forgotten. Run under a heap profiler, such as
+    /// `valgrind --tool=massif`, with SANDFS_WALK_FILES set to the number of files.
+    #[test]
+    #[ignore]
+    fn a_walk_of_a_big_folder() {
+        let files: usize = std::env::var("SANDFS_WALK_FILES").ok().and_then(|n| n.parse().ok()).unwrap_or(20_000);
+        let top =
+            tempfile::tempdir_in(std::env::var_os("SANDFS_WALK_IN").unwrap_or(std::env::temp_dir().into())).unwrap();
+        for i in 0..files {
+            let dir = top.path().join(format!("pkg_{:02}/module_{:03}", i / 10_000, (i / 100) % 100));
+            if i % 100 == 0 {
+                std::fs::create_dir_all(&dir).unwrap();
+            }
+            std::fs::write(dir.join(format!("source_file_number_{i}.rs")), "").unwrap();
+        }
+        let (nfs, _saved) = serve(Arc::new(crate::gitfile::FolderSource::new(top.path()).unwrap()));
+        let walk = || {
+            block(async {
+                let mut dirs = vec![ROOT_INO];
+                while let Some(dir) = dirs.pop() {
+                    let mut after = 0;
+                    loop {
+                        let page = nfs.readdir(dir, after, 512).await.unwrap();
+                        for entry in &page.entries {
+                            let id = nfs.lookup(dir, &entry.name).await.unwrap();
+                            let attr = nfs.getattr(id).await.unwrap();
+                            if matches!(attr.ftype, ftype3::NF3DIR) {
+                                dirs.push(id);
+                            }
+                            after = entry.cookie;
+                        }
+                        if page.end {
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        walk();
+        eprintln!("walked {files} files in {:?}, {} inodes known", started.elapsed(), nfs.shared.lock().node_count());
+        let started = std::time::Instant::now();
+        walk();
+        eprintln!("walked again in {:?}", started.elapsed());
+        // A trim lets go of what can be read again, and the next walk reads it.
+        nfs.shared.trim().unwrap();
+        crate::memory::give_back();
+        eprintln!("trimmed");
+        walk();
+        nfs.shared.trim().unwrap();
+        eprintln!("walked again and trimmed");
+    }
 }
