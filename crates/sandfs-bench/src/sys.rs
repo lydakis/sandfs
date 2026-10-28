@@ -164,7 +164,7 @@ fn parse_size(text: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{children_peak_rss, current_rss, disk_usage, parse_size, peak_rss, tree_peak_rss};
+    use super::{children_peak_rss, current_rss, disk_usage, parents, parse_size, peak_rss, tree_peak_rss};
 
     #[test]
     fn sizes_parse_as_vmmap_prints_them() {
@@ -177,24 +177,30 @@ mod tests {
 
     #[test]
     fn a_process_tree_counts_its_running_children() {
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        // Until the child has become `sleep`, it is a copy of this process with its peak.
-        let name = || {
-            let output =
-                std::process::Command::new("ps").args(["-o", "comm=", "-p"]).arg(child.id().to_string()).output();
+        // A tree of idle processes: this test's own process frees memory as other tests
+        // run, and Linux may then report a lower peak than it did a moment before.
+        let mut shell = std::process::Command::new("sh").args(["-c", "sleep 30 & sleep 30 & wait"]).spawn().unwrap();
+        let name = |pid: u32| {
+            let output = std::process::Command::new("ps").args(["-o", "comm=", "-p"]).arg(pid.to_string()).output();
             String::from_utf8_lossy(&output.unwrap().stdout).trim().to_owned()
         };
-        while !name().ends_with("sleep") {
+        // Until a child has become `sleep`, it is a copy of the shell.
+        let sleepers = loop {
+            let children: Vec<u32> =
+                parents().unwrap().into_iter().filter(|&(_, parent)| parent == shell.id()).map(|(c, _)| c).collect();
+            if children.len() == 2 && children.iter().all(|&child| name(child).ends_with("sleep")) {
+                break children;
+            }
             std::thread::yield_now();
+        };
+        let parts = peak_rss(shell.id()).unwrap() + sleepers.iter().map(|&child| peak_rss(child).unwrap()).sum::<u64>();
+        let tree = tree_peak_rss(shell.id()).unwrap();
+        for &child in &sleepers {
+            let _ = std::process::Command::new("kill").arg(child.to_string()).status();
         }
-        // Peaks only grow, so reading the parts before the whole keeps the sum below it.
-        let alone = peak_rss(std::process::id()).unwrap();
-        let sleeping = peak_rss(child.id()).unwrap();
-        let tree = tree_peak_rss(std::process::id()).unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(sleeping > 0);
-        assert!(tree >= alone + sleeping, "tree {tree} < {alone} + {sleeping}");
+        shell.kill().unwrap();
+        shell.wait().unwrap();
+        assert!(tree >= parts && parts > 0, "tree {tree} < {parts}");
     }
 
     #[test]
