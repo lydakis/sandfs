@@ -566,6 +566,11 @@ impl Home {
         }
         let Some(top) = disk_top(folder) else { return Ok(home) };
         let shared = top.join(SHARED).join("copies");
+        // Through a link, the copies could land in the folder being copied.
+        let real = |dir: &Path| std::fs::symlink_metadata(dir).map_or(true, |meta| meta.is_dir());
+        if !real(&top.join(SHARED)) || !real(&shared) {
+            return Ok(home);
+        }
         let made = std::fs::create_dir_all(&shared)
             .and_then(|()| tempfile::Builder::new().prefix("home-").tempdir_in(&shared))
             .map(tempfile::TempDir::keep);
@@ -787,7 +792,7 @@ fn linked_worktree(top: &Path, folder: &Path, path: &Path) -> Result<Option<Vec<
 pub(crate) const SHARED: &str = ".sandfs";
 
 /// The top of the disk `path` is on: its furthest folder on the same disk.
-fn disk_top(path: &Path) -> Option<PathBuf> {
+pub(crate) fn disk_top(path: &Path) -> Option<PathBuf> {
     let path = path.canonicalize().ok()?;
     let disk = device(&path)?;
     path.ancestors().take_while(|dir| device(dir) == Some(disk)).last().map(Path::to_path_buf)
