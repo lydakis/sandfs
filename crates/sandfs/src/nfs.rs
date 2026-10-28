@@ -943,6 +943,7 @@ mod tests {
         // the rest of a 3-byte read with zeros.
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join("notes.md"), "twenty-four bytes long..").unwrap();
+        std::fs::write(folder.path().join("pair.md"), "twenty-four bytes long..").unwrap();
         let mut ws = Workspace::new();
         ws.mount("/mnt", Arc::new(sandfs_core::DirSource::new(folder.path()).unwrap())).unwrap();
         let root = VPath::parse("/mnt").unwrap();
@@ -967,6 +968,19 @@ mod tests {
             let id = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();
             assert_eq!(fs.getattr(id).await.unwrap().size, 3, "a new inode with the size now");
             assert_eq!(fs.read(id, 0, 24).await.unwrap(), (b"new".to_vec(), true), "the end, not more to come");
+            // A file with two names gets a new inode under both.
+            let pair = fs.lookup(ROOT_INO, &name("pair.md")).await.unwrap();
+            fs.link(pair, ROOT_INO, &name("twin.md")).await.unwrap();
+            std::fs::write(folder.path().join("pair.md"), "new").unwrap();
+            assert!(fs.read(pair, 0, 24).await.is_err());
+            assert!(fs.read(pair, 0, 24).await.is_err(), "no name keeps the old inode");
+            let (one, two) = (
+                fs.lookup(ROOT_INO, &name("pair.md")).await.unwrap(),
+                fs.lookup(ROOT_INO, &name("twin.md")).await.unwrap(),
+            );
+            assert_eq!(one, two);
+            assert_ne!(one, pair);
+            assert_eq!(fs.getattr(one).await.unwrap().size, 3);
             // A read of part of a file that hasn't changed is not its end.
             std::fs::write(folder.path().join("notes.md"), "a longer file now").unwrap();
             let id2 = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();

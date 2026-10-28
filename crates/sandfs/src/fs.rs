@@ -1209,10 +1209,20 @@ impl Inner {
         let Some(Node { linked: true, path, .. }) = self.nodes.get(&ino) else { return Ok(false) };
         let path = path.clone();
         let changed = self.ws.recheck(path.as_str()).fs()?;
+        // Every name of the file goes off the inode at once: a hard link left on it
+        // would bring back the size the client keeps for it.
         if changed && self.renumber_changed {
-            let others = self.other_names(&path);
-            self.unlink_path(&path, None, &others);
-            self.times.extend(path.parent().map(|parent| (parent.to_string(), SystemTime::now())));
+            let now = SystemTime::now();
+            for name in self.other_names(&path).iter().chain([&path]) {
+                if self.inos.get(name.as_str()) == Some(&ino) {
+                    self.inos.remove(name.as_str());
+                }
+                self.times.extend(name.parent().map(|parent| (parent.to_string(), now)));
+            }
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                (node.linked, node.lookups) = (false, 0);
+            }
+            self.maybe_drop(ino);
         }
         Ok(changed)
     }
