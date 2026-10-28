@@ -752,8 +752,10 @@ fn a_linked_worktree_in_a_folder_commits_inside_the_workspace_or_not_at_all() {
     // The commit is the workspace's: the repositories on disk have what they had.
     assert_eq!(heads(), before);
     assert_eq!(std::fs::read_to_string(folder.join("repo/.worktrees/wt/notes.md")).unwrap(), "one\n");
+    // Git stops; its file says why (newer git leaves the path out of its message).
     let said = git_fails(&ws.join("theirs"), &["status"]);
-    assert!(said.contains("not a git repository") && said.contains("outside this folder"), "{said}");
+    assert!(said.contains("not a git repository"), "{said}");
+    assert!(std::fs::read_to_string(ws.join("theirs/.git")).unwrap().contains("outside this folder"));
     let output = sandfs.run(&["changes", "ws"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("git repository in repo has commits made here"), "{stderr}");
@@ -771,7 +773,8 @@ fn a_linked_worktree_in_a_folder_commits_inside_the_workspace_or_not_at_all() {
     git_out(&wt, &["commit", "-qam", "three"]);
     assert_eq!(heads(), before);
     let said = git_fails(&task.join("theirs"), &["status"]);
-    assert!(said.contains("outside this folder"), "{said}");
+    assert!(said.contains("not a git repository"), "{said}");
+    assert!(std::fs::read_to_string(task.join("theirs/.git")).unwrap().contains("outside this folder"));
     sandfs.unmount(&task);
 }
 

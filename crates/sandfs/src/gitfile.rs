@@ -5,7 +5,7 @@
 //! in the workspace, and the real worktree looks changed. So a mount shows such a file
 //! with the path its repository has in the mount: relative, when the repository is in
 //! the folder too, as a link into the folder is (see `DirSource`); and otherwise as a
-//! path that isn't there, so git stops with "not a git repository" and says why
+//! path that isn't there and says why, so git stops with "not a git repository"
 //! instead of writing outside the workspace. A copy of the folder (`fork`) gets the
 //! same file.
 
@@ -108,12 +108,14 @@ impl FolderSource {
         Ok(rewrite(&contents, at, &self.top).map(Bytes::from))
     }
 
-    /// `entry`, with the size its file shows if it is a rewritten `.git` file.
-    fn sized(&self, mut entry: SourceEntry) -> Result<SourceEntry> {
-        if let Some(shown) = self.git_file(&entry.key.clone(), Some(&entry))? {
+    /// `entry`, with the size its file shows if it is a rewritten `.git` file. A
+    /// `.git` file that can't be read is listed as it is, so its folder still lists;
+    /// reading it fails as it would anyway.
+    fn sized(&self, mut entry: SourceEntry) -> SourceEntry {
+        if let Ok(Some(shown)) = self.git_file(&entry.key.clone(), Some(&entry)) {
             entry.size = Some(shown.len() as u64);
         }
-        Ok(entry)
+        entry
     }
 }
 
@@ -125,7 +127,7 @@ impl Source for FolderSource {
     fn read_dir(&self, key: &str) -> Result<Listing> {
         let mut listing = self.files.read_dir(key)?;
         if let Some(entry) = listing.remove(".git") {
-            listing.insert(".git".to_owned(), self.sized(entry)?);
+            listing.insert(".git".to_owned(), self.sized(entry));
         }
         Ok(listing)
     }
@@ -157,7 +159,7 @@ impl Source for FolderSource {
     }
 
     fn entry_now(&self, key: &str) -> Result<Option<SourceEntry>> {
-        self.files.entry_now(key)?.map(|entry| self.sized(entry)).transpose()
+        Ok(self.files.entry_now(key)?.map(|entry| self.sized(entry)))
     }
 }
 
