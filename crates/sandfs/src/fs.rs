@@ -1197,14 +1197,24 @@ impl Inner {
     /// since it was listed (see [`Workspace::recheck`]). Its attributes then give the
     /// folder's size now, so a client never fills the bytes it lacks with zeros.
     /// Returns whether anything changed.
-    pub fn recheck(&self, ino: u64) -> FsResult<bool> {
+    ///
+    /// With [`Inner::renumber_changed`] (NFS), a changed file also gets a new inode
+    /// and its folder a new time, as [`Inner::replace`] does: the macOS client won't
+    /// take a smaller size from a read, and keeps the one it has for up to a minute,
+    /// so the old inode goes, and reads through it fail rather than fill with zeros.
+    pub fn recheck(&mut self, ino: u64) -> FsResult<bool> {
         if self.buffers.contains_key(&ino) {
             return Ok(false);
         }
-        match self.nodes.get(&ino) {
-            Some(Node { linked: true, path, .. }) => self.ws.recheck(path.as_str()).fs(),
-            _ => Ok(false),
+        let Some(Node { linked: true, path, .. }) = self.nodes.get(&ino) else { return Ok(false) };
+        let path = path.clone();
+        let changed = self.ws.recheck(path.as_str()).fs()?;
+        if changed && self.renumber_changed {
+            let others = self.other_names(&path);
+            self.unlink_path(&path, None, &others);
+            self.times.extend(path.parent().map(|parent| (parent.to_string(), SystemTime::now())));
         }
+        Ok(changed)
     }
 
     /// The workspace and path holding `ino`'s contents: the workspace itself, or for
@@ -2106,7 +2116,7 @@ impl Filesystem for SandFs {
                 // The kernel takes a short read as the file's end; its size from now on
                 // says the same (see `Inner::recheck`).
                 if data.len() < size as usize {
-                    let inner = self.0.lock();
+                    let mut inner = self.0.lock();
                     if inner.attr(ino.0).is_ok_and(|attr| attr.size > offset + data.len() as u64) {
                         let _ = inner.recheck(ino.0);
                     }

@@ -280,8 +280,8 @@ impl NFSFileSystem for SandNfs {
         // shrank in the folder under the mount since it was listed, and the client,
         // which still has the old size, fills the rest with zeros: a copy from the
         // mount would write zeros. The macOS client won't take a smaller size from a
-        // READ reply, so this read fails instead; its reply carries the new size (taken
-        // after the read), and the client asks again before its next look at the file.
+        // READ reply, so this read fails instead, and the file gets a new inode (see
+        // `Inner::recheck`) that the client looks up afresh.
         let short = data.len() < count as usize;
         if short && end < size && self.shared.lock().recheck(id).unwrap_or(false) {
             return Err(nfsstat3::NFS3ERR_STALE);
@@ -948,14 +948,24 @@ mod tests {
         let root = VPath::parse("/mnt").unwrap();
         let mut inner = Inner::new(ws, &root, BTreeMap::new(), BTreeSet::new(), UNIX_EPOCH, (501, 20));
         inner.ranged_reads = true;
+        (inner.keep_removed, inner.renumber_changed) = (false, true);
         let dir = tempfile::tempdir().unwrap();
         let fs = SandNfs::new(Shared::new(inner, Saved::new(dir.path()), root)).unwrap();
         block(async {
             let id = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();
             assert_eq!(fs.getattr(id).await.unwrap().size, 24);
+            let folder_time = |attr: fattr3| (attr.mtime.seconds, attr.mtime.nseconds);
+            let before = folder_time(fs.getattr(ROOT_INO).await.unwrap());
             std::fs::write(folder.path().join("notes.md"), "new").unwrap();
             assert!(fs.read(id, 0, 24).await.is_err(), "no zeros where the client expects 24 bytes");
-            assert_eq!(fs.getattr(id).await.unwrap().size, 3, "the size the reply carries");
+            assert!(fs.read(id, 0, 24).await.is_err(), "nor through the old inode later");
+            assert_ne!(
+                folder_time(fs.getattr(ROOT_INO).await.unwrap()),
+                before,
+                "so the client looks the name up again"
+            );
+            let id = fs.lookup(ROOT_INO, &name("notes.md")).await.unwrap();
+            assert_eq!(fs.getattr(id).await.unwrap().size, 3, "a new inode with the size now");
             assert_eq!(fs.read(id, 0, 24).await.unwrap(), (b"new".to_vec(), true), "the end, not more to come");
             // A read of part of a file that hasn't changed is not its end.
             std::fs::write(folder.path().join("notes.md"), "a longer file now").unwrap();
