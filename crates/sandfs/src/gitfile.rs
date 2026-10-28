@@ -76,7 +76,8 @@ fn relative(from: &Path, to: &Path) -> String {
 }
 
 /// A folder on disk as a mount shows it: [`DirSource`], with its linked worktrees'
-/// `.git` files rewritten (see [`rewrite`]).
+/// `.git` files rewritten (see [`rewrite`]), and at the top of a disk, without the
+/// copies sandfs keeps there (see `Home::freeze`).
 #[derive(Debug)]
 pub struct FolderSource {
     files: DirSource,
@@ -126,6 +127,14 @@ impl Source for FolderSource {
 
     fn read_dir(&self, key: &str) -> Result<Listing> {
         let mut listing = self.files.read_dir(key)?;
+        // At the top of a disk, the copies sandfs keeps of its folders (see `Home::freeze`).
+        if listing.contains_key(crate::store::SHARED)
+            && *self.files.root()? == *key
+            && self.top.join(crate::store::SHARED).join("copies").is_dir()
+            && crate::store::disk_top(&self.top).is_some_and(|top| Some(top) == self.top.canonicalize().ok())
+        {
+            listing.remove(crate::store::SHARED);
+        }
         if let Some(entry) = listing.remove(".git") {
             listing.insert(".git".to_owned(), self.sized(entry));
         }
@@ -202,6 +211,39 @@ mod tests {
         assert_eq!(rewrite(b"gitdir: ../.git/modules/lib\n", Path::new("lib"), top), None);
         assert_eq!(rewrite(b"not a git file", Path::new(""), top), None);
         assert_eq!(rewrite(&[0xff, 0xfe], Path::new(""), top), None);
+    }
+
+    #[test]
+    fn a_folder_s_own_sandfs_folder_is_listed_away_from_a_disk_s_top() {
+        let top = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(top.path().join(".sandfs/copies")).unwrap();
+        std::fs::create_dir_all(top.path().join("sub/.sandfs/copies")).unwrap();
+        let source = FolderSource::new(top.path()).unwrap();
+        let root = source.root().unwrap();
+        assert!(source.read_dir(&root).unwrap().contains_key(".sandfs"));
+        let sub = source.read_dir(&root).unwrap()["sub"].key.clone();
+        assert!(source.read_dir(&sub).unwrap().contains_key(".sandfs"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_copies_at_a_disk_s_top_are_left_out_of_its_listing() {
+        // /dev/shm is a disk of its own; the copies sandfs keeps there stay.
+        let top = Path::new("/dev/shm");
+        if crate::store::disk_top(top).as_deref() != Some(top) {
+            return;
+        }
+        let copies = top.join(".sandfs/copies");
+        // Other tests clean up an empty copies folder there as this one makes it.
+        let _home = (0..5)
+            .find_map(|_| {
+                std::fs::create_dir_all(&copies).ok()?;
+                tempfile::Builder::new().prefix("home-").tempdir_in(&copies).ok()
+            })
+            .unwrap();
+        let source = FolderSource::new(top).unwrap();
+        let root = source.root().unwrap();
+        assert!(!source.read_dir(&root).unwrap().contains_key(".sandfs"));
     }
 
     #[cfg(unix)]

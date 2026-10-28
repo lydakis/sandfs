@@ -258,18 +258,20 @@ pub struct ForkOptions {
     /// [`Home::fork`] read it as they read a mount; [`Home::remove`] with `unmount`
     /// deletes it. It can't be mounted, updated, served or confined.
     pub real_folder: Option<bool>,
-    /// For a plain folder whose files can't be cloned into the home, because it is on
-    /// another disk or on one that doesn't clone files (such as ext4), copy them in
-    /// full instead of refusing. That takes as much space as the folder, and the time
-    /// to copy it; [`Home::update`] copies the same way. Files that can be cloned still
-    /// are.
+    /// For a plain folder whose files can't be cloned, because its disk doesn't clone
+    /// files (such as ext4) or sandfs can't keep copies on it (see [`CrossDevice`]),
+    /// copy them in full instead of refusing. That takes as much space as the folder,
+    /// and the time to copy it; [`Home::update`] copies the same way. Files that can be
+    /// cloned still are.
     pub allow_copy: bool,
 }
 
 /// [`Home::fork`] refused to freeze a plain folder, since `folder` is on another disk
-/// than the home, and a file is cloned only within one disk. Set
-/// [`ForkOptions::allow_copy`] to copy the files instead, or mount the folder itself
-/// with [`Home::mount`], which shows its later changes too. Find it with
+/// than the copy, and a file is cloned only within one disk. A folder on another disk
+/// than the home is copied onto its own disk, into `.sandfs/copies` at that disk's top,
+/// so this is a folder mounted inside the one forked, or a disk whose top sandfs can't
+/// write. Set [`ForkOptions::allow_copy`] to copy the files instead, or mount the
+/// folder itself with [`Home::mount`], which shows its later changes too. Find it with
 /// `err.downcast_ref::<sandfs::CrossDevice>()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossDevice {
