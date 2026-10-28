@@ -17,7 +17,7 @@
 - `pre-commit install` – enables automatic Ruff and MyPy hooks before every commit.
 
 ## Coding Style & Naming Conventions
-- Rust: edition 2024, `rustfmt.toml` settings, no `unsafe`, doc comments on public items. Prefer small, composable functions over new concepts; a feature that can be built from mount, fork and changes should be.
+- Rust: edition 2024, `rustfmt.toml` settings, no `unsafe`, doc comments on public items. The one exception, approved by the maintainer, is `give_back` in `crates/sandfs/src/memory.rs`: one allocator call per platform that hands freed memory back to the system, allowed on that function alone (the workspace lint is `deny`, not `forbid`, for it). Don't add another without the maintainer's approval. Prefer small, composable functions over new concepts; a feature that can be built from mount, fork and changes should be.
 - Python 3.11+, 4-space indentation, PEP 8 naming, type hints everywhere.
 - Keep comments meaningful: a brief rationale before non-trivial logic. Avoid repository-specific jargon unless defined.
 

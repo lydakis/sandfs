@@ -105,14 +105,22 @@ impl<K: std::hash::Hash + Eq, V: Clone> Halves<K, V> {
         }
     }
 
-    /// Count `bytes` more for the young entry `key`, once loaded.
-    fn charge(&mut self, key: &K, bytes: usize) {
-        if let Some((_, held)) = self.young.get_mut(key) {
-            *held += bytes;
-            self.bytes += bytes;
-            if self.bytes > self.budget / 2 {
-                self.turn();
+    /// Count `bytes` more for the entry `key`, once loaded, if it is still the one
+    /// `loaded` picks out. A load may finish after its half turned old: the old half's
+    /// entry then holds the bytes, which count once it moves back.
+    fn charge(&mut self, key: &K, bytes: usize, loaded: impl Fn(&V) -> bool) {
+        if let Some((value, held)) = self.young.get_mut(key) {
+            if loaded(value) {
+                *held += bytes;
+                self.bytes += bytes;
+                if self.bytes > self.budget / 2 {
+                    self.turn();
+                }
             }
+        } else if let Some((value, held)) = self.old.get_mut(key)
+            && loaded(value)
+        {
+            *held += bytes;
         }
     }
 
@@ -231,7 +239,7 @@ impl Cache {
         let fetched = fetch()?;
         *value = Some(fetched.clone());
         drop(value);
-        with(map, |map| map.charge(&key, fetched.bytes()));
+        with(map, |map| map.charge(&key, fetched.bytes(), |held| Arc::ptr_eq(held, &slot)));
         Ok(fetched)
     }
 
@@ -1792,5 +1800,29 @@ fn content_size(content: &Content) -> Option<u64> {
         Content::Bytes(bytes) => Some(bytes.len() as u64),
         Content::Base { size, .. } => *size,
         Content::Stored(stored) => Some(stored.size),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_load_that_finishes_after_its_half_turned_old_is_counted_when_it_moves_back() {
+        let mut halves: Halves<&str, Arc<u8>> = Halves::new(200);
+        let slow = Arc::new(1);
+        halves.insert("slow", slow.clone(), 10);
+        // Another load fills the young half meanwhile, which turns it old.
+        let fast = Arc::new(2);
+        halves.insert("fast", fast.clone(), 10);
+        halves.charge(&"fast", 90, |held| Arc::ptr_eq(held, &fast));
+        assert!(halves.young.is_empty() && halves.old.contains_key("slow"));
+        halves.charge(&"slow", 90, |held| Arc::ptr_eq(held, &slow));
+        assert_eq!(halves.old["slow"].1, 100);
+        // A charge for a slot that was replaced since counts for nothing.
+        halves.charge(&"slow", 1000, |held| Arc::ptr_eq(held, &fast));
+        assert_eq!(halves.old["slow"].1, 100);
+        halves.get("slow");
+        assert_eq!(halves.bytes, 100, "its bytes count in the young half again");
     }
 }
