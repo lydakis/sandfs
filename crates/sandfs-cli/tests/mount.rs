@@ -712,11 +712,10 @@ fn a_fork_of_a_clone_is_a_real_folder_where_the_disk_clones_files() {
     assert_eq!(mounts_at(&mounted.canonicalize().unwrap()), 1);
 }
 
-/// Whether git in `dir` fails, and what it said.
-fn git_fails(dir: &Path, args: &[&str]) -> String {
+/// Check that git in `dir` fails.
+fn git_fails(dir: &Path, args: &[&str]) {
     let output = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
     assert!(!output.status.success(), "git {args:?} should fail in {}", dir.display());
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 #[test]
@@ -752,9 +751,8 @@ fn a_linked_worktree_in_a_folder_commits_inside_the_workspace_or_not_at_all() {
     // The commit is the workspace's: the repositories on disk have what they had.
     assert_eq!(heads(), before);
     assert_eq!(std::fs::read_to_string(folder.join("repo/.worktrees/wt/notes.md")).unwrap(), "one\n");
-    // Git stops; its file says why (newer git leaves the path out of its message).
-    let said = git_fails(&ws.join("theirs"), &["status"]);
-    assert!(said.contains("not a git repository"), "{said}");
+    // Git stops; its file says why, as git's own words differ between versions.
+    git_fails(&ws.join("theirs"), &["status"]);
     assert!(std::fs::read_to_string(ws.join("theirs/.git")).unwrap().contains("outside this folder"));
     let output = sandfs.run(&["changes", "ws"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -772,8 +770,7 @@ fn a_linked_worktree_in_a_folder_commits_inside_the_workspace_or_not_at_all() {
     std::fs::write(wt.join("notes.md"), "three\n").unwrap();
     git_out(&wt, &["commit", "-qam", "three"]);
     assert_eq!(heads(), before);
-    let said = git_fails(&task.join("theirs"), &["status"]);
-    assert!(said.contains("not a git repository"), "{said}");
+    git_fails(&task.join("theirs"), &["status"]);
     assert!(std::fs::read_to_string(task.join("theirs/.git")).unwrap().contains("outside this folder"));
     sandfs.unmount(&task);
 }

@@ -5,8 +5,8 @@
 //! in the workspace, and the real worktree looks changed. So a mount shows such a file
 //! with the path its repository has in the mount: relative, when the repository is in
 //! the folder too, as a link into the folder is (see `DirSource`); and otherwise as a
-//! path that isn't there and says why, so git stops with "not a git repository"
-//! instead of writing outside the workspace. A copy of the folder (`fork`) gets the
+//! path that isn't there and says why, so git stops instead of writing outside the
+//! workspace. A copy of the folder (`fork`) gets the
 //! same file.
 
 use std::path::{Component, Path, PathBuf};
