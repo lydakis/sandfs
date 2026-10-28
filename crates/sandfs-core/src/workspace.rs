@@ -54,10 +54,11 @@ type CacheKey = (u64, SourceKey);
 struct Cache {
     dirs: Mutex<HashMap<CacheKey, Arc<Slot<Arc<Listing>>>>>,
     blobs: Mutex<HashMap<CacheKey, Arc<Slot<Bytes>>>>,
-    /// Entries already found, by mount id and path below the mount, so resolving a
-    /// path costs one lookup instead of one listing lookup per component. Only
+    /// Directories already found, by mount id and path below the mount, so resolving a
+    /// path costs a lookup or two instead of one listing lookup per component. Only
     /// entries that exist are kept, so probing for missing names costs no memory.
-    entries: Mutex<HashMap<u64, HashMap<Box<str>, SourceEntry>>>,
+    /// A path that is its entry's key, as in a folder, shares the key's bytes.
+    entries: Mutex<HashMap<u64, HashMap<SourceKey, SourceEntry>>>,
     /// Directories already prefetched, and whether recursively, so each is asked once.
     prefetched: Mutex<HashSet<(CacheKey, bool)>>,
     /// Base files each directory needed fetched in the current look: sizes missing
@@ -93,7 +94,8 @@ impl Cache {
     }
 
     fn remember_entry(&self, mount: u64, rel: &str, entry: SourceEntry) {
-        self.entries.lock().expect("cache lock").entry(mount).or_default().insert(rel.into(), entry);
+        let rel = if *entry.key == *rel { entry.key.clone() } else { rel.into() };
+        self.entries.lock().expect("cache lock").entry(mount).or_default().insert(rel, entry);
     }
 
     /// Replace a cached listing with a newer answer from the same source.
@@ -109,9 +111,8 @@ impl Cache {
     /// Put `entry` in the cached listing `key` under `name`, in place of the entry with
     /// the same source key, and say whether that changed it. The listing's own lock is
     /// held throughout, so two files of one directory changed at once both stay changed.
-    /// `then` runs under that lock too, so what it caches from `entry` changes in the
-    /// same order as the listing.
-    fn patch_listing(&self, key: &CacheKey, name: &str, entry: SourceEntry, then: impl FnOnce(SourceEntry)) -> bool {
+    /// Files aren't in the path-entry cache, so the listing is the one place to change.
+    fn patch_listing(&self, key: &CacheKey, name: &str, entry: SourceEntry) -> bool {
         let Some(slot) = self.dirs.lock().expect("cache lock").get(key).cloned() else { return false };
         let mut listing = slot.lock().expect("cache slot lock");
         let Some(current) = listing.as_ref() else { return false };
@@ -119,9 +120,8 @@ impl Cache {
             return false;
         }
         let mut fresh = (**current).clone();
-        fresh.insert(name.to_owned(), entry.clone());
+        fresh.insert(name.to_owned(), entry);
         *listing = Some(Arc::new(fresh));
-        then(entry);
         true
     }
 
@@ -472,10 +472,7 @@ impl Workspace {
         if let (Some(parent), Some(name)) = (path.parent(), path.name())
             && let Some(dir) = self.base_dir(&parent, &mount)?
             && self.cached_listing(&mount, &dir)?.get(name).is_some_and(|entry| entry.key == key)
-            && let Some((mount_path, _)) = self.mounts.iter().find(|(_, owner)| owner.id == mount.id)
-            && self.cache.patch_listing(&(mount.id, dir), name, now, |now| {
-                self.cache.remember_entry(mount.id, &path.as_str()[mount_path.as_str().len() + 1..], now);
-            })
+            && self.cache.patch_listing(&(mount.id, dir), name, now)
         {
             changed = true;
         }
@@ -1038,13 +1035,29 @@ impl Workspace {
         if let Some(entry) = self.cache.entry(mount.id, rel) {
             return Ok(Some(entry));
         }
-        let mut parts = rel.split('/').peekable();
+        // Only directories are remembered, as files far outnumber them: a file is found
+        // in its directory's listing, one lookup more.
         let mut key = mount.root.clone();
+        let mut done = 0;
+        if let Some((dir, _)) = rel.rsplit_once('/')
+            && let Some(found) = self.cache.entry(mount.id, dir)
+        {
+            if !found.kind.is_dir() {
+                return Ok(None);
+            }
+            key = found.key;
+            done = dir.len() + 1;
+        }
+        let mut parts = rel[done..].split('/').peekable();
         while let Some(part) = parts.next() {
             let listing = self.cached_listing(mount, &key)?;
             let Some(entry) = listing.get(part) else { return Ok(None) };
+            done += part.len();
+            if entry.kind.is_dir() {
+                self.cache.remember_entry(mount.id, &rel[..done], entry.clone());
+            }
+            done += 1;
             if parts.peek().is_none() {
-                self.cache.remember_entry(mount.id, rel, entry.clone());
                 return Ok(Some(entry.clone()));
             }
             if !entry.kind.is_dir() {

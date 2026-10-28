@@ -78,7 +78,7 @@ const MAX_MEMORY_FILE: u64 = 4 << 30;
 /// can't read a range on its own. The kernel asks for a file in chunks and caches
 /// what it gets, so only the few files being read right now are worth keeping.
 const RECENT_FILES: usize = 16;
-const RECENT_BYTES: usize = 256 << 20;
+const RECENT_BYTES: usize = 64 << 20;
 /// How long a file goes without a write before its buffer is committed and saved.
 /// Nothing tells this filesystem when a file is closed, so a quiet spell stands in.
 pub const SETTLE: Duration = Duration::from_millis(250);
@@ -175,7 +175,8 @@ struct Node {
     sized: Cell<bool>,
     /// For a removed file, the workspace as it was before: the kernel may still have
     /// it open, and an open file stays readable until the kernel forgets the inode.
-    removed_from: Option<Workspace>,
+    /// Boxed, as few nodes have one and every node pays for its room.
+    removed_from: Option<Box<Workspace>>,
 }
 
 /// An open directory, listed once so `readdir` pages through a stable list.
@@ -865,6 +866,11 @@ impl Inner {
                 }
             }
             self.buffers.remove(&ino);
+            // A table keeps its room once grown: after a walk of a big folder the
+            // kernel forgets nearly all of it, and the room goes too.
+            if self.nodes.capacity() > 4096 && self.nodes.len() < self.nodes.capacity() / 4 {
+                self.nodes.shrink_to(self.nodes.len() * 2);
+            }
         }
     }
 
@@ -886,7 +892,7 @@ impl Inner {
         }
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.linked = false;
-            node.removed_from = before.filter(|_| self.keep_removed);
+            node.removed_from = before.filter(|_| self.keep_removed).map(Box::new);
             // Without removed files kept readable (NFS), nothing ever says a client is
             // done with an inode, so a removed one goes now; a client still holding its
             // handle gets an error.
@@ -1232,7 +1238,7 @@ impl Inner {
     fn contents(&self, ino: u64) -> FsResult<(&Workspace, &VPath)> {
         match self.nodes.get(&ino) {
             Some(Node { linked: true, path, .. }) => Ok((&self.ws, path)),
-            Some(Node { removed_from: Some(before), path, .. }) => Ok((before, path)),
+            Some(Node { removed_from: Some(before), path, .. }) => Ok((&**before, path)),
             _ => Err(Errno::ENOENT),
         }
     }
