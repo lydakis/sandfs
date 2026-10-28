@@ -87,10 +87,10 @@ enum Cmd {
         /// Mount the fork at DIR even where it would be kept as a real folder.
         #[arg(long)]
         mount: bool,
-        /// For a plain folder whose files can't be cloned into $SANDFS_HOME, because it
-        /// is on another disk or on one that doesn't clone files (such as ext4), copy
-        /// them in full instead of refusing. That takes as much space as the folder and
-        /// the time to copy it, and `update` copies the same way.
+        /// For a plain folder whose files can't be cloned, because its disk doesn't clone
+        /// files (such as ext4) or sandfs can't keep copies on it, copy them in full
+        /// instead of refusing. That takes as much space as the folder and the time to
+        /// copy it, and `update` copies the same way.
         #[arg(long)]
         allow_copy: bool,
         /// Serve in the foreground instead of in the background.

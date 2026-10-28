@@ -14,6 +14,7 @@
 //! workspaces/<name>/lock            held by the one process that may save it
 //! workspaces/<name>/holder          who holds the lock, for whoever it refuses
 //! copies/<id>/                      a plain folder as `fork` found it, cloned (see `Home::freeze`)
+//! copies-elsewhere                  this home's folders for copies on other disks, one a line
 //! run/                              the process serving every mount (see `server`)
 //! ```
 //!
@@ -490,9 +491,11 @@ impl Home {
 
     /// The record for a new workspace over the plain folder `folder` as it is now (see
     /// `fork`): its files are cloned into `copies/`, which costs no time or space for
-    /// their contents on a disk that clones files (APFS, btrfs, XFS). Where the disk
-    /// can't, or `folder` is on another disk than the home, it is refused rather than
-    /// copied in full, unless `allow_copy`. Pipes, sockets and devices are left out.
+    /// their contents on a disk that clones files (APFS, btrfs, XFS). A file is cloned
+    /// only within one disk, so a folder on another disk than the home is cloned into
+    /// `.sandfs/copies` at the top of its own disk (see [`Home::copies_for`]). Where the
+    /// disk can't clone, it is refused rather than copied in full, unless `allow_copy`.
+    /// Pipes, sockets and devices are left out.
     pub fn freeze(&self, folder: &Path, allow_copy: bool) -> Result<Record> {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if crate::resolve_new(&self.root)?.starts_with(folder) {
@@ -502,13 +505,15 @@ impl Home {
                 self.root.display()
             );
         }
-        let copies = self.copies_dir();
-        std::fs::create_dir_all(&copies).with_context(|| format!("creating {}", copies.display()))?;
+        let copies = self.copies_for(folder)?;
         let copy = tempfile::Builder::new()
             .prefix("copy-")
             .tempdir_in(&copies)
             .with_context(|| format!("making room in {}", copies.display()))?;
-        clone_tree(folder, copy.path(), &self.root, allow_copy)?;
+        // The copies at the top of the disk, when that is the folder: never in a copy.
+        let own = folder.canonicalize().map(|folder| folder.join(SHARED)).ok();
+        let skip = own.filter(|own| copies.starts_with(own)).map(|_| folder.join(SHARED));
+        clone_tree(folder, copy.path(), &self.root, allow_copy, skip.as_deref())?;
         let path = copy.keep();
         let source = folder.display().to_string();
         Ok(Record {
@@ -526,11 +531,48 @@ impl Home {
     /// home was named when it was made.
     pub fn holds_copy(&self, path: &Path) -> bool {
         let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        canonical(path).starts_with(canonical(&self.copies_dir()))
+        let path = canonical(path);
+        self.all_copies_dirs().iter().any(|dir| path.starts_with(canonical(dir)))
     }
 
     fn copies_dir(&self) -> PathBuf {
         self.root.join("copies")
+    }
+
+    /// The home's copies folder, then its folders on other disks.
+    fn all_copies_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.copies_dir()];
+        dirs.extend(self.copies_elsewhere());
+        dirs
+    }
+
+    /// This home's folders for copies of folders on other disks (see [`Home::copies_for`]).
+    fn copies_elsewhere(&self) -> Vec<PathBuf> {
+        let listed = std::fs::read_to_string(self.root.join("copies-elsewhere")).unwrap_or_default();
+        listed.lines().filter(|line| !line.is_empty()).map(PathBuf::from).collect()
+    }
+
+    /// The folder a copy of `folder` goes in, made if need be: the home's `copies/`, or,
+    /// for a folder on another disk, since a file is cloned only within one disk, this
+    /// home's own folder in `.sandfs/copies` at the top of that disk, where every home
+    /// gets one. Where that can't be made, the home's, which refuses the folder as on
+    /// another disk ([`CrossDevice`]).
+    fn copies_for(&self, folder: &Path) -> Result<PathBuf> {
+        let home = self.copies_dir();
+        std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        let Some(disk) = device(folder).filter(|disk| device(&home) != Some(*disk)) else { return Ok(home) };
+        if let Some(dir) = self.copies_elsewhere().into_iter().find(|dir| device(dir) == Some(disk)) {
+            return Ok(dir);
+        }
+        let Some(top) = disk_top(folder) else { return Ok(home) };
+        let shared = top.join(SHARED).join("copies");
+        let made = std::fs::create_dir_all(&shared)
+            .and_then(|()| tempfile::Builder::new().prefix("home-").tempdir_in(&shared))
+            .map(tempfile::TempDir::keep);
+        let Ok(dir) = made else { return Ok(home) };
+        let mut listed = File::options().create(true).append(true).open(self.root.join("copies-elsewhere"))?;
+        std::io::Write::write_all(&mut listed, format!("{}\n", dir.display()).as_bytes())?;
+        Ok(dir)
     }
 
     /// Keep the copy of a folder at `path` while the returned file is open, though no
@@ -547,7 +589,6 @@ impl Home {
     /// holds (see [`Home::hold_copy`]). The caller holds [`Home::repos_lock`]
     /// exclusively, so no workspace over one is being made.
     pub fn remove_unused_copies(&self) -> Result<()> {
-        let Ok(entries) = std::fs::read_dir(self.copies_dir()) else { return Ok(()) };
         // Compared as the disk sees them, since the home may have been named another way
         // (through a link, as /tmp is on macOS) when a workspace was made.
         let mut used = Vec::new();
@@ -558,19 +599,44 @@ impl Home {
                 used.push(path);
             }
         }
-        for entry in entries {
-            let path = entry?.path();
-            if path.extension().is_some_and(|ext| ext == "held") || used.contains(&path.canonicalize()?) {
-                continue;
+        for dir in self.all_copies_dirs() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "held") || used.contains(&path.canonicalize()?) {
+                    continue;
+                }
+                let held = held_path(&path);
+                let hold = File::options().write(true).open(&held);
+                match hold {
+                    Ok(hold) if hold.try_lock().is_err() => continue,
+                    Ok(_) => std::fs::remove_file(&held)?,
+                    Err(_) => {}
+                }
+                remove_copy(&path)?;
             }
-            let held = held_path(&path);
-            let hold = File::options().write(true).open(&held);
-            match hold {
-                Ok(hold) if hold.try_lock().is_err() => continue,
-                Ok(_) => std::fs::remove_file(&held)?,
-                Err(_) => {}
-            }
-            remove_copy(&path)?;
+        }
+        // A folder on another disk goes once it holds no copy, and `.sandfs` with it
+        // once no home has one there, so that disk keeps nothing of sandfs's.
+        let elsewhere = self.copies_elsewhere();
+        let kept: Vec<_> = elsewhere
+            .iter()
+            .filter(|dir| {
+                // Gone, unless its disk is: an unplugged disk keeps its copies listed.
+                let Some(shared) = dir.parent() else { return true };
+                let gone = std::fs::remove_dir(dir).is_ok() || (shared.exists() && !dir.exists());
+                if gone {
+                    let _ = std::fs::remove_dir(shared)
+                        .and_then(|()| std::fs::remove_dir(shared.parent().unwrap_or(shared)));
+                }
+                !gone
+            })
+            .collect();
+        if kept.len() != elsewhere.len() {
+            let listed: String = kept.iter().map(|dir| format!("{}\n", dir.display())).collect();
+            let (file, tmp) = (self.root.join("copies-elsewhere"), self.root.join("copies-elsewhere.tmp"));
+            std::fs::write(&tmp, listed).context("writing copies-elsewhere")?;
+            std::fs::rename(&tmp, file).context("writing copies-elsewhere")?;
         }
         Ok(())
     }
@@ -645,15 +711,18 @@ impl Home {
 /// Clone every file, link and folder in `top` into the empty folder `to`, keeping
 /// modes and modification times, so a build sees the files as it left them. A file
 /// that can't be cloned is copied if `allow_copy`, and refused otherwise.
-fn clone_tree(top: &Path, to: &Path, home: &Path, allow_copy: bool) -> Result<()> {
+fn clone_tree(top: &Path, to: &Path, home: &Path, allow_copy: bool, skip: Option<&Path>) -> Result<()> {
     let mut folders = vec![(top.to_path_buf(), to.to_path_buf())];
+    let copy_disk = device(to);
     let mut made = Vec::new();
     while let Some((from, to)) = folders.pop() {
         for entry in std::fs::read_dir(&from).with_context(|| format!("reading {}", from.display()))? {
             let entry = entry?;
             let (path, copy) = (entry.path(), to.join(entry.file_name()));
             let kind = entry.file_type()?;
-            if kind.is_dir() {
+            if skip == Some(path.as_path()) {
+                continue;
+            } else if kind.is_dir() {
                 std::fs::create_dir(&copy).with_context(|| format!("creating {}", copy.display()))?;
                 folders.push((path, copy));
             } else if kind.is_symlink() {
@@ -674,7 +743,7 @@ fn clone_tree(top: &Path, to: &Path, home: &Path, allow_copy: bool) -> Result<()
                 cloned.map_err(|err| -> anyhow::Error {
                     if err.kind() == std::io::ErrorKind::CrossesDevices {
                         // The folder itself, unless only a folder mounted in it is elsewhere.
-                        let same = device(top).is_some() && device(top) == device(home);
+                        let same = device(top).is_some() && device(top) == copy_disk;
                         let folder = if same { &from } else { top };
                         return CrossDevice { folder: folder.to_path_buf(), home: home.to_path_buf() }.into();
                     }
@@ -712,6 +781,16 @@ fn linked_worktree(top: &Path, folder: &Path, path: &Path) -> Result<Option<Vec<
     let contents = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let at = folder.strip_prefix(top).unwrap_or(Path::new(""));
     Ok(crate::gitfile::rewrite(&contents, at, top))
+}
+
+/// The folder at the top of each disk sandfs keeps copies of that disk's folders in.
+pub(crate) const SHARED: &str = ".sandfs";
+
+/// The top of the disk `path` is on: its furthest folder on the same disk.
+fn disk_top(path: &Path) -> Option<PathBuf> {
+    let path = path.canonicalize().ok()?;
+    let disk = device(&path)?;
+    path.ancestors().take_while(|dir| device(dir) == Some(disk)).last().map(Path::to_path_buf)
 }
 
 /// The disk `path` is on, where the system says.
@@ -923,7 +1002,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_folder_on_another_disk_is_refused_by_kind_or_copied() {
+    fn a_folder_on_another_disk_is_copied_on_that_disk() {
         use std::os::unix::fs::PermissionsExt;
 
         let state = tempfile::tempdir().unwrap();
@@ -936,23 +1015,47 @@ mod tests {
         std::fs::set_permissions(folder.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         File::options().write(true).open(folder.join("run.sh")).unwrap().set_modified(old).unwrap();
+        let top = disk_top(&folder).unwrap();
+        let ours = |home: &Home| home.copies_elsewhere().into_iter().next();
 
-        // Refused, naming both, with nothing left behind.
-        let err = home.freeze(&folder, false).unwrap_err();
-        let refused = err.downcast_ref::<CrossDevice>().expect("a CrossDevice error");
-        assert_eq!(refused, &CrossDevice { folder: folder.clone(), home: state.path().to_path_buf() });
-        assert!(err.to_string().contains("is on another disk than sandfs's home"), "{err}");
-        assert_eq!(std::fs::read_dir(home.copies_dir()).unwrap().count(), 0);
-
-        // Copied in full when allowed, with modes and times, and the record says so.
-        let record = home.freeze(&folder, true).unwrap();
-        assert!(record.allow_copy);
+        // Cloned on the folder's own disk, or where that disk can't clone, as tmpfs and
+        // RAM disks can't, copied in full only when allowed.
+        let record = match home.freeze(&folder, false) {
+            Ok(record) => record,
+            Err(err) => {
+                assert!(err.downcast_ref::<CrossDevice>().is_none(), "{err}");
+                assert!(err.to_string().contains("can't clone"), "{err}");
+                assert_eq!(std::fs::read_dir(ours(&home).unwrap()).unwrap().count(), 0);
+                home.freeze(&folder, true).unwrap()
+            }
+        };
         let Base::Dir { path } = &record.base else { panic!("{:?}", record.base) };
+        assert!(path.starts_with(top.join(SHARED).join("copies")), "{}", path.display());
+        assert_eq!(device(path), device(&folder));
         assert_eq!(std::fs::read_to_string(path.join("drafts/plan.md")).unwrap(), "plan\n");
         let meta = std::fs::metadata(path.join("run.sh")).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o755);
         assert_eq!(meta.modified().unwrap(), old);
         assert!(home.holds_copy(path));
+
+        // With no workspace over it, the copy goes, and this home's folder on that disk.
+        let dir = ours(&home).unwrap();
+        home.remove_unused_copies().unwrap();
+        assert!(!path.exists() && !dir.exists());
+        assert_eq!(ours(&home), None);
+    }
+
+    #[test]
+    fn a_folder_s_copies_of_its_disk_are_never_copied() {
+        let (data, copy) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir_all(data.path().join(".sandfs/copies/home-x/copy-y")).unwrap();
+        std::fs::create_dir_all(data.path().join("sub/.sandfs")).unwrap();
+        std::fs::write(data.path().join("notes.md"), "notes\n").unwrap();
+        let skip = data.path().join(SHARED);
+        clone_tree(data.path(), copy.path(), data.path(), true, Some(&skip)).unwrap();
+        assert!(!copy.path().join(SHARED).exists());
+        assert!(copy.path().join("sub/.sandfs").is_dir());
+        assert!(copy.path().join("notes.md").is_file());
     }
 
     #[test]

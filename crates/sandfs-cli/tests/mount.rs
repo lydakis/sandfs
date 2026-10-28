@@ -776,6 +776,42 @@ fn a_linked_worktree_in_a_folder_commits_inside_the_workspace_or_not_at_all() {
 }
 
 #[test]
+fn a_fork_of_a_folder_on_another_disk_is_a_copy_on_that_disk() {
+    // /dev/shm is a disk of its own on Linux.
+    let shm = Path::new("/dev/shm");
+    if !fuse_available() || !shm.is_dir() {
+        return;
+    }
+    let mut sandfs = Sandfs::new();
+    let data = tempfile::tempdir_in(shm).unwrap();
+    let folder = data.path().join("notes");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("todo.md"), "a\n").unwrap();
+    let task = sandfs.home.path().join("task");
+    // tmpfs doesn't clone files, so they are copied; on that disk all the same.
+    let output = sandfs.try_run(&["fork", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && stderr.contains("can't clone"), "{stderr}");
+    sandfs.run(&["fork", "--allow-copy", folder.to_str().unwrap(), task.to_str().unwrap()]);
+    sandfs.mounts.push(task.clone());
+    let ours = std::fs::read_to_string(sandfs.home.path().join("copies-elsewhere")).unwrap();
+    let ours = PathBuf::from(ours.trim());
+    assert!(ours.starts_with(shm.join(".sandfs/copies")), "{}", ours.display());
+    // One copy, beside the file that holds it for the mount.
+    assert_eq!(std::fs::read_dir(&ours).unwrap().flatten().filter(|entry| entry.path().is_dir()).count(), 1);
+    std::fs::write(folder.join("todo.md"), "a, later\n").unwrap();
+    assert_eq!(std::fs::read_to_string(task.join("todo.md")).unwrap(), "a\n");
+    std::fs::write(task.join("todo.md"), "b\n").unwrap();
+    std::fs::write(folder.join("todo.md"), "a\n").unwrap();
+    sandfs.run(&["changes", "task", "--copy-to", folder.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(folder.join("todo.md")).unwrap(), "b\n");
+    // With the workspace, its copy and this home's folder on that disk go.
+    sandfs.run(&["rm", "--unmount", "task"]);
+    sandfs.mounts.clear();
+    assert!(!ours.exists());
+}
+
+#[test]
 fn a_fork_of_a_plain_folder_keeps_it_as_it_was() {
     use std::os::unix::fs::PermissionsExt;
 
