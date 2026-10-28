@@ -561,23 +561,50 @@ impl Home {
         let home = self.copies_dir();
         std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
         let Some(disk) = device(folder).filter(|disk| device(&home) != Some(*disk)) else { return Ok(home) };
-        if let Some(dir) = self.copies_elsewhere().into_iter().find(|dir| device(dir) == Some(disk)) {
+        if let Some(dir) =
+            self.copies_elsewhere().into_iter().find(|dir| device(dir) == Some(disk) && self.private(dir))
+        {
             return Ok(dir);
         }
         let Some(top) = disk_top(folder) else { return Ok(home) };
         let shared = top.join(SHARED).join("copies");
-        // Through a link, the copies could land in the folder being copied.
-        let real = |dir: &Path| std::fs::symlink_metadata(dir).map_or(true, |meta| meta.is_dir());
-        if !real(&top.join(SHARED)) || !real(&shared) {
+        if std::fs::create_dir_all(&shared).is_err() || !self.private(&shared.join("home")) {
             return Ok(home);
         }
-        let made = std::fs::create_dir_all(&shared)
-            .and_then(|()| tempfile::Builder::new().prefix("home-").tempdir_in(&shared))
-            .map(tempfile::TempDir::keep);
+        let made = tempfile::Builder::new().prefix("home-").tempdir_in(&shared).map(tempfile::TempDir::keep);
         let Ok(dir) = made else { return Ok(home) };
         let mut listed = File::options().create(true).append(true).open(self.root.join("copies-elsewhere"))?;
         std::io::Write::write_all(&mut listed, format!("{}\n", dir.display()).as_bytes())?;
         Ok(dir)
+    }
+
+    /// Whether no one but this home's owner can change where the copies folder `dir`, on
+    /// another disk, leads: its `.sandfs/copies` and `.sandfs` are folders of the owner's
+    /// that no one else may write, at a disk's top where no one else may rename them, and
+    /// it is a folder, not a link. Anyone else could swap one for a link, and copies would
+    /// be written, and deleted, wherever it led.
+    #[cfg(unix)]
+    fn private(&self, dir: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(owner) = std::fs::metadata(&self.root).map(|meta| meta.uid()) else { return false };
+        let ours = |dir: &Path| {
+            std::fs::symlink_metadata(dir)
+                .is_ok_and(|meta| meta.is_dir() && meta.uid() == owner && meta.mode() & 0o022 == 0)
+        };
+        let (Some(copies), Some(shared), Some(top)) =
+            (dir.parent(), dir.parent().and_then(Path::parent), dir.ancestors().nth(3))
+        else {
+            return false;
+        };
+        // A sticky top, as /dev/shm and /tmp are, lets others rename only their own.
+        let top = std::fs::metadata(top).is_ok_and(|meta| meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0);
+        let dir = std::fs::symlink_metadata(dir).map_or(true, |meta| meta.is_dir());
+        dir && ours(copies) && ours(shared) && top
+    }
+
+    #[cfg(not(unix))]
+    fn private(&self, _dir: &Path) -> bool {
+        false
     }
 
     /// Keep the copy of a folder at `path` while the returned file is open, though no
@@ -605,6 +632,9 @@ impl Home {
             }
         }
         for dir in self.all_copies_dirs() {
+            if dir != self.copies_dir() && !self.private(&dir) {
+                continue;
+            }
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries {
                 let path = entry?.path();
@@ -1063,6 +1093,36 @@ mod tests {
         home.remove_unused_copies().unwrap();
         assert!(!path.exists() && !dir.exists());
         assert_eq!(ours(&home), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_go_on_another_disk_only_where_no_one_else_can_move_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (state, top) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::at(state.path());
+        std::fs::create_dir_all(state.path()).unwrap();
+        let copies = top.path().join(".sandfs/copies");
+        std::fs::create_dir_all(&copies).unwrap();
+        let mode = |path: &Path, mode| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        mode(top.path(), 0o755);
+        mode(&copies, 0o755);
+        mode(&top.path().join(".sandfs"), 0o755);
+        let dir = copies.join("home-x");
+        assert!(home.private(&dir));
+        // Anyone may write the copies folder, or rename what is in the disk's top.
+        mode(&copies, 0o777);
+        assert!(!home.private(&dir));
+        mode(&copies, 0o755);
+        mode(top.path(), 0o777);
+        assert!(!home.private(&dir));
+        mode(top.path(), 0o1777);
+        assert!(home.private(&dir));
+        // A link where the folder was.
+        std::fs::rename(top.path().join(".sandfs"), top.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(top.path().join("moved"), top.path().join(".sandfs")).unwrap();
+        assert!(!home.private(&dir));
     }
 
     #[test]
